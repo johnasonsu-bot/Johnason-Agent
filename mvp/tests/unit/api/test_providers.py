@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 from threading import Event, Thread
 
@@ -278,6 +279,86 @@ def test_provider_update_preserves_secret_reference_and_masks_its_status(
     assert b"secret-value" not in (tmp_path / "workflow.sqlite").read_bytes()
 
 
+@pytest.mark.parametrize(
+    "authority_change",
+    [
+        {"base_url": "https://changed-provider.invalid"},
+        {"protocol": "openai_chat"},
+    ],
+)
+def test_provider_authority_or_protocol_change_invalidates_the_old_credential(
+    tmp_path: Path, authority_change: dict[str, object]
+) -> None:
+    """A credential authorized for one authority must never be forwarded to another."""
+    password = secrets.token_urlsafe(24)
+    credential = secrets.token_urlsafe(32)
+    vault = CredentialVault.create(tmp_path / "vault.bin", password)
+    database = tmp_path / "workflow.sqlite"
+    client = _client(database, vault)
+    client.post("/api/providers", json=deepseek_payload())
+    client.post(
+        "/api/providers/deepseek-primary/secret", json={"value": credential}
+    )
+    before = ProviderRepository(database).get("deepseek-primary")
+
+    response = client.post(
+        "/api/providers", json=deepseek_payload() | authority_change
+    )
+
+    after = ProviderRepository(database).get("deepseek-primary")
+    assert response.status_code == 200
+    assert response.json()["credential_status"] == "missing"
+    assert before.secret_id != after.secret_id
+    with pytest.raises(KeyError):
+        vault.get(before.secret_id or "")
+    assert credential not in response.text
+
+
+def test_locked_vault_rejects_provider_authority_change_without_mutating_metadata(
+    tmp_path: Path,
+) -> None:
+    """Authority mutation cannot bypass credential invalidation while the vault is locked."""
+    password = secrets.token_urlsafe(24)
+    credential = secrets.token_urlsafe(32)
+    vault = CredentialVault.create(tmp_path / "vault.bin", password)
+    database = tmp_path / "workflow.sqlite"
+    client = _client(database, vault)
+    client.post("/api/providers", json=deepseek_payload())
+    client.post(
+        "/api/providers/deepseek-primary/secret", json={"value": credential}
+    )
+    before = ProviderRepository(database).get("deepseek-primary")
+    vault.lock()
+
+    response = client.post(
+        "/api/providers",
+        json=deepseek_payload() | {"base_url": "https://changed-provider.invalid"},
+    )
+
+    after = ProviderRepository(database).get("deepseek-primary")
+    assert response.status_code == 423
+    assert after == before
+    assert credential not in response.text
+
+
+def test_lm_studio_reports_that_credentials_are_not_required(tmp_path: Path) -> None:
+    vault = CredentialVault.create(tmp_path / "vault.bin", secrets.token_urlsafe(24))
+    vault.lock()
+    client = _client(tmp_path / "workflow.sqlite", vault)
+    payload = {
+        "id": "lmstudio",
+        "name": "LM Studio",
+        "protocol": "lmstudio",
+        "base_url": "http://127.0.0.1:1234",
+        "model_aliases": {},
+    }
+
+    response = client.post("/api/providers", json=payload)
+
+    assert response.status_code == 201
+    assert response.json()["credential_status"] == "not_required"
+
+
 def test_models_and_connection_are_normalized_through_gateway(tmp_path: Path) -> None:
     """Provider Center exposes discovered names and a compact connection result."""
     vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
@@ -388,6 +469,54 @@ def test_lm_studio_model_discovery_uses_the_saved_profile_url(tmp_path: Path) ->
         "models": ["configured-model"],
         "error_code": None,
     }
+    asyncio.run(provider.aclose())
+
+
+def test_lm_studio_connection_discovers_before_using_the_first_available_model(
+    tmp_path: Path,
+) -> None:
+    """The real adapter path must not send the placeholder model name on first setup."""
+    visited: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        visited.append(request.url.path)
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "loaded-model"}]})
+        if request.url.path == "/v1/chat/completions":
+            body = json.loads(request.content)
+            if body.get("model") != "loaded-model":
+                return httpx.Response(400, request=request)
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "ready"}}]},
+            )
+        return httpx.Response(404, request=request)
+
+    provider = LMStudioProvider(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    )
+    vault = CredentialVault.create(
+        tmp_path / "vault.bin", secrets.token_urlsafe(24)
+    )
+    client = _client(
+        tmp_path / "workflow.sqlite", vault, ModelGateway({"lmstudio": provider})
+    )
+    client.post(
+        "/api/providers",
+        json={
+            "id": "lmstudio",
+            "name": "LM Studio",
+            "protocol": "lmstudio",
+            "base_url": "http://configured-lm.test",
+            "model_aliases": {},
+        },
+    )
+
+    response = client.post("/api/providers/lmstudio/test")
+
+    assert response.json()["status"] == "online"
+    assert response.json()["models"] == ["loaded-model"]
+    assert visited == ["/v1/models", "/v1/chat/completions"]
     asyncio.run(provider.aclose())
 
 
@@ -537,6 +666,33 @@ def test_vault_management_routes_unlock_a_default_locked_vault_without_echoing_p
         assert client.get("/api/vault/status").json() == {"status": "unlocked"}
 
 
+def test_vault_unlock_reports_single_writer_conflict_as_locked(tmp_path: Path) -> None:
+    """A second application gets a retryable response instead of an internal error."""
+    from workbench.credentials.service import VaultService
+
+    path = tmp_path / "vault.bin"
+    owner = CredentialVault.create(path, "correct horse")
+    service = VaultService(path)
+    app = create_app(
+        AppSettings(
+            database=tmp_path / "workflow.sqlite",
+            runner=NoopRunner(),
+            owner_id="api",
+            vault=service,
+        )
+    )
+    try:
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/vault/unlock", json={"password": "correct horse"}
+            )
+
+            assert response.status_code == 423
+            assert response.json() == {"detail": "credential vault is already in use"}
+    finally:
+        owner.lock()
+
+
 def test_secret_persistence_reports_committed_durability_uncertainty(tmp_path: Path) -> None:
     """Post-replace fsync uncertainty is usable but distinct from a failed write."""
     vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
@@ -641,3 +797,31 @@ def test_app_shutdown_closes_each_owned_gateway_provider_once(tmp_path: Path) ->
         pass
 
     assert provider.closed == 1
+
+
+def test_app_shutdown_locks_vault_even_when_provider_close_fails(tmp_path: Path) -> None:
+    """Lifespan cleanup must lock credentials in an unconditional finally block."""
+
+    class FailingCloseProvider(AvailableProvider):
+        async def aclose(self) -> None:
+            raise RuntimeError("provider close failed")
+
+    vault = CredentialVault.create(
+        tmp_path / "vault.bin", secrets.token_urlsafe(24)
+    )
+    app = create_app(
+        AppSettings(
+            database=tmp_path / "workflow.sqlite",
+            runner=NoopRunner(),
+            owner_id="api",
+            vault=vault,
+            gateway=ModelGateway({"failing": FailingCloseProvider()}),
+            close_gateway=True,
+        )
+    )
+
+    with pytest.raises(ExceptionGroup):
+        with TestClient(app):
+            assert vault.is_unlocked is True
+
+    assert vault.is_unlocked is False

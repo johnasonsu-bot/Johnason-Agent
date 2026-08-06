@@ -11,6 +11,7 @@ from workbench.models.contracts import (
     ModelRequest,
     ModelResponse,
     ModelUsage,
+    ModelMessage,
     ToolCall,
 )
 from workbench.models.gateway import (
@@ -129,7 +130,7 @@ def _request_body(
     model = profile.model_aliases.get(request.model, request.model)
     return {
         "model": model,
-        "messages": request.messages,
+        "messages": [_message_body(message) for message in request.messages],
         "tools": [
             {
                 "type": "function",
@@ -144,6 +145,29 @@ def _request_body(
         "temperature": request.temperature,
         "stream": stream,
     }
+
+
+def _message_body(message: ModelMessage) -> dict[str, Any]:
+    body: dict[str, Any] = {"role": message.role}
+    if message.content is not None or message.role == "assistant":
+        body["content"] = message.content
+    if message.name is not None:
+        body["name"] = message.name
+    if message.tool_call_id is not None:
+        body["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        body["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":")),
+                },
+            }
+            for call in message.tool_calls
+        ]
+    return body
 
 
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall:

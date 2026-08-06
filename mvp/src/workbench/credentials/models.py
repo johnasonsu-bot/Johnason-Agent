@@ -13,6 +13,14 @@ class VaultUnlockError(VaultError):
     """Raised when a vault cannot be authenticated and decrypted."""
 
 
+class VaultInUseError(VaultError):
+    """Raised when another vault instance or process owns the writer lease."""
+
+
+class VaultRecoveryRequiredError(VaultError):
+    """Raised when an incomplete or corrupt vault needs explicit recovery."""
+
+
 class VaultPersistenceError(OSError):
     """Raised when a vault write fails, with its commit state made explicit."""
 

@@ -55,6 +55,8 @@ class ModelGateway:
         self._providers = dict(providers)
 
     def _provider(self, profile: ProviderProfileRecord) -> ModelProvider:
+        if not profile.enabled:
+            raise ValueError("provider is disabled")
         try:
             return self._providers[profile.protocol]
         except KeyError as exc:
@@ -83,10 +85,16 @@ class ModelGateway:
     async def aclose(self) -> None:
         """Close each owned adapter once, even when protocols share one instance."""
         closed: set[int] = set()
+        failures: list[Exception] = []
         for provider in self._providers.values():
             if id(provider) in closed:
                 continue
             closed.add(id(provider))
             close = getattr(provider, "aclose", None)
             if callable(close):
-                await close()
+                try:
+                    await close()
+                except Exception as exc:
+                    failures.append(exc)
+        if failures:
+            raise ExceptionGroup("model provider shutdown failed", failures)

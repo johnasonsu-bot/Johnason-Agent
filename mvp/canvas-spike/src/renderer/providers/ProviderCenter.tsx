@@ -7,12 +7,21 @@ const statusCopy: Record<ConnectionResult["status"], string> = {
 };
 
 const credentialCopy: Record<ProviderProfile["credential_status"], string> = {
-  configured: "凭据已配置", locked: "保险库已锁定", missing: "未配置凭据",
+  configured: "凭据已配置", locked: "保险库已锁定", missing: "未配置凭据", not_required: "无需凭据",
 };
 
 function asInput(draft: ProviderDraft, defaultModel?: string) {
-  const { apiKey: _apiKey, ...input } = draft;
-  return { ...input, model_aliases: defaultModel ? { ...input.model_aliases, default: defaultModel } : input.model_aliases };
+  return {
+    id: draft.id,
+    name: draft.name,
+    protocol: draft.protocol,
+    base_url: draft.base_url,
+    model_aliases: defaultModel ? { ...draft.model_aliases, default: defaultModel } : draft.model_aliases,
+    capabilities: draft.capabilities,
+    enabled: draft.enabled,
+    thinking_enabled: draft.thinking_enabled,
+    reasoning_effort: draft.reasoning_effort,
+  };
 }
 
 export function ProviderCenter() {
@@ -53,7 +62,9 @@ export function ProviderCenter() {
     try {
       const result = vaultStatus === "uninitialized"
         ? await providerApi.createVault(submittedPassword)
-        : await providerApi.unlockVault(submittedPassword);
+        : vaultStatus === "recovery_required"
+          ? await providerApi.recoverVault(submittedPassword)
+          : await providerApi.unlockVault(submittedPassword);
       setVaultStatus(result.status);
       setMessage("");
       await refresh();
@@ -95,10 +106,11 @@ export function ProviderCenter() {
       await providerApi.saveProvider({
         id: selected.id, name: selected.name, protocol: selected.protocol, base_url: selected.base_url,
         model_aliases: { ...selected.model_aliases, default: model }, capabilities: selected.capabilities,
-        thinking_enabled: selected.thinking_enabled, reasoning_effort: selected.reasoning_effort,
+        enabled: selected.enabled, thinking_enabled: selected.thinking_enabled, reasoning_effort: selected.reasoning_effort,
       });
       setModels((current) => current.includes(model) ? current : [model, ...current]);
       await refresh();
+      setMessage("默认模型已更新");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "无法更新默认模型");
     }
@@ -154,9 +166,10 @@ export function ProviderCenter() {
     <section className="provider-center" aria-labelledby="provider-title">
       <p className="eyebrow">安全连接</p><h2 id="provider-title">模型供应商</h2>
       <p>凭据仅保存在本机加密保险库中，应用重启后默认锁定。</p>
+      {vaultStatus === "recovery_required" && <p role="alert">保险库需要恢复；原始损坏文件会保留为本地恢复副本。</p>}
       <form className="vault-form" onSubmit={(event) => void unlock(event)}>
         <label>主密码<input aria-label="主密码" type="password" autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
-        <button type="submit">{vaultStatus === "uninitialized" ? "创建并解锁" : "解锁"}</button>
+        <button type="submit">{vaultStatus === "uninitialized" ? "创建并解锁" : vaultStatus === "recovery_required" ? "恢复并创建" : "解锁"}</button>
       </form>
       {message && <p role="status" className="notice">{message}</p>}
     </section>
@@ -168,10 +181,10 @@ export function ProviderCenter() {
       <div className="center-heading"><div><p className="eyebrow">本地连接</p><h2 id="provider-title">模型供应商</h2><p>管理本地和云端模型；保险库当前已解锁。</p></div><button type="button" className="quiet" disabled={locking} onClick={() => void lock()}>{locking ? "正在锁定…" : "锁定保险库"}</button></div>
       {message && <p role="status" className="notice">{message}</p>}
       <div className="provider-layout">
-        <aside aria-label="已保存的供应商"><h3>供应商</h3>{providers.length === 0 ? <p className="empty">从预设开始连接一个模型。</p> : providers.map((provider) => <button className={provider.id === selectedId ? "provider-item active" : "provider-item"} type="button" key={provider.id} onClick={() => { setSelectedId(provider.id); setModels([]); setConnection(null); }}><strong>{provider.name}</strong><span>{credentialCopy[provider.credential_status]}</span></button>)}</aside>
+        <aside aria-label="已保存的供应商"><h3>供应商</h3>{providers.length === 0 ? <p className="empty">从预设开始连接一个模型。</p> : providers.map((provider) => <button aria-pressed={provider.id === selectedId} className={provider.id === selectedId ? "provider-item active" : "provider-item"} type="button" key={provider.id} onClick={() => { setSelectedId(provider.id); setModels([]); setConnection(null); }}><strong>{provider.name}</strong><span>{provider.enabled ? credentialCopy[provider.credential_status] : "已停用"}</span></button>)}</aside>
         <div className="provider-detail">
           <ProviderForm provider={selected} onSave={save} onTest={test} />
-          {selected && <button type="button" className="quiet" onClick={() => void discoverModels()}>发现模型</button>}
+          {selected && <button type="button" className="quiet" disabled={!selected.enabled} onClick={() => void discoverModels()}>发现模型</button>}
           {selected && <button type="button" className="quiet danger" disabled={deleting} onClick={() => void removeSelected()}>{deleting ? "正在删除…" : "删除供应商"}</button>}
           {connection && <section className={`connection ${connection.status}`} aria-live="polite"><strong>{statusCopy[connection.status]}</strong>{connection.latency_ms !== undefined && <span>{connection.latency_ms} ms</span>}{connection.error_code && <span>{connection.error_code}</span>}</section>}
           {visibleModels.length > 0 && <label className="model-picker">默认模型<select aria-label="默认模型" value={selected?.model_aliases.default ?? visibleModels[0]} onChange={(event) => void selectModel(event.target.value)}>{visibleModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>}

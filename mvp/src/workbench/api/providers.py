@@ -13,13 +13,19 @@ from fastapi.responses import JSONResponse
 import httpx
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
-from workbench.credentials.models import VaultLockedError, VaultPersistenceError, VaultUnlockError
+from workbench.credentials.models import (
+    VaultInUseError,
+    VaultLockedError,
+    VaultPersistenceError,
+    VaultRecoveryRequiredError,
+    VaultUnlockError,
+)
 from workbench.credentials.service import VaultService
 from workbench.credentials.vault import CredentialVault
 from workbench.models.contracts import ModelRequest
 from workbench.models.lmstudio import ProviderResponseError, ProviderUnavailable
 from workbench.models.profiles import ProviderCapability, ProviderProfileRecord
-from workbench.providers.repository import ProviderRepository
+from workbench.providers.repository import ProviderRepository, same_credential_scope
 
 
 class ProviderPayload(BaseModel):
@@ -34,6 +40,7 @@ class ProviderPayload(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     capabilities: set[ProviderCapability] = Field(default_factory=set)
+    enabled: bool = True
     thinking_enabled: bool = False
     reasoning_effort: Literal["high", "max"] = "high"
 
@@ -84,8 +91,13 @@ class ProviderLockRegistry:
 _provider_locks = ProviderLockRegistry()
 
 
-def credential_status(record: ProviderProfileRecord, vault: CredentialVault | None) -> str:
+def credential_status(
+    record: ProviderProfileRecord,
+    vault: CredentialVault | VaultService | None,
+) -> str:
     """Return a masked credential state without returning a credential reference."""
+    if record.protocol == "lmstudio":
+        return "not_required"
     if vault is None:
         return "locked"
     try:
@@ -97,7 +109,10 @@ def credential_status(record: ProviderProfileRecord, vault: CredentialVault | No
     return "configured"
 
 
-def provider_response(record: ProviderProfileRecord, vault: CredentialVault | None) -> dict[str, object]:
+def provider_response(
+    record: ProviderProfileRecord,
+    vault: CredentialVault | VaultService | None,
+) -> dict[str, object]:
     """Serialize only non-secret metadata for an API response."""
     return {
         "id": record.id,
@@ -107,6 +122,7 @@ def provider_response(record: ProviderProfileRecord, vault: CredentialVault | No
         "headers": dict(record.headers),
         "model_aliases": record.model_aliases,
         "capabilities": sorted(capability.value for capability in record.capabilities),
+        "enabled": record.enabled,
         "thinking_enabled": record.thinking_enabled,
         "reasoning_effort": record.reasoning_effort,
         "credential_status": credential_status(record, vault),
@@ -146,12 +162,6 @@ def _error_code(error: Exception) -> tuple[str, str]:
     return ("error", "provider_error")
 
 
-def _test_model(record: ProviderProfileRecord) -> str:
-    return record.model_aliases.get(
-        "default", next(iter(record.model_aliases.values()), "default")
-    )
-
-
 def _provider_payload(value: dict[str, object]) -> ProviderPayload:
     try:
         return ProviderPayload.model_validate(value)
@@ -186,7 +196,7 @@ async def _json_object(request: Request, *, error_detail: str) -> dict[str, obje
 
 def provider_router(
     repository: ProviderRepository,
-    vault: CredentialVault | None,
+    vault: CredentialVault | VaultService | None,
     gateway: object | None = None,
 ) -> APIRouter:
     """Build routes with explicit runtime dependencies for local application wiring."""
@@ -208,10 +218,34 @@ def provider_router(
                 record = ProviderProfileRecord(**validated.model_dump())
             except ValidationError as exc:
                 raise HTTPException(422, "invalid provider metadata") from exc
+            try:
+                existing = repository.get(record.id)
+            except KeyError:
+                existing = None
+            cleanup_unconfirmed = False
+            if existing is not None and not same_credential_scope(existing, record):
+                if vault is None:
+                    raise HTTPException(423, "credential vault is locked")
+                try:
+                    vault.delete(existing.secret_id or "")
+                except (VaultLockedError, VaultInUseError) as exc:
+                    raise HTTPException(423, "credential vault is locked") from exc
+                except VaultPersistenceError as exc:
+                    if not exc.committed:
+                        raise HTTPException(
+                            503, "credential could not be invalidated"
+                        ) from exc
+                    cleanup_unconfirmed = True
             created, record = repository.upsert(record)
         if not created:
             response.status_code = 200
-        return provider_response(record, vault)
+        result = provider_response(record, vault)
+        if cleanup_unconfirmed:
+            return JSONResponse(
+                status_code=202,
+                content=result | {"credential_cleanup": "unconfirmed"},
+            )
+        return result
 
     @router.post("/{provider_id}/secret")
     async def put_secret(provider_id: str, request: Request) -> dict[str, str]:
@@ -278,17 +312,19 @@ def provider_router(
                 status="error", latency_ms=0, code="gateway_unavailable"
             )
         try:
+            models = await gateway.list_models(record)  # type: ignore[union-attr]
+            selected_model = record.model_aliases.get("default") or (
+                models[0] if models else None
+            )
+            if selected_model is None:
+                raise ProviderResponseError("provider returned no models")
             await gateway.complete(  # type: ignore[union-attr]
                 ModelRequest(
-                    model=_test_model(record),
+                    model=selected_model,
                     messages=[{"role": "user", "content": "Connection test"}],
                 ),
                 record,
             )
-            try:
-                models = await gateway.list_models(record)  # type: ignore[union-attr]
-            except Exception:
-                models = []
         except Exception as exc:
             status, code = _error_code(exc)
             return _error_result(
@@ -323,6 +359,37 @@ def vault_router(vault: VaultService) -> APIRouter:
             vault.create(password.password)
         except FileExistsError as exc:
             raise HTTPException(409, "vault already exists") from exc
+        except VaultInUseError as exc:
+            raise HTTPException(423, "credential vault is already in use") from exc
+        except VaultPersistenceError as exc:
+            if exc.committed:
+                return JSONResponse(
+                    status_code=202,
+                    content={"status": "locked", "durability": "unconfirmed"},
+                )
+            raise HTTPException(503, "vault could not be created") from exc
+        return {"status": "unlocked"}
+
+    @router.post("/recover")
+    async def recover(request: Request) -> dict[str, str]:
+        password = _password_payload(
+            await _json_object(request, error_detail="invalid vault request")
+        )
+        try:
+            vault.recover(password.password)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "vault not initialized") from exc
+        except FileExistsError as exc:
+            raise HTTPException(409, "vault does not require recovery") from exc
+        except VaultInUseError as exc:
+            raise HTTPException(423, "credential vault is already in use") from exc
+        except VaultPersistenceError as exc:
+            if exc.committed:
+                return JSONResponse(
+                    status_code=202,
+                    content={"status": "locked", "durability": "unconfirmed"},
+                )
+            raise HTTPException(503, "vault could not be recovered") from exc
         return {"status": "unlocked"}
 
     @router.post("/unlock")
@@ -334,6 +401,10 @@ def vault_router(vault: VaultService) -> APIRouter:
             vault.unlock(password.password)
         except FileNotFoundError as exc:
             raise HTTPException(404, "vault not initialized") from exc
+        except VaultRecoveryRequiredError as exc:
+            raise HTTPException(409, "vault requires recovery") from exc
+        except VaultInUseError as exc:
+            raise HTTPException(423, "credential vault is already in use") from exc
         except VaultUnlockError as exc:
             raise HTTPException(401, "vault could not be unlocked") from exc
         return {"status": "unlocked"}

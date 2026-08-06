@@ -1,10 +1,12 @@
 import json
+import secrets
 from collections.abc import Callable
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
-from workbench.models.contracts import ModelRequest, ToolDefinition
+from workbench.models.contracts import ModelMessage, ModelRequest, ToolDefinition
 from workbench.models.deepseek import DeepSeekProvider
 from workbench.models.gateway import ModelEventKind
 from workbench.models.profiles import ProviderProfileRecord
@@ -36,45 +38,69 @@ def deepseek_profile(**changes: object) -> ProviderProfileRecord:
     )
 
 
-def tool_turn_messages() -> list[dict[str, object]]:
-    return [
-        {"role": "user", "content": "What is the weather?"},
-        {
-            "role": "assistant",
-            "content": None,
-            "reasoning_content": "preserved",
-            "tool_calls": [
-                {
-                    "id": "call-weather",
-                    "type": "function",
-                    "function": {"name": "weather", "arguments": '{"city":"Shanghai"}'},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call-weather", "content": "sunny"},
-    ]
-
-
 @pytest.mark.asyncio
-async def test_thinking_tool_turn_replays_reasoning_content() -> None:
-    """Dropping the assistant reasoning token breaks a DeepSeek tool continuation."""
-    recorder = RequestRecorder(
-        lambda _request: httpx.Response(
-            200, json={"choices": [{"message": {"content": "It is sunny."}}]}
-        )
+async def test_thinking_tool_turn_replays_private_continuation_from_actual_response() -> None:
+    """The second turn must derive private continuation from the actual first response."""
+    responses = iter(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "reasoning_content": "preserved",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-weather",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "weather",
+                                            "arguments": '{"city":"Shanghai"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            ),
+            httpx.Response(
+                200, json={"choices": [{"message": {"content": "It is sunny."}}]}
+            ),
+        ]
     )
+    recorder = RequestRecorder(
+        lambda _request: next(responses)
+    )
+    credential = secrets.token_urlsafe(32)
     provider = DeepSeekProvider(
         client=httpx.AsyncClient(transport=httpx.MockTransport(recorder)),
-        vault=InMemoryVault({"provider/deepseek-primary": "secret-value"}),
+        vault=InMemoryVault({"provider/deepseek-primary": credential}),
     )
+    tools = [
+        ToolDefinition(
+            name="weather", description="Get weather", parameters={"type": "object"}
+        )
+    ]
+    first = await provider.complete(
+        ModelRequest(
+            model="deepseek-v4-flash",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=tools,
+        ),
+        deepseek_profile(),
+    )
+    assistant = ModelMessage.from_response(first)
     request = ModelRequest(
         model="deepseek-v4-flash",
-        messages=tool_turn_messages(),
-        tools=[
-            ToolDefinition(
-                name="weather", description="Get weather", parameters={"type": "object"}
-            )
+        messages=[
+            {"role": "user", "content": "What is the weather?"},
+            assistant,
+            {"role": "tool", "tool_call_id": "call-weather", "content": "sunny"},
         ],
+        tools=tools,
         temperature=0.7,
         top_p=0.8,
         presence_penalty=0.2,
@@ -85,7 +111,7 @@ async def test_thinking_tool_turn_replays_reasoning_content() -> None:
     await provider.complete(request, deepseek_profile())
 
     sent = json.loads(recorder.requests[-1].content)
-    assert recorder.requests[-1].headers["authorization"] == "Bearer secret-value"
+    assert recorder.requests[-1].headers["authorization"] == f"Bearer {credential}"
     assert sent["thinking"] == {"type": "enabled"}
     assert sent["reasoning_effort"] == "high"
     assert "temperature" not in sent
@@ -94,7 +120,23 @@ async def test_thinking_tool_turn_replays_reasoning_content() -> None:
     assert "frequency_penalty" not in sent
     assert "tool_choice" not in sent
     assert sent["messages"][1]["reasoning_content"] == "preserved"
+    assert "reasoning_content" not in assistant.model_dump_json()
     await provider.aclose()
+
+
+def test_public_message_dict_cannot_inject_deepseek_reasoning_content() -> None:
+    """Only typed private continuation may become adapter-specific reasoning data."""
+    with pytest.raises(ValidationError, match="reasoning_content"):
+        ModelRequest(
+            model="deepseek-v4-flash",
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "caller supplied",
+                }
+            ],
+        )
 
 
 @pytest.mark.asyncio

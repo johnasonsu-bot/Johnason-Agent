@@ -153,3 +153,18 @@ def test_profile_assignment_revalidates_headers() -> None:
 
     with pytest.raises(ValidationError):
         profile.headers = {"Cookie": "session=plaintext"}
+
+
+def test_profile_persists_enabled_state_and_deepseek_requires_thinking() -> None:
+    disabled = ProviderProfileRecord(
+        id="local",
+        name="Local",
+        protocol="lmstudio",
+        base_url="http://127.0.0.1:1234",
+        enabled=False,
+    )
+
+    assert disabled.model_dump()["enabled"] is False
+    assert ProviderProfileRecord.deepseek(id="deepseek").enabled is True
+    with pytest.raises(ValidationError, match="thinking"):
+        ProviderProfileRecord.deepseek(id="deepseek", thinking_enabled=False)

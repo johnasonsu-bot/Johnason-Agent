@@ -6,14 +6,23 @@ import base64
 import json
 import os
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Any
+from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
-from .models import VaultLockedError, VaultPersistenceError, VaultUnlockError
+from .models import (
+    VaultInUseError,
+    VaultLockedError,
+    VaultPersistenceError,
+    VaultRecoveryRequiredError,
+    VaultUnlockError,
+)
 
 _VERSION = 1
 _SALT_BYTES = 16
@@ -23,11 +32,86 @@ _KDF_PARAMETERS = {"iterations": 3, "lanes": 1, "memory_cost": 65_536}
 _DOCUMENT_FIELDS = {"version", "kdf", "salt", "nonce", "ciphertext"}
 
 
+@dataclass
+class _VaultPathState:
+    """Process-local coordination shared by every instance for one vault path."""
+
+    lock: RLock = field(default_factory=RLock)
+    writer_owner: object | None = None
+
+
+_PATH_STATES_GUARD = Lock()
+_PATH_STATES: dict[Path, _VaultPathState] = {}
+
+
+def _state_for(path: Path) -> _VaultPathState:
+    normalized = path.expanduser().resolve(strict=False)
+    with _PATH_STATES_GUARD:
+        return _PATH_STATES.setdefault(normalized, _VaultPathState())
+
+
+class _CrossProcessWriterLock:
+    """A non-blocking OS lock held for the complete unlocked vault lifetime."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path.with_name(f".{path.name}.lock")
+        self._descriptor: int | None = None
+
+    def acquire(self) -> None:
+        descriptor = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(descriptor, 0o600)
+            if os.name == "nt":
+                self._acquire_windows(descriptor)
+            else:
+                self._acquire_posix(descriptor)
+        except (BlockingIOError, OSError) as exc:
+            os.close(descriptor)
+            raise VaultInUseError("credential vault is already in use") from exc
+        self._descriptor = descriptor
+
+    @staticmethod
+    def _acquire_posix(descriptor: int) -> None:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _acquire_windows(descriptor: int) -> None:
+        import msvcrt
+
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\0")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+
+    def release(self) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 class CredentialVault:
     """A password-unlocked file vault whose contents are AES-GCM authenticated."""
 
     def __init__(self, path: Path) -> None:
-        self._path = path
+        self._path = path.expanduser().resolve(strict=False)
+        self._state = _state_for(self._path)
+        self._writer_lock: _CrossProcessWriterLock | None = None
         self._salt: bytes | None = None
         self._kdf_parameters: dict[str, int] | None = None
         self._key: bytearray | None = None
@@ -35,115 +119,173 @@ class CredentialVault:
 
     @classmethod
     def create(cls, path: Path, password: str) -> CredentialVault:
-        """Exclusively create an empty unlocked vault at *path*."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError as exc:
-            raise FileExistsError(f"vault already exists: {path}") from exc
-        try:
-            placeholder_stat = os.fstat(descriptor)
-        finally:
-            os.close(descriptor)
-
+        """Atomically publish a complete empty unlocked vault at *path*."""
         vault = cls(path)
-        try:
-            vault._salt = os.urandom(_SALT_BYTES)
-            vault._kdf_parameters = dict(_KDF_PARAMETERS)
-            vault._key = bytearray(
-                _derive_key(password, vault._salt, vault._kdf_parameters)
-            )
-            vault._secrets = {}
-            vault._write(vault._secrets)
-        except Exception:
-            vault.lock()
-            _remove_owned_placeholder(path, placeholder_stat)
-            raise
+        vault._path.parent.mkdir(parents=True, exist_ok=True)
+        with vault._state.lock:
+            if vault._path.exists():
+                raise FileExistsError(f"vault already exists: {vault._path}")
+            vault._acquire_writer()
+            try:
+                if vault._path.exists():
+                    raise FileExistsError(f"vault already exists: {vault._path}")
+                vault._initialize(password)
+                vault._write(vault._require_unlocked(), create=True)
+            except Exception:
+                vault._clear_sensitive()
+                vault._release_writer()
+                raise
         return vault
 
     @classmethod
     def open(cls, path: Path) -> CredentialVault:
         """Return a locked vault instance for an existing vault file."""
-        if not path.is_file():
-            raise FileNotFoundError(f"vault does not exist: {path}")
-        return cls(path)
+        vault = cls(path)
+        with vault._state.lock:
+            if not vault._path.is_file():
+                raise FileNotFoundError(f"vault does not exist: {vault._path}")
+            _validate_startup_document(vault._path)
+            return vault
+
+    @classmethod
+    def recover(cls, path: Path, password: str) -> CredentialVault:
+        """Explicitly preserve a corrupt document and publish a fresh vault."""
+        vault = cls(path)
+        vault._path.parent.mkdir(parents=True, exist_ok=True)
+        with vault._state.lock:
+            vault._acquire_writer()
+            backup_path: Path | None = None
+            try:
+                if not vault._path.is_file():
+                    raise FileNotFoundError(f"vault does not exist: {vault._path}")
+                try:
+                    _validate_startup_document(vault._path)
+                except VaultRecoveryRequiredError:
+                    pass
+                else:
+                    raise FileExistsError("vault is valid and does not require recovery")
+                backup_path = vault._path.with_name(
+                    f".{vault._path.name}.recovery-{uuid4().hex}"
+                )
+                os.replace(vault._path, backup_path)
+                vault._initialize(password)
+                vault._write(vault._require_unlocked(), create=True)
+            except Exception:
+                vault._clear_sensitive()
+                if backup_path is not None and backup_path.exists() and not vault._path.exists():
+                    try:
+                        os.replace(backup_path, vault._path)
+                    except OSError:
+                        pass
+                vault._release_writer()
+                raise
+            return vault
 
     def unlock(self, password: str) -> None:
         """Authenticate *password* and load the encrypted credential mapping."""
-        key: bytearray | None = None
-        try:
-            document = _read_document(json.loads(self._path.read_text(encoding="utf-8")))
-            salt = _decode(document["salt"])
-            nonce = _decode(document["nonce"])
-            ciphertext = _decode(document["ciphertext"])
-            kdf_parameters = _read_kdf_parameters(document)
-            if len(salt) != _SALT_BYTES or len(nonce) != _NONCE_BYTES:
-                raise ValueError("invalid vault salt or nonce length")
-            key = bytearray(_derive_key(password, salt, kdf_parameters))
-            plaintext = AESGCM(bytes(key)).decrypt(
-                nonce,
-                ciphertext,
-                _associated_data(document["version"], kdf_parameters, salt),
-            )
-            secrets = json.loads(plaintext.decode("utf-8"))
-            if not isinstance(secrets, dict) or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in secrets.items()
-            ):
-                raise ValueError("vault contents must be a string mapping")
-        except (KeyError, TypeError, ValueError, UnicodeDecodeError, InvalidTag) as exc:
-            if key is not None:
-                key[:] = b"\x00" * len(key)
-            raise VaultUnlockError("vault could not be unlocked") from exc
+        with self._state.lock:
+            acquired_here = self._writer_lock is None
+            if acquired_here:
+                self._acquire_writer()
+            key: bytearray | None = None
+            try:
+                document = _load_document(self._path)
+                salt = _decode(document["salt"])
+                nonce = _decode(document["nonce"])
+                ciphertext = _decode(document["ciphertext"])
+                kdf_parameters = _read_kdf_parameters(document)
+                if len(salt) != _SALT_BYTES or len(nonce) != _NONCE_BYTES:
+                    raise ValueError("invalid vault salt or nonce length")
+                key = bytearray(_derive_key(password, salt, kdf_parameters))
+                plaintext = AESGCM(bytes(key)).decrypt(
+                    nonce,
+                    ciphertext,
+                    _associated_data(document["version"], kdf_parameters, salt),
+                )
+                secrets = json.loads(plaintext.decode("utf-8"))
+                if not isinstance(secrets, dict) or not all(
+                    isinstance(name, str) and isinstance(value, str)
+                    for name, value in secrets.items()
+                ):
+                    raise ValueError("vault contents must be a string mapping")
+            except VaultRecoveryRequiredError:
+                if key is not None:
+                    key[:] = b"\x00" * len(key)
+                if acquired_here:
+                    self._release_writer()
+                raise
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError, InvalidTag) as exc:
+                if key is not None:
+                    key[:] = b"\x00" * len(key)
+                if acquired_here:
+                    self._release_writer()
+                raise VaultUnlockError("vault could not be unlocked") from exc
 
-        self.lock()
-        self._salt = salt
-        self._kdf_parameters = kdf_parameters
-        self._key = key
-        self._secrets = secrets
+            self._clear_sensitive()
+            self._salt = salt
+            self._kdf_parameters = kdf_parameters
+            self._key = key
+            self._secrets = secrets
 
     def put(self, secret_id: str, value: str) -> None:
         """Store a credential and persist a freshly encrypted vault payload."""
-        secrets = self._require_unlocked()
-        if not isinstance(secret_id, str) or not isinstance(value, str):
-            raise TypeError("secret id and value must be strings")
-        updated = dict(secrets)
-        updated[secret_id] = value
-        try:
-            self._write(updated)
-        except VaultPersistenceError as exc:
-            if exc.committed:
-                self._secrets = updated
-            raise
-        self._secrets = updated
+        with self._state.lock:
+            secrets = self._require_unlocked()
+            if not isinstance(secret_id, str) or not isinstance(value, str):
+                raise TypeError("secret id and value must be strings")
+            updated = dict(secrets)
+            updated[secret_id] = value
+            try:
+                self._write(updated)
+            except VaultPersistenceError as exc:
+                if exc.committed:
+                    self._secrets = updated
+                raise
+            self._secrets = updated
 
     def get(self, secret_id: str) -> str:
         """Return a credential value by opaque secret identifier."""
-        return self._require_unlocked()[secret_id]
+        with self._state.lock:
+            return self._require_unlocked()[secret_id]
 
     def delete(self, secret_id: str) -> None:
         """Remove a credential and atomically persist the reduced mapping."""
-        secrets = self._require_unlocked()
-        updated = dict(secrets)
-        updated.pop(secret_id, None)
-        try:
-            self._write(updated)
-        except VaultPersistenceError as exc:
-            if exc.committed:
-                self._secrets = updated
-            raise
-        self._secrets = updated
+        with self._state.lock:
+            secrets = self._require_unlocked()
+            updated = dict(secrets)
+            updated.pop(secret_id, None)
+            try:
+                self._write(updated)
+            except VaultPersistenceError as exc:
+                if exc.committed:
+                    self._secrets = updated
+                raise
+            self._secrets = updated
 
     @property
     def is_unlocked(self) -> bool:
         """Expose lock state without exposing any credential material."""
-        return self._secrets is not None
+        with self._state.lock:
+            return self._secrets is not None
 
     def lock(self) -> None:
         """Drop secret references and wipe the mutable derived-key buffer.
 
         Python immutable plaintext and password copies cannot be reliably zeroized.
         """
+        with self._state.lock:
+            self._clear_sensitive()
+            self._release_writer()
+
+    def _initialize(self, password: str) -> None:
+        self._salt = os.urandom(_SALT_BYTES)
+        self._kdf_parameters = dict(_KDF_PARAMETERS)
+        self._key = bytearray(
+            _derive_key(password, self._salt, self._kdf_parameters)
+        )
+        self._secrets = {}
+
+    def _clear_sensitive(self) -> None:
         if self._secrets is not None:
             self._secrets.clear()
             self._secrets = None
@@ -151,12 +293,32 @@ class CredentialVault:
             self._key[:] = b"\x00" * len(self._key)
             self._key = None
 
+    def _acquire_writer(self) -> None:
+        if self._writer_lock is not None:
+            return
+        if self._state.writer_owner not in (None, self):
+            raise VaultInUseError("credential vault is already in use")
+        writer_lock = _CrossProcessWriterLock(self._path)
+        writer_lock.acquire()
+        self._state.writer_owner = self
+        self._writer_lock = writer_lock
+
+    def _release_writer(self) -> None:
+        writer_lock, self._writer_lock = self._writer_lock, None
+        if writer_lock is None:
+            return
+        try:
+            writer_lock.release()
+        finally:
+            if self._state.writer_owner is self:
+                self._state.writer_owner = None
+
     def _require_unlocked(self) -> dict[str, str]:
         if self._secrets is None:
             raise VaultLockedError("vault is locked")
         return self._secrets
 
-    def _write(self, secrets: dict[str, str]) -> None:
+    def _write(self, secrets: dict[str, str], *, create: bool = False) -> None:
         key = self._require_key()
         salt = self._require_salt()
         kdf_parameters = self._require_kdf_parameters()
@@ -173,37 +335,85 @@ class CredentialVault:
             "nonce": _encode(nonce),
             "ciphertext": _encode(ciphertext),
         }
-        self._atomic_write(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        if create:
+            self._atomic_create(payload)
+        else:
+            self._atomic_write(payload)
 
-    def _atomic_write(self, payload: bytes) -> None:
+    def _write_temporary(self, payload: bytes) -> Path:
+        descriptor: int | None = None
+        temporary_path: Path | None = None
+        complete = False
         try:
-            descriptor, temporary_path = tempfile.mkstemp(
+            descriptor, raw_temporary_path = tempfile.mkstemp(
                 prefix=f".{self._path.name}.", dir=self._path.parent
             )
+            temporary_path = Path(raw_temporary_path)
             with os.fdopen(descriptor, "wb") as temporary_file:
+                descriptor = None
                 fchmod = getattr(os, "fchmod", None)
                 if fchmod is not None:
                     fchmod(temporary_file.fileno(), 0o600)
                 temporary_file.write(payload)
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
+            complete = True
+            return temporary_path
         except OSError as exc:
             raise VaultPersistenceError(
-                f"vault write failed before replacement: {exc}", committed=False
+                f"vault write failed before publication: {exc}", committed=False
             ) from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if not complete:
+                _remove_temporary(temporary_path)
 
+    def _atomic_create(self, payload: bytes) -> None:
+        temporary_path: Path | None = None
         try:
-            os.replace(temporary_path, self._path)
-        except OSError as exc:
-            raise VaultPersistenceError(f"vault replacement failed: {exc}", committed=False) from exc
+            temporary_path = self._write_temporary(payload)
+            try:
+                os.link(temporary_path, self._path)
+            except FileExistsError as exc:
+                raise FileExistsError(f"vault already exists: {self._path}") from exc
+            except OSError as exc:
+                raise VaultPersistenceError(
+                    f"vault publication failed: {exc}", committed=False
+                ) from exc
+            try:
+                self._fsync_parent_directory()
+            except OSError as exc:
+                raise VaultPersistenceError(
+                    f"vault was published but directory durability is unknown: {exc}",
+                    committed=True,
+                ) from exc
+        finally:
+            _remove_temporary(temporary_path)
 
+    def _atomic_write(self, payload: bytes) -> None:
+        temporary_path: Path | None = None
         try:
-            self._fsync_parent_directory()
-        except OSError as exc:
-            raise VaultPersistenceError(
-                f"vault was replaced but directory durability is unknown: {exc}",
-                committed=True,
-            ) from exc
+            temporary_path = self._write_temporary(payload)
+            try:
+                os.replace(temporary_path, self._path)
+            except OSError as exc:
+                raise VaultPersistenceError(
+                    f"vault replacement failed: {exc}", committed=False
+                ) from exc
+            try:
+                self._fsync_parent_directory()
+            except OSError as exc:
+                raise VaultPersistenceError(
+                    f"vault was replaced but directory durability is unknown: {exc}",
+                    committed=True,
+                ) from exc
+        finally:
+            _remove_temporary(temporary_path)
 
     def _fsync_parent_directory(self) -> None:
         if not hasattr(os, "O_DIRECTORY"):
@@ -270,15 +480,42 @@ def _read_document(document: Any) -> dict[str, Any]:
     return document
 
 
-def _remove_owned_placeholder(path: Path, placeholder_stat: os.stat_result) -> None:
+def _load_document(path: Path) -> dict[str, Any]:
     try:
-        current_stat = os.lstat(path)
+        return _read_document(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise VaultRecoveryRequiredError(
+            "vault is incomplete or corrupt; explicit recovery is required"
+        ) from exc
+
+
+def _validate_startup_document(path: Path) -> None:
+    try:
+        document = _load_document(path)
+        kdf_parameters = _read_kdf_parameters(document)
+        salt = _decode(document["salt"])
+        nonce = _decode(document["nonce"])
+        ciphertext = _decode(document["ciphertext"])
         if (
-            current_stat.st_dev == placeholder_stat.st_dev
-            and current_stat.st_ino == placeholder_stat.st_ino
-            and current_stat.st_size == 0
+            len(salt) != _SALT_BYTES
+            or len(nonce) != _NONCE_BYTES
+            or len(ciphertext) < 16
+            or kdf_parameters != _KDF_PARAMETERS
         ):
-            os.unlink(path)
+            raise ValueError("invalid vault document fields")
+    except VaultRecoveryRequiredError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VaultRecoveryRequiredError(
+            "vault is incomplete or corrupt; explicit recovery is required"
+        ) from exc
+
+
+def _remove_temporary(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
     except OSError:
         pass
 

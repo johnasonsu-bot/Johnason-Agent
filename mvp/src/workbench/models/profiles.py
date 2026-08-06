@@ -8,7 +8,14 @@ from types import MappingProxyType
 from typing import Any, Literal, Protocol, Self
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 class SecretResolver(Protocol):
@@ -102,6 +109,7 @@ class ProviderProfileRecord(BaseModel):
     headers: SafeHeaders = Field(default_factory=SafeHeaders)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     capabilities: set[ProviderCapability] = Field(default_factory=set)
+    enabled: bool = True
     thinking_enabled: bool = False
     reasoning_effort: Literal["high", "max"] = "high"
 
@@ -139,6 +147,12 @@ class ProviderProfileRecord(BaseModel):
     @field_serializer("headers")
     def serialize_headers(self, headers: SafeHeaders) -> dict[str, str]:
         return dict(headers)
+
+    @model_validator(mode="after")
+    def require_deepseek_thinking(self) -> ProviderProfileRecord:
+        if self.protocol == "deepseek" and not self.thinking_enabled:
+            raise ValueError("DeepSeek profiles require thinking to remain enabled")
+        return self
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False

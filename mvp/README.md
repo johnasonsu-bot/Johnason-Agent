@@ -11,15 +11,20 @@ python3 -m venv .venv
 .venv/bin/python -m pytest tests/unit -v
 ```
 
-## Run the local API
+## Run the Workbench
 
-```bash
-.venv/bin/python -m workbench.main
-```
+The local API is an Electron-owned child process rather than a standalone
+fixed-port service. On every start Electron generates a new capability, asks the
+backend to bind an operating-system-selected loopback port, verifies the
+service-instance identity, and exposes only the narrow preload IPC bridge to the
+renderer. Closing the window, quitting the application, or losing the renderer
+locks the credential vault and terminates the child process.
 
-Open `http://127.0.0.1:8765/api/health`. Runtime state is stored under
-`.runtime/`; credentials are referenced by environment-variable name and are
-never persisted in SQLite or Artifact metadata.
+Provider credentials are entered only in Provider Center and encrypted in the
+application-owned vault. SQLite stores an opaque credential reference, never the
+credential value. The vault starts locked after every application restart and
+does not use environment variables or an operating-system keychain for Provider
+Center credentials.
 
 ## Run Phase 1 acceptance
 

@@ -1,11 +1,13 @@
 """FastAPI composition root for local commands and AG-UI replay."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from pathlib import Path
+from secrets import compare_digest
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.api.agui import stream_run_events
@@ -34,6 +36,8 @@ class AppSettings:
     vault: CredentialVault | VaultService | None = None
     gateway: ModelGateway | None = None
     close_gateway: bool = False
+    capability_token: str | None = field(default=None, repr=False)
+    service_instance_id: str | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -43,17 +47,46 @@ def _require_key(value: str | None) -> str:
 
 
 def create_app(settings: AppSettings) -> FastAPI:
+    if (settings.capability_token is None) != (settings.service_instance_id is None):
+        raise ValueError("capability and service identity must be configured together")
+    if settings.capability_token is not None and len(settings.capability_token) < 43:
+        raise ValueError("capability token must contain at least 256 bits")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
             yield
         finally:
-            if settings.close_gateway and settings.gateway is not None:
-                await settings.gateway.aclose()
-            if isinstance(settings.vault, VaultService):
-                settings.vault.lock()
+            try:
+                if settings.close_gateway and settings.gateway is not None:
+                    await settings.gateway.aclose()
+            finally:
+                if settings.vault is not None:
+                    settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def authenticate_local_control_plane(request: Request, call_next):
+        capability = settings.capability_token
+        if capability is not None and request.url.path.startswith("/api/"):
+            try:
+                hostname = urlsplit(f"//{request.headers.get('host', '')}").hostname
+            except ValueError:
+                hostname = None
+            if hostname not in {"127.0.0.1", "::1"}:
+                return JSONResponse(status_code=400, content={"detail": "invalid host"})
+            provided = request.headers.get("X-Workbench-Capability")
+            if (
+                provided is None
+                or len(provided) != len(capability)
+                or not compare_digest(provided, capability)
+            ):
+                return JSONResponse(
+                    status_code=401, content={"detail": "local capability required"}
+                )
+        return await call_next(request)
+
     engine = SingleAgentEngine(
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
@@ -68,7 +101,15 @@ def create_app(settings: AppSettings) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        result = {"status": "ok"}
+        if settings.service_instance_id is not None:
+            result.update(
+                {
+                    "service": "hermes-workbench",
+                    "instance_id": settings.service_instance_id,
+                }
+            )
+        return result
 
     @app.post("/api/runs")
     def create_run(

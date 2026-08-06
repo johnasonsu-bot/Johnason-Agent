@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import time
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from workbench.models.profiles import ProviderProfileRecord
@@ -106,7 +107,13 @@ class ProviderRepository:
                 if not _is_secret_id(existing.secret_id):
                     raise ValueError("stored provider secret reference is invalid")
                 persisted = record.model_copy(
-                    update={"secret_id": existing.secret_id}
+                    update={
+                        "secret_id": (
+                            existing.secret_id
+                            if same_credential_scope(existing, record)
+                            else f"provider/{uuid4().hex}"
+                        )
+                    }
                 )
             connection.execute(
                 """
@@ -116,6 +123,24 @@ class ProviderRepository:
                 (persisted.id, persisted.model_dump_json()),
             )
         return created, persisted
+
+
+def same_credential_scope(
+    existing: ProviderProfileRecord, replacement: ProviderProfileRecord
+) -> bool:
+    """Return whether a credential may safely remain authorized after an update."""
+    return _credential_scope(existing) == _credential_scope(replacement)
+
+
+def _credential_scope(record: ProviderProfileRecord) -> tuple[str, str, str, int | None]:
+    parsed = urlsplit(record.base_url)
+    default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
+    return (
+        record.protocol,
+        parsed.scheme,
+        parsed.hostname or "",
+        parsed.port if parsed.port is not None else default_port,
+    )
 
 
 def _is_secret_id(value: str | None) -> bool:

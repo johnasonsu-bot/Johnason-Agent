@@ -1,4 +1,4 @@
-export type VaultStatus = "uninitialized" | "locked" | "unlocked";
+export type VaultStatus = "uninitialized" | "locked" | "unlocked" | "recovery_required";
 
 export interface ProviderProfile {
   id: string;
@@ -8,9 +8,10 @@ export interface ProviderProfile {
   headers: Record<string, string>;
   model_aliases: Record<string, string>;
   capabilities: string[];
+  enabled: boolean;
   thinking_enabled: boolean;
   reasoning_effort: "high" | "max";
-  credential_status: "configured" | "locked" | "missing";
+  credential_status: "configured" | "locked" | "missing" | "not_required";
 }
 
 export interface ProviderInput {
@@ -20,6 +21,7 @@ export interface ProviderInput {
   base_url: string;
   model_aliases: Record<string, string>;
   capabilities?: string[];
+  enabled?: boolean;
   thinking_enabled?: boolean;
   reasoning_effort?: "high" | "max";
 }
@@ -51,6 +53,9 @@ export const providerApi = {
     method: "POST", body: JSON.stringify({ password }),
   }),
   unlockVault: (password: string) => request<{ status: VaultStatus }>("/vault/unlock", {
+    method: "POST", body: JSON.stringify({ password }),
+  }),
+  recoverVault: (password: string) => request<{ status: VaultStatus }>("/vault/recover", {
     method: "POST", body: JSON.stringify({ password }),
   }),
   lockVault: () => request<{ status: VaultStatus }>("/vault/lock", { method: "POST" }),

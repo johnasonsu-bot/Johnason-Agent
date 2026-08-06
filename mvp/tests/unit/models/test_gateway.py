@@ -173,3 +173,57 @@ async def test_gateway_rejects_unsafe_persistent_openai_headers_before_transport
 
     assert requests == []
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_disabled_profiles_before_provider_access() -> None:
+    """Persisting disabled state must prevent every model request path."""
+
+    class ProviderThatMustNotRun:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request: ModelRequest, profile: ProviderProfileRecord):
+            self.calls += 1
+            raise AssertionError("disabled provider was called")
+
+    provider = ProviderThatMustNotRun()
+    gateway = ModelGateway({"openai_chat": provider})
+    profile = ProviderProfileRecord(
+        id="disabled",
+        name="Disabled",
+        protocol="openai_chat",
+        base_url="https://provider.invalid",
+        enabled=False,
+    )
+
+    with pytest.raises(ValueError, match="disabled"):
+        await gateway.complete(ModelRequest(model="model", messages=[]), profile)
+
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_gateway_close_attempts_every_provider_and_aggregates_failures() -> None:
+    """One adapter close failure must not leak every provider that follows it."""
+
+    class Closable:
+        def __init__(self, failure: Exception | None = None) -> None:
+            self.closed = 0
+            self.failure = failure
+
+        async def aclose(self) -> None:
+            self.closed += 1
+            if self.failure is not None:
+                raise self.failure
+
+    first = Closable(RuntimeError("first close failed"))
+    second = Closable()
+    third = Closable(ValueError("third close failed"))
+    gateway = ModelGateway({"first": first, "second": second, "third": third})
+
+    with pytest.raises(ExceptionGroup) as caught:
+        await gateway.aclose()
+
+    assert first.closed == second.closed == third.closed == 1
+    assert [type(error) for error in caught.value.exceptions] == [RuntimeError, ValueError]

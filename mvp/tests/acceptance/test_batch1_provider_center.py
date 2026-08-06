@@ -78,11 +78,11 @@ def test_provider_center_clean_runtime_keeps_only_credential_references(
     assert submitted_secret not in serialized_settings
 
 
-def test_provider_center_playwright_path_runs_through_the_isolated_ipc_proxy() -> None:
-    """The rendered Electron lifecycle uses an isolated fake loopback API, not a key."""
+def test_provider_center_playwright_path_uses_real_owned_workbench_backend() -> None:
+    """Only LM Studio is faked; Electron owns a real temporary Workbench backend."""
     canvas = Path(__file__).resolve().parents[2] / "canvas-spike"
     completed = subprocess.run(
-        ["npm", "test", "--", "--grep", "creates, locks, unlocks"],
+        ["npm", "test", "--", "--grep", "real Workbench backend"],
         cwd=canvas,
         check=False,
         capture_output=True,

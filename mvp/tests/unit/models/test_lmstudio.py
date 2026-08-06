@@ -5,6 +5,7 @@ import pytest
 
 from workbench.models.contracts import ModelRequest, ToolDefinition
 from workbench.models.lmstudio import LMStudioProvider, ProviderUnavailable
+from workbench.models.profiles import ProviderProfileRecord
 
 
 def _provider(handler) -> LMStudioProvider:
@@ -140,4 +141,31 @@ async def test_maps_connection_failure_to_provider_unavailable() -> None:
     provider = _provider(handler)
     with pytest.raises(ProviderUnavailable):
         await provider.list_models()
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completion_resolves_saved_model_aliases() -> None:
+    """A saved default alias must resolve before the LM Studio request is sent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == "loaded-model"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ready"}}]}
+        )
+
+    provider = _provider(handler)
+    profile = ProviderProfileRecord(
+        id="lmstudio",
+        name="LM Studio",
+        protocol="lmstudio",
+        base_url="http://lmstudio.test",
+        model_aliases={"default": "loaded-model"},
+    )
+
+    response = await provider.complete(
+        ModelRequest(model="default", messages=[]), profile
+    )
+
+    assert response.text == "ready"
     await provider.aclose()

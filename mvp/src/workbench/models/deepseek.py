@@ -11,6 +11,7 @@ import httpx
 
 from workbench.models.contracts import (
     ContinuationMetadata,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelUsage,
@@ -141,7 +142,7 @@ def _request_body(
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": model,
-        "messages": request.messages,
+        "messages": [_message_body(message) for message in request.messages],
         "tools": [
             {
                 "type": "function",
@@ -169,6 +170,33 @@ def _request_body(
         body["frequency_penalty"] = request.frequency_penalty
     if request.tool_choice is not None:
         body["tool_choice"] = request.tool_choice
+    return body
+
+
+def _message_body(message: ModelMessage) -> dict[str, Any]:
+    """Convert only typed private continuation into DeepSeek's provider field."""
+    body: dict[str, Any] = {"role": message.role}
+    if message.content is not None or message.role == "assistant":
+        body["content"] = message.content
+    if message.name is not None:
+        body["name"] = message.name
+    if message.tool_call_id is not None:
+        body["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        body["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":")),
+                },
+            }
+            for call in message.tool_calls
+        ]
+    continuation = message.continuation
+    if continuation is not None and continuation.reasoning_content is not None:
+        body["reasoning_content"] = continuation.reasoning_content
     return body
 
 

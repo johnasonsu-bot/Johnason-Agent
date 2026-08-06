@@ -1,17 +1,32 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomBytes, randomUUID } from "node:crypto";
 import path from "node:path";
+import { createInterface } from "node:readline";
+import { pathToFileURL } from "node:url";
 
-const configuredApiBase = new URL(process.env.HERMES_API_BASE ?? "http://127.0.0.1:8765");
-if (configuredApiBase.protocol !== "http:" || !["127.0.0.1", "::1"].includes(configuredApiBase.hostname)) {
-  throw new Error("Hermes API must use a loopback HTTP origin");
-}
-const apiBase = configuredApiBase.origin;
+const SERVICE_IDENTITY = "hermes-workbench";
+const CAPABILITY_HEADER = "X-Workbench-Capability";
 const allowedApiRequests = new Set([
-  "GET /api/vault/status", "POST /api/vault/create", "POST /api/vault/unlock", "POST /api/vault/lock",
+  "GET /api/vault/status", "POST /api/vault/create", "POST /api/vault/unlock", "POST /api/vault/lock", "POST /api/vault/recover",
   "GET /api/providers", "POST /api/providers",
 ]);
 
 interface ApiRequest { method: "GET" | "POST" | "DELETE"; path: string; body?: Record<string, unknown>; }
+interface BackendHandshake { service: string; instance_id: string; port: number; }
+interface BackendProcess {
+  child: ChildProcessWithoutNullStreams;
+  apiBase: string;
+  capability: string;
+  instanceId: string;
+}
+
+let mainWindow: BrowserWindow | null = null;
+let trustedDocumentUrl = "";
+let backend: BackendProcess | null = null;
+let stoppingBackend: Promise<void> | null = null;
+let quitAfterCleanup = false;
+let quitting = false;
 
 function isApiRequest(value: unknown): value is ApiRequest {
   if (!value || typeof value !== "object") return false;
@@ -27,16 +42,202 @@ function isApiRequest(value: unknown): value is ApiRequest {
   return true;
 }
 
-ipcMain.handle("api.request", async (_event, request: unknown) => {
-  if (!isApiRequest(request)) throw new Error("invalid local API request");
-  const response = await fetch(`${apiBase}/api${request.path}`, {
-    method: request.method,
+function sameTrustedDocument(value: string): boolean {
+  try {
+    const candidate = new URL(value);
+    candidate.hash = "";
+    candidate.search = "";
+    return candidate.toString() === trustedDocumentUrl;
+  } catch {
+    return false;
+  }
+}
+
+function assertTrustedSender(event: IpcMainInvokeEvent): void {
+  const frame = event.senderFrame;
+  if (
+    mainWindow === null
+    || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+    || frame === null
+    || frame !== mainWindow.webContents.mainFrame
+    || !sameTrustedDocument(frame.url)
+  ) {
+    throw new Error("untrusted IPC sender");
+  }
+}
+
+function childEnvironment(): NodeJS.ProcessEnv {
+  const safe: NodeJS.ProcessEnv = { PYTHONUNBUFFERED: "1" };
+  for (const name of ["PATH", "SystemRoot", "WINDIR", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "PYTHONPATH"]) {
+    if (process.env[name] !== undefined) safe[name] = process.env[name];
+  }
+  return safe;
+}
+
+function pythonExecutable(): string {
+  const configured = process.env.HERMES_PYTHON;
+  const bundled = process.platform === "win32"
+    ? "../../.venv/Scripts/python.exe"
+    : "../../.venv/bin/python";
+  const executable = configured ?? path.resolve(__dirname, bundled);
+  if (!path.isAbsolute(executable)) throw new Error("Hermes Python executable must be absolute");
+  return executable;
+}
+
+function runtimeDirectory(): string {
+  return path.resolve(process.env.HERMES_RUNTIME_DIR ?? path.join(app.getPath("userData"), "workbench-runtime"));
+}
+
+function lmStudioBaseUrl(): string {
+  const value = process.env.HERMES_LMSTUDIO_BASE_URL ?? "http://127.0.0.1:1234";
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" || !["127.0.0.1", "::1", "localhost"].includes(parsed.hostname)) {
+    throw new Error("LM Studio bootstrap URL must use loopback HTTP");
+  }
+  return parsed.origin;
+}
+
+function readHandshake(child: ChildProcessWithoutNullStreams, instanceId: string): Promise<BackendHandshake> {
+  return new Promise((resolve, reject) => {
+    const lines = createInterface({ input: child.stdout });
+    const timer = setTimeout(() => finish(new Error("Workbench backend handshake timed out")), 15_000);
+    const onExit = () => finish(new Error("Workbench backend exited before handshake"));
+    let settled = false;
+    const finish = (error?: Error, value?: BackendHandshake) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      lines.close();
+      if (error) reject(error); else resolve(value!);
+    };
+    child.once("exit", onExit);
+    lines.once("line", (line) => {
+      try {
+        const value = JSON.parse(line) as Partial<BackendHandshake>;
+        if (
+          value.service !== SERVICE_IDENTITY
+          || value.instance_id !== instanceId
+          || !Number.isInteger(value.port)
+          || (value.port ?? 0) < 1
+          || (value.port ?? 0) > 65_535
+        ) throw new Error("invalid Workbench backend handshake");
+        finish(undefined, value as BackendHandshake);
+      } catch {
+        finish(new Error("invalid Workbench backend handshake"));
+      }
+    });
+  });
+}
+
+async function authenticatedBackendRequest(
+  owned: BackendProcess,
+  pathname: string,
+  init: RequestInit = {},
+  timeoutMs = 5_000,
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set(CAPABILITY_HEADER, owned.capability);
+  return fetch(`${owned.apiBase}${pathname}`, {
+    ...init,
+    headers,
     redirect: "error",
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+async function verifyBackendIdentity(owned: BackendProcess): Promise<void> {
+  const response = await authenticatedBackendRequest(owned, "/api/health");
+  if (!response.ok || response.redirected) throw new Error("Workbench backend health check failed");
+  const body = await response.json() as Partial<BackendHandshake> & { status?: string };
+  if (body.status !== "ok" || body.service !== SERVICE_IDENTITY || body.instance_id !== owned.instanceId) {
+    throw new Error("Workbench backend identity mismatch");
+  }
+}
+
+async function startBackend(): Promise<void> {
+  if (backend !== null) return;
+  const capability = randomBytes(32).toString("base64url");
+  const instanceId = randomUUID();
+  const child = spawn(
+    pythonExecutable(),
+    [
+      "-m", "workbench.main", "--electron-owned",
+      "--runtime-dir", runtimeDirectory(),
+      "--host", "127.0.0.1",
+      "--port", "0",
+      "--lmstudio-base-url", lmStudioBaseUrl(),
+    ],
+    { env: childEnvironment(), stdio: ["pipe", "pipe", "pipe"] },
+  );
+  child.stderr.resume();
+  child.stdin.end(`${JSON.stringify({ capability, instance_id: instanceId })}\n`);
+  try {
+    const handshake = await readHandshake(child, instanceId);
+    child.stdout.resume();
+    const owned = {
+      child,
+      apiBase: `http://127.0.0.1:${handshake.port}`,
+      capability,
+      instanceId,
+    };
+    await verifyBackendIdentity(owned);
+    backend = owned;
+    child.once("exit", () => {
+      if (backend?.child === child) {
+        backend = null;
+        if (!quitting) app.quit();
+      }
+    });
+  } catch (error) {
+    child.kill();
+    throw error;
+  }
+}
+
+function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    child.once("exit", () => { clearTimeout(timer); resolve(true); });
+  });
+}
+
+async function stopBackend(): Promise<void> {
+  if (stoppingBackend !== null) return stoppingBackend;
+  const owned = backend;
+  backend = null;
+  if (owned === null) return;
+  stoppingBackend = (async () => {
+    try {
+      await authenticatedBackendRequest(owned, "/api/vault/lock", { method: "POST" }, 1_000);
+    } catch {
+      // The process lifespan also locks the vault; termination remains mandatory.
+    }
+    if (owned.child.exitCode === null && owned.child.signalCode === null) owned.child.kill();
+    if (!await waitForExit(owned.child, 3_000)) {
+      owned.child.kill("SIGKILL");
+      await waitForExit(owned.child, 2_000);
+    }
+  })().finally(() => { stoppingBackend = null; });
+  return stoppingBackend;
+}
+
+ipcMain.handle("api.request", async (event, request: unknown) => {
+  assertTrustedSender(event);
+  if (!isApiRequest(request)) throw new Error("invalid local API request");
+  const owned = backend;
+  if (owned === null) throw new Error("local Workbench backend is unavailable");
+  const response = await authenticatedBackendRequest(owned, `/api${request.path}`, {
+    method: request.method,
     headers: request.body === undefined ? undefined : { "content-type": "application/json" },
     body: request.body === undefined ? undefined : JSON.stringify(request.body),
   });
+  const responseText = await response.text();
+  if (responseText.length > 1_048_576) throw new Error("local API response is too large");
   let body: unknown = null;
-  try { body = await response.json(); } catch { /* Endpoint responses are JSON by contract. */ }
+  try { body = JSON.parse(responseText); } catch { /* Endpoint responses are JSON by contract. */ }
   return { status: response.status, body };
 });
 
@@ -57,12 +258,15 @@ function isInterventionCommand(value: unknown): value is InterventionCommand {
     && typeof command.payload === "object";
 }
 
-ipcMain.handle("intervention.submit", (_event, command: unknown) => {
+ipcMain.handle("intervention.submit", (event, command: unknown) => {
+  assertTrustedSender(event);
   if (!isInterventionCommand(command)) throw new Error("invalid intervention command");
   return { accepted: true, runId: command.runId, artifactId: command.artifactId };
 });
 
 function createWindow(): BrowserWindow {
+  const rendererPath = path.join(__dirname, "../dist/index.html");
+  trustedDocumentUrl = pathToFileURL(rendererPath).toString();
   const window = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -75,13 +279,49 @@ function createWindow(): BrowserWindow {
       webSecurity: true,
     },
   });
-
-  void window.loadFile(path.join(__dirname, "../dist/index.html"));
+  mainWindow = window;
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on("will-attach-webview", (event) => event.preventDefault());
+  window.webContents.on("will-navigate", (event, target) => {
+    if (!sameTrustedDocument(target)) event.preventDefault();
+  });
+  window.webContents.on("will-redirect", (event, target) => {
+    if (!sameTrustedDocument(target)) event.preventDefault();
+  });
+  window.webContents.on("render-process-gone", () => {
+    void stopBackend().finally(() => { if (!quitting) app.quit(); });
+  });
+  window.on("closed", () => {
+    if (mainWindow === window) mainWindow = null;
+    void stopBackend();
+  });
+  void window.loadFile(rendererPath);
   return window;
 }
 
-void app.whenReady().then(() => {
+async function ready(): Promise<void> {
+  await startBackend();
   createWindow();
+}
+
+void app.whenReady().then(ready).catch(() => {
+  void stopBackend().finally(() => app.exit(1));
+});
+
+app.on("activate", () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    void startBackend().then(() => createWindow()).catch(() => app.exit(1));
+  }
+});
+
+app.on("before-quit", (event) => {
+  quitting = true;
+  if (quitAfterCleanup || (backend === null && stoppingBackend === null)) return;
+  event.preventDefault();
+  void stopBackend().finally(() => {
+    quitAfterCleanup = true;
+    app.quit();
+  });
 });
 
 app.on("window-all-closed", () => app.quit());

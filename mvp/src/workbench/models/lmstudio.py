@@ -8,6 +8,7 @@ import httpx
 
 from workbench.models.contracts import (
     ModelDelta,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelUsage,
@@ -60,7 +61,7 @@ class LMStudioProvider:
         try:
             response = await self._client.post(
                 f"{_base_url(self, profile)}/v1/chat/completions",
-                json=_request_body(request, stream=False),
+                json=_request_body(request, profile, stream=False),
             )
             response.raise_for_status()
         except httpx.RequestError as exc:
@@ -97,7 +98,7 @@ class LMStudioProvider:
             async with self._client.stream(
                 "POST",
                 f"{_base_url(self, profile)}/v1/chat/completions",
-                json=_request_body(request, stream=True),
+                json=_request_body(request, profile, stream=True),
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -143,10 +144,20 @@ class LMStudioProvider:
                 yield ModelEvent(kind=ModelEventKind.TOOL_CALL, tool_call=delta.tool_call)
 
 
-def _request_body(request: ModelRequest, *, stream: bool) -> dict[str, Any]:
+def _request_body(
+    request: ModelRequest,
+    profile: ProviderProfileRecord | None,
+    *,
+    stream: bool,
+) -> dict[str, Any]:
+    model = (
+        profile.model_aliases.get(request.model, request.model)
+        if profile is not None
+        else request.model
+    )
     return {
-        "model": request.model,
-        "messages": request.messages,
+        "model": model,
+        "messages": [_message_body(message) for message in request.messages],
         "tools": [
             {
                 "type": "function",
@@ -161,6 +172,29 @@ def _request_body(request: ModelRequest, *, stream: bool) -> dict[str, Any]:
         "temperature": request.temperature,
         "stream": stream,
     }
+
+
+def _message_body(message: ModelMessage) -> dict[str, Any]:
+    body: dict[str, Any] = {"role": message.role}
+    if message.content is not None or message.role == "assistant":
+        body["content"] = message.content
+    if message.name is not None:
+        body["name"] = message.name
+    if message.tool_call_id is not None:
+        body["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        body["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":")),
+                },
+            }
+            for call in message.tool_calls
+        ]
+    return body
 
 
 def _base_url(
