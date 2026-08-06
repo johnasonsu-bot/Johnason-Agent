@@ -13,7 +13,7 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
-from .models import VaultLockedError, VaultUnlockError
+from .models import VaultLockedError, VaultPersistenceError, VaultUnlockError
 
 _VERSION = 1
 _SALT_BYTES = 16
@@ -41,15 +41,24 @@ class CredentialVault:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
             raise FileExistsError(f"vault already exists: {path}") from exc
-        else:
+        try:
+            placeholder_stat = os.fstat(descriptor)
+        finally:
             os.close(descriptor)
 
         vault = cls(path)
-        vault._salt = os.urandom(_SALT_BYTES)
-        vault._kdf_parameters = dict(_KDF_PARAMETERS)
-        vault._key = bytearray(_derive_key(password, vault._salt, vault._kdf_parameters))
-        vault._secrets = {}
-        vault._write(vault._secrets)
+        try:
+            vault._salt = os.urandom(_SALT_BYTES)
+            vault._kdf_parameters = dict(_KDF_PARAMETERS)
+            vault._key = bytearray(
+                _derive_key(password, vault._salt, vault._kdf_parameters)
+            )
+            vault._secrets = {}
+            vault._write(vault._secrets)
+        except Exception:
+            vault.lock()
+            _remove_owned_placeholder(path, placeholder_stat)
+            raise
         return vault
 
     @classmethod
@@ -100,7 +109,12 @@ class CredentialVault:
             raise TypeError("secret id and value must be strings")
         updated = dict(secrets)
         updated[secret_id] = value
-        self._write(updated)
+        try:
+            self._write(updated)
+        except VaultPersistenceError as exc:
+            if exc.committed:
+                self._secrets = updated
+            raise
         self._secrets = updated
 
     def get(self, secret_id: str) -> str:
@@ -144,16 +158,34 @@ class CredentialVault:
         self._atomic_write(json.dumps(document, separators=(",", ":")).encode("utf-8"))
 
     def _atomic_write(self, payload: bytes) -> None:
-        descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{self._path.name}.", dir=self._path.parent
-        )
-        with os.fdopen(descriptor, "wb") as temporary_file:
-            os.fchmod(temporary_file.fileno(), 0o600)
-            temporary_file.write(payload)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        os.replace(temporary_path, self._path)
-        self._fsync_parent_directory()
+        try:
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=f".{self._path.name}.", dir=self._path.parent
+            )
+            with os.fdopen(descriptor, "wb") as temporary_file:
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(temporary_file.fileno(), 0o600)
+                temporary_file.write(payload)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+        except OSError as exc:
+            raise VaultPersistenceError(
+                f"vault write failed before replacement: {exc}", committed=False
+            ) from exc
+
+        try:
+            os.replace(temporary_path, self._path)
+        except OSError as exc:
+            raise VaultPersistenceError(f"vault replacement failed: {exc}", committed=False) from exc
+
+        try:
+            self._fsync_parent_directory()
+        except OSError as exc:
+            raise VaultPersistenceError(
+                f"vault was replaced but directory durability is unknown: {exc}",
+                committed=True,
+            ) from exc
 
     def _fsync_parent_directory(self) -> None:
         if not hasattr(os, "O_DIRECTORY"):
@@ -218,6 +250,19 @@ def _read_document(document: Any) -> dict[str, Any]:
     if not isinstance(document, dict) or set(document) != _DOCUMENT_FIELDS:
         raise ValueError("invalid vault document")
     return document
+
+
+def _remove_owned_placeholder(path: Path, placeholder_stat: os.stat_result) -> None:
+    try:
+        current_stat = os.lstat(path)
+        if (
+            current_stat.st_dev == placeholder_stat.st_dev
+            and current_stat.st_ino == placeholder_stat.st_ino
+            and current_stat.st_size == 0
+        ):
+            os.unlink(path)
+    except OSError:
+        pass
 
 
 def _encode(value: bytes) -> str:

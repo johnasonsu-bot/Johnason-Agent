@@ -157,3 +157,61 @@ def test_vault_rolls_back_new_secret_when_atomic_replace_fails(
     assert vault.get("provider/deepseek") == "persisted-secret"
     with pytest.raises(KeyError):
         vault.get("provider/openai")
+
+
+def test_vault_commits_memory_when_directory_fsync_fails_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "vault.bin"
+    vault = CredentialVault.create(path, "password")
+    vault.put("provider/deepseek", "persisted-secret")
+
+    def directory_fsync_failure(_self: CredentialVault) -> None:
+        raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(
+        CredentialVault, "_fsync_parent_directory", directory_fsync_failure
+    )
+
+    with pytest.raises(OSError, match="simulated directory fsync failure") as caught:
+        vault.put("provider/openai", "committed-secret")
+
+    assert caught.value.committed is True
+    assert vault.get("provider/openai") == "committed-secret"
+    reopened = CredentialVault.open(path)
+    reopened.unlock("password")
+    assert reopened.get("provider/openai") == vault.get("provider/openai")
+
+
+def test_vault_create_removes_its_empty_placeholder_after_initialization_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "vault.bin"
+
+    def derivation_failure(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated key derivation failure")
+
+    with monkeypatch.context() as scoped_monkeypatch:
+        scoped_monkeypatch.setattr(vault_module, "_derive_key", derivation_failure)
+        with pytest.raises(OSError, match="simulated key derivation failure"):
+            CredentialVault.create(path, "password")
+
+    assert not path.exists()
+    retried = CredentialVault.create(path, "password")
+    retried.put("provider/deepseek", "secret-value")
+    assert retried.get("provider/deepseek") == "secret-value"
+
+
+def test_vault_operates_when_fchmod_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "vault.bin"
+    monkeypatch.delattr(vault_module.os, "fchmod")
+
+    vault = CredentialVault.create(path, "password")
+    vault.put("provider/deepseek", "secret-value")
+    vault.lock()
+
+    reopened = CredentialVault.open(path)
+    reopened.unlock("password")
+    assert reopened.get("provider/deepseek") == "secret-value"
