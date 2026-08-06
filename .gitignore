@@ -1,4 +1,5 @@
 node_modules/
+.worktrees/
 .DS_Store
 docs/.vitepress/cache/
 *.bak_*
