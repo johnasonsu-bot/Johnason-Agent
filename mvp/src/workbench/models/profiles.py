@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from enum import StrEnum
 from collections.abc import Mapping
-from typing import Any, Literal, Protocol
+from types import MappingProxyType
+from typing import Any, Literal, Protocol, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 
 class SecretResolver(Protocol):
@@ -37,6 +38,46 @@ def validate_provider_headers(headers: Mapping[object, object]) -> dict[str, str
     return safe_headers
 
 
+class SafeHeaders(Mapping[str, str]):
+    """An immutable allowlisted mapping for serializable provider metadata."""
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Mapping[object, object] | None = None) -> None:
+        self._values = MappingProxyType(validate_provider_headers(values or {}))
+
+    def __getitem__(self, name: str) -> str:
+        return self._values[name]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        memo[id(self)] = self
+        return self
+
+    def __setitem__(self, name: str, value: str) -> None:
+        raise TypeError("provider headers are immutable")
+
+    def __delitem__(self, name: str) -> None:
+        raise TypeError("provider headers are immutable")
+
+    def update(self, *args: object, **kwargs: str) -> None:
+        raise TypeError("provider headers are immutable")
+
+    def pop(self, *args: object, **kwargs: str) -> None:
+        raise TypeError("provider headers are immutable")
+
+    def clear(self) -> None:
+        raise TypeError("provider headers are immutable")
+
+
 class ProviderCapability(StrEnum):
     """Provider features used by routing and request normalization."""
 
@@ -48,35 +89,43 @@ class ProviderCapability(StrEnum):
 class ProviderProfileRecord(BaseModel):
     """Durable provider metadata; credentials live in ``CredentialVault`` only."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True, extra="forbid", validate_assignment=True
+    )
 
     id: str
     name: str
     protocol: str
     base_url: str
     secret_id: str | None = None
-    headers: dict[str, str] = Field(default_factory=dict)
+    headers: SafeHeaders = Field(default_factory=SafeHeaders)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     capabilities: set[ProviderCapability] = Field(default_factory=set)
     thinking_enabled: bool = False
     reasoning_effort: Literal["high", "max"] = "high"
 
-    @field_validator("headers")
+    @field_validator("headers", mode="before")
     @classmethod
-    def reject_credential_headers(cls, headers: dict[str, str]) -> dict[str, str]:
+    def reject_credential_headers(cls, headers: object) -> SafeHeaders:
         """Ensure durable metadata cannot embed a credential by header name."""
-        return validate_provider_headers(headers)
+        if not isinstance(headers, Mapping):
+            raise ValueError("provider metadata headers must be a mapping")
+        return SafeHeaders(headers)
 
-    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
-        self._validate_headers_for_serialization()
-        return super().model_dump(**kwargs)
+    @field_serializer("headers")
+    def serialize_headers(self, headers: SafeHeaders) -> dict[str, str]:
+        return dict(headers)
 
-    def model_dump_json(self, **kwargs: Any) -> str:
-        self._validate_headers_for_serialization()
-        return super().model_dump_json(**kwargs)
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        """Copy only after normalizing any replacement header mapping."""
+        if update is None or "headers" not in update:
+            return super().model_copy(update=update, deep=deep)
+        validated_update = dict(update)
+        validated_update["headers"] = SafeHeaders(validated_update["headers"])
+        return super().model_copy(update=validated_update, deep=deep)
 
-    def _validate_headers_for_serialization(self) -> None:
-        validate_provider_headers(self.headers)
 
     @classmethod
     def deepseek(

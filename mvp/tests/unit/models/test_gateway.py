@@ -166,10 +166,10 @@ async def test_gateway_rejects_unsafe_persistent_openai_headers_before_transport
         protocol="openai_chat",
         base_url="https://provider.test",
         secret_id="provider/openai-primary",
-    ).model_copy(update={"headers": {"Cookie": "session=plaintext"}})
+    )
 
-    with pytest.raises(ValueError, match="provider metadata"):
-        await gateway.complete(ModelRequest(model="gpt-compatible", messages=[]), profile)
+    with pytest.raises(ValueError, match="safe metadata allowlist"):
+        profile.model_copy(update={"headers": {"Cookie": "session=plaintext"}})
 
     assert requests == []
     await provider.aclose()

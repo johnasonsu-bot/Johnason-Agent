@@ -242,12 +242,10 @@ async def test_unsafe_custom_headers_are_rejected_before_a_deepseek_request() ->
         client=httpx.AsyncClient(transport=httpx.MockTransport(recorder)),
         vault=InMemoryVault({"provider/deepseek-primary": "secret-value"}),
     )
-    profile = deepseek_profile().model_copy(
-        update={"headers": {"X-Api-Token": "plaintext-token"}}
-    )
-
-    with pytest.raises(ValueError, match="provider metadata"):
-        await provider.complete(ModelRequest(model="deepseek-v4-flash", messages=[]), profile)
+    with pytest.raises(ValueError, match="safe metadata allowlist"):
+        deepseek_profile().model_copy(
+            update={"headers": {"X-Api-Token": "plaintext-token"}}
+        )
 
     assert recorder.requests == []
     await provider.aclose()

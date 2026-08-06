@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from workbench.models.profiles import ProviderCapability, ProviderProfileRecord
+from workbench.models.profiles import ProviderCapability, ProviderProfileRecord, SafeHeaders
 
 
 def test_profile_persists_secret_reference_and_deepseek_capabilities() -> None:
@@ -83,8 +83,8 @@ def test_profile_allows_only_safe_custom_metadata_headers() -> None:
     assert profile.model_dump()["headers"] == headers
 
 
-def test_mutated_credential_header_cannot_be_serialized() -> None:
-    """Validation must still run after callers mutate Pydantic's header dict."""
+def test_headers_are_immutable_and_dict_profile_exposes_only_safe_mapping() -> None:
+    """Normal mapping mutations must not create an unsafe profile state."""
     profile = ProviderProfileRecord(
         id="custom-provider",
         name="Custom Provider",
@@ -92,20 +92,64 @@ def test_mutated_credential_header_cannot_be_serialized() -> None:
         base_url="https://provider.test",
         headers={"Accept": "application/json"},
     )
-    profile.headers["Cookie"] = "session=plaintext"
 
-    with pytest.raises(ValueError, match="provider metadata"):
-        profile.model_dump()
+    with pytest.raises(TypeError, match="immutable"):
+        profile.headers["Cookie"] = "session=plaintext"
+    with pytest.raises(TypeError, match="immutable"):
+        profile.headers.update({"X-Api-Token": "plaintext-token"})
+    with pytest.raises(TypeError, match="immutable"):
+        profile.headers.pop("Accept")
+    with pytest.raises(TypeError, match="immutable"):
+        profile.headers.clear()
+
+    exposed = dict(profile)["headers"]
+    assert isinstance(exposed, SafeHeaders)
+    assert dict(exposed) == {"Accept": "application/json"}
+    assert profile.model_dump()["headers"] == {"Accept": "application/json"}
 
 
-def test_model_copy_with_credential_header_cannot_be_serialized() -> None:
+def test_model_copy_revalidates_header_updates() -> None:
     """model_copy(update=...) must not turn a safe record into a secret payload."""
     profile = ProviderProfileRecord(
         id="custom-provider",
         name="Custom Provider",
         protocol="openai_chat",
         base_url="https://provider.test",
-    ).model_copy(update={"headers": {"X-Access-Token": "plaintext-token"}})
+    )
 
-    with pytest.raises(ValueError, match="provider metadata"):
-        profile.model_dump_json()
+    with pytest.raises(ValueError, match="safe metadata allowlist"):
+        profile.model_copy(update={"headers": {"X-Access-Token": "plaintext-token"}})
+
+    copied = profile.model_copy(update={"headers": {"X-Title": "Workbench"}})
+
+    assert isinstance(copied.headers, SafeHeaders)
+    assert copied.model_dump_json().count("Workbench") == 1
+
+
+def test_deep_model_copy_preserves_immutable_safe_headers() -> None:
+    """Deep copies must keep the immutable mapping usable for persistence."""
+    profile = ProviderProfileRecord(
+        id="custom-provider",
+        name="Custom Provider",
+        protocol="openai_chat",
+        base_url="https://provider.test",
+        headers={"Accept": "application/json"},
+    )
+
+    copied = profile.model_copy(deep=True)
+
+    assert copied.headers is profile.headers
+    assert copied.model_dump()["headers"] == {"Accept": "application/json"}
+
+
+def test_profile_assignment_revalidates_headers() -> None:
+    """Replacing the controlled mapping also cannot introduce an unsafe header."""
+    profile = ProviderProfileRecord(
+        id="custom-provider",
+        name="Custom Provider",
+        protocol="openai_chat",
+        base_url="https://provider.test",
+    )
+
+    with pytest.raises(ValidationError):
+        profile.headers = {"Cookie": "session=plaintext"}
