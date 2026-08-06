@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Phase 0 validation probes for the Hermes local agent workbench"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+  "cryptography>=44,<47",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
