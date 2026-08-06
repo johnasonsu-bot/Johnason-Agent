@@ -1,6 +1,7 @@
 """Stable lifecycle domain contract for the local workbench."""
 
 from workbench.domain.models import (
+    EpochRecord,
     InterventionRecord,
     InterventionState,
     MissionRecord,
@@ -13,6 +14,7 @@ from workbench.domain.models import (
 )
 
 __all__ = [
+    "EpochRecord",
     "InterventionRecord",
     "InterventionState",
     "MissionRecord",

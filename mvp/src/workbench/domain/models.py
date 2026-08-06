@@ -75,6 +75,13 @@ class MissionRecord(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class EpochRecord(BaseModel):
+    epoch_id: str
+    mission_id: str
+    ordinal: int = Field(ge=1)
+    opened_at: datetime = Field(default_factory=utc_now)
+
+
 class RunRecord(BaseModel):
     run_id: str
     mission_id: str
