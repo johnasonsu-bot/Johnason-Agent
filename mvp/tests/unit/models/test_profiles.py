@@ -33,3 +33,21 @@ def test_profile_rejects_plaintext_credential_fields() -> None:
             base_url="https://api.deepseek.com",
             api_key="must-not-be-stored",
         )
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    ["aUtHoRiZaTiOn", "PrOxY_AuThOrIzAtIoN", "X API Key"],
+)
+def test_profile_rejects_credential_headers_regardless_of_case_or_separator(
+    header_name: str,
+) -> None:
+    """Serialized provider metadata must not be a second secret store."""
+    with pytest.raises(ValidationError):
+        ProviderProfileRecord(
+            id="custom-provider",
+            name="Custom Provider",
+            protocol="openai_chat",
+            base_url="https://provider.test",
+            headers={header_name: "plaintext-credential"},
+        )

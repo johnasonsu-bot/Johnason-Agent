@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class SecretResolver(Protocol):
+    """The narrow encrypted-vault interface used by model providers."""
+
+    def get(self, secret_id: str) -> str: ...
 
 
 class ProviderCapability(StrEnum):
@@ -32,6 +38,26 @@ class ProviderProfileRecord(BaseModel):
     thinking_enabled: bool = False
     reasoning_effort: Literal["high", "max"] = "high"
 
+    @field_validator("headers")
+    @classmethod
+    def reject_credential_headers(cls, headers: dict[str, str]) -> dict[str, str]:
+        """Ensure durable metadata cannot embed a credential by header name."""
+        credential_headers = {
+            "authorization",
+            "proxyauthorization",
+            "xapikey",
+            "apikey",
+            "accesstoken",
+            "authtoken",
+        }
+        for name in headers:
+            normalized = "".join(
+                character for character in name.casefold() if character.isalnum()
+            )
+            if normalized in credential_headers:
+                raise ValueError("credential headers must be stored in the credential vault")
+        return headers
+
     @classmethod
     def deepseek(
         cls,
@@ -42,19 +68,20 @@ class ProviderProfileRecord(BaseModel):
         **changes: object,
     ) -> ProviderProfileRecord:
         """Build the safe default profile for DeepSeek V4 Flash thinking."""
-        return cls(
-            id=id,
-            name="DeepSeek V4 Flash",
-            protocol="deepseek",
-            base_url="https://api.deepseek.com",
-            secret_id=secret_id,
-            model_aliases={"default": "deepseek-v4-flash"},
-            capabilities={
+        defaults: dict[str, object] = {
+            "id": id,
+            "name": "DeepSeek V4 Flash",
+            "protocol": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "secret_id": secret_id,
+            "model_aliases": {"default": "deepseek-v4-flash"},
+            "capabilities": {
                 ProviderCapability.STREAMING,
                 ProviderCapability.TOOL_CALLING,
                 ProviderCapability.THINKING,
             },
-            thinking_enabled=True,
-            reasoning_effort=reasoning_effort,
-            **changes,
-        )
+            "thinking_enabled": True,
+            "reasoning_effort": reasoning_effort,
+        }
+        defaults.update(changes)
+        return cls(**defaults)

@@ -197,3 +197,34 @@ async def test_http_error_never_includes_vault_secret() -> None:
 
     assert "secret-value" not in str(exc_info.value)
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_model", "profile_changes", "error"),
+    [
+        ("different-model", {}, "deepseek-v4-flash"),
+        ("deepseek-v4-flash", {"protocol": "openai_chat"}, "protocol"),
+        ("deepseek-v4-flash", {"thinking_enabled": False}, "thinking"),
+    ],
+)
+async def test_incompatible_profile_is_rejected_before_a_deepseek_request(
+    request_model: str, profile_changes: dict[str, object], error: str
+) -> None:
+    """Sending a non-V4-flash thinking request can produce an incompatible turn."""
+    recorder = RequestRecorder(
+        lambda _request: httpx.Response(
+            200, json={"choices": [{"message": {"content": "unexpected"}}]}
+        )
+    )
+    provider = DeepSeekProvider(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(recorder)),
+        vault=InMemoryVault({"provider/deepseek-primary": "secret-value"}),
+    )
+    profile = deepseek_profile().model_copy(update=profile_changes)
+
+    with pytest.raises(ValueError, match=error):
+        await provider.complete(ModelRequest(model=request_model, messages=[]), profile)
+
+    assert recorder.requests == []
+    await provider.aclose()

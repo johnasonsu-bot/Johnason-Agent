@@ -16,23 +16,29 @@ from workbench.models.contracts import (
 from workbench.models.gateway import (
     ModelEvent,
     ModelEventKind,
-    ProviderProfile,
 )
+from workbench.models.profiles import ProviderProfileRecord, SecretResolver
 
 
 class OpenAICompatibleProvider:
-    def __init__(self, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient | None = None,
+        vault: SecretResolver | None = None,
+    ) -> None:
         self._client = client or httpx.AsyncClient(timeout=60)
+        self._vault = vault
 
     async def aclose(self) -> None:
         await self._client.aclose()
 
     async def complete(
-        self, request: ModelRequest, profile: ProviderProfile
+        self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> ModelResponse:
         response = await self._client.post(
             f"{profile.base_url.rstrip('/')}/v1/chat/completions",
-            headers=_headers(profile),
+            headers=_headers(profile, self._vault),
             json=_request_body(request, profile, stream=False),
         )
         response.raise_for_status()
@@ -46,13 +52,13 @@ class OpenAICompatibleProvider:
         )
 
     async def stream(
-        self, request: ModelRequest, profile: ProviderProfile
+        self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> AsyncIterator[ModelEvent]:
         tool_parts: dict[int, dict[str, str]] = {}
         async with self._client.stream(
             "POST",
             f"{profile.base_url.rstrip('/')}/v1/chat/completions",
-            headers=_headers(profile),
+            headers=_headers(profile, self._vault),
             json=_request_body(request, profile, stream=True),
         ) as response:
             response.raise_for_status()
@@ -86,18 +92,26 @@ class OpenAICompatibleProvider:
             )
 
 
-def _headers(profile: ProviderProfile) -> dict[str, str]:
+def _headers(
+    profile: ProviderProfileRecord, vault: SecretResolver | None
+) -> dict[str, str]:
     headers = dict(profile.headers)
-    if profile.secret_env:
-        secret = os.getenv(profile.secret_env)
+    if profile.secret_id:
+        if vault is None:
+            raise ValueError("credential vault is required for this provider profile")
+        headers["Authorization"] = f"Bearer {vault.get(profile.secret_id)}"
+        return headers
+    secret_env = getattr(profile, "secret_env", None)
+    if secret_env:
+        secret = os.getenv(secret_env)
         if not secret:
-            raise ValueError(f"credential environment is unset: {profile.secret_env}")
+            raise ValueError(f"credential environment is unset: {secret_env}")
         headers["Authorization"] = f"Bearer {secret}"
     return headers
 
 
 def _request_body(
-    request: ModelRequest, profile: ProviderProfile, *, stream: bool
+    request: ModelRequest, profile: ProviderProfileRecord, *, stream: bool
 ) -> dict[str, Any]:
     model = profile.model_aliases.get(request.model, request.model)
     return {

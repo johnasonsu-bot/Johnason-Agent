@@ -6,6 +6,13 @@ import pytest
 from workbench.models.contracts import ModelRequest, ToolDefinition
 from workbench.models.gateway import ModelEventKind, ModelGateway, ProviderProfile
 from workbench.models.openai_compatible import OpenAICompatibleProvider
+from workbench.models.profiles import ProviderProfileRecord
+
+
+class InMemoryVault:
+    def get(self, secret_id: str) -> str:
+        assert secret_id == "provider/openai-primary"
+        return "secret-value"
 
 
 def test_provider_profile_contains_secret_reference_not_secret_value() -> None:
@@ -108,3 +115,32 @@ async def test_gateway_stream_has_versioned_event_kinds() -> None:
     assert events[0].text == "hello"
     await provider.aclose()
 
+
+@pytest.mark.asyncio
+async def test_gateway_uses_persistent_profile_secret_reference_for_openai() -> None:
+    """Persistent profiles must use the vault rather than a legacy env field."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer secret-value"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "hello"}}]}
+        )
+
+    provider = OpenAICompatibleProvider(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        vault=InMemoryVault(),
+    )
+    gateway = ModelGateway({"openai_chat": provider})
+
+    response = await gateway.complete(
+        ModelRequest(model="gpt-compatible", messages=[]),
+        ProviderProfileRecord(
+            id="openai-primary",
+            name="OpenAI-compatible",
+            protocol="openai_chat",
+            base_url="https://provider.test",
+            secret_id="provider/openai-primary",
+        ),
+    )
+
+    assert response.text == "hello"
+    await provider.aclose()

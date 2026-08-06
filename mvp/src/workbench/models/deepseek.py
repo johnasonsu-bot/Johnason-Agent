@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from collections.abc import AsyncIterator
-from typing import Any, Protocol
+from typing import Any
 
 import httpx
 
@@ -17,13 +17,7 @@ from workbench.models.contracts import (
     ToolCall,
 )
 from workbench.models.gateway import ModelEvent, ModelEventKind
-from workbench.models.profiles import ProviderProfileRecord
-
-
-class CredentialReader(Protocol):
-    """The narrow vault capability needed by a provider adapter."""
-
-    def get(self, secret_id: str) -> str: ...
+from workbench.models.profiles import ProviderProfileRecord, SecretResolver
 
 
 class DeepSeekProvider:
@@ -33,7 +27,7 @@ class DeepSeekProvider:
         self,
         *,
         client: httpx.AsyncClient | None = None,
-        vault: CredentialReader | None = None,
+        vault: SecretResolver | None = None,
     ) -> None:
         self._client = client or httpx.AsyncClient(timeout=60)
         self._vault = vault
@@ -44,10 +38,11 @@ class DeepSeekProvider:
     async def complete(
         self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> ModelResponse:
+        model = _validate_profile(request, profile)
         response = await self._client.post(
             _endpoint(profile),
             headers=_headers(profile, self._vault),
-            json=_request_body(request, profile, stream=False),
+            json=_request_body(request, profile, model=model, stream=False),
         )
         response.raise_for_status()
         raw = response.json()
@@ -63,13 +58,14 @@ class DeepSeekProvider:
     async def stream(
         self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> AsyncIterator[ModelEvent]:
+        model = _validate_profile(request, profile)
         tool_parts: dict[int, dict[str, str]] = {}
         reasoning_parts: list[str] = []
         async with self._client.stream(
             "POST",
             _endpoint(profile),
             headers=_headers(profile, self._vault),
-            json=_request_body(request, profile, stream=True),
+            json=_request_body(request, profile, model=model, stream=True),
         ) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -117,7 +113,7 @@ def _endpoint(profile: ProviderProfileRecord) -> str:
 
 
 def _headers(
-    profile: ProviderProfileRecord, vault: CredentialReader | None
+    profile: ProviderProfileRecord, vault: SecretResolver | None
 ) -> dict[str, str]:
     headers = dict(profile.headers)
     if profile.secret_id:
@@ -128,9 +124,8 @@ def _headers(
 
 
 def _request_body(
-    request: ModelRequest, profile: ProviderProfileRecord, *, stream: bool
+    request: ModelRequest, profile: ProviderProfileRecord, *, model: str, stream: bool
 ) -> dict[str, Any]:
-    model = profile.model_aliases.get(request.model, request.model)
     body: dict[str, Any] = {
         "model": model,
         "messages": request.messages,
@@ -162,6 +157,17 @@ def _request_body(
     if request.tool_choice is not None:
         body["tool_choice"] = request.tool_choice
     return body
+
+
+def _validate_profile(request: ModelRequest, profile: ProviderProfileRecord) -> str:
+    if profile.protocol != "deepseek":
+        raise ValueError("DeepSeek adapter requires a deepseek protocol profile")
+    if not profile.thinking_enabled:
+        raise ValueError("DeepSeek adapter requires thinking to be enabled")
+    model = profile.model_aliases.get(request.model, request.model)
+    if model != "deepseek-v4-flash":
+        raise ValueError("DeepSeek adapter requires model deepseek-v4-flash")
+    return model
 
 
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall:
