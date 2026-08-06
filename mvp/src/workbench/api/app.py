@@ -1,6 +1,7 @@
 """FastAPI composition root for local commands and AG-UI replay."""
 
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
@@ -9,8 +10,9 @@ from fastapi.responses import StreamingResponse
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.api.agui import stream_run_events
 from workbench.api.commands import CreateRunRequest, InterventionRequest
-from workbench.api.providers import provider_router
+from workbench.api.providers import provider_router, vault_router
 from workbench.credentials.vault import CredentialVault
+from workbench.credentials.service import VaultService
 from workbench.domain.models import RunRecord
 from workbench.models.gateway import ModelGateway
 from workbench.providers.repository import ProviderRepository
@@ -29,8 +31,9 @@ class AppSettings:
     database: Path
     runner: AgentStepRunner
     owner_id: str
-    vault: CredentialVault | None = None
+    vault: CredentialVault | VaultService | None = None
     gateway: ModelGateway | None = None
+    close_gateway: bool = False
 
 
 def _require_key(value: str | None) -> str:
@@ -40,7 +43,17 @@ def _require_key(value: str | None) -> str:
 
 
 def create_app(settings: AppSettings) -> FastAPI:
-    app = FastAPI(title="Hermes Workbench", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            if settings.close_gateway and settings.gateway is not None:
+                await settings.gateway.aclose()
+            if isinstance(settings.vault, VaultService):
+                settings.vault.lock()
+
+    app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
     engine = SingleAgentEngine(
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
@@ -50,6 +63,8 @@ def create_app(settings: AppSettings) -> FastAPI:
             ProviderRepository(settings.database), settings.vault, settings.gateway
         )
     )
+    if isinstance(settings.vault, VaultService):
+        app.include_router(vault_router(settings.vault))
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

@@ -83,3 +83,49 @@ The skipped tests are pre-existing live integrations.
 - Live provider requests remain intentionally unperformed; unit tests use
   local HTTP transports and the provided fake gateway. No credential has been
   supplied or recorded.
+
+## Fix round 1
+
+### RED
+
+```bash
+cd mvp && .venv/bin/python -m pytest tests/unit/api/test_providers.py -v
+```
+
+Observed 5 expected failures: provider URLs accepted userinfo/query secrets,
+repository retained a caller-supplied first `secret_id`, no vault lifecycle API
+existed in the normal application composition root, committed vault durability
+uncertainty collapsed to 503, and LM Studio did not implement the gateway
+stream contract. A follow-up concurrent test exposed one test-fixture race in
+simultaneous schema initialization; sharing the already-migrated repository
+isolated the actual first-upsert concurrency contract.
+
+### Changes
+
+- Validated and normalized durable base URLs to http/https only, rejecting
+  userinfo, absent host, query, and fragment components before persistence.
+- Moved secret-reference allocation into the repository transaction; first
+  insert always ignores caller input, updates preserve only a valid stored
+  `provider/<uuid4-hex>` reference, and concurrent first upserts converge.
+- Added a locked-by-default `VaultService`, safe vault status/create/unlock/lock
+  API, and normal `build_app()` wiring for the vault plus LM Studio, DeepSeek,
+  and OpenAI-compatible gateway adapters.
+- Added model discovery on the remote adapters, gateway/client shutdown
+  ownership, and LM Studio stream-event adaptation.
+- Distinguished committed-but-not-durable vault writes (202 configured with
+  `durability: unconfirmed`) from uncommitted persistence failure (503).
+
+### GREEN
+
+```bash
+cd mvp && .venv/bin/python -m pytest tests/unit/api/test_providers.py -v
+# 19 passed, 1 warning
+
+cd mvp && .venv/bin/python -m pytest -v
+# 134 passed, 4 skipped, 1 warning
+```
+
+The skipped tests remain pre-existing live integrations; the warning remains
+the existing TestClient deprecation warning.
+
+Fix round 1 commit: `fix: harden provider center runtime`.

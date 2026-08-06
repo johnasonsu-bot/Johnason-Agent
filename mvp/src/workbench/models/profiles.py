@@ -6,6 +6,7 @@ from enum import StrEnum
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, Self
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
@@ -103,6 +104,29 @@ class ProviderProfileRecord(BaseModel):
     capabilities: set[ProviderCapability] = Field(default_factory=set)
     thinking_enabled: bool = False
     reasoning_effort: Literal["high", "max"] = "high"
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        """Keep credentials and request selectors out of durable provider URLs."""
+        try:
+            parsed = urlsplit(value)
+            host = parsed.hostname
+            port = parsed.port
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("provider base URL is invalid") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("provider base URL is invalid")
+        normalized_host = f"[{host.lower()}]" if ":" in host else host.lower()
+        netloc = normalized_host if port is None else f"{normalized_host}:{port}"
+        return urlunsplit((parsed.scheme.lower(), netloc, parsed.path.rstrip("/"), "", ""))
 
     @field_validator("headers", mode="before")
     @classmethod

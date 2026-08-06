@@ -1,5 +1,9 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sqlite3
+
+import pytest
 
 import httpx
 
@@ -9,8 +13,10 @@ from workbench.adapters.hermes.runner import AgentStepResult
 from workbench.api.app import AppSettings, create_app
 from workbench.credentials.vault import CredentialVault
 from workbench.models.contracts import ModelRequest, ModelResponse
-from workbench.models.gateway import ModelGateway
+from workbench.models.gateway import ModelEventKind, ModelGateway
 from workbench.models.lmstudio import LMStudioProvider
+from workbench.models.profiles import ProviderProfileRecord
+from workbench.providers.repository import ProviderRepository
 
 
 class NoopRunner:
@@ -305,3 +311,203 @@ def test_lm_studio_auth_failure_is_normalized(tmp_path: Path) -> None:
     assert response.json()["status"] == "authentication_failed"
     assert response.json()["error_code"] == "authentication_failed"
     asyncio.run(provider.aclose())
+
+
+def test_provider_url_rejects_credential_and_query_without_persisting_them(
+    tmp_path: Path,
+) -> None:
+    """URL authority/query fields can otherwise become a covert credential store."""
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    database = tmp_path / "workflow.sqlite"
+    client = _client(database, vault)
+
+    userinfo = client.post(
+        "/api/providers",
+        json=deepseek_payload() | {"base_url": "https://secret-user:secret-pass@api.test"},
+    )
+    query = client.post(
+        "/api/providers",
+        json=deepseek_payload() | {"base_url": "https://api.test?api_key=secret-query"},
+    )
+
+    assert userinfo.status_code == query.status_code == 422
+    assert "secret-user" not in userinfo.text
+    assert "secret-pass" not in userinfo.text
+    assert "secret-query" not in query.text
+    assert b"secret-user" not in database.read_bytes()
+    assert b"secret-pass" not in database.read_bytes()
+    assert b"secret-query" not in database.read_bytes()
+
+
+def test_repository_allocates_opaque_secret_reference_and_rejects_invalid_stored_one(
+    tmp_path: Path,
+) -> None:
+    """Repository, not a caller, owns the durable secret identifier."""
+    repository = ProviderRepository(tmp_path / "workflow.sqlite")
+    supplied = ProviderProfileRecord.deepseek(
+        id="deepseek", secret_id="caller-controlled-reference"
+    )
+
+    created, record = repository.upsert(supplied)
+
+    assert created is True
+    assert record.secret_id is not None
+    assert record.secret_id.startswith("provider/")
+    assert record.secret_id != "caller-controlled-reference"
+
+    with sqlite3.connect(tmp_path / "workflow.sqlite") as connection:
+        connection.execute(
+            "UPDATE model_provider_profiles SET record_json = ? WHERE provider_id = ?",
+            (
+                record.model_copy(update={"secret_id": "invalid"}).model_dump_json(),
+                record.id,
+            ),
+        )
+    with pytest.raises(ValueError, match="stored provider secret reference"):
+        repository.upsert(ProviderProfileRecord.deepseek(id="deepseek"))
+
+
+def test_concurrent_first_upserts_return_one_secret_reference(tmp_path: Path) -> None:
+    """Concurrent first writes must converge on one vault reference."""
+    database = tmp_path / "workflow.sqlite"
+    repository = ProviderRepository(database)
+
+    def save(index: int) -> tuple[bool, ProviderProfileRecord]:
+        return repository.upsert(
+            ProviderProfileRecord.deepseek(
+                id="deepseek", secret_id=f"caller-{index}"
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        outcomes = list(executor.map(save, range(4)))
+
+    assert sum(created for created, _ in outcomes) == 1
+    assert len({record.secret_id for _, record in outcomes}) == 1
+
+
+def test_vault_management_routes_unlock_a_default_locked_vault_without_echoing_password(
+    tmp_path: Path,
+) -> None:
+    """Provider Center can initialize and unlock its own local vault safely."""
+    from workbench.main import build_app
+    from workbench.settings import WorkbenchSettings
+
+    password = "correct horse secret-value"
+    app = build_app(WorkbenchSettings(runtime_dir=tmp_path))
+    with TestClient(app) as client:
+        assert client.get("/api/vault/status").json() == {"status": "uninitialized"}
+        created = client.post("/api/vault/create", json={"password": password})
+        client.post("/api/vault/lock")
+        unlocked = client.post("/api/vault/unlock", json={"password": password})
+
+        assert created.status_code == unlocked.status_code == 200
+        assert created.json() == unlocked.json() == {"status": "unlocked"}
+        assert password not in created.text + unlocked.text
+        assert client.get("/api/vault/status").json() == {"status": "unlocked"}
+
+
+def test_secret_persistence_reports_committed_durability_uncertainty(tmp_path: Path) -> None:
+    """Post-replace fsync uncertainty is usable but distinct from a failed write."""
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(tmp_path / "workflow.sqlite", vault)
+    client.post("/api/providers", json=deepseek_payload())
+
+    def uncertain(_secrets: dict[str, str]) -> None:
+        from workbench.credentials.models import VaultPersistenceError
+
+        raise VaultPersistenceError("secret-value", committed=True)
+
+    vault._write = uncertain  # type: ignore[method-assign]
+    response = client.post(
+        "/api/providers/deepseek-primary/secret", json={"value": "secret-value"}
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "id": "deepseek-primary",
+        "credential_status": "configured",
+        "durability": "unconfirmed",
+    }
+    assert "secret-value" not in response.text
+
+
+def test_secret_persistence_failure_is_not_reported_as_configured(tmp_path: Path) -> None:
+    """A write that never replaced the vault is distinct from post-replace uncertainty."""
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(tmp_path / "workflow.sqlite", vault)
+    client.post("/api/providers", json=deepseek_payload())
+
+    def failed(_secrets: dict[str, str]) -> None:
+        from workbench.credentials.models import VaultPersistenceError
+
+        raise VaultPersistenceError("secret-value", committed=False)
+
+    vault._write = failed  # type: ignore[method-assign]
+    response = client.post(
+        "/api/providers/deepseek-primary/secret", json={"value": "secret-value"}
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "credential could not be persisted"}
+    assert "secret-value" not in response.text
+
+
+def test_lm_studio_gateway_stream_is_normalized(tmp_path: Path) -> None:
+    """LM Studio must fulfill ModelGateway's stream contract, not only completion."""
+    body = 'data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n'
+    provider = LMStudioProvider(
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, text=body)
+            )
+        )
+    )
+    profile = ProviderProfileRecord(
+        id="lmstudio", name="LM Studio", protocol="lmstudio", base_url="http://lm.test"
+    )
+
+    events = asyncio.run(
+        _collect(ModelGateway({"lmstudio": provider}), profile)
+    )
+
+    assert events[0].kind is ModelEventKind.TEXT_DELTA
+    assert events[0].text == "hello"
+    asyncio.run(provider.aclose())
+
+
+async def _collect(gateway: ModelGateway, profile: ProviderProfileRecord):
+    return [
+        event
+        async for event in gateway.stream(
+            ModelRequest(model="local", messages=[]), profile
+        )
+    ]
+
+
+def test_app_shutdown_closes_each_owned_gateway_provider_once(tmp_path: Path) -> None:
+    """Lifespan shutdown owns runtime HTTP clients rather than leaking them."""
+
+    class ClosableProvider(AvailableProvider):
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def aclose(self) -> None:
+            self.closed += 1
+
+    provider = ClosableProvider()
+    gateway = ModelGateway({"one": provider, "two": provider})
+    app = create_app(
+        AppSettings(
+            database=tmp_path / "workflow.sqlite",
+            runner=NoopRunner(),
+            owner_id="api",
+            gateway=gateway,
+            close_gateway=True,
+        )
+    )
+
+    with TestClient(app):
+        pass
+
+    assert provider.closed == 1

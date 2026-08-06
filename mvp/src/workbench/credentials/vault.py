@@ -121,6 +121,11 @@ class CredentialVault:
         """Return a credential value by opaque secret identifier."""
         return self._require_unlocked()[secret_id]
 
+    @property
+    def is_unlocked(self) -> bool:
+        """Expose lock state without exposing any credential material."""
+        return self._secrets is not None
+
     def lock(self) -> None:
         """Drop secret references and wipe the mutable derived-key buffer.
 

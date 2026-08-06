@@ -20,5 +20,9 @@ class WorkbenchSettings(BaseModel):
         return self.runtime_dir / "workbench.sqlite"
 
     @property
+    def vault_path(self) -> Path:
+        return self.runtime_dir / "credentials.vault"
+
+    @property
     def artifact_root(self) -> Path:
         return self.runtime_dir / "artifacts"

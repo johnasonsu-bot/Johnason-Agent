@@ -14,6 +14,7 @@ from workbench.models.contracts import (
     ToolCall,
 )
 from workbench.models.profiles import ProviderProfileRecord
+from workbench.models.gateway import ModelEvent, ModelEventKind
 
 
 class ProviderUnavailable(RuntimeError):
@@ -89,13 +90,13 @@ class LMStudioProvider:
         return await self.complete_with_tools(request, profile)
 
     async def stream_with_tools(
-        self, request: ModelRequest
+        self, request: ModelRequest, profile: ProviderProfileRecord | None = None
     ) -> AsyncIterator[ModelDelta]:
         tool_parts: dict[int, dict[str, str]] = {}
         try:
             async with self._client.stream(
                 "POST",
-                f"{self.base_url}/v1/chat/completions",
+                f"{_base_url(self, profile)}/v1/chat/completions",
                 json=_request_body(request, stream=True),
             ) as response:
                 response.raise_for_status()
@@ -130,6 +131,16 @@ class LMStudioProvider:
                     id=part["id"], name=part["name"], arguments=arguments
                 )
             )
+
+    async def stream(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> AsyncIterator[ModelEvent]:
+        """Expose legacy LM Studio deltas through the gateway event contract."""
+        async for delta in self.stream_with_tools(request, profile):
+            if delta.text:
+                yield ModelEvent(kind=ModelEventKind.TEXT_DELTA, text=delta.text)
+            elif delta.tool_call:
+                yield ModelEvent(kind=ModelEventKind.TOOL_CALL, tool_call=delta.tool_call)
 
 
 def _request_body(request: ModelRequest, *, stream: bool) -> dict[str, Any]:

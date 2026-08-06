@@ -39,6 +39,15 @@ class DeepSeekProvider:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def list_models(self, profile: ProviderProfileRecord) -> list[str]:
+        response = await self._client.get(
+            f"{profile.base_url.rstrip('/')}/models",
+            headers=_headers(profile, self._vault),
+        )
+        response.raise_for_status()
+        data = response.json()
+        return [item["id"] for item in data.get("data", []) if item.get("id")]
+
     async def complete(
         self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> ModelResponse:

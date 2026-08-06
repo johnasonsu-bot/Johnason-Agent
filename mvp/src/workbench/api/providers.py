@@ -7,10 +7,12 @@ from time import perf_counter
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 import httpx
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
 
-from workbench.credentials.models import VaultLockedError, VaultPersistenceError
+from workbench.credentials.models import VaultLockedError, VaultPersistenceError, VaultUnlockError
+from workbench.credentials.service import VaultService
 from workbench.credentials.vault import CredentialVault
 from workbench.models.contracts import ModelRequest
 from workbench.models.lmstudio import ProviderResponseError, ProviderUnavailable
@@ -43,6 +45,13 @@ class SecretPayload(BaseModel):
         min_length=1,
         validation_alias=AliasChoices("value", "secret", "api_key"),
     )
+
+
+class PasswordPayload(BaseModel):
+    """Password input accepted only by vault lifecycle endpoints."""
+
+    model_config = ConfigDict(extra="forbid")
+    password: str = Field(min_length=1)
 
 
 def credential_status(record: ProviderProfileRecord, vault: CredentialVault | None) -> str:
@@ -127,6 +136,13 @@ def _secret_payload(value: dict[str, object]) -> SecretPayload:
         raise HTTPException(422, "invalid credential payload") from exc
 
 
+def _password_payload(value: dict[str, object]) -> PasswordPayload:
+    try:
+        return PasswordPayload.model_validate(value)
+    except ValidationError as exc:
+        raise HTTPException(422, "invalid vault request") from exc
+
+
 async def _json_object(request: Request, *, error_detail: str) -> dict[str, object]:
     """Read a JSON object ourselves so FastAPI cannot reflect a secret on errors."""
     try:
@@ -181,6 +197,15 @@ def provider_router(
         except VaultLockedError as exc:
             raise HTTPException(423, "credential vault is locked") from exc
         except VaultPersistenceError as exc:
+            if exc.committed:
+                return JSONResponse(
+                    status_code=202,
+                    content={
+                        "id": record.id,
+                        "credential_status": "configured",
+                        "durability": "unconfirmed",
+                    },
+                )
             raise HTTPException(503, "credential could not be persisted") from exc
         return {"id": record.id, "credential_status": "configured"}
 
@@ -229,5 +254,45 @@ def provider_router(
             "models": models,
             "error_code": None,
         }
+
+    return router
+
+
+def vault_router(vault: VaultService) -> APIRouter:
+    """Provide password-redacting lifecycle operations for the local vault."""
+    router = APIRouter(prefix="/api/vault", tags=["vault"])
+
+    @router.get("/status")
+    def status() -> dict[str, str]:
+        return {"status": vault.status}
+
+    @router.post("/create")
+    async def create(request: Request) -> dict[str, str]:
+        password = _password_payload(
+            await _json_object(request, error_detail="invalid vault request")
+        )
+        try:
+            vault.create(password.password)
+        except FileExistsError as exc:
+            raise HTTPException(409, "vault already exists") from exc
+        return {"status": "unlocked"}
+
+    @router.post("/unlock")
+    async def unlock(request: Request) -> dict[str, str]:
+        password = _password_payload(
+            await _json_object(request, error_detail="invalid vault request")
+        )
+        try:
+            vault.unlock(password.password)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "vault not initialized") from exc
+        except VaultUnlockError as exc:
+            raise HTTPException(401, "vault could not be unlocked") from exc
+        return {"status": "unlocked"}
+
+    @router.post("/lock")
+    def lock() -> dict[str, str]:
+        vault.lock()
+        return {"status": vault.status}
 
     return router

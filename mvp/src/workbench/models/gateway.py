@@ -79,3 +79,14 @@ class ModelGateway:
     ) -> AsyncIterator[ModelEvent]:
         async for event in self._provider(profile).stream(request, profile):
             yield event
+
+    async def aclose(self) -> None:
+        """Close each owned adapter once, even when protocols share one instance."""
+        closed: set[int] = set()
+        for provider in self._providers.values():
+            if id(provider) in closed:
+                continue
+            closed.add(id(provider))
+            close = getattr(provider, "aclose", None)
+            if callable(close):
+                await close()

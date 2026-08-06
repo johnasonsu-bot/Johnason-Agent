@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from workbench.models.profiles import ProviderProfileRecord
@@ -48,14 +49,14 @@ class ProviderRepository:
             created = row is None
             if row is None:
                 persisted = record.model_copy(
-                    update={"secret_id": record.secret_id or f"provider/{uuid4().hex}"}
+                    update={"secret_id": f"provider/{uuid4().hex}"}
                 )
             else:
                 existing = ProviderProfileRecord.model_validate_json(row["record_json"])
+                if not _is_secret_id(existing.secret_id):
+                    raise ValueError("stored provider secret reference is invalid")
                 persisted = record.model_copy(
-                    update={
-                        "secret_id": existing.secret_id or f"provider/{uuid4().hex}"
-                    }
+                    update={"secret_id": existing.secret_id}
                 )
             connection.execute(
                 """
@@ -65,3 +66,7 @@ class ProviderRepository:
                 (persisted.id, persisted.model_dump_json()),
             )
         return created, persisted
+
+
+def _is_secret_id(value: str | None) -> bool:
+    return bool(value and re.fullmatch(r"provider/[a-f0-9]{32}", value))
