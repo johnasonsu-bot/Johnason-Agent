@@ -13,6 +13,7 @@ from workbench.domain.models import (
     MissionRecord,
     ProjectRecord,
     RunRecord,
+    RunState,
 )
 from workbench.workflow.store import WorkflowStore
 
@@ -68,6 +69,33 @@ class WorkflowRepository:
             ),
         )
 
+    def get_run(self, run_id: str) -> RunRecord:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT record_json FROM lifecycle_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return RunRecord.model_validate_json(row["record_json"])
+
+    def update_run(self, record: RunRecord) -> None:
+        with self.store.connect() as connection:
+            result = connection.execute(
+                "UPDATE lifecycle_runs SET record_json = ? WHERE run_id = ?",
+                (record.model_dump_json(), record.run_id),
+            )
+        if result.rowcount != 1:
+            raise KeyError(record.run_id)
+
+    def list_active_runs(self) -> list[RunRecord]:
+        terminal = {RunState.COMPLETED, RunState.CANCELLED}
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                "SELECT record_json FROM lifecycle_runs ORDER BY rowid"
+            ).fetchall()
+        records = [RunRecord.model_validate_json(row["record_json"]) for row in rows]
+        return [record for record in records if record.state not in terminal]
+
     def save_checkpoint(self, run_id: str, state: dict[str, Any]) -> None:
         if any(key.lower() in SECRET_KEYS for key in walk_keys(state)):
             raise ValueError("checkpoint contains a secret-shaped key")
@@ -102,6 +130,42 @@ class WorkflowRepository:
                 record.model_dump_json(),
             ),
         )
+
+    def next_intervention_sequence(self, run_id: str) -> int:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+                FROM lifecycle_interventions WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return int(row["next_sequence"])
+
+    def update_intervention(self, record: InterventionRecord) -> None:
+        with self.store.connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE lifecycle_interventions SET state = ?, record_json = ?
+                WHERE intervention_id = ?
+                """,
+                (record.state.value, record.model_dump_json(), record.intervention_id),
+            )
+        if result.rowcount != 1:
+            raise KeyError(record.intervention_id)
+
+    def list_interventions(self, run_id: str) -> list[InterventionRecord]:
+        with self.store.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT record_json FROM lifecycle_interventions
+                WHERE run_id = ? ORDER BY sequence
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            InterventionRecord.model_validate_json(row["record_json"]) for row in rows
+        ]
 
     def list_pending_interventions(self, run_id: str) -> list[InterventionRecord]:
         terminal = (
