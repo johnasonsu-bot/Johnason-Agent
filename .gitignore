@@ -11,4 +11,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 docs/.vitepress/cache/
+docs/.vitepress/dist/
+mvp/canvas-spike/dist/
+mvp/canvas-spike/dist-electron/
+mvp/canvas-spike/test-results/
 *.bak_*
