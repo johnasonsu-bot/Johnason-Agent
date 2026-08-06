@@ -31,7 +31,7 @@ async def probe_data_platform(
         job = await port.inspect_job(job_id)
         expected_url = port.browser_location(job_id)
         inspector = browser_inspector or _inspect_existing_browser
-        matched = await inspector(cdp_url, job_id)
+        matched = await inspector(cdp_url, expected_url)
     except Exception as exc:
         return ValidationResult(
             check="data_platform.dual_channel",
@@ -60,16 +60,13 @@ async def probe_data_platform(
     )
 
 
-async def _inspect_existing_browser(cdp_url: str, job_id: str) -> bool:
+async def _inspect_existing_browser(cdp_url: str, expected_url: str) -> bool:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.connect_over_cdp(cdp_url)
         for context in browser.contexts:
             for page in context.pages:
-                if job_id in page.url:
-                    return True
-                content = await page.content()
-                if job_id in content:
+                if page.url.rstrip("/") == expected_url.rstrip("/"):
                     return True
         return False

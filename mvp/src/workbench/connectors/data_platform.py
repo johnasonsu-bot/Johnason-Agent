@@ -39,7 +39,20 @@ class DataPlatformPort:
             headers=self._headers(),
         )
         response.raise_for_status()
-        raw = response.json()
+        payload = response.json()
+        raw = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(raw, list):
+            raw = next(
+                (
+                    item
+                    for item in raw
+                    if isinstance(item, dict)
+                    and str(item.get("id") or item.get("job_id") or "") == job_id
+                ),
+                None,
+            )
+        if not isinstance(raw, dict):
+            raise ValueError("Data Platform response does not contain a job object")
         returned_id = str(raw.get("id") or raw.get("job_id") or "")
         if returned_id != job_id:
             raise ValueError(

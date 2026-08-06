@@ -42,6 +42,60 @@ async def test_inspects_job_and_normalizes_browser_location() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inspects_job_from_platform_success_envelope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {"id": 28, "status": "running", "logs": ["started"]},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    port = DataPlatformPort(
+        DataPlatformConfig(api_base_url="http://platform.test/api"), client=client
+    )
+
+    job = await port.inspect_job("28")
+
+    assert job.job_id == "28"
+    assert job.status == "running"
+    assert job.logs == ["started"]
+    await port.aclose()
+
+
+@pytest.mark.asyncio
+async def test_selects_object_by_id_from_platform_collection() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": [
+                    {"id": 27, "status": "stopped"},
+                    {"id": 28, "status": "running"},
+                ],
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    port = DataPlatformPort(
+        DataPlatformConfig(
+            api_base_url="http://platform.test/api",
+            job_path_template="/system/services",
+        ),
+        client=client,
+    )
+
+    job = await port.inspect_job("28")
+
+    assert job.job_id == "28"
+    assert job.status == "running"
+    await port.aclose()
+
+
+@pytest.mark.asyncio
 async def test_rejects_api_object_id_mismatch() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"id": "job-other", "status": "done"})
