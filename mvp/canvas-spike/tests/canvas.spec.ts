@@ -14,6 +14,7 @@ test("renders artifacts without exposing Node or unrestricted IPC", async () => 
   expect(await page.evaluate(() => typeof (window as any).process)).toBe("undefined");
   expect(await page.evaluate(() => (window as any).workbenchBridge.capabilities())).toEqual([
     "artifact.read",
+    "intervention.submit",
   ]);
 
   const frame = page.getByTestId("artifact-html");
