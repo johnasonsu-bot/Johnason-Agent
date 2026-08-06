@@ -1,0 +1,2 @@
+"""AG-UI projection adapter."""
+
