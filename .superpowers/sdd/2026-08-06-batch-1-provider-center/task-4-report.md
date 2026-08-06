@@ -60,3 +60,9 @@ No screenshots were created or retained, so no password/key could enter a screen
 
 - A deterministic event-barrier test starts a secret PUT while holding its provider lock, starts DELETE, then releases PUT. DELETE waits, removes the same encrypted secret and metadata, proving the forbidden metadata-absent/secret-present terminal state cannot occur.
 - A rendered Electron test returns a fake IPC-proxied `202` DELETE response with `secret_cleanup: unconfirmed`; it asserts the durable-warning copy is visible, selection/delete UI clears, and no runtime credential text enters DOM or browser storage.
+
+### Final verification (round 3)
+
+- `cd mvp && .venv/bin/python -m pytest -q`: **147 passed, 4 skipped, 1 existing deprecation warning** (151 collected).
+- `cd mvp/canvas-spike && npm test`: **6 passed**.
+- `git diff --check`: passed.
