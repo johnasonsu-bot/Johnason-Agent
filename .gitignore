@@ -1,5 +1,6 @@
 node_modules/
 .worktrees/
+.superpowers/
 .vendor/
 mvp/.runtime/
 mvp/.venv/
