@@ -1,5 +1,14 @@
 node_modules/
 .worktrees/
+.vendor/
+mvp/.runtime/
+mvp/.venv/
+.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+__pycache__/
+.pytest_cache/
 .DS_Store
 docs/.vitepress/cache/
 *.bak_*
