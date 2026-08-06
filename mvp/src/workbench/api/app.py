@@ -9,7 +9,11 @@ from fastapi.responses import StreamingResponse
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.api.agui import stream_run_events
 from workbench.api.commands import CreateRunRequest, InterventionRequest
+from workbench.api.providers import provider_router
+from workbench.credentials.vault import CredentialVault
 from workbench.domain.models import RunRecord
+from workbench.models.gateway import ModelGateway
+from workbench.providers.repository import ProviderRepository
 from workbench.workflow.engine import (
     PauseRun,
     ResumeRun,
@@ -25,6 +29,8 @@ class AppSettings:
     database: Path
     runner: AgentStepRunner
     owner_id: str
+    vault: CredentialVault | None = None
+    gateway: ModelGateway | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -39,6 +45,11 @@ def create_app(settings: AppSettings) -> FastAPI:
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
     event_store = EventStore(settings.database)
+    app.include_router(
+        provider_router(
+            ProviderRepository(settings.database), settings.vault, settings.gateway
+        )
+    )
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

@@ -65,6 +65,15 @@ class ModelGateway:
     ) -> ModelResponse:
         return await self._provider(profile).complete(request, profile)
 
+    async def list_models(self, profile: ProviderProfileRecord) -> list[str]:
+        """Discover provider model identifiers when its adapter supports discovery."""
+        provider = self._provider(profile)
+        discover = getattr(provider, "list_models", None)
+        if not callable(discover):
+            raise ValueError("provider does not support model discovery")
+        models = await discover(profile)
+        return [model for model in models if isinstance(model, str)]
+
     async def stream(
         self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> AsyncIterator[ModelEvent]:

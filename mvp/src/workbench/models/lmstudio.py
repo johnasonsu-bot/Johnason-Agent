@@ -13,6 +13,7 @@ from workbench.models.contracts import (
     ModelUsage,
     ToolCall,
 )
+from workbench.models.profiles import ProviderProfileRecord
 
 
 class ProviderUnavailable(RuntimeError):
@@ -43,28 +44,26 @@ class LMStudioProvider:
     async def health(self) -> bool:
         return bool(await self.list_models())
 
-    async def list_models(self) -> list[str]:
+    async def list_models(self, profile: ProviderProfileRecord | None = None) -> list[str]:
         try:
-            response = await self._client.get(f"{self.base_url}/v1/models")
+            response = await self._client.get(f"{_base_url(self, profile)}/v1/models")
             response.raise_for_status()
         except httpx.RequestError as exc:
             raise ProviderUnavailable(str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            raise ProviderResponseError(str(exc)) from exc
         data = response.json()
         return [item["id"] for item in data.get("data", []) if item.get("id")]
 
-    async def complete_with_tools(self, request: ModelRequest) -> ModelResponse:
+    async def complete_with_tools(
+        self, request: ModelRequest, profile: ProviderProfileRecord | None = None
+    ) -> ModelResponse:
         try:
             response = await self._client.post(
-                f"{self.base_url}/v1/chat/completions",
+                f"{_base_url(self, profile)}/v1/chat/completions",
                 json=_request_body(request, stream=False),
             )
             response.raise_for_status()
         except httpx.RequestError as exc:
             raise ProviderUnavailable(str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            raise ProviderResponseError(str(exc)) from exc
 
         raw = response.json()
         try:
@@ -82,6 +81,12 @@ class LMStudioProvider:
             ),
             raw=raw,
         )
+
+    async def complete(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> ModelResponse:
+        """Adapt the legacy LM Studio probe to the provider-neutral gateway."""
+        return await self.complete_with_tools(request, profile)
 
     async def stream_with_tools(
         self, request: ModelRequest
@@ -115,9 +120,6 @@ class LMStudioProvider:
                         current["arguments"] += function.get("arguments") or ""
         except httpx.RequestError as exc:
             raise ProviderUnavailable(str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            raise ProviderResponseError(str(exc)) from exc
-
         for part in tool_parts.values():
             try:
                 arguments = json.loads(part["arguments"] or "{}")
@@ -148,6 +150,12 @@ def _request_body(request: ModelRequest, *, stream: bool) -> dict[str, Any]:
         "temperature": request.temperature,
         "stream": stream,
     }
+
+
+def _base_url(
+    provider: LMStudioProvider, profile: ProviderProfileRecord | None
+) -> str:
+    return profile.base_url.rstrip("/") if profile is not None else provider.base_url
 
 
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall:
