@@ -1,0 +1,198 @@
+"""DeepSeek V4 Flash adapter with thinking-mode compatibility rules."""
+
+from __future__ import annotations
+
+import json
+from copy import deepcopy
+from collections.abc import AsyncIterator
+from typing import Any, Protocol
+
+import httpx
+
+from workbench.models.contracts import (
+    ContinuationMetadata,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    ToolCall,
+)
+from workbench.models.gateway import ModelEvent, ModelEventKind
+from workbench.models.profiles import ProviderProfileRecord
+
+
+class CredentialReader(Protocol):
+    """The narrow vault capability needed by a provider adapter."""
+
+    def get(self, secret_id: str) -> str: ...
+
+
+class DeepSeekProvider:
+    """OpenAI-shaped DeepSeek API adapter that keeps reasoning private."""
+
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient | None = None,
+        vault: CredentialReader | None = None,
+    ) -> None:
+        self._client = client or httpx.AsyncClient(timeout=60)
+        self._vault = vault
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def complete(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> ModelResponse:
+        response = await self._client.post(
+            _endpoint(profile),
+            headers=_headers(profile, self._vault),
+            json=_request_body(request, profile, stream=False),
+        )
+        response.raise_for_status()
+        raw = response.json()
+        message = raw["choices"][0]["message"]
+        return ModelResponse(
+            text=message.get("content"),
+            tool_calls=[_parse_tool_call(call) for call in message.get("tool_calls", [])],
+            usage=ModelUsage(**_usage(raw.get("usage") or {})),
+            raw=_public_raw(raw),
+            continuation=_continuation(message.get("reasoning_content")),
+        )
+
+    async def stream(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> AsyncIterator[ModelEvent]:
+        tool_parts: dict[int, dict[str, str]] = {}
+        reasoning_parts: list[str] = []
+        async with self._client.stream(
+            "POST",
+            _endpoint(profile),
+            headers=_headers(profile, self._vault),
+            json=_request_body(request, profile, stream=True),
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                value = line[6:]
+                if value == "[DONE]":
+                    break
+                delta = json.loads(value).get("choices", [{}])[0].get("delta", {})
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    yield ModelEvent(
+                        kind=ModelEventKind.REASONING_DELTA,
+                        continuation=ContinuationMetadata(reasoning_content=reasoning),
+                    )
+                if delta.get("content"):
+                    yield ModelEvent(
+                        kind=ModelEventKind.TEXT_DELTA,
+                        text=delta["content"],
+                    )
+                for part in delta.get("tool_calls", []):
+                    current = tool_parts.setdefault(
+                        part.get("index", 0), {"id": "", "name": "", "arguments": ""}
+                    )
+                    current["id"] = part.get("id") or current["id"]
+                    function = part.get("function") or {}
+                    current["name"] = function.get("name") or current["name"]
+                    current["arguments"] += function.get("arguments") or ""
+        continuation = _continuation("".join(reasoning_parts))
+        for part in tool_parts.values():
+            yield ModelEvent(
+                kind=ModelEventKind.TOOL_CALL,
+                tool_call=ToolCall(
+                    id=part["id"],
+                    name=part["name"],
+                    arguments=json.loads(part["arguments"] or "{}"),
+                ),
+                continuation=continuation,
+            )
+
+
+def _endpoint(profile: ProviderProfileRecord) -> str:
+    return f"{profile.base_url.rstrip('/')}/chat/completions"
+
+
+def _headers(
+    profile: ProviderProfileRecord, vault: CredentialReader | None
+) -> dict[str, str]:
+    headers = dict(profile.headers)
+    if profile.secret_id:
+        if vault is None:
+            raise ValueError("credential vault is required for this provider profile")
+        headers["Authorization"] = f"Bearer {vault.get(profile.secret_id)}"
+    return headers
+
+
+def _request_body(
+    request: ModelRequest, profile: ProviderProfileRecord, *, stream: bool
+) -> dict[str, Any]:
+    model = profile.model_aliases.get(request.model, request.model)
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": request.messages,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in request.tools
+        ],
+        "stream": stream,
+    }
+    if profile.thinking_enabled:
+        body["thinking"] = {"type": "enabled"}
+        body["reasoning_effort"] = profile.reasoning_effort
+        return body
+    if request.temperature is not None:
+        body["temperature"] = request.temperature
+    if request.top_p is not None:
+        body["top_p"] = request.top_p
+    if request.presence_penalty is not None:
+        body["presence_penalty"] = request.presence_penalty
+    if request.frequency_penalty is not None:
+        body["frequency_penalty"] = request.frequency_penalty
+    if request.tool_choice is not None:
+        body["tool_choice"] = request.tool_choice
+    return body
+
+
+def _parse_tool_call(raw: dict[str, Any]) -> ToolCall:
+    function = raw.get("function") or {}
+    return ToolCall(
+        id=raw.get("id", ""),
+        name=function.get("name", ""),
+        arguments=json.loads(function.get("arguments") or "{}"),
+    )
+
+
+def _usage(raw: dict[str, Any]) -> dict[str, int]:
+    return {
+        "prompt_tokens": int(raw.get("prompt_tokens", 0)),
+        "completion_tokens": int(raw.get("completion_tokens", 0)),
+    }
+
+
+def _continuation(reasoning_content: object) -> ContinuationMetadata | None:
+    if not reasoning_content:
+        return None
+    if not isinstance(reasoning_content, str):
+        raise ValueError("DeepSeek reasoning_content must be a string")
+    return ContinuationMetadata(reasoning_content=reasoning_content)
+
+
+def _public_raw(raw: dict[str, Any]) -> dict[str, Any]:
+    """Retain provider diagnostics while removing private reasoning traces."""
+    sanitized = deepcopy(raw)
+    for choice in sanitized.get("choices", []):
+        message = choice.get("message") if isinstance(choice, dict) else None
+        if isinstance(message, dict):
+            message.pop("reasoning_content", None)
+    return sanitized

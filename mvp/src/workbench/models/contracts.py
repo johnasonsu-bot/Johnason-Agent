@@ -15,7 +15,11 @@ class ModelRequest(BaseModel):
     model: str
     messages: list[dict[str, Any]]
     tools: list[ToolDefinition] = Field(default_factory=list)
-    temperature: float = 0
+    temperature: float | None = 0
+    top_p: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
 
 class ToolCall(BaseModel):
@@ -29,14 +33,20 @@ class ModelUsage(BaseModel):
     completion_tokens: int = 0
 
 
+class ContinuationMetadata(BaseModel):
+    """Provider-neutral private data required to continue a model turn."""
+
+    reasoning_content: str | None = None
+
+
 class ModelResponse(BaseModel):
     text: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: ModelUsage = Field(default_factory=ModelUsage)
     raw: dict[str, Any] = Field(default_factory=dict)
+    continuation: ContinuationMetadata | None = Field(default=None, exclude=True)
 
 
 class ModelDelta(BaseModel):
     text: str | None = None
     tool_call: ToolCall | None = None
-

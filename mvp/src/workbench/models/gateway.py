@@ -6,20 +6,29 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field
 
-from workbench.models.contracts import ModelRequest, ModelResponse, ToolCall
+from workbench.models.contracts import (
+    ContinuationMetadata,
+    ModelRequest,
+    ModelResponse,
+    ToolCall,
+)
+from workbench.models.profiles import ProviderProfileRecord
 
 
-class ProviderProfile(BaseModel):
-    name: str
-    protocol: str
-    base_url: str
+class ProviderProfile(ProviderProfileRecord):
+    """Backward-compatible runtime profile for existing environment providers.
+
+    New persisted profiles use ``secret_id``.  ``secret_env`` remains a reference
+    to an environment variable for the pre-existing OpenAI-compatible adapter.
+    """
+
+    id: str = "runtime"
     secret_env: str | None = None
-    headers: dict[str, str] = Field(default_factory=dict)
-    model_aliases: dict[str, str] = Field(default_factory=dict)
 
 
 class ModelEventKind(StrEnum):
     TEXT_DELTA = "text_delta"
+    REASONING_DELTA = "reasoning_delta"
     TOOL_CALL = "tool_call"
 
 
@@ -28,15 +37,16 @@ class ModelEvent(BaseModel):
     version: int = 1
     text: str | None = None
     tool_call: ToolCall | None = None
+    continuation: ContinuationMetadata | None = Field(default=None, exclude=True)
 
 
 class ModelProvider(Protocol):
     async def complete(
-        self, request: ModelRequest, profile: ProviderProfile
+        self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> ModelResponse: ...
 
     def stream(
-        self, request: ModelRequest, profile: ProviderProfile
+        self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> AsyncIterator[ModelEvent]: ...
 
 
@@ -44,19 +54,19 @@ class ModelGateway:
     def __init__(self, providers: Mapping[str, ModelProvider]) -> None:
         self._providers = dict(providers)
 
-    def _provider(self, profile: ProviderProfile) -> ModelProvider:
+    def _provider(self, profile: ProviderProfileRecord) -> ModelProvider:
         try:
             return self._providers[profile.protocol]
         except KeyError as exc:
             raise ValueError(f"unsupported model protocol: {profile.protocol}") from exc
 
     async def complete(
-        self, request: ModelRequest, profile: ProviderProfile
+        self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> ModelResponse:
         return await self._provider(profile).complete(request, profile)
 
     async def stream(
-        self, request: ModelRequest, profile: ProviderProfile
+        self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> AsyncIterator[ModelEvent]:
         async for event in self._provider(profile).stream(request, profile):
             yield event
