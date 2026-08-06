@@ -41,6 +41,28 @@ class WorkflowRepository:
             (record.project_id, record.model_dump_json()),
         )
 
+    def find_command_result(self, command_id: str) -> tuple[str, str] | None:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT result_type, result_json FROM lifecycle_command_results
+                WHERE command_id = ?
+                """,
+                (command_id,),
+            ).fetchone()
+        return (row["result_type"], row["result_json"]) if row else None
+
+    def record_command_result(
+        self, command_id: str, result_type: str, result_json: str
+    ) -> None:
+        self._insert(
+            """
+            INSERT INTO lifecycle_command_results(command_id, result_type, result_json)
+            VALUES (?, ?, ?)
+            """,
+            (command_id, result_type, result_json),
+        )
+
     def create_mission(self, record: MissionRecord) -> None:
         self._insert(
             "INSERT INTO lifecycle_missions(mission_id, project_id, record_json) VALUES (?, ?, ?)",

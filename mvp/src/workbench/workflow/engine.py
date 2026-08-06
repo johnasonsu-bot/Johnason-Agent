@@ -73,18 +73,32 @@ class SingleAgentEngine:
         self.runner = runner
 
     def start_run(self, command: StartRun) -> RunRecord:
+        persisted_run_id = self.runtime.start_run(
+            command.record.run_id, command_id=command.command_id
+        )
+        if persisted_run_id != command.record.run_id:
+            return self.repository.get_run(persisted_run_id)
+        try:
+            return self.repository.get_run(persisted_run_id)
+        except KeyError:
+            pass
         record = command.record.model_copy(
             update={
                 "state": transition_run(command.record.state, RunState.RUNNING)
             }
         )
         self.repository.create_run(record)
-        self.runtime.start_run(record.run_id, command_id=command.command_id)
         return record
 
     def submit_intervention(
         self, command: SubmitIntervention
     ) -> InterventionRecord:
+        existing = self.repository.find_command_result(command.command_id)
+        if existing:
+            result_type, result_json = existing
+            if result_type != "intervention":
+                raise ValueError("command id was used for another result type")
+            return InterventionRecord.model_validate_json(result_json)
         sequence = self.repository.next_intervention_sequence(command.run_id)
         record = InterventionRecord(
             intervention_id=str(uuid4()),
@@ -95,13 +109,20 @@ class SingleAgentEngine:
             context_version=command.context_version,
         )
         self.repository.submit_intervention(record)
+        self.repository.record_command_result(
+            command.command_id, "intervention", record.model_dump_json()
+        )
         return record
 
     def pause_run(self, command: PauseRun) -> RunRecord:
-        return self._set_run_state(command.run_id, RunState.PAUSED)
+        return self._set_run_state_idempotently(
+            command.run_id, RunState.PAUSED, command.command_id
+        )
 
     def resume_run(self, command: ResumeRun) -> RunRecord:
-        return self._set_run_state(command.run_id, RunState.RUNNING)
+        return self._set_run_state_idempotently(
+            command.run_id, RunState.RUNNING, command.command_id
+        )
 
     async def tick(
         self,
@@ -152,6 +173,21 @@ class SingleAgentEngine:
             update={"state": transition_run(current.state, target)}
         )
         self.repository.update_run(updated)
+        return updated
+
+    def _set_run_state_idempotently(
+        self, run_id: str, target: RunState, command_id: str
+    ) -> RunRecord:
+        existing = self.repository.find_command_result(command_id)
+        if existing:
+            result_type, result_json = existing
+            if result_type != "run":
+                raise ValueError("command id was used for another result type")
+            return RunRecord.model_validate_json(result_json)
+        updated = self._set_run_state(run_id, target)
+        self.repository.record_command_result(
+            command_id, "run", updated.model_dump_json()
+        )
         return updated
 
     def _apply_interventions(self, run_id: str) -> int:

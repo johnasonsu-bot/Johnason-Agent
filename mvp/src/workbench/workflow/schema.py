@@ -91,6 +91,11 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             projection_name TEXT PRIMARY KEY,
             sequence INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS lifecycle_command_results (
+            command_id TEXT PRIMARY KEY,
+            result_type TEXT NOT NULL,
+            result_json TEXT NOT NULL
+        );
         """
     )
     connection.execute(
