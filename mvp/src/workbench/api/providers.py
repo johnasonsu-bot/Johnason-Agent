@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
+from threading import Lock
 from time import perf_counter
 from typing import Literal
 
@@ -52,6 +54,34 @@ class PasswordPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     password: str = Field(min_length=1)
+
+
+class ProviderLockRegistry:
+    """Reference-counted per-provider locks, removed once idle."""
+
+    def __init__(self) -> None:
+        self._guard = Lock()
+        self._locks: dict[str, tuple[Lock, int]] = {}
+
+    @contextmanager
+    def hold(self, provider_id: str):
+        with self._guard:
+            lock, count = self._locks.get(provider_id, (Lock(), 0))
+            self._locks[provider_id] = (lock, count + 1)
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._guard:
+                current, count = self._locks[provider_id]
+                if count == 1:
+                    del self._locks[provider_id]
+                else:
+                    self._locks[provider_id] = (current, count - 1)
+
+
+_provider_locks = ProviderLockRegistry()
 
 
 def credential_status(record: ProviderProfileRecord, vault: CredentialVault | None) -> str:
@@ -173,61 +203,58 @@ def provider_router(
         validated = _provider_payload(
             await _json_object(request, error_detail="invalid provider metadata")
         )
-        try:
-            record = ProviderProfileRecord(
-                **validated.model_dump(),
-            )
-        except ValidationError as exc:
-            raise HTTPException(422, "invalid provider metadata") from exc
-        created, record = repository.upsert(record)
+        with _provider_locks.hold(validated.id):
+            try:
+                record = ProviderProfileRecord(**validated.model_dump())
+            except ValidationError as exc:
+                raise HTTPException(422, "invalid provider metadata") from exc
+            created, record = repository.upsert(record)
         if not created:
             response.status_code = 200
         return provider_response(record, vault)
 
     @router.post("/{provider_id}/secret")
     async def put_secret(provider_id: str, request: Request) -> dict[str, str]:
-        record = _record_or_404(repository, provider_id)
         secret = _secret_payload(
             await _json_object(request, error_detail="invalid credential payload")
         )
         if vault is None:
             raise HTTPException(423, "credential vault is locked")
-        try:
-            vault.put(record.secret_id or "", secret.value)
-        except VaultLockedError as exc:
-            raise HTTPException(423, "credential vault is locked") from exc
-        except VaultPersistenceError as exc:
-            if exc.committed:
-                return JSONResponse(
-                    status_code=202,
-                    content={
-                        "id": record.id,
-                        "credential_status": "configured",
-                        "durability": "unconfirmed",
-                    },
-                )
-            raise HTTPException(503, "credential could not be persisted") from exc
+        with _provider_locks.hold(provider_id):
+            record = _record_or_404(repository, provider_id)
+            try:
+                vault.put(record.secret_id or "", secret.value)
+            except VaultLockedError as exc:
+                raise HTTPException(423, "credential vault is locked") from exc
+            except VaultPersistenceError as exc:
+                if exc.committed:
+                    return JSONResponse(
+                        status_code=202,
+                        content={"id": record.id, "credential_status": "configured", "durability": "unconfirmed"},
+                    )
+                raise HTTPException(503, "credential could not be persisted") from exc
         return {"id": record.id, "credential_status": "configured"}
 
     @router.delete("/{provider_id}")
     def delete_provider(provider_id: str) -> dict[str, str]:
         """Delete the encrypted credential before removing its metadata reference."""
-        record = _record_or_404(repository, provider_id)
         if vault is None:
             raise HTTPException(423, "credential vault is locked")
-        try:
-            vault.delete(record.secret_id or "")
-        except VaultLockedError as exc:
-            raise HTTPException(423, "credential vault is locked") from exc
-        except VaultPersistenceError as exc:
-            if not exc.committed:
-                raise HTTPException(503, "credential could not be deleted") from exc
+        with _provider_locks.hold(provider_id):
+            record = _record_or_404(repository, provider_id)
+            try:
+                vault.delete(record.secret_id or "")
+            except VaultLockedError as exc:
+                raise HTTPException(423, "credential vault is locked") from exc
+            except VaultPersistenceError as exc:
+                if not exc.committed:
+                    raise HTTPException(503, "credential could not be deleted") from exc
+                repository.delete(provider_id)
+                return JSONResponse(
+                    status_code=202,
+                    content={"id": provider_id, "status": "deleted", "secret_cleanup": "unconfirmed"},
+                )
             repository.delete(provider_id)
-            return JSONResponse(
-                status_code=202,
-                content={"id": provider_id, "status": "deleted", "secret_cleanup": "unconfirmed"},
-            )
-        repository.delete(provider_id)
         return {"id": provider_id, "status": "deleted", "secret_cleanup": "confirmed"}
 
     @router.get("/{provider_id}/models")

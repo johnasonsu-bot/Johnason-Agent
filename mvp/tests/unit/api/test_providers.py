@@ -1,6 +1,8 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
+import re
 import sqlite3
 
 import pytest
@@ -167,6 +169,28 @@ def test_deleting_a_locked_provider_preserves_metadata_for_retry(tmp_path: Path)
 
     assert deleted.status_code == 423
     assert ProviderRepository(tmp_path / "workflow.sqlite").get("deepseek-primary").id == "deepseek-primary"
+
+
+@pytest.mark.parametrize("committed,status,exists", [(False, 503, True), (True, 202, False)])
+def test_delete_persistence_failure_preserves_or_removes_metadata_by_commit_state(
+    tmp_path: Path, committed: bool, status: int, exists: bool
+) -> None:
+    from workbench.credentials.models import VaultPersistenceError
+
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(tmp_path / "workflow.sqlite", vault)
+    client.post("/api/providers", json=deepseek_payload())
+    vault._write = lambda _secrets: (_ for _ in ()).throw(VaultPersistenceError("redacted", committed=committed))  # type: ignore[method-assign]
+
+    response = client.delete("/api/providers/deepseek-primary")
+
+    assert response.status_code == status
+    if committed:
+        assert response.json()["secret_cleanup"] == "unconfirmed"
+    if exists:
+        assert ProviderRepository(tmp_path / "workflow.sqlite").get("deepseek-primary").id == "deepseek-primary"
+    else:
+        assert ProviderRepository(tmp_path / "workflow.sqlite").list() == []
 
 
 def test_secret_write_reports_locked_vault_without_echoing_input(tmp_path: Path) -> None:
@@ -430,6 +454,30 @@ def test_concurrent_first_upserts_return_one_secret_reference(tmp_path: Path) ->
 
     assert sum(created for created, _ in outcomes) == 1
     assert len({record.secret_id for _, record in outcomes}) == 1
+
+
+def test_repository_migrates_legacy_provider_ids_deterministically(tmp_path: Path) -> None:
+    database = tmp_path / "workflow.sqlite"
+    seed = ProviderRepository(database)
+    base = ProviderProfileRecord.deepseek(id="seed")
+    with sqlite3.connect(database) as connection:
+        for legacy_id in ("a.b", "中文", "a b"):
+            payload = json.loads(base.model_dump_json())
+            payload["id"] = legacy_id
+            connection.execute(
+                "INSERT INTO model_provider_profiles(provider_id, record_json) VALUES (?, ?)",
+                (legacy_id, json.dumps(payload)),
+            )
+
+    migrated = ProviderRepository(database)
+    first_ids = [record.id for record in migrated.list()]
+    repeated = ProviderRepository(database)
+
+    assert len(first_ids) == len(set(first_ids)) == 3
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) for value in first_ids)
+    assert [record.id for record in repeated.list()] == first_ids
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM provider_profile_id_migrations").fetchone()[0] == 3
 
 
 def test_vault_management_routes_unlock_a_default_locked_vault_without_echoing_password(

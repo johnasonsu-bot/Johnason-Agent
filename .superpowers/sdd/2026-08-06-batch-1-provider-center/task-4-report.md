@@ -49,3 +49,9 @@ No screenshots were created or retained, so no password/key could enter a screen
 
 - Provider IDs are now limited end-to-end to 1–64 ASCII `[A-Za-z0-9_-]` characters: the API payload, durable profile record and IPC proxy reject dots, spaces, Unicode, controls and path separators.
 - Deletion requires an unlocked vault and deletes the encrypted secret before removing metadata. An uncommitted vault-write failure returns an error and preserves metadata for retry. A committed-but-durability-unconfirmed cleanup removes metadata and returns a visible UI warning.
+
+## Round 3 lifecycle and legacy migration correction
+
+- Metadata upsert, secret writes and deletion share a bounded, reference-counted provider lock. Secret writes re-read metadata while holding the lock; delete re-reads it, deletes the encrypted value, then removes metadata.
+- Repository startup atomically migrates legacy IDs to deterministic safe canonical IDs, preserves every opaque secret reference and records every mapping in `provider_profile_id_migrations` for audit. The migration is idempotent.
+- Delete persistence tests cover both pre-commit failure (metadata retained for retry) and committed-but-unconfirmed cleanup (metadata removed with `202` warning status).
