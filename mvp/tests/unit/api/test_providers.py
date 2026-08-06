@@ -123,6 +123,27 @@ def test_secret_is_written_to_unlocked_vault_and_never_echoed(tmp_path: Path) ->
     assert b"secret-value" not in (tmp_path / "workflow.sqlite").read_bytes()
 
 
+def test_deleting_provider_removes_metadata_and_its_vault_secret(tmp_path: Path) -> None:
+    """Deletion removes the profile and best-effort cleans its opaque vault entry."""
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(tmp_path / "workflow.sqlite", vault)
+    client.post("/api/providers", json=deepseek_payload())
+    client.post("/api/providers/deepseek-primary/secret", json={"value": "secret-value"})
+    secret_id = ProviderRepository(tmp_path / "workflow.sqlite").get("deepseek-primary").secret_id
+
+    deleted = client.delete("/api/providers/deepseek-primary")
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {
+        "id": "deepseek-primary",
+        "status": "deleted",
+        "secret_cleanup": "confirmed",
+    }
+    assert client.get("/api/providers").json() == []
+    with pytest.raises(KeyError):
+        vault.get(secret_id or "")
+
+
 def test_secret_write_reports_locked_vault_without_echoing_input(tmp_path: Path) -> None:
     """A locked vault must prevent credential writes without leaking their value."""
     vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")

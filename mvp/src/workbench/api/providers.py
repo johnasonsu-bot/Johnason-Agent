@@ -209,6 +209,32 @@ def provider_router(
             raise HTTPException(503, "credential could not be persisted") from exc
         return {"id": record.id, "credential_status": "configured"}
 
+    @router.delete("/{provider_id}")
+    def delete_provider(provider_id: str) -> dict[str, str]:
+        """Remove metadata, then best-effort delete its now-unreferenced secret.
+
+        Metadata is authoritative. If vault cleanup cannot run or its durability is
+        unknown, the remaining encrypted value is an inaccessible orphan rather
+        than a credential exposed by a surviving provider profile.
+        """
+        try:
+            record = repository.delete(provider_id)
+        except KeyError as exc:
+            raise HTTPException(404, "provider not found") from exc
+        if vault is None:
+            return {"id": provider_id, "status": "deleted", "secret_cleanup": "deferred"}
+        try:
+            vault.delete(record.secret_id or "")
+        except VaultLockedError:
+            return {"id": provider_id, "status": "deleted", "secret_cleanup": "deferred"}
+        except VaultPersistenceError as exc:
+            return {
+                "id": provider_id,
+                "status": "deleted",
+                "secret_cleanup": "unconfirmed" if exc.committed else "deferred",
+            }
+        return {"id": provider_id, "status": "deleted", "secret_cleanup": "confirmed"}
+
     @router.get("/{provider_id}/models")
     async def list_models(provider_id: str) -> dict[str, object]:
         record = _record_or_404(repository, provider_id)

@@ -12,6 +12,7 @@ label { color: #4b5563; display: grid; gap: 7px; font-size: 14px; font-weight: 6
 input, select { min-height: 40px; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px 10px; color: #1f2937; background: white; font: inherit; }
 button { min-height: 36px; border: 1px solid #0e2841; border-radius: 6px; background: #0e2841; color: #fff; cursor: pointer; padding: 7px 12px; font: inherit; }
 button:disabled { opacity: .55; cursor: wait; } .quiet, .preset-row button { background: #fff; color: #0e2841; border-color: #cbd5e1; }
+.danger { color: #9f1239; border-color: #fecdd3; }
 .notice { margin-top: 18px; color: #0e2841; background: #eaf7fd; padding: 10px 12px; border-radius: 6px; }
 .center-heading { display: flex; justify-content: space-between; gap: 24px; }.provider-layout { display: grid; grid-template-columns: 230px 1fr; gap: 36px; margin-top: 32px; border-top: 1px solid #ececec; padding-top: 26px; }
 .provider-item { display: grid; gap: 4px; width: 100%; text-align: left; border: 0; border-radius: 5px; background: transparent; color: #202124; padding: 10px; }.provider-item:hover, .provider-item.active { background: #edf7fb; }.provider-item span { color: #6b7280; font-size: 12px; }.empty, .hint { color: #6b7280; font-size: 13px; }

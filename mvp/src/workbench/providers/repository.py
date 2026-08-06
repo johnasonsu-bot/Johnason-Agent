@@ -38,6 +38,21 @@ class ProviderRepository:
         created, _ = self.upsert(record)
         return created
 
+    def delete(self, provider_id: str) -> ProviderProfileRecord:
+        """Remove metadata first; callers can then safely clean its vault orphan."""
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT record_json FROM model_provider_profiles WHERE provider_id = ?",
+                (provider_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(provider_id)
+            connection.execute(
+                "DELETE FROM model_provider_profiles WHERE provider_id = ?", (provider_id,)
+            )
+        return ProviderProfileRecord.model_validate_json(row["record_json"])
+
     def upsert(self, record: ProviderProfileRecord) -> tuple[bool, ProviderProfileRecord]:
         """Atomically save metadata while preserving or allocating its vault reference."""
         with self.store.connect() as connection:

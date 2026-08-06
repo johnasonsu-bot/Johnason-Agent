@@ -38,3 +38,10 @@ No screenshots were created or retained, so no password/key could enter a screen
 ## Commit
 
 `6be7f4b feat: add provider center interface`
+
+## Round 1 security and CRUD correction
+
+- Removed renderer-to-loopback `fetch` and the global `Origin: null` CORS exception. A context-isolated preload exposes a single request function; Electron main validates method, path and bounded JSON body against the Provider/Vault allowlist before making the loopback request. It forwards no renderer headers and never logs bodies.
+- Added provider deletion. Metadata is removed first, then the opaque vault entry is deleted. A locked or failed cleanup leaves only an encrypted, unreferenced orphan; the delete result states `confirmed`, `deferred`, or `unconfirmed` cleanup without exposing a secret.
+- Locking is now async/error-aware, disabled while pending, and immediately clears all provider, model and connection UI state. Deletion requires explicit confirmation and clears the selected UI state.
+- Reworked rendered Electron tests around an isolated in-process fake loopback API consumed through IPC. They cover create → lock → unlock, presets, model selection persistence, connection test, explicit deletion, allowlist rejection and secret input clearance before a delayed `/secret` reply. No screenshot is retained and all test credentials are runtime-generated.

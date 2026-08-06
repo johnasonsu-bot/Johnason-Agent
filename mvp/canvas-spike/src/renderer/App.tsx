@@ -14,7 +14,7 @@ export function App() {
 
   return (
     <main>
-      <header className="app-header"><h1>Hermes Workbench</h1><nav aria-label="主导航"><a href="#artifacts" role="tab" aria-selected={view === "artifacts"} aria-current={view === "artifacts" ? "page" : undefined}>Artifacts</a><a href="#providers" aria-current={view === "providers" ? "page" : undefined}>模型供应商</a></nav></header>
+      <header className="app-header"><h1>Hermes Workbench</h1><nav aria-label="主导航"><a href="#artifacts" aria-current={view === "artifacts" ? "page" : undefined}>Artifacts</a><a href="#providers" aria-current={view === "providers" ? "page" : undefined}>模型供应商</a></nav></header>
       {view === "providers" ? <ProviderCenter /> : artifacts.map((artifact) => {
         const Renderer = registry.resolve(artifact.kind);
         return <Renderer key={artifact.id} artifact={artifact} />;

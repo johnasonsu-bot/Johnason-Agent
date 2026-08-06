@@ -31,8 +31,7 @@ def test_provider_center_clean_runtime_keeps_only_credential_references(
                 "Access-Control-Request-Method": "GET",
             },
         )
-        assert cors.status_code == 200
-        assert cors.headers["access-control-allow-origin"] == "null"
+        assert "access-control-allow-origin" not in cors.headers
         assert client.get("/api/vault/status").json() == {"status": "uninitialized"}
         assert client.post("/api/vault/create", json={"password": password}).json() == {
             "status": "unlocked"
@@ -79,11 +78,11 @@ def test_provider_center_clean_runtime_keeps_only_credential_references(
     assert submitted_secret not in serialized_settings
 
 
-def test_provider_center_playwright_path_runs_against_an_isolated_fake_api() -> None:
-    """The rendered Electron path uses a fake local API; it does not need a live key."""
+def test_provider_center_playwright_path_runs_through_the_isolated_ipc_proxy() -> None:
+    """The rendered Electron lifecycle uses an isolated fake loopback API, not a key."""
     canvas = Path(__file__).resolve().parents[2] / "canvas-spike"
     completed = subprocess.run(
-        ["npm", "test", "--", "--grep", "unlocks vault and selects an LM Studio model"],
+        ["npm", "test", "--", "--grep", "creates, locks, unlocks"],
         cwd=canvas,
         check=False,
         capture_output=True,

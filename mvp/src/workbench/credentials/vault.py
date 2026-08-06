@@ -121,6 +121,19 @@ class CredentialVault:
         """Return a credential value by opaque secret identifier."""
         return self._require_unlocked()[secret_id]
 
+    def delete(self, secret_id: str) -> None:
+        """Remove a credential and atomically persist the reduced mapping."""
+        secrets = self._require_unlocked()
+        updated = dict(secrets)
+        updated.pop(secret_id, None)
+        try:
+            self._write(updated)
+        except VaultPersistenceError as exc:
+            if exc.committed:
+                self._secrets = updated
+            raise
+        self._secrets = updated
+
     @property
     def is_unlocked(self) -> bool:
         """Expose lock state without exposing any credential material."""

@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from workbench.adapters.hermes.runner import AgentStepRunner
@@ -55,16 +54,6 @@ def create_app(settings: AppSettings) -> FastAPI:
                 settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
-    # The packaged Electron renderer is served from file://, which Chromium sends
-    # as Origin: null. The API stays bound to localhost; no network origins are
-    # trusted and credential values are never part of responses.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["null"],
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["content-type"],
-    )
     engine = SingleAgentEngine(
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )

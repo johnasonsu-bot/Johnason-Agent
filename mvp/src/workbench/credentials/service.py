@@ -41,6 +41,9 @@ class VaultService:
     def put(self, secret_id: str, value: str) -> None:
         self._require().put(secret_id, value)
 
+    def delete(self, secret_id: str) -> None:
+        self._require().delete(secret_id)
+
     def _require(self) -> CredentialVault:
         if self._vault is None:
             raise VaultLockedError("vault is locked")

@@ -5,7 +5,7 @@ test("shows artifact workbench renderers while preserving the sandbox", async ()
   const app = await electron.launch({ args: [path.resolve(".")] });
   const page = await app.firstWindow();
 
-  await expect(page.getByRole("tab", { name: "Artifacts" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Artifacts" })).toBeVisible();
   await expect(page.getByText("application/json")).toBeVisible();
   await expect(page.getByTestId("artifact-table")).toBeVisible();
   await expect(page.getByTestId("artifact-run-graph")).toBeVisible();

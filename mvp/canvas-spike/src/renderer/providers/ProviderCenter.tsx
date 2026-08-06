@@ -23,6 +23,8 @@ export function ProviderCenter() {
   const [message, setMessage] = useState("正在连接本地服务…");
   const [connection, setConnection] = useState<ConnectionResult | null>(null);
   const [models, setModels] = useState<string[]>([]);
+  const [locking, setLocking] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -114,6 +116,40 @@ export function ProviderCenter() {
     }
   };
 
+  const lock = async () => {
+    setLocking(true);
+    try {
+      await providerApi.lockVault();
+      setProviders([]);
+      setSelectedId(null);
+      setModels([]);
+      setConnection(null);
+      setVaultStatus("locked");
+      setMessage("");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法锁定保险库");
+    } finally {
+      setLocking(false);
+    }
+  };
+
+  const removeSelected = async () => {
+    if (!selected || !window.confirm(`删除供应商“${selected.name}”？此操作会移除其本地凭据引用。`)) return;
+    setDeleting(true);
+    try {
+      await providerApi.delete(selected.id);
+      setProviders((current) => current.filter((provider) => provider.id !== selected.id));
+      setSelectedId(null);
+      setModels([]);
+      setConnection(null);
+      setMessage("供应商已删除");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法删除供应商");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   if (vaultStatus !== "unlocked") return (
     <section className="provider-center" aria-labelledby="provider-title">
       <p className="eyebrow">安全连接</p><h2 id="provider-title">模型供应商</h2>
@@ -129,13 +165,14 @@ export function ProviderCenter() {
   const visibleModels = models.length ? models : selected ? Object.values(selected.model_aliases) : [];
   return (
     <section className="provider-center" aria-labelledby="provider-title">
-      <div className="center-heading"><div><p className="eyebrow">本地连接</p><h2 id="provider-title">模型供应商</h2><p>管理本地和云端模型；保险库当前已解锁。</p></div><button type="button" className="quiet" onClick={() => void providerApi.lockVault().then(refresh)}>锁定保险库</button></div>
+      <div className="center-heading"><div><p className="eyebrow">本地连接</p><h2 id="provider-title">模型供应商</h2><p>管理本地和云端模型；保险库当前已解锁。</p></div><button type="button" className="quiet" disabled={locking} onClick={() => void lock()}>{locking ? "正在锁定…" : "锁定保险库"}</button></div>
       {message && <p role="status" className="notice">{message}</p>}
       <div className="provider-layout">
         <aside aria-label="已保存的供应商"><h3>供应商</h3>{providers.length === 0 ? <p className="empty">从预设开始连接一个模型。</p> : providers.map((provider) => <button className={provider.id === selectedId ? "provider-item active" : "provider-item"} type="button" key={provider.id} onClick={() => { setSelectedId(provider.id); setModels([]); setConnection(null); }}><strong>{provider.name}</strong><span>{credentialCopy[provider.credential_status]}</span></button>)}</aside>
         <div className="provider-detail">
           <ProviderForm provider={selected} onSave={save} onTest={test} />
           {selected && <button type="button" className="quiet" onClick={() => void discoverModels()}>发现模型</button>}
+          {selected && <button type="button" className="quiet danger" disabled={deleting} onClick={() => void removeSelected()}>{deleting ? "正在删除…" : "删除供应商"}</button>}
           {connection && <section className={`connection ${connection.status}`} aria-live="polite"><strong>{statusCopy[connection.status]}</strong>{connection.latency_ms !== undefined && <span>{connection.latency_ms} ms</span>}{connection.error_code && <span>{connection.error_code}</span>}</section>}
           {visibleModels.length > 0 && <label className="model-picker">默认模型<select aria-label="默认模型" value={selected?.model_aliases.default ?? visibleModels[0]} onChange={(event) => void selectModel(event.target.value)}>{visibleModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>}
         </div>

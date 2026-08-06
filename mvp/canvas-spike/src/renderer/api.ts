@@ -31,20 +31,18 @@ export interface ConnectionResult {
   error_code: string | null;
 }
 
-const API_BASE = "http://127.0.0.1:8765/api";
+interface ApiBridge { apiRequest(request: { method: string; path: string; body?: Record<string, unknown> }): Promise<{ status: number; body: unknown }>; }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response;
+async function request<T>(path: string, init?: { method?: string; body?: string }): Promise<T> {
+  let response: { status: number; body: unknown };
   try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...init,
-      headers: { "content-type": "application/json", ...init?.headers },
-    });
+    const parsedBody = init?.body ? JSON.parse(init.body) as Record<string, unknown> : undefined;
+    response = await (window as Window & { workbenchBridge: ApiBridge }).workbenchBridge.apiRequest({ method: init?.method ?? "GET", path, body: parsedBody });
   } catch {
     throw new Error("无法连接到本地 Hermes 服务");
   }
-  if (!response.ok) throw new Error(`本地服务请求失败（${response.status}）`);
-  return response.json() as Promise<T>;
+  if (response.status < 200 || response.status >= 300) throw new Error(`本地服务请求失败（${response.status}）`);
+  return response.body as T;
 }
 
 export const providerApi = {
@@ -65,4 +63,5 @@ export const providerApi = {
   }),
   models: (id: string) => request<{ status: ConnectionResult["status"]; models: string[]; error_code: string | null }>(`/providers/${encodeURIComponent(id)}/models`),
   test: (id: string) => request<ConnectionResult>(`/providers/${encodeURIComponent(id)}/test`, { method: "POST" }),
+  delete: (id: string) => request<{ id: string; status: string; secret_cleanup: string }>(`/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
