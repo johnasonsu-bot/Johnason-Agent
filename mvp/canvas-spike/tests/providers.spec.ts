@@ -61,6 +61,7 @@ test("uses the isolated IPC bridge and rejects unapproved local API requests", a
   expect(await page.evaluate(() => typeof (window as any).workbenchBridge.apiRequest)).toBe("function");
   await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "PUT", path: "/providers" }))).rejects.toThrow();
   await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/health" }))).rejects.toThrow();
+  await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "DELETE", path: "/providers/not.valid" }))).rejects.toThrow();
   await app.close();
 });
 

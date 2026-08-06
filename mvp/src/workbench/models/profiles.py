@@ -94,7 +94,7 @@ class ProviderProfileRecord(BaseModel):
         arbitrary_types_allowed=True, extra="forbid", validate_assignment=True
     )
 
-    id: str
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     name: str
     protocol: str
     base_url: str

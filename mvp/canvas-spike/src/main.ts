@@ -18,7 +18,7 @@ function isApiRequest(value: unknown): value is ApiRequest {
   const request = value as Partial<ApiRequest>;
   if ((request.method !== "GET" && request.method !== "POST" && request.method !== "DELETE") || typeof request.path !== "string") return false;
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
-    const providerPath = /^\/providers\/[A-Za-z0-9_-]+(?:\/(secret|test|models))?$/.exec(request.path);
+    const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
     if (!providerPath) return false;
     const operation = providerPath[1];
     if (!((!operation && request.method === "DELETE") || (operation === "secret" && request.method === "POST") || (operation === "test" && request.method === "POST") || (operation === "models" && request.method === "GET"))) return false;

@@ -137,12 +137,12 @@ export function ProviderCenter() {
     if (!selected || !window.confirm(`删除供应商“${selected.name}”？此操作会移除其本地凭据引用。`)) return;
     setDeleting(true);
     try {
-      await providerApi.delete(selected.id);
+      const result = await providerApi.delete(selected.id);
       setProviders((current) => current.filter((provider) => provider.id !== selected.id));
       setSelectedId(null);
       setModels([]);
       setConnection(null);
-      setMessage("供应商已删除");
+      setMessage(result.secret_cleanup === "unconfirmed" ? "供应商元数据已删除；凭据删除耐久性未确认" : "供应商已删除");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "无法删除供应商");
     } finally {

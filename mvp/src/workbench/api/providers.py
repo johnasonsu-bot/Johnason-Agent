@@ -25,7 +25,7 @@ class ProviderPayload(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str
+    id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     name: str
     protocol: str
     base_url: str
@@ -211,28 +211,23 @@ def provider_router(
 
     @router.delete("/{provider_id}")
     def delete_provider(provider_id: str) -> dict[str, str]:
-        """Remove metadata, then best-effort delete its now-unreferenced secret.
-
-        Metadata is authoritative. If vault cleanup cannot run or its durability is
-        unknown, the remaining encrypted value is an inaccessible orphan rather
-        than a credential exposed by a surviving provider profile.
-        """
-        try:
-            record = repository.delete(provider_id)
-        except KeyError as exc:
-            raise HTTPException(404, "provider not found") from exc
+        """Delete the encrypted credential before removing its metadata reference."""
+        record = _record_or_404(repository, provider_id)
         if vault is None:
-            return {"id": provider_id, "status": "deleted", "secret_cleanup": "deferred"}
+            raise HTTPException(423, "credential vault is locked")
         try:
             vault.delete(record.secret_id or "")
-        except VaultLockedError:
-            return {"id": provider_id, "status": "deleted", "secret_cleanup": "deferred"}
+        except VaultLockedError as exc:
+            raise HTTPException(423, "credential vault is locked") from exc
         except VaultPersistenceError as exc:
-            return {
-                "id": provider_id,
-                "status": "deleted",
-                "secret_cleanup": "unconfirmed" if exc.committed else "deferred",
-            }
+            if not exc.committed:
+                raise HTTPException(503, "credential could not be deleted") from exc
+            repository.delete(provider_id)
+            return JSONResponse(
+                status_code=202,
+                content={"id": provider_id, "status": "deleted", "secret_cleanup": "unconfirmed"},
+            )
+        repository.delete(provider_id)
         return {"id": provider_id, "status": "deleted", "secret_cleanup": "confirmed"}
 
     @router.get("/{provider_id}/models")

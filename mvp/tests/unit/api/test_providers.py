@@ -88,6 +88,18 @@ def test_provider_response_never_contains_secret(tmp_path: Path) -> None:
     assert response.json()["credential_status"] == "missing"
 
 
+@pytest.mark.parametrize("provider_id", ["contains.dot", "has space", "中文", "line\nbreak", "slash/id"])
+def test_provider_creation_rejects_unsafe_provider_ids(tmp_path: Path, provider_id: str) -> None:
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(tmp_path / "workflow.sqlite", vault)
+
+    response = client.post("/api/providers", json=deepseek_payload() | {"id": provider_id})
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid provider metadata"}
+    assert ProviderRepository(tmp_path / "workflow.sqlite").list() == []
+
+
 def test_provider_validation_error_never_echoes_rejected_secret_value(
     tmp_path: Path,
 ) -> None:
@@ -142,6 +154,19 @@ def test_deleting_provider_removes_metadata_and_its_vault_secret(tmp_path: Path)
     assert client.get("/api/providers").json() == []
     with pytest.raises(KeyError):
         vault.get(secret_id or "")
+
+
+def test_deleting_a_locked_provider_preserves_metadata_for_retry(tmp_path: Path) -> None:
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(tmp_path / "workflow.sqlite", vault)
+    client.post("/api/providers", json=deepseek_payload())
+    client.post("/api/providers/deepseek-primary/secret", json={"value": "secret-value"})
+    vault.lock()
+
+    deleted = client.delete("/api/providers/deepseek-primary")
+
+    assert deleted.status_code == 423
+    assert ProviderRepository(tmp_path / "workflow.sqlite").get("deepseek-primary").id == "deepseek-primary"
 
 
 def test_secret_write_reports_locked_vault_without_echoing_input(tmp_path: Path) -> None:
