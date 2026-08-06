@@ -144,3 +144,32 @@ async def test_gateway_uses_persistent_profile_secret_reference_for_openai() -> 
 
     assert response.text == "hello"
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_unsafe_persistent_openai_headers_before_transport() -> None:
+    """OpenAI-compatible requests must revalidate bypassed persistent metadata."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "bad"}}]})
+
+    provider = OpenAICompatibleProvider(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        vault=InMemoryVault(),
+    )
+    gateway = ModelGateway({"openai_chat": provider})
+    profile = ProviderProfileRecord(
+        id="openai-primary",
+        name="OpenAI-compatible",
+        protocol="openai_chat",
+        base_url="https://provider.test",
+        secret_id="provider/openai-primary",
+    ).model_copy(update={"headers": {"Cookie": "session=plaintext"}})
+
+    with pytest.raises(ValueError, match="provider metadata"):
+        await gateway.complete(ModelRequest(model="gpt-compatible", messages=[]), profile)
+
+    assert requests == []
+    await provider.aclose()

@@ -17,7 +17,11 @@ from workbench.models.gateway import (
     ModelEvent,
     ModelEventKind,
 )
-from workbench.models.profiles import ProviderProfileRecord, SecretResolver
+from workbench.models.profiles import (
+    ProviderProfileRecord,
+    SecretResolver,
+    validate_provider_headers,
+)
 
 
 class OpenAICompatibleProvider:
@@ -95,7 +99,7 @@ class OpenAICompatibleProvider:
 def _headers(
     profile: ProviderProfileRecord, vault: SecretResolver | None
 ) -> dict[str, str]:
-    headers = dict(profile.headers)
+    headers = validate_provider_headers(profile.headers)
     if profile.secret_id:
         if vault is None:
             raise ValueError("credential vault is required for this provider profile")
