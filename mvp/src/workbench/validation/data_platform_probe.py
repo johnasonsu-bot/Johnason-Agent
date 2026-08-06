@@ -3,6 +3,7 @@
 from collections.abc import Awaitable, Callable
 
 from workbench.connectors.data_platform import DataPlatformConfig, DataPlatformPort
+from workbench.connectors.data_platform_browser import browser_has_exact_page
 from workbench.validation.result import (
     ValidationEvidence,
     ValidationResult,
@@ -30,7 +31,7 @@ async def probe_data_platform(
     try:
         job = await port.inspect_job(job_id)
         expected_url = port.browser_location(job_id)
-        inspector = browser_inspector or _inspect_existing_browser
+        inspector = browser_inspector or browser_has_exact_page
         matched = await inspector(cdp_url, expected_url)
     except Exception as exc:
         return ValidationResult(
@@ -58,15 +59,3 @@ async def probe_data_platform(
             ValidationEvidence(name="browser_url", value=expected_url),
         ],
     )
-
-
-async def _inspect_existing_browser(cdp_url: str, expected_url: str) -> bool:
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.connect_over_cdp(cdp_url)
-        for context in browser.contexts:
-            for page in context.pages:
-                if page.url.rstrip("/") == expected_url.rstrip("/"):
-                    return True
-        return False
