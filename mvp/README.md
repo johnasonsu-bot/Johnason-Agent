@@ -13,3 +13,13 @@ python3 -m venv .venv
 
 Runtime databases, external Hermes checkouts, logs, and probe results remain
 local and are excluded from Git.
+
+## Open the Canvas probe
+
+Do not open `canvas-spike/index.html` with a browser. It is Electron source and
+requires its preload sandbox. Launch the runnable application instead:
+
+```bash
+cd canvas-spike
+npm start
+```
