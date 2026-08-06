@@ -5,7 +5,7 @@ import path from "node:path";
 
 type RequestRecord = { method: string; path: string; body: Record<string, unknown> | null };
 
-async function fakeApi(delayInitialVault = false) {
+async function fakeApi(delayInitialVault = false, unconfirmedDelete = false) {
   let vaultStatus = "uninitialized";
   let providers: any[] = [];
   const requests: RequestRecord[] = [];
@@ -40,7 +40,7 @@ async function fakeApi(delayInitialVault = false) {
     }
     if (pathname.endsWith("/models")) return send({ status: "online", models: ["first-model", "second-model"], error_code: null });
     if (pathname.endsWith("/test")) return send({ status: "online", latency_ms: 12, models: ["first-model", "second-model"], error_code: null });
-    if (method === "DELETE") { providers = providers.filter((value) => value.id !== id); return send({ id, status: "deleted", secret_cleanup: "confirmed" }); }
+    if (method === "DELETE") { providers = providers.filter((value) => value.id !== id); return send({ id, status: "deleted", secret_cleanup: unconfirmedDelete ? "unconfirmed" : "confirmed" }, unconfirmedDelete ? 202 : 200); }
     return send({ detail: "not found" }, 404);
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -107,6 +107,25 @@ test("creates, locks, unlocks, edits, tests, selects and deletes providers witho
   await page.getByRole("button", { name: "删除供应商" }).click();
   await expect(page.getByText("供应商已删除")).toBeVisible();
   expect(api.requests.some((request) => request.method === "DELETE" && request.path === "/api/providers/deepseek-primary")).toBeTruthy();
+  await app.close();
+  await api.close();
+});
+
+test("shows a durability warning after a 202 provider delete and clears selection", async () => {
+  const api = await fakeApi(false, true);
+  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_API_BASE: api.base } });
+  const page = await app.firstWindow();
+  page.on("dialog", (dialog) => void dialog.accept());
+
+  await page.getByRole("link", { name: "模型供应商" }).click();
+  await page.getByLabel("主密码").fill(`runtime-${randomUUID()}`);
+  await page.getByRole("button", { name: "创建并解锁" }).click();
+  await page.getByRole("button", { name: "保存供应商" }).click();
+  await page.getByRole("button", { name: "删除供应商" }).click();
+
+  await expect(page.getByText("供应商元数据已删除；凭据删除耐久性未确认")).toBeVisible();
+  await expect(page.getByRole("button", { name: "删除供应商" })).toHaveCount(0);
+  expect(await page.evaluate(() => `${document.body.innerText}|${localStorage.length}|${sessionStorage.length}`.includes("runtime-"))).toBeFalsy();
   await app.close();
   await api.close();
 });

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+from threading import Event, Thread
 
 import pytest
 
@@ -191,6 +192,41 @@ def test_delete_persistence_failure_preserves_or_removes_metadata_by_commit_stat
         assert ProviderRepository(tmp_path / "workflow.sqlite").get("deepseek-primary").id == "deepseek-primary"
     else:
         assert ProviderRepository(tmp_path / "workflow.sqlite").list() == []
+
+
+def test_secret_put_racing_delete_cannot_leave_an_orphaned_secret(tmp_path: Path) -> None:
+    """The delete waits for a started secret write, then removes that exact secret."""
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    database = tmp_path / "workflow.sqlite"
+    client = _client(database, vault)
+    client.post("/api/providers", json=deepseek_payload())
+    started, release = Event(), Event()
+    original_put = vault.put
+
+    def blocked_put(secret_id: str, value: str) -> None:
+        started.set()
+        assert release.wait(timeout=3)
+        original_put(secret_id, value)
+
+    vault.put = blocked_put  # type: ignore[method-assign]
+    secret_response: list[object] = []
+    delete_response: list[object] = []
+
+    secret_thread = Thread(target=lambda: secret_response.append(client.post("/api/providers/deepseek-primary/secret", json={"value": "runtime-value"})))
+    delete_thread = Thread(target=lambda: delete_response.append(client.delete("/api/providers/deepseek-primary")))
+    secret_thread.start()
+    assert started.wait(timeout=3)
+    delete_thread.start()
+    release.set()
+    secret_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+
+    assert not secret_thread.is_alive() and not delete_thread.is_alive()
+    assert secret_response[0].status_code in {200, 202}  # type: ignore[union-attr]
+    assert delete_response[0].status_code == 200  # type: ignore[union-attr]
+    assert ProviderRepository(database).list() == []
+    assert vault._secrets is not None
+    assert vault._secrets == {}
 
 
 def test_secret_write_reports_locked_vault_without_echoing_input(tmp_path: Path) -> None:

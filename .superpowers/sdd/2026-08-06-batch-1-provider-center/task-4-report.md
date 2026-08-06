@@ -55,3 +55,8 @@ No screenshots were created or retained, so no password/key could enter a screen
 - Metadata upsert, secret writes and deletion share a bounded, reference-counted provider lock. Secret writes re-read metadata while holding the lock; delete re-reads it, deletes the encrypted value, then removes metadata.
 - Repository startup atomically migrates legacy IDs to deterministic safe canonical IDs, preserves every opaque secret reference and records every mapping in `provider_profile_id_migrations` for audit. The migration is idempotent.
 - Delete persistence tests cover both pre-commit failure (metadata retained for retry) and committed-but-unconfirmed cleanup (metadata removed with `202` warning status).
+
+### Round 3 coverage completion
+
+- A deterministic event-barrier test starts a secret PUT while holding its provider lock, starts DELETE, then releases PUT. DELETE waits, removes the same encrypted secret and metadata, proving the forbidden metadata-absent/secret-present terminal state cannot occur.
+- A rendered Electron test returns a fake IPC-proxied `202` DELETE response with `secret_cleanup: unconfirmed`; it asserts the durable-warning copy is visible, selection/delete UI clears, and no runtime credential text enters DOM or browser storage.
