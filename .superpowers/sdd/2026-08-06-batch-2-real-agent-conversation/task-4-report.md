@@ -40,10 +40,21 @@ HERMES_RUN_LIVE_CONVERSATION=1 HERMES_LMSTUDIO_MODEL=gemma-4-31b-it \
   mvp/.venv/bin/python -m pytest -q mvp/tests/acceptance/test_batch2_live_conversation.py -k lmstudio
 → 1 passed, 1 deselected (real LM Studio, two durable turns, 14.23s).
 ```
+
+Electron UI live pass (using the already configured Provider Center vault; no
+credential value was read or logged):
+
+```text
+DeepSeek connection test → online, 1515 ms; discovered deepseek-v4-flash and deepseek-v4-pro.
+Conversation UI → CLOUD_READY, then CLOUD_CONFIRMED on two consecutive turns.
+SQLite durable turn evidence → 4 completed turns for provider_id=deepseek-primary.
+Multi-Agent UI → group picker created a collaboration session with at least three selected Agents and rendered the avatar stack.
+Provider state after the pass → LM Studio and DeepSeek both enabled.
+```
 ```
 
 ## Concerns / follow-up
 
 - Normal Playwright automation uses deterministic fixtures, while the renderer now attempts the real local REST/SSE session first and exposes the source in the UI. Its live gate is intentionally opt-in and must be run after the user enters the DeepSeek key in Provider Center or supplies it only for that one terminal invocation.
-- The live acceptance file currently verifies the backend API contract and durable event flow, not a real Electron/provider round trip. A separate UI live pass remains the next test step and must be executed with LM Studio running and a just-in-time DeepSeek key; no key is stored by this change.
+- The scripted live acceptance file verifies the backend API contract, while the Electron UI live pass above verifies the provider connection, two durable cloud turns, event projection, and multi-Agent selection. No key is stored by this change.
 - The client has the existing Vite warning about native config loading; it predates this task and does not affect the test outcome.
