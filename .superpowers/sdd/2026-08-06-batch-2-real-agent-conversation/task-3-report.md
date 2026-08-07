@@ -68,6 +68,62 @@ Expanded conversation, AG-UI, and API-security regression set:
 
 The remaining warning is the existing Starlette `httpx` deprecation warning.
 
+## Review round 1 hardening
+
+### RED evidence
+
+The following newly added tests failed before the corresponding changes:
+
+- A loop-bound runner completed the first HTTP request but failed the second,
+  exposing the per-request `asyncio.run()` event-loop boundary.
+- A retryable `turn_failed` response returned `200` and then conflicted on the
+  same command ID instead of returning retryable HTTP semantics and recovering.
+- Two structured `(session_id, command_id)` pairs that flattened to the same
+  colon-delimited string collided with `409`.
+- A message sharing a prior intervention command ID started its runner before
+  returning `409`.
+- Raw `agent.tool.completed.result` was exposed by the mapper.
+- A real AgentRuntime composition test that issued only `POST /api/sessions`
+  followed by an intervention did not inject the human content at its next safe
+  model boundary because no lifecycle run existed.
+- An active-turn pause test ended as `completed` rather than preserving the
+  durable `paused` control state.
+
+### Changes
+
+- Conversation commands now use async FastAPI routes and per-session
+  `asyncio.Lock` instances. A turn uses the app lifespan loop; interventions
+  and controls deliberately do not wait on the active turn lock.
+- The API durably reserves the `(session, command)` identity before invoking a
+  runner. Canonical JSON SHA-256 keys prevent delimiter collisions, validate
+  command kind/prompt/model before side effects, and isolate retry attempts.
+- Retryable runtime events project as `turn_retryable`; the request returns
+  `503` with `Retry-After: 1`, remains non-terminal, and the same command may
+  later finish successfully.
+- `create_session` now idempotently creates the stable lifecycle project,
+  mission, epoch, and run for the session when an engine is injected. Session
+  interventions enter `lifecycle_interventions` through `engine.submit_intervention`;
+  the actual `WorkflowInterventions` boundary claims and acknowledges them,
+  and the API publishes `intervention.applied` afterwards.
+- Tool completion output is omitted unless a producer explicitly supplies a
+  bounded `public_result`; raw tool output is never replayed.
+
+### Review verification
+
+Focused conversation/replay tests:
+
+```text
+23 passed, 1 warning in 0.86s
+```
+
+Expanded API, AG-UI, runtime, and persistence regression set:
+
+```text
+31 passed, 1 warning in 1.35s
+```
+
+The full Python suite was also invoked after the focused and expanded checks.
+
 ## Remaining concern
 
 The in-process scheduler serializes commands for one backend instance. A

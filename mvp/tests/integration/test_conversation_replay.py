@@ -3,8 +3,14 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from workbench.adapters.hermes.runtime import AgentRuntime, WorkflowInterventions
 from workbench.api.app import AppSettings, create_app
+from workbench.conversations.repository import ConversationRepository
+from workbench.models.contracts import ModelResponse
+from workbench.models.gateway import ModelGateway
+from workbench.models.profiles import ProviderProfileRecord
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
+from workbench.workflow.repository import WorkflowRepository
 
 
 class ReplayRunner:
@@ -62,3 +68,49 @@ def test_invalid_last_event_id_is_rejected(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Last-Event-ID must be an integer"
+
+
+class ProviderStub:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def complete(self, request, profile):
+        self.requests.append(request)
+        return ModelResponse(text="done")
+
+
+def test_real_agent_runtime_applies_session_intervention_at_safe_boundary(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    workflow = WorkflowRepository(database)
+    provider = ProviderStub()
+    runtime = AgentRuntime(
+        gateway=ModelGateway({"test": provider}),
+        profile=ProviderProfileRecord(
+            id="test", name="Test", protocol="test", base_url="https://example.test"
+        ),
+        conversations=ConversationRepository(database),
+        checkpoints=workflow,
+        interventions=WorkflowInterventions(workflow),
+    )
+    client = TestClient(create_app(AppSettings(database=database, runner=runtime, owner_id="api")))
+    assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
+    queued = client.post(
+        "/api/sessions/session-1/interventions",
+        headers={"Idempotency-Key": "intervention-1"},
+        json={"kind": "supplement", "content": "include hidden files"},
+    )
+    completed = client.post(
+        "/api/sessions/session-1/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "inspect"},
+    )
+
+    assert queued.status_code == completed.status_code == 200
+    assert any(
+        message.content == "Human intervention: include hidden files"
+        for message in provider.requests[0].messages
+    )
+    assert workflow.list_interventions("session-1")[0].state.value == "acknowledged"
+    assert "intervention.applied" in client.get("/api/sessions/session-1/events").text

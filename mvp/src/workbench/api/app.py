@@ -99,6 +99,7 @@ def create_app(settings: AppSettings) -> FastAPI:
                 conversations=ConversationRepository(settings.database),
                 events=event_store,
                 runner=settings.runner,
+                engine=engine,
             )
         )
     )

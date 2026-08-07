@@ -10,8 +10,13 @@ import pytest
 
 from workbench.agui.mapper import map_domain_event
 from workbench.api.app import AppSettings, create_app
+from workbench.adapters.hermes.runtime import WorkflowInterventions
+from workbench.adapters.hermes.runner import AgentStepResult
+from workbench.domain.models import EpochRecord, MissionRecord, ProjectRecord, RunRecord
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
+from workbench.workflow.engine import SingleAgentEngine, StartRun
+from workbench.workflow.repository import WorkflowRepository
 
 
 class ConversationRunner:
@@ -37,6 +42,95 @@ class ConversationRunner:
         finally:
             with self.lock:
                 self.active -= 1
+
+
+class LoopBoundRunner:
+    """Fails when a second request advances it on a closed/different loop."""
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    async def run_turn(self, command: RunAgentTurn):
+        loop = asyncio.get_running_loop()
+        if self.loop is not None and self.loop is not loop:
+            raise RuntimeError("Event loop is closed")
+        self.loop = loop
+        yield AgentEvent(kind="turn_started", session_id=command.session_id, run_id=command.run_id)
+        yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
+
+
+class RetryRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run_turn(self, command: RunAgentTurn):
+        self.calls += 1
+        yield AgentEvent(kind="turn_started", session_id=command.session_id, run_id=command.run_id)
+        if self.calls == 1:
+            yield AgentEvent(
+                kind="turn_failed",
+                session_id=command.session_id,
+                run_id=command.run_id,
+                payload={"reason": "provider_error", "retryable": True},
+            )
+            return
+        yield AgentEvent(
+            kind="text_delta",
+            session_id=command.session_id,
+            run_id=command.run_id,
+            payload={"text": "recovered"},
+        )
+        yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
+
+
+class AcknowledgingRunner:
+    def __init__(self, database: Path) -> None:
+        self.interventions = WorkflowInterventions(WorkflowRepository(database))
+
+    async def run_turn(self, command: RunAgentTurn):
+        yield AgentEvent(kind="turn_started", session_id=command.session_id, run_id=command.run_id)
+        claimed = self.interventions.claim_pending(
+            command.run_id, boundary="before_model", owner_id="test-runner"
+        )
+        self.interventions.acknowledge([item[0] for item in claimed], owner_id="test-runner")
+        yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
+
+
+class BlockingAcknowledgingRunner(AcknowledgingRunner):
+    def __init__(self, database: Path) -> None:
+        super().__init__(database)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    async def run_turn(self, command: RunAgentTurn):
+        yield AgentEvent(kind="turn_started", session_id=command.session_id, run_id=command.run_id)
+        self.started.set()
+        await asyncio.to_thread(self.release.wait)
+        claimed = self.interventions.claim_pending(
+            command.run_id, boundary="before_model", owner_id="test-runner"
+        )
+        self.interventions.acknowledge([item[0] for item in claimed], owner_id="test-runner")
+        yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
+
+
+def _lifecycle_run(database: Path, run_id: str) -> None:
+    repository = WorkflowRepository(database)
+    repository.create_project(ProjectRecord(project_id="project-1", name="Demo"))
+    repository.create_mission(
+        MissionRecord(mission_id="mission-1", project_id="project-1", objective="Inspect")
+    )
+    repository.open_epoch(EpochRecord(epoch_id="epoch-1", mission_id="mission-1", ordinal=1))
+
+    class NoopRunner:
+        async def execute_step(self, _run_id: str, _step_id: str) -> AgentStepResult:
+            return AgentStepResult()
+
+    SingleAgentEngine(database, runner=NoopRunner(), owner_id="setup").start_run(
+        StartRun(
+            record=RunRecord(run_id=run_id, mission_id="mission-1", epoch_id="epoch-1"),
+            command_id=f"start-{run_id}",
+        )
+    )
 
 
 def _client(database: Path, runner: ConversationRunner | None = None) -> TestClient:
@@ -128,20 +222,159 @@ def test_scoped_controls_and_interventions_do_not_cross_session_boundaries(tmp_p
 
 def test_same_session_commands_are_serialized(tmp_path: Path) -> None:
     runner = ConversationRunner()
-    client = _client(tmp_path / "conversation.sqlite", runner)
-    _start_session(client)
+    with _client(tmp_path / "conversation.sqlite", runner) as client:
+        _start_session(client)
 
-    def send(index: int) -> int:
-        return client.post(
-            "/api/sessions/session-1/messages",
-            headers={"Idempotency-Key": f"message-{index}"},
-            json={"content": str(index)},
-        ).status_code
+        def send(index: int) -> int:
+            return client.post(
+                "/api/sessions/session-1/messages",
+                headers={"Idempotency-Key": f"message-{index}"},
+                json={"content": str(index)},
+            ).status_code
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        assert list(pool.map(send, (1, 2))) == [200, 200]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(send, (1, 2))) == [200, 200]
 
     assert runner.maximum_active == 1
+
+
+def test_different_sessions_progress_independently(tmp_path: Path) -> None:
+    runner = ConversationRunner()
+    with _client(tmp_path / "conversation.sqlite", runner) as client:
+        _start_session(client, "session-a")
+        _start_session(client, "session-b")
+
+        def send(session_id: str) -> int:
+            return client.post(
+                f"/api/sessions/{session_id}/messages",
+                headers={"Idempotency-Key": f"message-{session_id}"},
+                json={"content": session_id},
+            ).status_code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(send, ("session-a", "session-b"))) == [200, 200]
+
+    assert runner.maximum_active == 2
+
+
+def test_two_real_http_turns_reuse_the_app_lifespan_loop(tmp_path: Path) -> None:
+    runner = LoopBoundRunner()
+    with _client(tmp_path / "conversation.sqlite", runner) as client:
+        _start_session(client)
+        first = _send_message(client, "session-1", "one", "message-1")
+        second = _send_message(client, "session-1", "two", "message-2")
+
+    assert first["status"] == second["status"] == "completed"
+
+
+def test_retryable_turn_can_be_retried_with_the_same_command_id(tmp_path: Path) -> None:
+    client = _client(tmp_path / "conversation.sqlite", RetryRunner())
+    _start_session(client)
+
+    first = client.post(
+        "/api/sessions/session-1/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "recover"},
+    )
+    second = client.post(
+        "/api/sessions/session-1/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "recover"},
+    )
+
+    assert first.status_code == 503
+    assert second.status_code == 200
+    assert second.json()["status"] == "completed"
+    replay = client.get("/api/sessions/session-1/events").text
+    assert "turn_retryable" in replay
+    assert "recovered" in replay
+
+
+def test_canonical_command_keys_cannot_collide_across_sessions(tmp_path: Path) -> None:
+    client = _client(tmp_path / "conversation.sqlite")
+    _start_session(client, "a:b")
+    _start_session(client, "a")
+
+    first = _send_message(client, "a:b", "one", "c")
+    second = _send_message(client, "a", "two", "b:c")
+
+    assert first["status"] == second["status"] == "completed"
+
+
+def test_conflicting_message_command_never_starts_the_runner(tmp_path: Path) -> None:
+    runner = ConversationRunner()
+    client = _client(tmp_path / "conversation.sqlite", runner)
+    _start_session(client)
+    intervention = client.post(
+        "/api/sessions/session-1/interventions",
+        headers={"Idempotency-Key": "shared"},
+        json={"kind": "supplement", "content": "fact"},
+    )
+    message = client.post(
+        "/api/sessions/session-1/messages",
+        headers={"Idempotency-Key": "shared"},
+        json={"content": "must not run"},
+    )
+
+    assert intervention.status_code == 200
+    assert message.status_code == 409
+    assert runner.maximum_active == 0
+
+
+def test_lifecycle_intervention_is_claimed_acknowledged_and_projected(tmp_path: Path) -> None:
+    database = tmp_path / "conversation.sqlite"
+    _lifecycle_run(database, "session-1")
+    client = _client(database, AcknowledgingRunner(database))
+    _start_session(client)
+    queued = client.post(
+        "/api/sessions/session-1/interventions",
+        headers={"Idempotency-Key": "intervention-1"},
+        json={"kind": "supplement", "content": "include hidden files"},
+    )
+    completed = _send_message(client, "session-1", "inspect", "message-1")
+
+    records = WorkflowRepository(database).list_interventions("session-1")
+    replay = client.get("/api/sessions/session-1/events").text
+    assert queued.status_code == 200
+    assert completed["status"] == "completed"
+    assert [record.state.value for record in records] == ["acknowledged"]
+    assert "intervention.applied" in replay
+
+
+def test_active_turn_does_not_block_intervention_or_pause(tmp_path: Path) -> None:
+    database = tmp_path / "conversation.sqlite"
+    _lifecycle_run(database, "session-1")
+    runner = BlockingAcknowledgingRunner(database)
+    with _client(database, runner) as client:
+        _start_session(client)
+        result: list[object] = []
+        request = threading.Thread(
+            target=lambda: result.append(
+                client.post(
+                    "/api/sessions/session-1/messages",
+                    headers={"Idempotency-Key": "message-1"},
+                    json={"content": "inspect"},
+                )
+            )
+        )
+        request.start()
+        assert runner.started.wait(timeout=2)
+
+        intervention = client.post(
+            "/api/sessions/session-1/interventions",
+            headers={"Idempotency-Key": "intervention-1"},
+            json={"kind": "supplement", "content": "include hidden files"},
+        )
+        paused = client.post(
+            "/api/sessions/session-1/pause", headers={"Idempotency-Key": "pause-1"}
+        )
+        runner.release.set()
+        request.join(timeout=2)
+
+    assert intervention.status_code == paused.status_code == 200
+    assert result and result[0].status_code == 200
+    assert result[0].json()["status"] == "paused"
+    assert [item.state.value for item in WorkflowRepository(database).list_interventions("session-1")] == ["acknowledged"]
 
 
 def test_conversation_routes_use_existing_capability_middleware(tmp_path: Path) -> None:
@@ -210,3 +443,21 @@ def test_mapper_projects_the_conversation_event_surface(
 
     assert expected in json.dumps(mapped)
     assert "private" not in json.dumps(mapped)
+
+
+def test_tool_result_requires_explicit_public_projection() -> None:
+    raw = DomainEvent.new(
+        "agent.tool.completed",
+        "test",
+        {"tool_call_id": "tool-1", "result": "secret output"},
+        run_id="session-1",
+    )
+    public = DomainEvent.new(
+        "agent.tool.completed",
+        "test",
+        {"tool_call_id": "tool-1", "public_result": "safe output"},
+        run_id="session-1",
+    )
+
+    assert "result" not in map_domain_event(raw)[0]
+    assert map_domain_event(public)[0]["result"] == "safe output"
