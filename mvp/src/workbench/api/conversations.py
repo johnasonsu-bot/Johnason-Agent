@@ -119,11 +119,13 @@ class ConversationAPI:
             )
         if retryable:
             raise RetryableTurnError("agent turn is retryable")
-        status = self._status(session_id)
+        terminal = self._terminal_response(session_id, command_id, reservation_id)
+        if terminal is not None:
+            return terminal
         return {
             "session_id": session_id,
             "command_id": command_id,
-            "status": status,
+            "status": self._status(session_id),
             "events": projected,
         }
 
@@ -242,6 +244,13 @@ class ConversationAPI:
             async for event in self.runner.run_turn(command):  # type: ignore[union-attr]
                 domain_type, payload = _public_turn_event(event)
                 retryable = retryable or domain_type == "conversation.turn.retryable"
+                if domain_type in {
+                    "conversation.turn.finished",
+                    "conversation.turn.failed",
+                }:
+                    payload["response_status"] = self._terminal_status(
+                        command.session_id, domain_type
+                    )
                 projected.append(
                     self._append(
                         command.session_id,
@@ -257,11 +266,17 @@ class ConversationAPI:
         except ValueError:
             raise
         except Exception:
+            payload = {
+                "reason": "agent_error",
+                "response_status": self._terminal_status(
+                    command.session_id, "conversation.turn.failed"
+                ),
+            }
             projected.append(
                 self._append(
                     command.session_id,
                     "conversation.turn.failed",
-                    {"reason": "agent_error"},
+                    payload,
                     command.command_id,
                     ordinal=len(projected),
                     causation_id=reservation_id,
@@ -270,6 +285,15 @@ class ConversationAPI:
             )
         self._record_applied_interventions(command.session_id)
         return projected, retryable
+
+    def _terminal_status(self, session_id: str, event_type: str) -> str:
+        if self._status(session_id) == "paused":
+            return "paused"
+        return (
+            "completed"
+            if event_type == "conversation.turn.finished"
+            else "failed"
+        )
 
     def _append(
         self,
@@ -372,9 +396,12 @@ class ConversationAPI:
         return {
             "session_id": session_id,
             "command_id": command_id,
-            "status": "completed"
-            if terminal.event_type == "conversation.turn.finished"
-            else "failed",
+            "status": terminal.payload.get("response_status")
+            or (
+                "completed"
+                if terminal.event_type == "conversation.turn.finished"
+                else "failed"
+            ),
             "events": [
                 projected
                 for event in final_attempt
@@ -393,13 +420,18 @@ class ConversationAPI:
     def _has_lifecycle_run(self, session_id: str) -> bool:
         if self.engine is None:
             return False
-        run_id, mission_id, epoch_id, _project_id = self._lifecycle_ids(session_id)
+        run_id, mission_id, epoch_id, project_id = self._lifecycle_ids(session_id)
         try:
             record = self.engine.repository.get_run(run_id)
         except KeyError:
             return False
         if record.mission_id != mission_id or record.epoch_id != epoch_id:
             raise ValueError("conversation lifecycle identity conflict")
+        self._require_lifecycle_hierarchy(
+            project_id=project_id,
+            mission_id=mission_id,
+            epoch_id=epoch_id,
+        )
         return True
 
     def _require_lifecycle_ownership(self, session_id: str) -> None:
@@ -413,8 +445,14 @@ class ConversationAPI:
             return
         run_id, mission_id, epoch_id, project_id = self._lifecycle_ids(session_id)
         repository = self.engine.repository
-        for create, record in (
-            (repository.create_project, ProjectRecord(project_id=project_id, name="Conversation")),
+        for create, record, table, key, identity in (
+            (
+                repository.create_project,
+                ProjectRecord(project_id=project_id, name="Conversation"),
+                "lifecycle_projects",
+                "project_id",
+                {"project_id": project_id, "name": "Conversation"},
+            ),
             (
                 repository.create_mission,
                 MissionRecord(
@@ -422,17 +460,28 @@ class ConversationAPI:
                     project_id=project_id,
                     objective="Conversation session",
                 ),
+                "lifecycle_missions",
+                "mission_id",
+                {
+                    "mission_id": mission_id,
+                    "project_id": project_id,
+                    "objective": "Conversation session",
+                },
             ),
             (
                 repository.open_epoch,
                 EpochRecord(epoch_id=epoch_id, mission_id=mission_id, ordinal=1),
+                "lifecycle_epochs",
+                "epoch_id",
+                {"epoch_id": epoch_id, "mission_id": mission_id, "ordinal": 1},
             ),
         ):
             try:
                 create(record)
             except sqlite3.IntegrityError:
                 pass
-        self.engine.start_run(
+            self._require_lifecycle_record(table, key, identity)
+        started = self.engine.start_run(
             StartRun(
                 record=RunRecord(
                     run_id=run_id, mission_id=mission_id, epoch_id=epoch_id
@@ -440,6 +489,50 @@ class ConversationAPI:
                 command_id="conversation-session:" + self._digest({"session_id": session_id}),
             )
         )
+        if (
+            started.run_id != run_id
+            or started.mission_id != mission_id
+            or started.epoch_id != epoch_id
+        ):
+            raise ValueError("conversation lifecycle identity conflict")
+
+    def _require_lifecycle_hierarchy(
+        self, *, project_id: str, mission_id: str, epoch_id: str
+    ) -> None:
+        self._require_lifecycle_record(
+            "lifecycle_projects",
+            "project_id",
+            {"project_id": project_id, "name": "Conversation"},
+        )
+        self._require_lifecycle_record(
+            "lifecycle_missions",
+            "mission_id",
+            {
+                "mission_id": mission_id,
+                "project_id": project_id,
+                "objective": "Conversation session",
+            },
+        )
+        self._require_lifecycle_record(
+            "lifecycle_epochs",
+            "epoch_id",
+            {"epoch_id": epoch_id, "mission_id": mission_id, "ordinal": 1},
+        )
+
+    def _require_lifecycle_record(
+        self, table: str, key: str, identity: dict[str, Any]
+    ) -> None:
+        assert self.engine is not None
+        with self.engine.repository.store.connect() as connection:
+            row = connection.execute(
+                f"SELECT record_json FROM {table} WHERE {key} = ?",
+                (identity[key],),
+            ).fetchone()
+        if row is None:
+            raise ValueError("conversation lifecycle is unavailable")
+        persisted = json.loads(row["record_json"])
+        if any(persisted.get(name) != value for name, value in identity.items()):
+            raise ValueError("conversation lifecycle identity conflict")
 
     def _record_applied_interventions(self, session_id: str) -> None:
         if not self._has_lifecycle_run(session_id):

@@ -130,3 +130,48 @@ The in-process scheduler serializes commands for one backend instance. A
 future multi-process deployment would need a durable cross-process session
 lease/queue; this local Electron-owned backend intentionally has one API
 process.
+
+## Review round 4 hardening
+
+### RED evidence
+
+Three focused regressions failed before the fix:
+
+- A lifecycle start command preempted by a foreign run still allowed
+  `POST /api/sessions` to return `200`, leaving a session whose canonical run
+  could never be acquired.
+- An existing canonical mission ID owned by another project was accepted
+  because lifecycle `IntegrityError` exceptions were ignored without checking
+  the persisted record.
+- A turn paused while active returned `status=paused` initially, but replaying
+  the same message command returned `status=completed` with otherwise identical
+  events.
+
+The RED command collected three tests and reported `3 failed, 1 warning`.
+
+### Changes
+
+- Lifecycle setup now validates the canonical project, mission, and epoch
+  identity after every create-or-reuse operation, and validates the `RunRecord`
+  returned by `engine.start_run()` across run, mission, and epoch IDs before the
+  conversation session is written.
+- Terminal turn events persist the response status observed at the terminal
+  boundary. Both the first request and duplicate replay now assemble their HTTP
+  body from the same durable terminal events, preserving `paused`, `completed`,
+  or `failed` exactly.
+
+### Review verification
+
+Focused conversation and replay tests:
+
+```text
+30 passed, 1 warning in 1.11s
+```
+
+Expanded API, AG-UI, runtime, engine, event-store, and repository regressions:
+
+```text
+78 passed, 1 warning in 2.40s
+```
+
+The warning remains the existing Starlette `httpx` deprecation warning.

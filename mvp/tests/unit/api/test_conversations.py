@@ -116,7 +116,9 @@ class BlockingAcknowledgingRunner(AcknowledgingRunner):
         yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
 
 
-def _lifecycle_run(database: Path, run_id: str) -> None:
+def _lifecycle_run(
+    database: Path, run_id: str, *, command_id: str | None = None
+) -> None:
     repository = WorkflowRepository(database)
     repository.create_project(ProjectRecord(project_id="project-1", name="Demo"))
     repository.create_mission(
@@ -131,7 +133,7 @@ def _lifecycle_run(database: Path, run_id: str) -> None:
     SingleAgentEngine(database, runner=NoopRunner(), owner_id="setup").start_run(
         StartRun(
             record=RunRecord(run_id=run_id, mission_id="mission-1", epoch_id="epoch-1"),
-            command_id=f"start-{run_id}",
+            command_id=command_id or f"start-{run_id}",
         )
     )
 
@@ -382,10 +384,17 @@ def test_active_turn_does_not_block_intervention_or_pause(tmp_path: Path) -> Non
         )
         runner.release.set()
         request.join(timeout=2)
+        duplicate = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "message-1"},
+            json={"content": "inspect"},
+        )
 
     assert intervention.status_code == paused.status_code == 200
     assert result and result[0].status_code == 200
     assert result[0].json()["status"] == "paused"
+    assert duplicate.status_code == 200
+    assert duplicate.json() == result[0].json()
     assert [
         item.state.value
         for item in WorkflowRepository(database).list_interventions(
@@ -501,6 +510,64 @@ def test_session_rejects_a_foreign_lifecycle_run_with_the_internal_identifier(
         json={"content": "must not run"},
     )
     assert blocked.status_code == 404
+
+
+def test_session_rejects_a_preempted_lifecycle_start_command_before_creation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    session_id = "session-1"
+    digest = hashlib.sha256(
+        json.dumps({"session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    _lifecycle_run(
+        database,
+        "foreign-run",
+        command_id=f"conversation-session:{digest}",
+    )
+    runner = ConversationRunner()
+    client = _client(database, runner)
+
+    response = client.post("/api/sessions", json={"session_id": session_id})
+    blocked = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "must not run"},
+    )
+
+    assert response.status_code == 409
+    assert blocked.status_code == 404
+    assert runner.calls == 0
+
+
+def test_session_rejects_an_existing_lifecycle_mission_owned_by_another_project(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    session_id = "session-1"
+    digest = hashlib.sha256(
+        json.dumps({"session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    mission_id = f"conversation-mission:{digest}"
+    repository = WorkflowRepository(database)
+    repository.create_project(ProjectRecord(project_id="foreign-project", name="Foreign"))
+    repository.create_mission(
+        MissionRecord(
+            mission_id=mission_id,
+            project_id="foreign-project",
+            objective="Foreign mission",
+        )
+    )
+    client = _client(database)
+
+    response = client.post("/api/sessions", json={"session_id": session_id})
+
+    assert response.status_code == 409
+    assert client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "must not run"},
+    ).status_code == 404
 
 
 def test_completed_message_command_replays_without_calling_runner_again(tmp_path: Path) -> None:
