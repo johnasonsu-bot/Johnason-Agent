@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Sequence
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any
+from uuid import uuid4
 
 from workbench.adapters.hermes.runner import AgentStepResult
 from workbench.conversations.models import ConversationMessage
 from workbench.conversations.repository import ConversationRepository
-from workbench.domain.models import InterventionState
-from workbench.domain.transitions import transition_intervention
-from workbench.models.contracts import ModelMessage, ModelRequest, ModelResponse
+from workbench.models.contracts import (
+    ContinuationMetadata,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+)
 from workbench.models.gateway import ModelGateway
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.runtime.agent_loop import (
@@ -24,8 +29,16 @@ from workbench.workflow.repository import WorkflowRepository
 
 
 class _NoInterventions:
-    def apply_pending(self, run_id: str, *, boundary: str) -> list[str]:
+    def claim_pending(
+        self, run_id: str, *, boundary: str, owner_id: str
+    ) -> list[tuple[str, str]]:
         return []
+
+    def acknowledge(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        return None
+
+    def release(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        return None
 
 
 class WorkflowInterventions:
@@ -34,34 +47,27 @@ class WorkflowInterventions:
     def __init__(self, repository: WorkflowRepository) -> None:
         self.repository = repository
 
-    def apply_pending(self, run_id: str, *, boundary: str) -> list[str]:
-        if boundary not in {"before_model", "before_tool"}:
+    def claim_pending(
+        self, run_id: str, *, boundary: str, owner_id: str
+    ) -> list[tuple[str, str]]:
+        if boundary != "before_model":
             raise ValueError(f"unsafe intervention boundary: {boundary}")
-        applied: list[str] = []
-        for record in self.repository.list_pending_interventions(run_id):
-            current = record
-            if current.state is InterventionState.NEEDS_CLARIFICATION:
-                continue
-            if current.state is InterventionState.SUBMITTED:
-                current = self._move(current, InterventionState.QUEUED)
-            if current.state is InterventionState.QUEUED and current.kind == "replan":
-                current = self._move(current, InterventionState.REPLAN_REQUIRED)
-            if current.state in {
-                InterventionState.QUEUED,
-                InterventionState.REPLAN_REQUIRED,
-            }:
-                current = self._move(current, InterventionState.APPLIED)
-            if current.state is InterventionState.APPLIED:
-                current = self._move(current, InterventionState.ACKNOWLEDGED)
-                applied.append(current.content)
-        return applied
+        return [
+            (record.intervention_id, record.content)
+            for record in self.repository.claim_pending_interventions(
+                run_id, owner_id=owner_id
+            )
+        ]
 
-    def _move(self, record, target: InterventionState):
-        updated = record.model_copy(
-            update={"state": transition_intervention(record.state, target)}
+    def acknowledge(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        self.repository.acknowledge_claimed_interventions(
+            intervention_ids, owner_id=owner_id
         )
-        self.repository.update_intervention(updated)
-        return updated
+
+    def release(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        self.repository.release_claimed_interventions(
+            intervention_ids, owner_id=owner_id
+        )
 
 
 class AgentRuntime:
@@ -78,21 +84,28 @@ class AgentRuntime:
         checkpoints: CheckpointStore | None = None,
         interventions: InterventionBoundary | None = None,
         max_model_steps: int = 8,
+        turn_lease_seconds: float = 30,
     ) -> None:
         if max_model_steps < 1:
             raise ValueError("max_model_steps must be positive")
         self.gateway = gateway
         self._profile = profile
         self.conversations = conversations
+        names = [tool.definition.name for tool in tools]
+        if len(names) != len(set(names)):
+            raise ValueError("duplicate tool name")
         self.tools = {tool.definition.name: tool for tool in tools}
         self.skills = tuple(skills)
         self.checkpoints = checkpoints
         self.interventions = interventions or _NoInterventions()
         self.max_model_steps = max_model_steps
+        self.turn_lease_seconds = turn_lease_seconds
 
     async def run_turn(
         self, command: RunAgentTurn
     ) -> AsyncIterator[AgentEvent]:
+        owner_id = str(uuid4())
+        profile = self._resolve_profile()
         self.conversations.append_message(
             ConversationMessage(
                 session_id=command.session_id,
@@ -101,26 +114,180 @@ class AgentRuntime:
                 content=command.prompt,
             )
         )
-        yield self._event("turn_started", command)
-
-        messages = self._model_messages(command.session_id)
-        for _ in range(self.max_model_steps):
-            self._apply_interventions(command, messages, boundary="before_model")
-            response = await self.gateway.complete(
-                ModelRequest(
+        initial_state = {
+            "phase": "before_model",
+            "messages": [
+                self._serialize_message(message)
+                for message in self._model_messages(command.session_id)
+            ],
+            "events": [],
+        }
+        claim = self.conversations.claim_turn(
+            session_id=command.session_id,
+            command_id=command.command_id,
+            run_id=command.run_id,
+            provider_id=profile.id,
+            model=command.model,
+            owner_id=owner_id,
+            initial_state=initial_state,
+            lease_seconds=self.turn_lease_seconds,
+        )
+        if claim.disposition == "busy":
+            while claim.disposition == "busy":
+                await asyncio.sleep(min(0.01, self.turn_lease_seconds))
+                claim = self.conversations.claim_turn(
+                    session_id=command.session_id,
+                    command_id=command.command_id,
+                    run_id=command.run_id,
+                    provider_id=profile.id,
                     model=command.model,
-                    messages=messages,
-                    tools=[tool.definition for tool in self.tools.values()],
-                ),
-                self._resolve_profile(),
+                    owner_id=owner_id,
+                    initial_state=initial_state,
+                    lease_seconds=self.turn_lease_seconds,
+                )
+        if claim.disposition == "terminal":
+            for raw in claim.result or []:
+                yield AgentEvent.model_validate(raw)
+            return
+        state = claim.state
+        events = [AgentEvent.model_validate(raw) for raw in state.get("events", [])]
+        if claim.disposition == "uncertain":
+            async for event in self._fail_turn(
+                command,
+                owner_id,
+                state,
+                events,
+                reason="reconciliation_required",
+                status="reconciliation_required",
+            ):
+                yield event
+            return
+        if not events:
+            started = self._event("turn_started", command)
+            events.append(started)
+            state["events"] = [event.model_dump(mode="json") for event in events]
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
             )
+            yield started
+
+        messages = [self._deserialize_message(raw) for raw in state["messages"]]
+        if state.get("phase") == "after_model":
+            pending = messages[-1] if messages else None
+            if pending is None or not pending.tool_calls:
+                async for event in self._fail_turn(
+                    command,
+                    owner_id,
+                    state,
+                    events,
+                    reason="provider_protocol_error",
+                ):
+                    yield event
+                return
+            failed = False
+            async for event in self._execute_tools(
+                command,
+                ModelResponse(tool_calls=pending.tool_calls),
+                messages,
+                state,
+                events,
+                owner_id,
+            ):
+                yield event
+                if event.kind == "turn_failed":
+                    failed = True
+            if failed:
+                return
+        for _ in range(self.max_model_steps):
+            base_messages = list(messages)
+            claimed = self.interventions.claim_pending(
+                command.run_id, boundary="before_model", owner_id=owner_id
+            )
+            intervention_ids = [item[0] for item in claimed]
+            already_included = set(state.get("included_intervention_ids", []))
+            for intervention_id, content in claimed:
+                if intervention_id in already_included:
+                    continue
+                messages.append(
+                    ModelMessage(
+                        role="system", content=f"Human intervention: {content}"
+                    )
+                )
+            state["included_intervention_ids"] = intervention_ids
+            state["phase"] = "model_running"
+            state["messages"] = [self._serialize_message(message) for message in messages]
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
+            )
+            try:
+                response = await self._await_with_heartbeat(
+                    self.gateway.complete(
+                        ModelRequest(
+                            model=command.model,
+                            messages=messages,
+                            tools=[tool.definition for tool in self.tools.values()],
+                        ),
+                        profile,
+                    ),
+                    command,
+                    owner_id,
+                )
+            except Exception as exc:
+                self.interventions.release(intervention_ids, owner_id=owner_id)
+                state["phase"] = "before_model"
+                state.pop("included_intervention_ids", None)
+                state["messages"] = [
+                    self._serialize_message(message) for message in base_messages
+                ]
+                async for event in self._retryable_failure(
+                    command,
+                    owner_id,
+                    state,
+                    reason="provider_error",
+                    detail=str(exc),
+                ):
+                    yield event
+                return
+            if response.text is None and not response.tool_calls:
+                self.interventions.release(intervention_ids, owner_id=owner_id)
+                async for event in self._fail_turn(
+                    command,
+                    owner_id,
+                    state,
+                    events,
+                    reason="provider_protocol_error",
+                ):
+                    yield event
+                return
+            self.interventions.acknowledge(intervention_ids, owner_id=owner_id)
+            state.pop("included_intervention_ids", None)
             assistant = ModelMessage.from_response(response)
             messages.append(assistant)
-            self._persist_continuation(command.session_id, response)
+            state["messages"] = [self._serialize_message(message) for message in messages]
+            state["phase"] = "after_model"
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
+            )
 
             if response.tool_calls:
-                async for event in self._execute_tools(command, response, messages):
+                failed = False
+                async for event in self._execute_tools(
+                    command, response, messages, state, events, owner_id
+                ):
                     yield event
+                    if event.kind == "turn_failed":
+                        failed = True
+                if failed:
+                    return
                 continue
 
             answer = response.text or ""
@@ -132,13 +299,32 @@ class AgentRuntime:
                     content=answer,
                 )
             )
-            if answer:
-                yield self._event("text_delta", command, text=answer)
+            delta = self._event("text_delta", command, text=answer)
+            events.append(delta)
+            yield delta
             self._save_checkpoint(command)
-            yield self._event("turn_finished", command)
+            finished = self._event("turn_finished", command)
+            events.append(finished)
+            state = {"phase": "completed", "messages": [], "events": []}
+            self.conversations.finish_turn(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                status="completed",
+                state=state,
+                result=[event.model_dump(mode="json") for event in events],
+            )
+            yield finished
             return
 
-        raise RuntimeError("agent turn exceeded the model step limit")
+        async for event in self._fail_turn(
+            command,
+            owner_id,
+            state,
+            events,
+            reason="max_steps_exceeded",
+        ):
+            yield event
 
     async def execute_step(self, run_id: str, step_id: str) -> AgentStepResult:
         """Compatibility port for the existing lifecycle engine.
@@ -167,21 +353,112 @@ class AgentRuntime:
         command: RunAgentTurn,
         response: ModelResponse,
         messages: list[ModelMessage],
+        state: dict[str, Any],
+        events: list[AgentEvent],
+        owner_id: str,
     ) -> AsyncIterator[AgentEvent]:
         for call in response.tool_calls:
-            self._apply_interventions(command, messages, boundary="before_tool")
-            try:
-                tool = self.tools[call.name]
-            except KeyError as exc:
-                raise ValueError(f"model requested unknown tool: {call.name}") from exc
-            yield self._event(
+            started = self._event(
                 "tool_started",
                 command,
                 tool_call_id=call.id,
                 tool_name=call.name,
                 arguments=call.arguments,
             )
-            result = await tool.invoke(call.arguments)
+            events.append(started)
+            state["events"] = [event.model_dump(mode="json") for event in events]
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
+            )
+            yield started
+            tool = self.tools.get(call.name)
+            if tool is None:
+                result = f"Unknown tool: {call.name}"
+                failed = self._event(
+                    "tool_failed",
+                    command,
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    reason="unknown_tool",
+                )
+                events.append(failed)
+                messages.append(
+                    ModelMessage(
+                        role="tool",
+                        content=result,
+                        tool_call_id=call.id,
+                        name=call.name,
+                    )
+                )
+                state["messages"] = [
+                    self._serialize_message(message) for message in messages
+                ]
+                state["events"] = [event.model_dump(mode="json") for event in events]
+                self.conversations.save_turn_state(
+                    command.session_id,
+                    command.command_id,
+                    owner_id=owner_id,
+                    state=state,
+                )
+                yield failed
+                continue
+            effect = self.conversations.claim_tool_effect(
+                session_id=command.session_id,
+                command_id=command.command_id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                arguments=call.arguments,
+                owner_id=owner_id,
+            )
+            if effect.disposition == "uncertain":
+                async for event in self._fail_turn(
+                    command,
+                    owner_id,
+                    state,
+                    events,
+                    reason="reconciliation_required",
+                    status="reconciliation_required",
+                    tool_call_id=call.id,
+                ):
+                    yield event
+                return
+            if effect.disposition == "completed":
+                result = effect.result or ""
+            else:
+                try:
+                    result = await self._await_with_heartbeat(
+                        tool.invoke(call.arguments), command, owner_id
+                    )
+                except Exception as exc:
+                    self.conversations.mark_tool_uncertain(
+                        session_id=command.session_id,
+                        command_id=command.command_id,
+                        tool_call_id=call.id,
+                        owner_id=owner_id,
+                    )
+                    tool_failed = self._event(
+                        "tool_failed",
+                        command,
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        reason="tool_effect_uncertain",
+                        detail=str(exc),
+                    )
+                    events.append(tool_failed)
+                    yield tool_failed
+                    async for event in self._fail_turn(
+                        command,
+                        owner_id,
+                        state,
+                        events,
+                        reason="reconciliation_required",
+                        status="reconciliation_required",
+                    ):
+                        yield event
+                    return
             messages.append(
                 ModelMessage(
                     role="tool",
@@ -190,13 +467,33 @@ class AgentRuntime:
                     name=call.name,
                 )
             )
-            yield self._event(
+            state["messages"] = [self._serialize_message(message) for message in messages]
+            state["phase"] = "after_tool"
+            if effect.disposition == "execute":
+                self.conversations.complete_tool_effect(
+                    session_id=command.session_id,
+                    command_id=command.command_id,
+                    tool_call_id=call.id,
+                    owner_id=owner_id,
+                    result=result,
+                    turn_state=state,
+                )
+            finished = self._event(
                 "tool_finished",
                 command,
                 tool_call_id=call.id,
                 tool_name=call.name,
                 result=result,
             )
+            events.append(finished)
+            state["events"] = [event.model_dump(mode="json") for event in events]
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
+            )
+            yield finished
 
     def _model_messages(self, session_id: str) -> list[ModelMessage]:
         messages = [
@@ -213,42 +510,108 @@ class AgentRuntime:
             )
         return messages
 
-    def _apply_interventions(
+    def _save_checkpoint(
         self,
         command: RunAgentTurn,
-        messages: list[ModelMessage],
         *,
-        boundary: str,
+        status: str = "completed",
+        reason: str | None = None,
     ) -> None:
-        for content in self.interventions.apply_pending(
-            command.run_id, boundary=boundary
-        ):
-            messages.append(
-                ModelMessage(role="system", content=f"Human intervention: {content}")
-            )
-
-    def _persist_continuation(
-        self, session_id: str, response: ModelResponse
-    ) -> None:
-        if response.continuation is not None:
-            self.conversations.save_continuation_state(
-                session_id,
-                response.continuation.model_dump(exclude_none=True),
-            )
-
-    def _save_checkpoint(self, command: RunAgentTurn) -> None:
         if self.checkpoints is not None:
             self.checkpoints.save_checkpoint(
                 command.run_id,
                 {
                     "session_id": command.session_id,
                     "command_id": command.command_id,
-                    "safe_boundary": "turn_finished",
+                    "safe_boundary": "turn_finished" if status == "completed" else "turn_failed",
+                    "status": status,
+                    **({"reason": reason} if reason is not None else {}),
                 },
             )
 
     def _resolve_profile(self) -> ProviderProfileRecord:
         return self._profile() if callable(self._profile) else self._profile
+
+    async def _fail_turn(
+        self,
+        command: RunAgentTurn,
+        owner_id: str,
+        state: dict[str, Any],
+        events: list[AgentEvent],
+        *,
+        reason: str,
+        status: str = "failed",
+        **payload: Any,
+    ) -> AsyncIterator[AgentEvent]:
+        failed = self._event("turn_failed", command, reason=reason, **payload)
+        events.append(failed)
+        terminal_state = {"phase": status, "messages": [], "events": []}
+        self.conversations.finish_turn(
+            command.session_id,
+            command.command_id,
+            owner_id=owner_id,
+            status=status,
+            state=terminal_state,
+            result=[event.model_dump(mode="json") for event in events],
+        )
+        self._save_checkpoint(command, status=status, reason=reason)
+        yield failed
+
+    async def _retryable_failure(
+        self,
+        command: RunAgentTurn,
+        owner_id: str,
+        state: dict[str, Any],
+        *,
+        reason: str,
+        **payload: Any,
+    ) -> AsyncIterator[AgentEvent]:
+        failed = self._event(
+            "turn_failed", command, reason=reason, retryable=True, **payload
+        )
+        self.conversations.release_turn(
+            command.session_id,
+            command.command_id,
+            owner_id=owner_id,
+            state=state,
+        )
+        self._save_checkpoint(command, status="retryable", reason=reason)
+        yield failed
+
+    async def _await_with_heartbeat(
+        self,
+        awaitable: Awaitable[Any],
+        command: RunAgentTurn,
+        owner_id: str,
+    ) -> Any:
+        task = asyncio.ensure_future(awaitable)
+        interval = max(0.001, self.turn_lease_seconds / 3)
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            except TimeoutError:
+                self.conversations.renew_turn(
+                    command.session_id,
+                    command.command_id,
+                    owner_id=owner_id,
+                    lease_seconds=self.turn_lease_seconds,
+                )
+
+    @staticmethod
+    def _serialize_message(message: ModelMessage) -> dict[str, Any]:
+        value = message.model_dump(mode="json")
+        if message.continuation is not None:
+            value["continuation"] = message.continuation.model_dump(mode="json")
+        return value
+
+    @staticmethod
+    def _deserialize_message(value: dict[str, Any]) -> ModelMessage:
+        raw = dict(value)
+        continuation = raw.pop("continuation", None)
+        message = ModelMessage.model_validate(raw)
+        if continuation is not None:
+            message._continuation = ContinuationMetadata.model_validate(continuation)
+        return message
 
     @staticmethod
     def _event(kind: Any, command: RunAgentTurn, **payload: Any) -> AgentEvent:

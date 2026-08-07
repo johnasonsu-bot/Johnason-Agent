@@ -7,6 +7,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 from workbench.adapters.hermes.runner import AgentStepResult
+from workbench.adapters.hermes.runtime import WorkflowInterventions
 from workbench.agui.stream import replay_agui
 from workbench.artifacts.store import ArtifactStore
 from workbench.domain.models import EpochRecord, MissionRecord, ProjectRecord, RunRecord
@@ -36,14 +37,25 @@ class AcceptanceResult(BaseModel):
 
 
 class AcceptanceRunner:
-    def __init__(self) -> None:
+    def __init__(self, repository: WorkflowRepository) -> None:
         self.call_count = 0
+        self.interventions = WorkflowInterventions(repository)
 
     async def execute_step(self, run_id: str, step_id: str) -> AgentStepResult:
         self.call_count += 1
+        claimed = self.interventions.claim_pending(
+            run_id, boundary="before_model", owner_id="acceptance-model"
+        )
+        self.interventions.acknowledge(
+            [intervention_id for intervention_id, _ in claimed],
+            owner_id="acceptance-model",
+        )
         return AgentStepResult(
             external_id="artifact-answer",
-            checkpoint={"answer_state": "generated"},
+            checkpoint={
+                "answer_state": "generated",
+                "observed_intervention_sequence": len(claimed),
+            },
         )
 
 
@@ -71,7 +83,7 @@ async def run_acceptance(
     repository.open_epoch(
         EpochRecord(epoch_id=epoch_id, mission_id=mission_id, ordinal=1)
     )
-    runner = AcceptanceRunner()
+    runner = AcceptanceRunner(repository)
     engine = SingleAgentEngine(database, runner=runner, owner_id="acceptance-a")
     run = engine.start_run(
         StartRun(

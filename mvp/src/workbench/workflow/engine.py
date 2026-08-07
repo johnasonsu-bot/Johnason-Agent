@@ -9,12 +9,10 @@ from pydantic import BaseModel
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.domain.models import (
     InterventionRecord,
-    InterventionState,
     RunRecord,
     RunState,
 )
 from workbench.domain.transitions import (
-    transition_intervention,
     transition_run,
 )
 from workbench.workflow.repository import WorkflowRepository
@@ -131,7 +129,7 @@ class SingleAgentEngine:
         step_id: str = "agent-step",
         idempotency_key: str | None = None,
     ) -> TickResult:
-        observed = self._apply_interventions(run_id)
+        observed = 0
         recovered = self.runtime.recover_run(run_id)
         existing = next((step for step in recovered.steps if step.step_id == step_id), None)
         if existing and existing.status == "effect_committed":
@@ -151,14 +149,14 @@ class SingleAgentEngine:
             claim, EffectOutcome.CONFIRMED, external_id=result.external_id
         )
         checkpoint = dict(result.checkpoint)
-        checkpoint["observed_intervention_sequence"] = observed
+        checkpoint.setdefault("observed_intervention_sequence", observed)
         checkpoint["last_committed_step"] = step_id
         self.repository.save_checkpoint(run_id, checkpoint)
         return TickResult(
             run_id=run_id,
             next_action="step_committed",
             external_id=result.external_id,
-            observed_intervention_sequence=observed,
+            observed_intervention_sequence=checkpoint["observed_intervention_sequence"],
         )
 
     def recover_active_runs(self) -> list[RecoveredRun]:
@@ -188,28 +186,4 @@ class SingleAgentEngine:
         self.repository.record_command_result(
             command_id, "run", updated.model_dump_json()
         )
-        return updated
-
-    def _apply_interventions(self, run_id: str) -> int:
-        observed = 0
-        for record in self.repository.list_pending_interventions(run_id):
-            current = record
-            if current.state is InterventionState.SUBMITTED:
-                current = self._move_intervention(current, InterventionState.QUEUED)
-            if current.kind == "replan":
-                current = self._move_intervention(
-                    current, InterventionState.REPLAN_REQUIRED
-                )
-            current = self._move_intervention(current, InterventionState.APPLIED)
-            self._move_intervention(current, InterventionState.ACKNOWLEDGED)
-            observed = current.sequence
-        return observed
-
-    def _move_intervention(
-        self, record: InterventionRecord, target: InterventionState
-    ) -> InterventionRecord:
-        updated = record.model_copy(
-            update={"state": transition_intervention(record.state, target)}
-        )
-        self.repository.update_intervention(updated)
         return updated

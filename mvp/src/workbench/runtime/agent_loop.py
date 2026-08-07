@@ -30,8 +30,10 @@ class AgentEvent(BaseModel):
         "turn_started",
         "tool_started",
         "tool_finished",
+        "tool_failed",
         "text_delta",
         "turn_finished",
+        "turn_failed",
     ]
     session_id: str
     run_id: str
@@ -53,4 +55,10 @@ class CheckpointStore(Protocol):
 
 
 class InterventionBoundary(Protocol):
-    def apply_pending(self, run_id: str, *, boundary: str) -> list[str]: ...
+    def claim_pending(
+        self, run_id: str, *, boundary: str, owner_id: str
+    ) -> list[tuple[str, str]]: ...
+
+    def acknowledge(self, intervention_ids: list[str], *, owner_id: str) -> None: ...
+
+    def release(self, intervention_ids: list[str], *, owner_id: str) -> None: ...

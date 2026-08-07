@@ -2,7 +2,7 @@
 
 ## Outcome
 
-Implemented a provider-neutral, durable single-turn Agent loop and wired it into
+Implemented a provider-neutral, crash-aware single-turn Agent loop and wired it into
 the Electron backend composition root. `IdleRunner` is removed; callers may
 inject an `AgentStepRunner`, while the default app exposes the real
 `AgentRuntime` at `app.state.agent_runtime` and uses it for lifecycle steps.
@@ -22,6 +22,12 @@ The persisted workflow-intervention boundary test was also observed RED with
 `ImportError: cannot import name 'WorkflowInterventions'` before its
 implementation.
 
+Independent review then found five blocking durability failures. The expanded
+RED suite reproduced them: 9 failed / 1 passed, including duplicate gateway and
+tool execution, premature intervention acknowledgement, continuation leakage,
+and missing failure terminals. Short-lease concurrency and retry tests were
+also observed failing before heartbeat and retryable-release support.
+
 ## Design decisions
 
 - `RunAgentTurn`, `AgentEvent`, `AgentTool`, checkpoint, and intervention ports
@@ -30,11 +36,24 @@ implementation.
   `ModelGateway` and a runtime-selected `ProviderProfileRecord`; no provider or
   API key is hard-coded.
 - Public user/assistant messages are persisted through
-  `ConversationRepository`. Provider continuation metadata is stored only in
-  the separate continuation state and is attached only to the in-memory model
-  message needed for the follow-up tool result request.
-- Human interventions are transitioned and acknowledged only at
-  `before_model` and `before_tool` boundaries.
+  `ConversationRepository`. Private provider continuation, assistant tool calls,
+  tool results, provider/model identity, and protocol phase are scoped to one
+  durable turn. Terminal turns seal that private protocol state so it cannot
+  enter a later command.
+- SQLite v5 adds atomic `(session_id, command_id)` turn ownership/results and a
+  tool-effect journal. Completed and failed terminals replay without executing;
+  a stale running tool becomes `reconciliation_required` and is never invoked
+  automatically again.
+- Active model/tool calls renew a fenced turn lease. Busy duplicate callers wait
+  for the owner and replay its terminal result; restart resumes the saved legal
+  protocol sequence rather than rebuilding it from public messages.
+- Human interventions have one durable claimant and a stale-claim lease. They
+  enter requests only at `before_model`, are acknowledged only after a valid
+  provider response, and are released on provider/protocol failure. The
+  lifecycle engine no longer consumes them before the runtime.
+- Unknown tools produce a controlled `tool_failed` result for model correction;
+  tool exceptions, empty responses, and max-step exhaustion persist explicit
+  `turn_failed` outcomes and failure checkpoints.
 - The assistant message and safe checkpoint are persisted before
   `turn_finished` is yielded.
 - Skill instructions and tool definitions are constructor dependencies, so the
@@ -42,22 +61,22 @@ implementation.
 
 ## Verification
 
-Focused runtime tests:
+Review-fix focused runtime/integration tests:
 
 ```text
-4 passed in 0.08s
+23 passed, 1 warning in 0.75s
 ```
 
-Existing main/API compatibility tests:
+Expanded persistence/workflow set:
 
 ```text
-6 passed, 1 warning in 0.29s
+30 passed in 0.51s
 ```
 
 Full Python suite:
 
 ```text
-199 passed, 4 skipped, 1 warning in 71.62s
+213 passed, 4 skipped, 1 warning in 72.71s
 ```
 
 The skipped tests are environment-gated live probes. The warning is the
@@ -67,8 +86,9 @@ existing Starlette `httpx` deprecation warning.
 
 - The runtime emits one normalized `text_delta` per non-streaming completion;
   token-level SSE projection belongs to Task 3.
-- The composition root supplies provider profiles dynamically but does not yet
-  expose conversation routes or built-in project tools; those are Task 3/4
-  integration work.
+- The composition root supplies provider profiles dynamically and exposes the
+  runtime on app state, but the existing `/api/runs` lifecycle endpoint does not
+  itself create conversation prompts. Conversation HTTP routes, explicit UI
+  provider selection, and built-in project tools remain Task 3/4 work.
 - Live LM Studio and DeepSeek credentials/models were intentionally not used in
   this task; the live provider gate remains in Task 4.

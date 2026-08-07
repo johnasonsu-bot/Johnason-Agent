@@ -15,6 +15,7 @@ from workbench.domain.models import (
     RunRecord,
     RunState,
 )
+from workbench.domain.transitions import transition_intervention
 from workbench.workflow.store import WorkflowStore
 
 
@@ -205,6 +206,128 @@ class WorkflowRepository:
         return [
             InterventionRecord.model_validate_json(row["record_json"]) for row in rows
         ]
+
+    def claim_pending_interventions(
+        self,
+        run_id: str,
+        *,
+        owner_id: str,
+        lease_seconds: float = 30,
+        clock: Any = time.time,
+    ) -> list[InterventionRecord]:
+        """Atomically give one runtime ownership without applying the content."""
+        claimed: list[InterventionRecord] = []
+        now = clock()
+        stale_before = now - lease_seconds
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT intervention_id, record_json FROM lifecycle_interventions
+                WHERE run_id = ?
+                  AND state NOT IN ('acknowledged', 'rejected', 'needs_clarification')
+                  AND (
+                    claimed_by IS NULL OR claimed_by = ? OR claimed_at <= ?
+                  )
+                ORDER BY sequence
+                """,
+                (run_id, owner_id, stale_before),
+            ).fetchall()
+            for row in rows:
+                record = InterventionRecord.model_validate_json(row["record_json"])
+                if record.state is InterventionState.SUBMITTED:
+                    record = record.model_copy(
+                        update={
+                            "state": transition_intervention(
+                                record.state, InterventionState.QUEUED
+                            )
+                        }
+                    )
+                connection.execute(
+                    """
+                    UPDATE lifecycle_interventions
+                    SET state = ?, record_json = ?, claimed_by = ?, claimed_at = ?
+                    WHERE intervention_id = ?
+                    """,
+                    (
+                        record.state.value,
+                        record.model_dump_json(),
+                        owner_id,
+                        now,
+                        record.intervention_id,
+                    ),
+                )
+                claimed.append(record)
+            connection.commit()
+        return claimed
+
+    def acknowledge_claimed_interventions(
+        self, intervention_ids: list[str], *, owner_id: str
+    ) -> None:
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for intervention_id in intervention_ids:
+                row = connection.execute(
+                    """
+                    SELECT record_json FROM lifecycle_interventions
+                    WHERE intervention_id = ? AND claimed_by = ?
+                    """,
+                    (intervention_id, owner_id),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("intervention claim is no longer owned")
+                record = InterventionRecord.model_validate_json(row["record_json"])
+                if record.kind == "replan" and record.state is InterventionState.QUEUED:
+                    record = record.model_copy(
+                        update={
+                            "state": transition_intervention(
+                                record.state, InterventionState.REPLAN_REQUIRED
+                            )
+                        }
+                    )
+                record = record.model_copy(
+                    update={
+                        "state": transition_intervention(
+                            record.state, InterventionState.APPLIED
+                        )
+                    }
+                )
+                record = record.model_copy(
+                    update={
+                        "state": transition_intervention(
+                            record.state, InterventionState.ACKNOWLEDGED
+                        )
+                    }
+                )
+                connection.execute(
+                    """
+                    UPDATE lifecycle_interventions
+                    SET state = ?, record_json = ?, claimed_by = NULL, claimed_at = NULL
+                    WHERE intervention_id = ? AND claimed_by = ?
+                    """,
+                    (
+                        record.state.value,
+                        record.model_dump_json(),
+                        intervention_id,
+                        owner_id,
+                    ),
+                )
+            connection.commit()
+
+    def release_claimed_interventions(
+        self, intervention_ids: list[str], *, owner_id: str
+    ) -> None:
+        if not intervention_ids:
+            return
+        placeholders = ",".join("?" for _ in intervention_ids)
+        with self.store.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE lifecycle_interventions SET claimed_by = NULL, claimed_at = NULL
+                WHERE claimed_by = ? AND intervention_id IN ({placeholders})
+                """,
+                (owner_id, *intervention_ids),
+            )
 
     def _insert(self, sql: str, params: tuple[Any, ...]) -> None:
         with self.store.connect() as connection:

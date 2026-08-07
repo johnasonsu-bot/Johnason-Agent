@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 4
+PHASE1_SCHEMA_VERSION = 5
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -119,7 +119,42 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             state_json TEXT NOT NULL,
             FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
         );
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            provider_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner_id TEXT,
+            lease_expires_at REAL NOT NULL,
+            state_json TEXT NOT NULL,
+            result_json TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS conversation_tool_effects (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            arguments_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner_id TEXT,
+            result TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id, tool_call_id),
+            FOREIGN KEY (session_id, command_id)
+                REFERENCES conversation_turns(session_id, command_id)
+        );
         """
+    )
+    _add_column_if_missing(
+        connection, "lifecycle_interventions", "claimed_by", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "lifecycle_interventions", "claimed_at", "REAL"
     )
     _upgrade_conversation_command_scope(connection)
     connection.execute(
@@ -188,3 +223,12 @@ def _pragma_value(row: sqlite3.Row | tuple[object, ...], name: str, index: int) 
     if isinstance(row, sqlite3.Row):
         return row[name]
     return row[index]
+
+
+def _add_column_if_missing(
+    connection: sqlite3.Connection, table: str, column: str, declaration: str
+) -> None:
+    columns = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    if any(_pragma_value(row, "name", 1) == column for row in columns):
+        return
+    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
