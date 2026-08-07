@@ -101,6 +101,8 @@ test("startup and activate share one backend launch", async ({}, testInfo) => {
     await app.evaluate(({ app: electronApp }) => electronApp.emit("activate"));
     await app.firstWindow();
     await expect.poll(async () => (await eventsText(events)).match(/^started$/gm)?.length ?? 0).toBe(1);
+    await app.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
+    await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length)).toBe(1);
   } finally {
     try { await app.close(); } catch { /* The failing implementation may already exit. */ }
   }

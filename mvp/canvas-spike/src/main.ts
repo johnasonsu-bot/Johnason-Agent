@@ -308,6 +308,7 @@ ipcMain.handle("intervention.submit", (event, command: unknown) => {
 });
 
 function createWindow(): BrowserWindow {
+  if (mainWindow !== null && !mainWindow.isDestroyed()) return mainWindow;
   if (process.env.HERMES_TEST_FAIL_CREATE_WINDOW === "1") {
     throw new Error("Workbench window creation failed by test request");
   }
