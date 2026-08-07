@@ -135,7 +135,7 @@
 
 - [ ] **Step 3: Implement a durable recovery transaction.**
 
-  Add a versioned JSON marker containing only paths/phase metadata (no secrets), write and fsync it before recovery publication, create and fsync a complete replacement temporary file, atomically publish the replacement at the primary path, then atomically move the corrupt primary to a uniquely named backup and fsync the directory. On startup, `CredentialVault.open`/`VaultService.__init__` must inspect the marker and candidate files: finalize a complete replacement, or set `_recovery_required` without treating the path as uninitialized. Clear the marker only after the new primary is validated and durable.
+  Add a versioned JSON marker containing only paths/phase metadata (no secrets), write and fsync it before recovery publication, create and fsync a complete replacement temporary file, create a durable backup copy/link of the corrupt primary while the original remains in place, fsync the backup and directory, then atomically publish the replacement over the primary and fsync the directory. On startup, `CredentialVault.open`/`VaultService.__init__` must inspect the marker and candidate files: finalize a complete replacement, or set `_recovery_required` without treating the path as uninitialized. Clear the marker only after the new primary is validated and durable; never move the original away before a complete replacement or backup is durable.
 
 - [ ] **Step 4: Preserve explicit recovery semantics and cleanup rules.**
 
