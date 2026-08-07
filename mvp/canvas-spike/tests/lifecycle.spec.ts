@@ -190,3 +190,36 @@ test("quit during pending startup stops its child before Electron exits", async 
   expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
   await expect.poll(async () => eventsText(events)).toContain("exited");
 });
+
+test("close then activate waits for backend stop before quit", async ({}, testInfo) => {
+  const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, false, 300, false);
+  const runtimeDir = testInfo.outputPath("runtime");
+  const events = path.join(runtimeDir, "backend-events.log");
+  const app = await electron.launch({
+    args: [path.resolve(".")],
+    env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
+  });
+
+  try {
+    await app.firstWindow();
+    await expect.poll(async () => eventsText(events)).toContain("ready");
+    const windowId = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]?.id);
+    if (typeof windowId !== "number") throw new Error("test window was not found");
+    await app.evaluate(({ BrowserWindow, app: electronApp }, id) => {
+      const target = BrowserWindow.fromId(id);
+      if (target === null) throw new Error("test window was not found");
+      target.once("closed", () => {
+        electronApp.emit("activate");
+        electronApp.quit();
+      });
+      target.close();
+    }, windowId);
+    await app.waitForEvent("close");
+
+    const startedEvents = (await eventsText(events)).match(/^started$/gm) ?? [];
+    expect(startedEvents).toHaveLength(1);
+    await expect.poll(async () => eventsText(events)).toContain("exited");
+  } finally {
+    try { await app.close(); } catch { /* The app may already have quit. */ }
+  }
+});

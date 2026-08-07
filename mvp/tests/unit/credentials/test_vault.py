@@ -1,5 +1,7 @@
 import base64
+import errno
 import json
+import os
 import secrets
 import stat
 import subprocess
@@ -12,6 +14,7 @@ import pytest
 from workbench.credentials.models import (
     VaultLockedError,
     VaultPersistenceError,
+    VaultRecoveryRequiredError,
     VaultUnlockError,
 )
 from workbench.credentials.service import VaultService
@@ -628,6 +631,84 @@ def test_recovery_restart_after_publication_fsync_keeps_one_encrypted_backup(
     restarted.unlock(password)
     assert restarted.status == "unlocked"
     restarted.lock()
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV])
+def test_recovery_falls_back_to_durable_copy_when_hard_links_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
+) -> None:
+    """A same-directory copy keeps recovery usable on filesystems without links."""
+    path = tmp_path / "vault.bin"
+    corrupt_input = b"corrupt original vault"
+    password = secrets.token_urlsafe(24)
+    path.write_bytes(corrupt_input)
+    service = VaultService(path)
+
+    def link_unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(link_errno, "hard links are unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "link", link_unavailable)
+        service.recover(password)
+
+    backups = list(path.parent.glob(f".{path.name}.recovery-*"))
+    assert len(backups) == 1
+    backup_path = backups[0]
+    assert backup_path.read_bytes() == corrupt_input
+    assert not os.path.samefile(path, backup_path)
+    assert VaultService(path).status == "locked"
+
+
+def test_startup_reports_recovery_required_when_backup_fallback_cannot_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An impossible interrupted backup must remain explicit, not escape as OSError."""
+    path = tmp_path / "vault.bin"
+    path.write_bytes(b"corrupt original vault")
+    service = VaultService(path)
+
+    def link_unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EOPNOTSUPP, "hard links are unavailable")
+
+    def copy_unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EIO, "backup copy is unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "link", link_unavailable)
+        scoped.setattr(
+            vault_module, "_copy_recovery_backup", copy_unavailable, raising=False
+        )
+        with pytest.raises(VaultRecoveryRequiredError):
+            service.recover("recovery-password")
+        restarted = VaultService(path)
+
+    assert restarted.status == "recovery_required"
+
+
+def test_startup_reports_recovery_required_when_replacement_publish_cannot_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart publish error must become explicit recovery state, not raw OSError."""
+    path = tmp_path / "vault.bin"
+    path.write_bytes(b"corrupt original vault")
+    service = VaultService(path)
+    original_replace = vault_module.os.replace
+
+    def interrupt_primary_publication(source: object, destination: object) -> None:
+        if Path(destination) == path:
+            raise OSError(errno.EIO, "primary publication is unavailable")
+        original_replace(source, destination)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "replace", interrupt_primary_publication)
+        with pytest.raises(OSError, match="primary publication"):
+            service.recover("recovery-password")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "replace", interrupt_primary_publication)
+        restarted = VaultService(path)
+
+    assert restarted.status == "recovery_required"
 
 
 def test_an_unlocked_vault_allows_only_one_writer_process(tmp_path: Path) -> None:

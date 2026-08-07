@@ -29,6 +29,7 @@ class RecordingListener:
 
 class StartedServer:
     def __init__(self, _config: object) -> None:
+        self.config = _config
         self.started = False
         self.sockets: list[RecordingListener] | None = None
 
@@ -82,6 +83,8 @@ def test_windows_listener_is_exclusive_before_bind_and_reuses_selected_port(
     assert ("setsockopt", socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) not in listener.events
     assert listener.events.count(("getsockname",)) == 1
     assert server.sockets == [listener]
+    assert server.config.host == "127.0.0.1"
+    assert server.config.port == 43127
 
 
 def test_posix_listener_reuses_address_without_requesting_windows_exclusivity(
@@ -100,3 +103,5 @@ def test_posix_listener_reuses_address_without_requesting_windows_exclusivity(
     assert ("setsockopt", socket.SOL_SOCKET, exclusive, 1) not in listener.events
     assert listener.events.count(("getsockname",)) == 1
     assert server.sockets == [listener]
+    assert server.config.host == "127.0.0.1"
+    assert server.config.port == 43127

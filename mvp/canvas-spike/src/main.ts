@@ -164,6 +164,8 @@ async function startBackend(): Promise<void> {
   if (startingBackend !== null) return startingBackend;
 
   const pending = (async () => {
+    if (stoppingBackend !== null) await stoppingBackend;
+    if (quitting) throw new Error("Workbench backend startup was cancelled");
     const capability = randomBytes(32).toString("base64url");
     const instanceId = randomUUID();
     const child = spawn(

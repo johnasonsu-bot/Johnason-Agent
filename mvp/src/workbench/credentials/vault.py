@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import tempfile
@@ -33,6 +34,11 @@ _DOCUMENT_FIELDS = {"version", "kdf", "salt", "nonce", "ciphertext"}
 _RECOVERY_MARKER_VERSION = 1
 _RECOVERY_MARKER_FIELDS = {"version", "phase", "replacement", "backup"}
 _RECOVERY_PHASES = {"prepared", "replacement_ready", "backup_ready", "publishing"}
+_LINK_FALLBACK_ERRNOS = {
+    getattr(errno, name)
+    for name in ("EPERM", "EOPNOTSUPP", "ENOTSUP", "EXDEV")
+    if hasattr(errno, name)
+}
 
 
 @dataclass
@@ -148,7 +154,14 @@ class CredentialVault:
             if vault._recovery_marker_path().exists():
                 vault._acquire_writer()
                 try:
-                    vault._finish_interrupted_recovery()
+                    try:
+                        vault._finish_interrupted_recovery()
+                    except VaultRecoveryRequiredError:
+                        raise
+                    except OSError as exc:
+                        raise VaultRecoveryRequiredError(
+                            "interrupted recovery could not be completed"
+                        ) from exc
                 finally:
                     vault._release_writer()
             if not vault._path.is_file():
@@ -428,19 +441,31 @@ class CredentialVault:
 
     def _ensure_recovery_backup(self, backup_path: Path) -> None:
         if backup_path.exists():
-            try:
-                if not os.path.samefile(self._path, backup_path):
-                    raise VaultRecoveryRequiredError(
-                        "recovery backup does not match the corrupt vault"
-                    )
-            except OSError as exc:
+            if not _files_match(self._path, backup_path):
                 raise VaultRecoveryRequiredError(
-                    "recovery backup could not be validated"
-                ) from exc
+                    "recovery backup does not match the corrupt vault"
+                )
         else:
-            os.link(self._path, backup_path)
-        _fsync_file(backup_path)
-        self._fsync_parent_directory()
+            try:
+                os.link(self._path, backup_path)
+            except OSError as exc:
+                if exc.errno not in _LINK_FALLBACK_ERRNOS:
+                    raise VaultRecoveryRequiredError(
+                        "recovery backup could not be created"
+                    ) from exc
+                try:
+                    _copy_recovery_backup(self._path, backup_path)
+                except OSError as copy_exc:
+                    raise VaultRecoveryRequiredError(
+                        "recovery backup could not be created"
+                    ) from copy_exc
+        try:
+            _fsync_file(backup_path)
+            self._fsync_parent_directory()
+        except OSError as exc:
+            raise VaultRecoveryRequiredError(
+                "recovery backup could not be made durable"
+            ) from exc
 
     def _finish_interrupted_recovery(self) -> None:
         marker = _load_recovery_marker(self._path)
@@ -702,6 +727,62 @@ def _fsync_file(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _copy_recovery_backup(source: Path, destination: Path) -> None:
+    """Copy a corrupt primary through a durable same-directory temporary file."""
+    descriptor: int | None = None
+    temporary_path: Path | None = None
+    published = False
+    try:
+        descriptor, raw_temporary_path = tempfile.mkstemp(
+            prefix=f".{destination.name}.", dir=destination.parent
+        )
+        temporary_path = Path(raw_temporary_path)
+        with open(source, "rb") as source_file, os.fdopen(descriptor, "wb") as backup_file:
+            descriptor = None
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(backup_file.fileno(), 0o600)
+            while chunk := source_file.read(1024 * 1024):
+                backup_file.write(chunk)
+            backup_file.flush()
+            os.fsync(backup_file.fileno())
+        if destination.exists():
+            raise FileExistsError(f"recovery backup already exists: {destination}")
+        os.replace(temporary_path, destination)
+        published = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if not published:
+            _remove_temporary(temporary_path)
+
+
+def _files_match(left: Path, right: Path) -> bool:
+    samefile = getattr(os.path, "samefile", None)
+    if samefile is not None:
+        try:
+            if samefile(left, right):
+                return True
+        except OSError:
+            pass
+    try:
+        with open(left, "rb") as left_file, open(right, "rb") as right_file:
+            while True:
+                left_chunk = left_file.read(1024 * 1024)
+                right_chunk = right_file.read(1024 * 1024)
+                if left_chunk != right_chunk:
+                    return False
+                if not left_chunk:
+                    return True
+    except OSError as exc:
+        raise VaultRecoveryRequiredError(
+            "recovery backup could not be validated"
+        ) from exc
 
 
 def _remove_temporary(path: Path | None) -> None:
