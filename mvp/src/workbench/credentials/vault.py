@@ -730,36 +730,24 @@ def _fsync_file(path: Path) -> None:
 
 
 def _copy_recovery_backup(source: Path, destination: Path) -> None:
-    """Copy a corrupt primary through a durable same-directory temporary file."""
+    """Copy a corrupt primary to a durably published, exclusive backup path."""
     descriptor: int | None = None
-    temporary_path: Path | None = None
-    published = False
     try:
-        descriptor, raw_temporary_path = tempfile.mkstemp(
-            prefix=f".{destination.name}.", dir=destination.parent
+        descriptor = os.open(
+            destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
         )
-        temporary_path = Path(raw_temporary_path)
         with open(source, "rb") as source_file, os.fdopen(descriptor, "wb") as backup_file:
             descriptor = None
-            fchmod = getattr(os, "fchmod", None)
-            if fchmod is not None:
-                fchmod(backup_file.fileno(), 0o600)
             while chunk := source_file.read(1024 * 1024):
                 backup_file.write(chunk)
             backup_file.flush()
             os.fsync(backup_file.fileno())
-        if destination.exists():
-            raise FileExistsError(f"recovery backup already exists: {destination}")
-        os.replace(temporary_path, destination)
-        published = True
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
-        if not published:
-            _remove_temporary(temporary_path)
 
 
 def _files_match(left: Path, right: Path) -> bool:

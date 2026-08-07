@@ -659,6 +659,84 @@ def test_recovery_falls_back_to_durable_copy_when_hard_links_are_unavailable(
     assert VaultService(path).status == "locked"
 
 
+def test_recovery_no_replace_fallback_preserves_racing_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fallback race must leave the competing backup and recovery evidence intact."""
+    path = tmp_path / "vault.bin"
+    corrupt_input = b"corrupt original vault"
+    sentinel = b"backup created by another recovery process"
+    path.write_bytes(corrupt_input)
+    service = VaultService(path)
+    original_open = vault_module.os.open
+    original_replace = vault_module.os.replace
+
+    def link_unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hard links are unavailable")
+
+    def is_backup_path(candidate: object) -> bool:
+        return (
+            Path(candidate).parent == path.parent
+            and Path(candidate).name.startswith(f".{path.name}.recovery-")
+            and not Path(candidate).name.startswith(f".{path.name}.recovery-new-")
+        )
+
+    def publish_competing_backup(source: object, destination: object) -> None:
+        if is_backup_path(destination):
+            Path(destination).write_bytes(sentinel)
+        original_replace(source, destination)
+
+    def create_backup_exclusively(
+        candidate: object, flags: int, mode: int = 0o777
+    ) -> int:
+        if is_backup_path(candidate) and flags & os.O_CREAT and flags & os.O_EXCL:
+            Path(candidate).write_bytes(sentinel)
+        return original_open(candidate, flags, mode)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "link", link_unavailable)
+        scoped.setattr(vault_module.os, "replace", publish_competing_backup)
+        scoped.setattr(vault_module.os, "open", create_backup_exclusively)
+        with pytest.raises(VaultRecoveryRequiredError):
+            service.recover("recovery-password")
+
+    marker_path = _recovery_marker_path(path)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    backup_path = _recovery_artifact_path(path, marker, "backup")
+    assert backup_path.read_bytes() == sentinel
+    assert path.read_bytes() == corrupt_input
+    assert marker_path.is_file()
+    assert VaultService(path).status == "recovery_required"
+
+
+def test_recovery_hard_link_fallback_copies_backup_and_unlocks_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hard-link fallback copies the corrupt vault and leaves a usable replacement."""
+    path = tmp_path / "vault.bin"
+    corrupt_input = b"corrupt original vault"
+    password = secrets.token_urlsafe(24)
+    path.write_bytes(corrupt_input)
+    service = VaultService(path)
+
+    def link_unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EPERM, "hard links are unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "link", link_unavailable)
+        service.recover(password)
+
+    service.lock()
+    backups = list(path.parent.glob(f".{path.name}.recovery-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == corrupt_input
+    restarted = VaultService(path)
+    assert restarted.status == "locked"
+    restarted.unlock(password)
+    assert restarted.status == "unlocked"
+    restarted.lock()
+
+
 def test_startup_reports_recovery_required_when_backup_fallback_cannot_complete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
