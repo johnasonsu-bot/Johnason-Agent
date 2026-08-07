@@ -32,6 +32,14 @@ npm test --prefix canvas-spike
 
 PYTHONPATH=mvp/src python -m pytest mvp/tests/acceptance/test_batch2_live_conversation.py -v
 → 2 skipped (the explicit HERMES_RUN_LIVE_CONVERSATION=1 gate was not enabled; no provider secret was provided).
+
+Local live smoke (after creating `mvp/.venv` from `mvp/pyproject.toml`):
+
+```text
+HERMES_RUN_LIVE_CONVERSATION=1 HERMES_LMSTUDIO_MODEL=gemma-4-31b-it \
+  mvp/.venv/bin/python -m pytest -q mvp/tests/acceptance/test_batch2_live_conversation.py -k lmstudio
+→ 1 passed, 1 deselected (real LM Studio, two durable turns, 14.23s).
+```
 ```
 
 ## Concerns / follow-up

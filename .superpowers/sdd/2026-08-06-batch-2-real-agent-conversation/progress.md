@@ -24,3 +24,4 @@ Task 3: fix round 4/5 (2 addressed, 0 open; commits 14cb335..fa6a87b).
 Task 3: complete (commits 8675b09..fa6a87b, review clean; full Python 257 passed, 4 skipped; graph finalized at e254dae plus 66513f1).
 Task 4: initial implementation `9977507`; review round 1 found REST/SSE disconnect, fixture-only UI evidence, missing session wiring, misleading live-gate skips, and narrow-pane risk.
 Task 4: fix round 1 connected the renderer through constrained conversation IPC, added REST/SSE replay mapping, session-switch hooks, stable event IDs, strict opt-in live-gate failures, and narrow-window Artifact overlay; npm regression 23 passed and live API gate remains 2 skipped when disabled.
+Task 4: local live smoke passed against LM Studio `gemma-4-31b-it` (two durable turns; 1 passed, 1 deselected); DeepSeek live turn remains pending just-in-time API key.
