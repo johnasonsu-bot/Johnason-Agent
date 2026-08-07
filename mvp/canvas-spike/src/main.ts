@@ -164,51 +164,52 @@ async function startBackend(): Promise<void> {
   if (startingBackend !== null) return startingBackend;
 
   const pending = (async () => {
-  const capability = randomBytes(32).toString("base64url");
-  const instanceId = randomUUID();
-  const child = spawn(
-    pythonExecutable(),
-    [
-      "-m", "workbench.main", "--electron-owned",
-      "--runtime-dir", runtimeDirectory(),
-      "--host", "127.0.0.1",
-      "--port", "0",
-      "--lmstudio-base-url", lmStudioBaseUrl(),
-    ],
-    { env: childEnvironment(), stdio: ["pipe", "pipe", "pipe"] },
-  );
-  startingChild = child;
-  child.stderr.resume();
-  child.stdin.write(`${JSON.stringify({ capability, instance_id: instanceId })}\n`);
-  try {
-    const handshake = await readHandshake(child, instanceId);
-    child.stdout.resume();
-    const owned = {
-      child,
-      apiBase: `http://127.0.0.1:${handshake.port}`,
-      capability,
-      instanceId,
-    };
-    await verifyBackendIdentity(owned);
-    if (startingChild !== child) throw new Error("Workbench backend startup was cancelled");
-    backend = owned;
-    startingChild = null;
-    child.once("exit", () => {
-      if (backend?.child === child) {
-        backend = null;
-        if (!quitting) void stopAndExit(1);
+    const capability = randomBytes(32).toString("base64url");
+    const instanceId = randomUUID();
+    const child = spawn(
+      pythonExecutable(),
+      [
+        "-m", "workbench.main", "--electron-owned",
+        "--runtime-dir", runtimeDirectory(),
+        "--host", "127.0.0.1",
+        "--port", "0",
+        "--lmstudio-base-url", lmStudioBaseUrl(),
+      ],
+      { env: childEnvironment(), stdio: ["pipe", "pipe", "pipe"] },
+    );
+    startingChild = child;
+    child.stderr.resume();
+    child.stdin.write(`${JSON.stringify({ capability, instance_id: instanceId })}\n`);
+    if (process.env.HERMES_TEST_CLOSE_BACKEND_STDIN_AFTER_BOOTSTRAP === "1") child.stdin.end();
+    try {
+      const handshake = await readHandshake(child, instanceId);
+      child.stdout.resume();
+      const owned = {
+        child,
+        apiBase: `http://127.0.0.1:${handshake.port}`,
+        capability,
+        instanceId,
+      };
+      await verifyBackendIdentity(owned);
+      if (quitting || startingChild !== child) throw new Error("Workbench backend startup was cancelled");
+      backend = owned;
+      startingChild = null;
+      child.once("exit", () => {
+        if (backend?.child === child) {
+          backend = null;
+          if (!quitting) void stopAndExit(1);
+        }
+      });
+    } catch (error) {
+      if (startingChild === child) startingChild = null;
+      if (!child.stdin.destroyed) child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      if (!await waitForExit(child, 3_000)) {
+        child.kill("SIGKILL");
+        await waitForExit(child, 2_000);
       }
-    });
-  } catch (error) {
-    if (startingChild === child) startingChild = null;
-    if (!child.stdin.destroyed) child.stdin.end();
-    if (child.exitCode === null && child.signalCode === null) child.kill();
-    if (!await waitForExit(child, 3_000)) {
-      child.kill("SIGKILL");
-      await waitForExit(child, 2_000);
+      throw error;
     }
-    throw error;
-  }
   })();
   startingBackend = pending;
   try {
@@ -307,6 +308,9 @@ ipcMain.handle("intervention.submit", (event, command: unknown) => {
 });
 
 function createWindow(): BrowserWindow {
+  if (process.env.HERMES_TEST_FAIL_CREATE_WINDOW === "1") {
+    throw new Error("Workbench window creation failed by test request");
+  }
   const rendererPath = path.join(__dirname, "../dist/index.html");
   trustedDocumentUrl = pathToFileURL(rendererPath).toString();
   const window = new BrowserWindow({
@@ -367,7 +371,7 @@ app.on("activate", () => {
 
 app.on("before-quit", (event) => {
   quitting = true;
-  if (quitAfterCleanup || (backend === null && stoppingBackend === null)) return;
+  if (quitAfterCleanup || (backend === null && startingChild === null && startingBackend === null && stoppingBackend === null)) return;
   event.preventDefault();
   void stopBackend().finally(() => {
     quitAfterCleanup = true;

@@ -8,6 +8,7 @@ async function writeLivenessBackend(
   invalidHandshake = false,
   shutdownDelayMs = 0,
   exitOnStdinEof = true,
+  unexpectedExitDelayMs: number | null = null,
 ): Promise<string> {
   await mkdir(testDir, { recursive: true });
   const executable = path.join(testDir, "liveness-backend.mjs");
@@ -28,6 +29,10 @@ process.stdin.once("end", () => {
   record("stdin-eof");
   if (${exitOnStdinEof}) process.exit(0);
 });
+process.on("SIGTERM", () => {
+  record("sigterm");
+  setTimeout(() => { record("exited"); process.exit(0); }, ${shutdownDelayMs});
+});
 setTimeout(() => {
   const { instance_id } = JSON.parse(bootstrap);
   const server = http.createServer((request, response) => {
@@ -43,10 +48,12 @@ setTimeout(() => {
     const { port } = server.address();
     record("ready");
     process.stdout.write(JSON.stringify(${invalidHandshake ? '{ service: "wrong-service", instance_id, port }' : '{ service: "hermes-workbench", instance_id, port }'}) + "\\n");
-  });
-  process.on("SIGTERM", () => {
-    record("sigterm");
-    setTimeout(() => server.close(() => { record("exited"); process.exit(0); }), ${shutdownDelayMs});
+    if (${unexpectedExitDelayMs ?? "null"} !== null) {
+      setTimeout(() => {
+        record("unexpected-exit");
+        server.close(() => { record("exited"); process.exit(17); });
+      }, ${unexpectedExitDelayMs ?? 0});
+    }
   });
 }, ${handshakeDelayMs});
 `);
@@ -109,6 +116,74 @@ test("invalid handshake cleans up its backend before Electron exits", async ({},
   });
 
   const startedAt = Date.now();
+  await app.waitForEvent("close");
+  expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+  await expect.poll(async () => eventsText(events)).toContain("exited");
+});
+
+test("parent-control EOF terminates the backend fixture", async ({}, testInfo) => {
+  const executable = await writeLivenessBackend(testInfo.outputPath("fixture"));
+  const runtimeDir = testInfo.outputPath("runtime");
+  const events = path.join(runtimeDir, "backend-events.log");
+  const app = await electron.launch({
+    args: [path.resolve(".")],
+    env: {
+      ...process.env,
+      HERMES_PYTHON: executable,
+      HERMES_RUNTIME_DIR: runtimeDir,
+      HERMES_TEST_CLOSE_BACKEND_STDIN_AFTER_BOOTSTRAP: "1",
+    },
+  });
+
+  await app.waitForEvent("close", { timeout: 2_000 });
+  await expect.poll(async () => eventsText(events)).toContain("stdin-eof");
+});
+
+test("window creation failure stops the started backend before Electron exits", async ({}, testInfo) => {
+  const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, false, 300, false);
+  const runtimeDir = testInfo.outputPath("runtime");
+  const events = path.join(runtimeDir, "backend-events.log");
+  const app = await electron.launch({
+    args: [path.resolve(".")],
+    env: {
+      ...process.env,
+      HERMES_PYTHON: executable,
+      HERMES_RUNTIME_DIR: runtimeDir,
+      HERMES_TEST_FAIL_CREATE_WINDOW: "1",
+    },
+  });
+
+  const startedAt = Date.now();
+  await app.waitForEvent("close");
+  expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+  await expect.poll(async () => eventsText(events)).toContain("exited");
+});
+
+test("unexpected backend exit completes before Electron closes", async ({}, testInfo) => {
+  const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, false, 0, false, 100);
+  const runtimeDir = testInfo.outputPath("runtime");
+  const events = path.join(runtimeDir, "backend-events.log");
+  const app = await electron.launch({
+    args: [path.resolve(".")],
+    env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
+  });
+
+  await app.waitForEvent("close");
+  await expect.poll(async () => eventsText(events)).toContain("exited");
+});
+
+test("quit during pending startup stops its child before Electron exits", async ({}, testInfo) => {
+  const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 1_500, false, 300, false, 500);
+  const runtimeDir = testInfo.outputPath("runtime");
+  const events = path.join(runtimeDir, "backend-events.log");
+  const app = await electron.launch({
+    args: [path.resolve(".")],
+    env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
+  });
+
+  await expect.poll(async () => eventsText(events)).toContain("started");
+  const startedAt = Date.now();
+  await app.evaluate(({ app: electronApp }) => electronApp.quit());
   await app.waitForEvent("close");
   expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
   await expect.poll(async () => eventsText(events)).toContain("exited");
