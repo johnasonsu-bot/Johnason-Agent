@@ -12,7 +12,7 @@ const allowedApiRequests = new Set([
   "GET /api/providers", "POST /api/providers",
 ]);
 
-interface ApiRequest { method: "GET" | "POST" | "DELETE"; path: string; body?: Record<string, unknown>; }
+interface ApiRequest { method: "GET" | "POST" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }
 interface BackendHandshake { service: string; instance_id: string; port: number; }
 interface BackendProcess {
   child: ChildProcessWithoutNullStreams;
@@ -37,11 +37,20 @@ function isApiRequest(value: unknown): value is ApiRequest {
   if ((request.method !== "GET" && request.method !== "POST" && request.method !== "DELETE") || typeof request.path !== "string") return false;
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
     const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
+    const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events))?)?$/.exec(request.path);
+    if (!providerPath && !conversationPath) return false;
+    if (conversationPath) {
+      const operation = conversationPath[1];
+      return (operation === "events" && request.method === "GET")
+        || (operation === "messages" && request.method === "POST")
+        || (!operation && request.method === "POST");
+    }
     if (!providerPath) return false;
     const operation = providerPath[1];
     if (!((!operation && request.method === "DELETE") || (operation === "secret" && request.method === "POST") || (operation === "test" && request.method === "POST") || (operation === "models" && request.method === "GET"))) return false;
   }
   if (request.body !== undefined && (typeof request.body !== "object" || request.body === null || Array.isArray(request.body) || JSON.stringify(request.body).length > 16_384)) return false;
+  if (request.headers !== undefined && (typeof request.headers !== "object" || request.headers === null || Array.isArray(request.headers))) return false;
   return true;
 }
 
@@ -276,14 +285,14 @@ ipcMain.handle("api.request", async (event, request: unknown) => {
   if (owned === null) throw new Error("local Workbench backend is unavailable");
   const response = await authenticatedBackendRequest(owned, `/api${request.path}`, {
     method: request.method,
-    headers: request.body === undefined ? undefined : { "content-type": "application/json" },
+    headers: { ...(request.body === undefined ? {} : { "content-type": "application/json" }), ...(request.headers ?? {}) },
     body: request.body === undefined ? undefined : JSON.stringify(request.body),
   });
   const responseText = await response.text();
   if (responseText.length > 1_048_576) throw new Error("local API response is too large");
   let body: unknown = null;
   try { body = JSON.parse(responseText); } catch { /* Endpoint responses are JSON by contract. */ }
-  return { status: response.status, body };
+  return { status: response.status, body, text: responseText };
 });
 
 interface InterventionCommand {

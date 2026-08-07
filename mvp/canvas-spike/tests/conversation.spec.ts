@@ -11,6 +11,7 @@ test("sends a prompt and shows model, steps, and answer", async () => {
     await page.getByRole("button", { name: "发送" }).click();
 
     await expect(page.getByTestId("model-badge")).toContainText(/LM Studio|DeepSeek/);
+    await expect(page.getByTestId("conversation-source")).toContainText(/Task 3 REST\/SSE|fixture/);
     await expect(page.getByText("工具执行完成")).toBeVisible();
     await expect(page.getByText(/README\.md/)).toBeVisible();
   } finally {

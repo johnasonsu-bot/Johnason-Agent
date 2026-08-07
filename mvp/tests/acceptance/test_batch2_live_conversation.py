@@ -31,7 +31,7 @@ pytestmark = pytest.mark.skipif(
 def _require(name: str) -> str:
     value = os.environ.get(name)
     if not value:
-        pytest.skip(f"{name} is required for the live conversation gate")
+        pytest.fail(f"{name} is required when the live conversation gate is enabled")
     return value
 
 
@@ -65,7 +65,7 @@ def test_real_provider_completes_two_durable_conversation_turns(
     tmp_path: Path, provider: str
 ) -> None:
     """Exercise a real model twice and retain only public AG-UI event projections."""
-    lmstudio_model = _require("HERMES_LMSTUDIO_MODEL")
+    lmstudio_model = _require("HERMES_LMSTUDIO_MODEL") if provider == "lmstudio" else "unused"
     deepseek_key = _require("DEEPSEEK_API_KEY") if provider == "deepseek" else None
     settings = WorkbenchSettings(
         runtime_dir=tmp_path,

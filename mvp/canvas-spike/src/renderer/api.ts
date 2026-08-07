@@ -33,13 +33,13 @@ export interface ConnectionResult {
   error_code: string | null;
 }
 
-interface ApiBridge { apiRequest(request: { method: string; path: string; body?: Record<string, unknown> }): Promise<{ status: number; body: unknown }>; }
+interface ApiBridge { apiRequest(request: { method: string; path: string; body?: Record<string, unknown>; headers?: Record<string, string> }): Promise<{ status: number; body: unknown; text?: string }>; }
 
-async function request<T>(path: string, init?: { method?: string; body?: string }): Promise<T> {
+async function request<T>(path: string, init?: { method?: string; body?: string; headers?: Record<string, string> }): Promise<T> {
   let response: { status: number; body: unknown };
   try {
     const parsedBody = init?.body ? JSON.parse(init.body) as Record<string, unknown> : undefined;
-    response = await (window as Window & { workbenchBridge: ApiBridge }).workbenchBridge.apiRequest({ method: init?.method ?? "GET", path, body: parsedBody });
+    response = await (window as Window & { workbenchBridge: ApiBridge }).workbenchBridge.apiRequest({ method: init?.method ?? "GET", path, body: parsedBody, headers: init?.headers });
   } catch {
     throw new Error("无法连接到本地 Hermes 服务");
   }
@@ -69,4 +69,20 @@ export const providerApi = {
   models: (id: string) => request<{ status: ConnectionResult["status"]; models: string[]; error_code: string | null }>(`/providers/${encodeURIComponent(id)}/models`),
   test: (id: string) => request<ConnectionResult>(`/providers/${encodeURIComponent(id)}/test`, { method: "POST" }),
   delete: (id: string) => request<{ id: string; status: string; secret_cleanup: string }>(`/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+};
+
+export type ConversationEvent = { type?: string; name?: string; delta?: string; value?: Record<string, unknown>; runId?: string; sequence?: number; eventId?: string };
+
+export const conversationApi = {
+  createSession: (sessionId: string) => request<{ session_id: string }>("/sessions", { method: "POST", body: JSON.stringify({ session_id: sessionId }) }),
+  sendMessage: (sessionId: string, content: string, commandId: string) => request<{ session_id: string; status: string; events: ConversationEvent[] }>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: "POST", body: JSON.stringify({ content, model: "default" }), headers: { "Idempotency-Key": commandId } }),
+  events: async (sessionId: string): Promise<ConversationEvent[]> => {
+    const bridge = (window as Window & { workbenchBridge: ApiBridge }).workbenchBridge;
+    const response = await bridge.apiRequest({ method: "GET", path: `/sessions/${encodeURIComponent(sessionId)}/events` });
+    if (response.status < 200 || response.status >= 300) throw new Error(`本地服务请求失败（${response.status}）`);
+    return (response.text ?? "").split("\n\n").filter(Boolean).map((frame) => {
+      const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+      return data ? JSON.parse(data) as ConversationEvent : null;
+    }).filter((event): event is ConversationEvent => event !== null);
+  },
 };
