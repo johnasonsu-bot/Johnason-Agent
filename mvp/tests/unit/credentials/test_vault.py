@@ -19,6 +19,17 @@ from workbench.credentials.vault import CredentialVault
 import workbench.credentials.vault as vault_module
 
 
+def _recovery_marker_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.recovery.json")
+
+
+def _recovery_artifact_path(
+    path: Path, marker: dict[str, object], name: str
+) -> Path:
+    artifact = Path(str(marker[name]))
+    return artifact if artifact.is_absolute() else path.parent / artifact
+
+
 def test_vault_encrypts_and_requires_correct_password(tmp_path: Path) -> None:
     path = tmp_path / "vault.bin"
     vault = CredentialVault.create(path, "correct horse")
@@ -482,6 +493,141 @@ def test_incomplete_startup_state_requires_explicit_recovery(tmp_path: Path) -> 
     service.lock()
     service.unlock(password)
     assert service.get("provider/recovered") == "recovered-value"
+
+
+def test_recovery_restart_publishes_complete_replacement_after_primary_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart must finish a durable replacement instead of losing the vault."""
+    path = tmp_path / "vault.bin"
+    corrupt_input = b"corrupt original vault"
+    password = secrets.token_urlsafe(24)
+    path.write_bytes(corrupt_input)
+    service = VaultService(path)
+    original_replace = vault_module.os.replace
+
+    def interrupt_primary_publication(source: object, destination: object) -> None:
+        if Path(destination) == path:
+            raise OSError("simulated crash before primary publication")
+        original_replace(source, destination)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(vault_module.os, "replace", interrupt_primary_publication)
+        with pytest.raises(OSError, match="before primary publication"):
+            service.recover(password)
+
+    marker_path = _recovery_marker_path(path)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    replacement_path = _recovery_artifact_path(path, marker, "replacement")
+    backup_path = _recovery_artifact_path(path, marker, "backup")
+    assert path.read_bytes() == corrupt_input
+    assert replacement_path.stat().st_size > 0
+    assert backup_path.read_bytes() == corrupt_input
+
+    restarted = VaultService(path)
+
+    assert restarted.status == "locked"
+    assert not marker_path.exists()
+    assert not replacement_path.exists()
+    assert backup_path.read_bytes() == corrupt_input
+    restarted.unlock(password)
+    assert restarted.status == "unlocked"
+    restarted.lock()
+
+
+def test_recovery_restart_preserves_marker_and_original_for_incomplete_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An incomplete candidate must keep explicit recovery state and evidence."""
+    path = tmp_path / "vault.bin"
+    corrupt_input = b"corrupt original vault"
+    password = secrets.token_urlsafe(24)
+    path.write_bytes(corrupt_input)
+    service = VaultService(path)
+    marker_path = _recovery_marker_path(path)
+    incomplete_candidates: list[Path] = []
+
+    def interrupt_replacement_write(
+        _self: CredentialVault, payload: bytes
+    ) -> Path:
+        assert marker_path.is_file(), "recovery marker was not durable before replacement"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        candidate = _recovery_artifact_path(path, marker, "replacement")
+        candidate.write_bytes(payload[:8])
+        incomplete_candidates.append(candidate)
+        raise VaultPersistenceError(
+            "simulated crash during replacement write", committed=False
+        )
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(CredentialVault, "_write_temporary", interrupt_replacement_write)
+        with pytest.raises(VaultPersistenceError, match="during replacement write"):
+            service.recover(password)
+
+    restarted = VaultService(path)
+
+    assert restarted.status == "recovery_required"
+    assert path.read_bytes() == corrupt_input
+    assert marker_path.is_file()
+    assert len(incomplete_candidates) == 1
+    assert incomplete_candidates[0].is_file()
+
+    restarted.recover(password)
+    assert restarted.status == "unlocked"
+    assert not marker_path.exists()
+    restarted.lock()
+
+
+def test_recovery_restart_after_publication_fsync_keeps_one_encrypted_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A published recovery is finalized on restart without leaking its password."""
+    path = tmp_path / "vault.bin"
+    corrupt_input = b"corrupt original vault"
+    password = "recovery-password-must-never-be-persisted"
+    path.write_bytes(corrupt_input)
+    service = VaultService(path)
+    marker_path = _recovery_marker_path(path)
+    original_directory_fsync = CredentialVault._fsync_parent_directory
+
+    def interrupt_after_primary_publication(vault: CredentialVault) -> None:
+        if (
+            marker_path.is_file()
+            and path.is_file()
+            and path.read_bytes() != corrupt_input
+        ):
+            raise OSError("simulated crash after primary publication")
+        original_directory_fsync(vault)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            CredentialVault,
+            "_fsync_parent_directory",
+            interrupt_after_primary_publication,
+        )
+        with pytest.raises(OSError, match="after primary publication"):
+            service.recover(password)
+
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    backup_path = _recovery_artifact_path(path, marker, "backup")
+    assert path.read_bytes() != corrupt_input
+    assert backup_path.read_bytes() == corrupt_input
+
+    restarted = VaultService(path)
+
+    assert restarted.status == "locked"
+    assert not marker_path.exists()
+    assert backup_path.read_bytes() == corrupt_input
+    assert [
+        candidate
+        for candidate in path.parent.iterdir()
+        if "recovery-" in candidate.name
+    ] == [backup_path]
+    for artifact in path.parent.iterdir():
+        assert password.encode("utf-8") not in artifact.read_bytes()
+    restarted.unlock(password)
+    assert restarted.status == "unlocked"
+    restarted.lock()
 
 
 def test_an_unlocked_vault_allows_only_one_writer_process(tmp_path: Path) -> None:

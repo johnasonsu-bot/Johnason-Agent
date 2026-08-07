@@ -30,6 +30,9 @@ _NONCE_BYTES = 12
 _KEY_BYTES = 32
 _KDF_PARAMETERS = {"iterations": 3, "lanes": 1, "memory_cost": 65_536}
 _DOCUMENT_FIELDS = {"version", "kdf", "salt", "nonce", "ciphertext"}
+_RECOVERY_MARKER_VERSION = 1
+_RECOVERY_MARKER_FIELDS = {"version", "phase", "replacement", "backup"}
+_RECOVERY_PHASES = {"prepared", "replacement_ready", "backup_ready", "publishing"}
 
 
 @dataclass
@@ -142,6 +145,12 @@ class CredentialVault:
         """Return a locked vault instance for an existing vault file."""
         vault = cls(path)
         with vault._state.lock:
+            if vault._recovery_marker_path().exists():
+                vault._acquire_writer()
+                try:
+                    vault._finish_interrupted_recovery()
+                finally:
+                    vault._release_writer()
             if not vault._path.is_file():
                 raise FileNotFoundError(f"vault does not exist: {vault._path}")
             _validate_startup_document(vault._path)
@@ -154,7 +163,6 @@ class CredentialVault:
         vault._path.parent.mkdir(parents=True, exist_ok=True)
         with vault._state.lock:
             vault._acquire_writer()
-            backup_path: Path | None = None
             try:
                 if not vault._path.is_file():
                     raise FileNotFoundError(f"vault does not exist: {vault._path}")
@@ -164,19 +172,38 @@ class CredentialVault:
                     pass
                 else:
                     raise FileExistsError("vault is valid and does not require recovery")
-                backup_path = vault._path.with_name(
-                    f".{vault._path.name}.recovery-{uuid4().hex}"
+
+                marker = vault._prepare_recovery_marker()
+                replacement_path = vault._recovery_artifact_path(
+                    marker, "replacement"
                 )
-                os.replace(vault._path, backup_path)
+                backup_path = vault._recovery_artifact_path(marker, "backup")
                 vault._initialize(password)
-                vault._write(vault._require_unlocked(), create=True)
+                payload = vault._serialize(vault._require_unlocked())
+                temporary_path: Path | None = None
+                try:
+                    temporary_path = vault._write_temporary(payload)
+                    os.replace(temporary_path, replacement_path)
+                    temporary_path = None
+                finally:
+                    _remove_temporary(temporary_path)
+                vault._fsync_parent_directory()
+                _validate_startup_document(replacement_path)
+                marker["phase"] = "replacement_ready"
+                vault._write_recovery_marker(marker)
+
+                vault._ensure_recovery_backup(backup_path)
+                marker["phase"] = "backup_ready"
+                vault._write_recovery_marker(marker)
+
+                marker["phase"] = "publishing"
+                vault._write_recovery_marker(marker)
+                os.replace(replacement_path, vault._path)
+                vault._fsync_parent_directory()
+                _validate_startup_document(vault._path)
+                vault._clear_recovery_marker()
             except Exception:
                 vault._clear_sensitive()
-                if backup_path is not None and backup_path.exists() and not vault._path.exists():
-                    try:
-                        os.replace(backup_path, vault._path)
-                    except OSError:
-                        pass
                 vault._release_writer()
                 raise
             return vault
@@ -319,6 +346,13 @@ class CredentialVault:
         return self._secrets
 
     def _write(self, secrets: dict[str, str], *, create: bool = False) -> None:
+        payload = self._serialize(secrets)
+        if create:
+            self._atomic_create(payload)
+        else:
+            self._atomic_write(payload)
+
+    def _serialize(self, secrets: dict[str, str]) -> bytes:
         key = self._require_key()
         salt = self._require_salt()
         kdf_parameters = self._require_kdf_parameters()
@@ -335,11 +369,118 @@ class CredentialVault:
             "nonce": _encode(nonce),
             "ciphertext": _encode(ciphertext),
         }
-        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
-        if create:
-            self._atomic_create(payload)
+        return json.dumps(document, separators=(",", ":")).encode("utf-8")
+
+    def _recovery_marker_path(self) -> Path:
+        return self._path.with_name(f".{self._path.name}.recovery.json")
+
+    def _recovery_artifact_path(
+        self, marker: dict[str, object], field_name: str
+    ) -> Path:
+        return self._path.parent / str(marker[field_name])
+
+    def _prepare_recovery_marker(self) -> dict[str, object]:
+        marker_path = self._recovery_marker_path()
+        if marker_path.exists():
+            marker = _load_recovery_marker(self._path)
+            marker["phase"] = "prepared"
         else:
-            self._atomic_write(payload)
+            transaction_id = uuid4().hex
+            marker = {
+                "version": _RECOVERY_MARKER_VERSION,
+                "phase": "prepared",
+                "replacement": f".{self._path.name}.recovery-new-{transaction_id}",
+                "backup": f".{self._path.name}.recovery-{transaction_id}",
+            }
+        self._write_recovery_marker(marker)
+        return marker
+
+    def _write_recovery_marker(self, marker: dict[str, object]) -> None:
+        marker_path = self._recovery_marker_path()
+        payload = json.dumps(marker, separators=(",", ":")).encode("utf-8")
+        descriptor: int | None = None
+        temporary_path: Path | None = None
+        published = False
+        try:
+            descriptor, raw_temporary_path = tempfile.mkstemp(
+                prefix=f".{marker_path.name}.", dir=self._path.parent
+            )
+            temporary_path = Path(raw_temporary_path)
+            with os.fdopen(descriptor, "wb") as marker_file:
+                descriptor = None
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(marker_file.fileno(), 0o600)
+                marker_file.write(payload)
+                marker_file.flush()
+                os.fsync(marker_file.fileno())
+            os.replace(temporary_path, marker_path)
+            published = True
+            self._fsync_parent_directory()
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if not published:
+                _remove_temporary(temporary_path)
+
+    def _ensure_recovery_backup(self, backup_path: Path) -> None:
+        if backup_path.exists():
+            try:
+                if not os.path.samefile(self._path, backup_path):
+                    raise VaultRecoveryRequiredError(
+                        "recovery backup does not match the corrupt vault"
+                    )
+            except OSError as exc:
+                raise VaultRecoveryRequiredError(
+                    "recovery backup could not be validated"
+                ) from exc
+        else:
+            os.link(self._path, backup_path)
+        _fsync_file(backup_path)
+        self._fsync_parent_directory()
+
+    def _finish_interrupted_recovery(self) -> None:
+        marker = _load_recovery_marker(self._path)
+        replacement_path = self._recovery_artifact_path(marker, "replacement")
+        backup_path = self._recovery_artifact_path(marker, "backup")
+
+        if _is_valid_startup_document(self._path):
+            if not backup_path.is_file():
+                raise VaultRecoveryRequiredError(
+                    "recovery backup is missing; explicit recovery is required"
+                )
+            _fsync_file(self._path)
+            _fsync_file(backup_path)
+            self._fsync_parent_directory()
+            self._clear_recovery_marker()
+            return
+
+        if not _is_valid_startup_document(replacement_path):
+            raise VaultRecoveryRequiredError(
+                "recovery replacement is incomplete; explicit recovery is required"
+            )
+
+        _fsync_file(replacement_path)
+        if self._path.is_file():
+            self._ensure_recovery_backup(backup_path)
+        elif not backup_path.is_file():
+            raise VaultRecoveryRequiredError(
+                "recovery source is missing; explicit recovery is required"
+            )
+        else:
+            _fsync_file(backup_path)
+            self._fsync_parent_directory()
+        os.replace(replacement_path, self._path)
+        self._fsync_parent_directory()
+        _validate_startup_document(self._path)
+        self._clear_recovery_marker()
+
+    def _clear_recovery_marker(self) -> None:
+        self._recovery_marker_path().unlink(missing_ok=True)
+        self._fsync_parent_directory()
 
     def _write_temporary(self, payload: bytes) -> Path:
         descriptor: int | None = None
@@ -509,6 +650,58 @@ def _validate_startup_document(path: Path) -> None:
         raise VaultRecoveryRequiredError(
             "vault is incomplete or corrupt; explicit recovery is required"
         ) from exc
+
+
+def _is_valid_startup_document(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        _validate_startup_document(path)
+    except VaultRecoveryRequiredError:
+        return False
+    return True
+
+
+def _load_recovery_marker(path: Path) -> dict[str, object]:
+    marker_path = path.with_name(f".{path.name}.recovery.json")
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != _RECOVERY_MARKER_FIELDS
+            or type(marker["version"]) is not int
+            or marker["version"] != _RECOVERY_MARKER_VERSION
+            or marker["phase"] not in _RECOVERY_PHASES
+        ):
+            raise ValueError("invalid recovery marker")
+        replacement = marker["replacement"]
+        backup = marker["backup"]
+        replacement_prefix = f".{path.name}.recovery-new-"
+        backup_prefix = f".{path.name}.recovery-"
+        if (
+            not isinstance(replacement, str)
+            or Path(replacement).name != replacement
+            or not replacement.startswith(replacement_prefix)
+            or len(replacement) == len(replacement_prefix)
+            or not isinstance(backup, str)
+            or Path(backup).name != backup
+            or not backup.startswith(backup_prefix)
+            or len(backup) == len(backup_prefix)
+        ):
+            raise ValueError("invalid recovery artifact paths")
+        return marker
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise VaultRecoveryRequiredError(
+            "recovery transaction is incomplete; explicit recovery is required"
+        ) from exc
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _remove_temporary(path: Path | None) -> None:

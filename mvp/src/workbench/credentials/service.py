@@ -17,7 +17,9 @@ class VaultService:
         self._lock = RLock()
         self._recovery_required = False
         try:
-            self._vault = CredentialVault.open(path) if path.is_file() else None
+            self._vault = CredentialVault.open(path)
+        except FileNotFoundError:
+            self._vault = None
         except VaultRecoveryRequiredError:
             self._vault = None
             self._recovery_required = True
@@ -33,7 +35,7 @@ class VaultService:
 
     def create(self, password: str) -> None:
         with self._lock:
-            if self._vault is not None or self.path.exists():
+            if self._recovery_required or self._vault is not None or self.path.exists():
                 raise FileExistsError("vault already exists")
             try:
                 self._vault = CredentialVault.create(self.path, password)
