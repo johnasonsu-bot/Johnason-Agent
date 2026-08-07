@@ -15,19 +15,18 @@ from uuid import UUID
 import uvicorn
 from fastapi import FastAPI
 
-from workbench.adapters.hermes.runner import AgentStepResult
+from workbench.adapters.hermes.runner import AgentStepRunner
+from workbench.adapters.hermes.runtime import AgentRuntime, WorkflowInterventions
 from workbench.api.app import AppSettings, create_app
+from workbench.conversations.repository import ConversationRepository
 from workbench.credentials.service import VaultService
 from workbench.models.deepseek import DeepSeekProvider
 from workbench.models.gateway import ModelGateway
 from workbench.models.lmstudio import LMStudioProvider
 from workbench.models.openai_compatible import OpenAICompatibleProvider
+from workbench.providers.repository import ProviderRepository
 from workbench.settings import WorkbenchSettings
-
-
-class IdleRunner:
-    async def execute_step(self, run_id: str, step_id: str) -> AgentStepResult:
-        return AgentStepResult(checkpoint={"runner": "idle"})
+from workbench.workflow.repository import WorkflowRepository
 
 
 def build_app(
@@ -35,6 +34,7 @@ def build_app(
     *,
     capability_token: str | None = None,
     service_instance_id: str | None = None,
+    runner: AgentStepRunner | None = None,
 ) -> FastAPI:
     resolved = settings or WorkbenchSettings()
     resolved.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -47,10 +47,26 @@ def build_app(
             "openai_chat": OpenAICompatibleProvider(vault=vault),
         }
     )
-    return create_app(
+    providers = ProviderRepository(resolved.database)
+
+    def active_profile():
+        try:
+            return next(profile for profile in providers.list() if profile.enabled)
+        except StopIteration as exc:
+            raise ValueError("no enabled model provider is configured") from exc
+
+    workflow = WorkflowRepository(resolved.database)
+    agent_runtime = AgentRuntime(
+        gateway=gateway,
+        profile=active_profile,
+        conversations=ConversationRepository(resolved.database),
+        checkpoints=workflow,
+        interventions=WorkflowInterventions(workflow),
+    )
+    app = create_app(
         AppSettings(
             database=resolved.database,
-            runner=IdleRunner(),
+            runner=runner or agent_runtime,
             owner_id=resolved.owner_id,
             vault=vault,
             gateway=gateway,
@@ -59,6 +75,8 @@ def build_app(
             service_instance_id=service_instance_id,
         )
     )
+    app.state.agent_runtime = agent_runtime
+    return app
 
 
 def _read_bootstrap() -> tuple[str, str]:
