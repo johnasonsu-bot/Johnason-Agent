@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 2
+PHASE1_SCHEMA_VERSION = 3
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -99,6 +99,24 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS model_provider_profiles (
             provider_id TEXT PRIMARY KEY,
             record_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS conversation_sessions (
+            session_id TEXT PRIMARY KEY,
+            record_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            message_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL UNIQUE,
+            sequence INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            UNIQUE (session_id, sequence),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS conversation_continuation_states (
+            session_id TEXT PRIMARY KEY,
+            state_json TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
         );
         """
     )
