@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import secrets
 import threading
@@ -23,11 +24,13 @@ class ConversationRunner:
     def __init__(self) -> None:
         self.active = 0
         self.maximum_active = 0
+        self.calls = 0
         self.lock = threading.Lock()
 
     async def run_turn(self, command: RunAgentTurn):
         with self.lock:
             self.active += 1
+            self.calls += 1
             self.maximum_active = max(self.maximum_active, self.active)
         try:
             yield AgentEvent(kind="turn_started", session_id=command.session_id, run_id=command.run_id)
@@ -146,6 +149,13 @@ def _start_session(client: TestClient, session_id: str = "session-1") -> None:
     assert response.status_code == 200
 
 
+def _conversation_run_id(session_id: str) -> str:
+    digest = hashlib.sha256(
+        json.dumps({"session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return f"conversation-run:{digest}"
+
+
 def _send_message(
     client: TestClient,
     session_id: str,
@@ -165,7 +175,7 @@ def _frames(response) -> list[tuple[int, dict]]:
     assert response.status_code == 200, response.text
     return [
         (
-            int(frame.splitlines()[0].removeprefix("id: ")),
+            int(frame.splitlines()[0].removeprefix("id: ").split(":", 1)[0]),
             json.loads(frame.splitlines()[1].removeprefix("data: ")),
         )
         for frame in response.text.strip().split("\n\n")
@@ -333,7 +343,9 @@ def test_lifecycle_intervention_is_claimed_acknowledged_and_projected(tmp_path: 
     )
     completed = _send_message(client, "session-1", "inspect", "message-1")
 
-    records = WorkflowRepository(database).list_interventions("session-1")
+    records = WorkflowRepository(database).list_interventions(
+        _conversation_run_id("session-1")
+    )
     replay = client.get("/api/sessions/session-1/events").text
     assert queued.status_code == 200
     assert completed["status"] == "completed"
@@ -374,7 +386,12 @@ def test_active_turn_does_not_block_intervention_or_pause(tmp_path: Path) -> Non
     assert intervention.status_code == paused.status_code == 200
     assert result and result[0].status_code == 200
     assert result[0].json()["status"] == "paused"
-    assert [item.state.value for item in WorkflowRepository(database).list_interventions("session-1")] == ["acknowledged"]
+    assert [
+        item.state.value
+        for item in WorkflowRepository(database).list_interventions(
+            _conversation_run_id("session-1")
+        )
+    ] == ["acknowledged"]
 
 
 def test_conversation_routes_use_existing_capability_middleware(tmp_path: Path) -> None:
@@ -461,3 +478,55 @@ def test_tool_result_requires_explicit_public_projection() -> None:
 
     assert "result" not in map_domain_event(raw)[0]
     assert map_domain_event(public)[0]["result"] == "safe output"
+
+
+def test_session_rejects_a_foreign_lifecycle_run_with_the_internal_identifier(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    session_id = "session-1"
+    digest = hashlib.sha256(
+        json.dumps({"session_id": session_id}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    internal_run_id = f"conversation-run:{digest}"
+    _lifecycle_run(database, internal_run_id)
+    client = _client(database)
+
+    response = client.post("/api/sessions", json={"session_id": session_id})
+
+    assert response.status_code == 409
+
+
+def test_completed_message_command_replays_without_calling_runner_again(tmp_path: Path) -> None:
+    runner = ConversationRunner()
+    client = _client(tmp_path / "conversation.sqlite", runner)
+    _start_session(client)
+
+    first = _send_message(client, "session-1", "hello", "message-1")
+    second = _send_message(client, "session-1", "hello", "message-1")
+
+    assert first == second
+    assert runner.calls == 1
+
+
+def test_sse_composite_cursor_replays_later_projections_of_the_same_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import workbench.api.conversations as conversation_api
+
+    client = _client(tmp_path / "conversation.sqlite")
+    _start_session(client)
+    _send_message(client, "session-1", "hello", "message-1")
+    original = conversation_api.map_domain_event
+    monkeypatch.setattr(
+        conversation_api,
+        "map_domain_event",
+        lambda event: [*original(event), {"type": "CUSTOM", "name": "extra"}],
+    )
+
+    replay = client.get(
+        "/api/sessions/session-1/events", headers={"Last-Event-ID": "2:0"}
+    )
+
+    ids = [frame.splitlines()[0].removeprefix("id: ") for frame in replay.text.strip().split("\n\n")]
+    assert ids == ["2:1", "3:0", "3:1"]

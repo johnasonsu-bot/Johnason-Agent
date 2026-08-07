@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -49,7 +50,7 @@ def test_stream_resumes_after_last_event_id(tmp_path: Path) -> None:
     assert "id: 1\n" not in replay.text
     assert "turn_finished" in replay.text
     frames = [frame for frame in replay.text.strip().split("\n\n") if frame]
-    assert [int(frame.splitlines()[0].removeprefix("id: ")) for frame in frames] == [3]
+    assert [frame.splitlines()[0].removeprefix("id: ") for frame in frames] == ["3:0"]
     assert json.loads(frames[0].splitlines()[1].removeprefix("data: "))["name"] == "turn_finished"
 
 
@@ -67,7 +68,7 @@ def test_invalid_last_event_id_is_rejected(tmp_path: Path) -> None:
     response = client.get("/api/sessions/session-1/events", headers={"Last-Event-ID": "nope"})
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "Last-Event-ID must be an integer"
+    assert response.json()["detail"] == "Last-Event-ID must be an integer or sequence:index"
 
 
 class ProviderStub:
@@ -112,5 +113,8 @@ def test_real_agent_runtime_applies_session_intervention_at_safe_boundary(
         message.content == "Human intervention: include hidden files"
         for message in provider.requests[0].messages
     )
-    assert workflow.list_interventions("session-1")[0].state.value == "acknowledged"
+    run_id = "conversation-run:" + hashlib.sha256(
+        json.dumps({"session_id": "session-1"}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert workflow.list_interventions(run_id)[0].state.value == "acknowledged"
     assert "intervention.applied" in client.get("/api/sessions/session-1/events").text

@@ -95,6 +95,9 @@ class ConversationAPI:
         reservation_id = self._reserve(
             session_id, command_id, "message", {"content": content, "model": model}
         )
+        terminal = self._terminal_response(session_id, command_id, reservation_id)
+        if terminal is not None:
+            return terminal
         async with self._session_lock(session_id):
             if self._status(session_id) == "paused":
                 raise SessionPausedError(session_id)
@@ -103,11 +106,12 @@ class ConversationAPI:
             projected, retryable = await self._record_turn(
                 RunAgentTurn(
                     session_id=session_id,
-                    run_id=session_id,
+                    run_id=self._lifecycle_run_id(session_id),
                     command_id=command_id,
                     prompt=content,
                     model=model,
-                )
+                ),
+                reservation_id=reservation_id,
             )
         if retryable:
             raise RetryableTurnError("agent turn is retryable")
@@ -138,7 +142,7 @@ class ConversationAPI:
             assert self.engine is not None
             record = self.engine.submit_intervention(
                 SubmitIntervention(
-                    run_id=session_id,
+                    run_id=self._lifecycle_run_id(session_id),
                     command_id="conversation-lifecycle:" + self._digest(
                         {"session_id": session_id, "command_id": command_id}
                     ),
@@ -171,11 +175,17 @@ class ConversationAPI:
             )
             if status == "paused":
                 self.engine.pause_run(
-                    PauseRun(run_id=session_id, command_id=lifecycle_command_id)
+                    PauseRun(
+                        run_id=self._lifecycle_run_id(session_id),
+                        command_id=lifecycle_command_id,
+                    )
                 )
             else:
                 self.engine.resume_run(
-                    ResumeRun(run_id=session_id, command_id=lifecycle_command_id)
+                    ResumeRun(
+                        run_id=self._lifecycle_run_id(session_id),
+                        command_id=lifecycle_command_id,
+                    )
                 )
         event = self._append(
             session_id,
@@ -186,28 +196,36 @@ class ConversationAPI:
         )
         return {"session_id": session_id, "status": status, "event": event}
 
-    def stream(self, session_id: str, *, after_sequence: int) -> StreamingResponse:
+    def stream(
+        self, session_id: str, *, after_cursor: tuple[int, int]
+    ) -> StreamingResponse:
         self._require_session(session_id)
         return StreamingResponse(
-            self._stream_events(session_id, after_sequence=after_sequence),
+            self._stream_events(session_id, after_cursor=after_cursor),
             media_type="text/event-stream",
         )
 
     async def _stream_events(
-        self, session_id: str, *, after_sequence: int) -> AsyncIterator[str]:
+        self, session_id: str, *, after_cursor: tuple[int, int]
+    ) -> AsyncIterator[str]:
         import json
 
         for event in self.events.read_stream(
-            f"run:{session_id}", after_sequence=after_sequence
+            f"run:{session_id}", after_sequence=max(0, after_cursor[0] - 1)
         ):
-            for projected in map_domain_event(event):
-                yield f"id: {event.sequence}\ndata: {json.dumps(projected, ensure_ascii=False)}\n\n"
+            for projection_index, projected in enumerate(map_domain_event(event)):
+                cursor = (event.sequence or 0, projection_index)
+                if cursor <= after_cursor:
+                    continue
+                yield (
+                    f"id: {cursor[0]}:{cursor[1]}\n"
+                    f"data: {json.dumps(projected, ensure_ascii=False)}\n\n"
+                )
 
     async def _record_turn(
-        self, command: RunAgentTurn
+        self, command: RunAgentTurn, *, reservation_id: str
     ) -> tuple[list[dict[str, Any]], bool]:
         projected: list[dict[str, Any]] = []
-        reservation_id = self._reservation_id(command.session_id, command.command_id)
         attempt = sum(
             event.event_type == "conversation.turn.retryable"
             and event.causation_id == reservation_id
@@ -315,6 +333,40 @@ class ConversationAPI:
                     status = "failed"
         return status
 
+    def _terminal_response(
+        self, session_id: str, command_id: str, reservation_id: str
+    ) -> dict[str, Any] | None:
+        events = [
+            event
+            for event in self.events.read_stream(f"run:{session_id}")
+            if event.causation_id == reservation_id
+        ]
+        if not events:
+            return None
+        terminal = next(
+            (
+                event
+                for event in reversed(events)
+                if event.event_type
+                in {"conversation.turn.finished", "conversation.turn.failed"}
+            ),
+            None,
+        )
+        if terminal is None:
+            return None
+        return {
+            "session_id": session_id,
+            "command_id": command_id,
+            "status": "completed"
+            if terminal.event_type == "conversation.turn.finished"
+            else "failed",
+            "events": [
+                projected
+                for event in events
+                for projected in map_domain_event(event)
+            ],
+        }
+
     def _require_session(self, session_id: str) -> None:
         with self.conversations.store.connect() as connection:
             row = connection.execute(
@@ -326,10 +378,13 @@ class ConversationAPI:
     def _has_lifecycle_run(self, session_id: str) -> bool:
         if self.engine is None:
             return False
+        run_id, mission_id, epoch_id, _project_id = self._lifecycle_ids(session_id)
         try:
-            self.engine.repository.get_run(session_id)
+            record = self.engine.repository.get_run(run_id)
         except KeyError:
             return False
+        if record.mission_id != mission_id or record.epoch_id != epoch_id:
+            raise ValueError("conversation lifecycle identity conflict")
         return True
 
     def _ensure_lifecycle_run(self, session_id: str) -> None:
@@ -337,9 +392,7 @@ class ConversationAPI:
         assert self.engine is not None
         if self._has_lifecycle_run(session_id):
             return
-        project_id = f"conversation:{session_id}"
-        mission_id = f"conversation:{session_id}"
-        epoch_id = f"conversation:{session_id}"
+        run_id, mission_id, epoch_id, project_id = self._lifecycle_ids(session_id)
         repository = self.engine.repository
         for create, record in (
             (repository.create_project, ProjectRecord(project_id=project_id, name="Conversation")),
@@ -363,7 +416,7 @@ class ConversationAPI:
         self.engine.start_run(
             StartRun(
                 record=RunRecord(
-                    run_id=session_id, mission_id=mission_id, epoch_id=epoch_id
+                    run_id=run_id, mission_id=mission_id, epoch_id=epoch_id
                 ),
                 command_id="conversation-session:" + self._digest({"session_id": session_id}),
             )
@@ -373,7 +426,9 @@ class ConversationAPI:
         if not self._has_lifecycle_run(session_id):
             return
         assert self.engine is not None
-        for record in self.engine.repository.list_interventions(session_id):
+        for record in self.engine.repository.list_interventions(
+            self._lifecycle_run_id(session_id)
+        ):
             if record.state.value != "acknowledged":
                 continue
             self._append(
@@ -419,6 +474,20 @@ class ConversationAPI:
     def _digest(value: dict[str, Any]) -> str:
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _lifecycle_ids(cls, session_id: str) -> tuple[str, str, str, str]:
+        digest = cls._digest({"session_id": session_id})
+        return (
+            f"conversation-run:{digest}",
+            f"conversation-mission:{digest}",
+            f"conversation-epoch:{digest}",
+            f"conversation-project:{digest}",
+        )
+
+    @classmethod
+    def _lifecycle_run_id(cls, session_id: str) -> str:
+        return cls._lifecycle_ids(session_id)[0]
 
     @classmethod
     def _reservation_id(cls, session_id: str, command_id: str) -> str:
@@ -483,12 +552,28 @@ def _public_turn_event(event: AgentEvent) -> tuple[str, dict[str, Any]]:
     }
 
 
+def _parse_last_event_id(value: str | None) -> tuple[int, int]:
+    """Accept legacy sequence cursors and exact projection cursors."""
+    if value is None or value == "":
+        return (0, -1)
+    try:
+        if ":" not in value:
+            return (int(value), 2**31 - 1)
+        sequence, projection = value.split(":", 1)
+        return (int(sequence), int(projection))
+    except ValueError as exc:
+        raise ValueError("Last-Event-ID must be an integer or sequence:index") from exc
+
+
 def conversation_router(api: ConversationAPI) -> APIRouter:
     router = APIRouter(prefix="/api")
 
     @router.post("/sessions")
     def create_session(payload: CreateSessionRequest) -> dict[str, Any]:
-        return api.create_session(payload.session_id).model_dump(mode="json")
+        try:
+            return api.create_session(payload.session_id).model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @router.post("/sessions/{session_id}/messages")
     async def send_message(
@@ -522,13 +607,13 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         last_event_id: str | None = Header(None, alias="Last-Event-ID"),
     ) -> StreamingResponse:
         try:
-            cursor = int(last_event_id or 0)
+            cursor = _parse_last_event_id(last_event_id)
         except ValueError as exc:
-            raise HTTPException(400, "Last-Event-ID must be an integer") from exc
-        if cursor < 0:
+            raise HTTPException(400, str(exc)) from exc
+        if cursor[0] < 0 or cursor[1] < -1:
             raise HTTPException(400, "Last-Event-ID must be non-negative")
         try:
-            return api.stream(session_id, after_sequence=cursor)
+            return api.stream(session_id, after_cursor=cursor)
         except KeyError as exc:
             raise HTTPException(404, "session not found") from exc
         except ValueError as exc:
