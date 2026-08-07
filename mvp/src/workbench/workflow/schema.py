@@ -161,6 +161,11 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         connection, "conversation_turns", "prompt_digest", "TEXT"
     )
     _upgrade_conversation_command_scope(connection)
+    current_version = connection.execute(
+        "SELECT MAX(version) FROM schema_migrations"
+    ).fetchone()[0]
+    if current_version != PHASE1_SCHEMA_VERSION:
+        connection.execute("DELETE FROM conversation_continuation_states")
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, unixepoch('subsec'))",
         (PHASE1_SCHEMA_VERSION,),

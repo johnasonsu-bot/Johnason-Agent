@@ -1,4 +1,5 @@
 import asyncio
+import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -781,3 +782,161 @@ async def test_model_heartbeat_renews_claimed_interventions(tmp_path: Path) -> N
     assert stolen == []
     assert events[-1].kind == "turn_finished"
     assert workflow.list_pending_interventions("run-1") == []
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_is_sealed_before_consumer_can_cancel(tmp_path: Path) -> None:
+    operations: list[str] = []
+    checkpoints = RecordingCheckpointStore(operations)
+    repository = ConversationRepository(tmp_path / "runtime.sqlite")
+    runtime = AgentRuntime(
+        gateway=SequencedGateway(),
+        profile=profile(),
+        conversations=repository,
+        tools=[ExplodingTool(operations)],
+        checkpoints=checkpoints,
+    )
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="list",
+    )
+    stream = runtime.run_turn(command)
+
+    assert (await anext(stream)).kind == "turn_started"
+    assert (await anext(stream)).kind == "tool_started"
+    assert (await anext(stream)).kind == "tool_failed"
+    await stream.aclose()
+
+    loaded = repository.load_turn("session-1", "turn-1")
+    assert loaded is not None
+    assert loaded[0] == "reconciliation_required"
+    assert [event["kind"] for event in loaded[2] or []][-2:] == [
+        "tool_failed",
+        "turn_failed",
+    ]
+    assert checkpoints.checkpoint[1]["status"] == "reconciliation_required"
+
+
+class FailsFirstCheckpoint:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def save_checkpoint(self, run_id: str, state: dict) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("checkpoint unavailable")
+
+
+@pytest.mark.asyncio
+async def test_failure_finalizing_recovers_checkpoint_before_terminal_seal(
+    tmp_path: Path,
+) -> None:
+    repository = ConversationRepository(tmp_path / "runtime.sqlite")
+    checkpoints = FailsFirstCheckpoint()
+    runtime = AgentRuntime(
+        gateway=EmptyGateway(),
+        profile=profile(),
+        conversations=repository,
+        checkpoints=checkpoints,
+        turn_lease_seconds=0.01,
+    )
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="hello",
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint unavailable"):
+        await _collect(runtime, command)
+    in_flight = repository.load_turn("session-1", "turn-1")
+    assert in_flight is not None
+    assert in_flight[0] == "running"
+    assert in_flight[1]["phase"] == "failure_finalizing"
+    await asyncio.sleep(0.02)
+
+    events = await _collect(runtime, command)
+    assert events[-1].kind == "turn_failed"
+    assert repository.load_turn("session-1", "turn-1")[0] == "failed"
+    assert checkpoints.calls == 2
+
+
+@pytest.mark.parametrize("lease", [0, -1, math.inf, math.nan])
+def test_turn_lease_must_be_finite_and_positive(tmp_path: Path, lease: float) -> None:
+    with pytest.raises(ValueError, match="turn_lease_seconds"):
+        AgentRuntime(
+            gateway=EmptyGateway(),
+            profile=profile(),
+            conversations=ConversationRepository(tmp_path / "runtime.sqlite"),
+            turn_lease_seconds=lease,
+        )
+
+
+@pytest.mark.asyncio
+async def test_busy_turn_wait_has_a_deadline(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "runtime.sqlite")
+    state = {"phase": "before_model", "messages": [], "events": []}
+    repository.claim_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="local",
+        model="default",
+        prompt="hello",
+        owner_id="other-owner",
+        initial_state=state,
+        lease_seconds=1,
+    )
+    runtime = AgentRuntime(
+        gateway=EmptyGateway(),
+        profile=profile(),
+        conversations=repository,
+        turn_lease_seconds=0.01,
+        busy_wait_timeout=0.02,
+    )
+
+    with pytest.raises(TimeoutError, match="busy turn"):
+        await _collect(
+            runtime,
+            RunAgentTurn(
+                session_id="session-1",
+                run_id="run-1",
+                command_id="turn-1",
+                prompt="hello",
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_model_step_budget_survives_restart(tmp_path: Path) -> None:
+    gateway = SequencedGateway()
+    gateway.responses = [
+        ModelResponse(
+            tool_calls=[ToolCall(id="call-1", name="list_files", arguments={})]
+        )
+    ]
+    repository = CrashAfterFirstToolRepository(tmp_path / "runtime.sqlite")
+    runtime = AgentRuntime(
+        gateway=gateway,
+        profile=profile(),
+        conversations=repository,
+        tools=[RecordingTool([])],
+        max_model_steps=1,
+        turn_lease_seconds=0.01,
+    )
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="one model step only",
+    )
+
+    with pytest.raises(SimulatedCrash):
+        await _collect(runtime, command)
+    await asyncio.sleep(0.02)
+    events = await _collect(runtime, command)
+
+    assert events[-1].payload["reason"] == "max_steps_exceeded"
+    assert len(gateway.requests) == 1

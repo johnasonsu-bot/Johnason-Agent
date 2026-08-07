@@ -33,6 +33,13 @@ completion, final-answer finalization, committed tool-event recovery, command
 identity conflicts, and intervention leases expiring during a long model call.
 Those tests failed before the v6 state-machine changes and pass afterward.
 
+The final review loop added RED cancellation/checkpoint fault injection. It
+proved that a consumer could previously cancel after observing `tool_failed`
+but before terminal persistence, and that checkpoint failure could leave a
+sealed terminal without its checkpoint. Lease validation, busy-wait timeout,
+restart-persistent model-step budget, and one-time legacy continuation cleanup
+were covered in the same round.
+
 ## Design decisions
 
 - `RunAgentTurn`, `AgentEvent`, `AgentTool`, checkpoint, and intervention ports
@@ -67,6 +74,15 @@ Those tests failed before the v6 state-machine changes and pass afterward.
 - Unknown tools produce a controlled `tool_failed` result for model correction;
   tool exceptions, empty responses, and max-step exhaustion persist explicit
   `turn_failed` outcomes and failure checkpoints.
+- Failure paths now persist `failure_finalizing`, write the failure checkpoint,
+  seal the replayable terminal, and only then emit `tool_failed`/`turn_failed`.
+  Restart can finish a checkpoint that previously failed without repeating an
+  uncertain tool effect.
+- Turn leases must be finite and at least 10 ms. Busy duplicate waits have a
+  configurable finite deadline, and the model-step count is part of turn state
+  so restart cannot reset the maximum-step budget.
+- The v6 migration removes legacy session-wide continuation data once; current
+  turn-scoped private protocol state remains authoritative.
 - The assistant message and safe checkpoint are persisted before
   `turn_finished` is yielded.
 - Skill instructions and tool definitions are constructor dependencies, so the
@@ -77,7 +93,7 @@ Those tests failed before the v6 state-machine changes and pass afterward.
 Review-fix focused runtime/integration tests:
 
 ```text
-39 passed, 1 warning in 1.01s
+48 passed, 1 warning in 1.16s
 ```
 
 Expanded persistence/workflow set:
@@ -89,7 +105,7 @@ Expanded persistence/workflow set:
 Full Python suite:
 
 ```text
-218 passed, 4 skipped, 1 warning in 73.78s
+227 passed, 4 skipped, 1 warning in 73.47s
 ```
 
 The skipped tests are environment-gated live probes. The warning is the
@@ -105,3 +121,6 @@ existing Starlette `httpx` deprecation warning.
   provider selection, and built-in project tools remain Task 3/4 work.
 - Live LM Studio and DeepSeek credentials/models were intentionally not used in
   this task; the live provider gate remains in Task 4.
+- Serializing different command IDs within one session is intentionally left to
+  the Task 3 conversation scheduler/API boundary; this runtime guarantees
+  ownership and replay for each `(session_id, command_id)` independently.

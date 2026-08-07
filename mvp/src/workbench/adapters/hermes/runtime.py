@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any
 from uuid import uuid4
@@ -97,9 +99,14 @@ class AgentRuntime:
         interventions: InterventionBoundary | None = None,
         max_model_steps: int = 8,
         turn_lease_seconds: float = 30,
+        busy_wait_timeout: float = 30,
     ) -> None:
         if max_model_steps < 1:
             raise ValueError("max_model_steps must be positive")
+        if not math.isfinite(turn_lease_seconds) or turn_lease_seconds < 0.01:
+            raise ValueError("turn_lease_seconds must be finite and at least 0.01")
+        if not math.isfinite(busy_wait_timeout) or busy_wait_timeout <= 0:
+            raise ValueError("busy_wait_timeout must be finite and positive")
         self.gateway = gateway
         self._profile = profile
         self.conversations = conversations
@@ -112,6 +119,7 @@ class AgentRuntime:
         self.interventions = interventions or _NoInterventions()
         self.max_model_steps = max_model_steps
         self.turn_lease_seconds = turn_lease_seconds
+        self.busy_wait_timeout = busy_wait_timeout
 
     async def run_turn(
         self, command: RunAgentTurn
@@ -133,6 +141,7 @@ class AgentRuntime:
                 for message in self._model_messages(command.session_id)
             ],
             "events": [],
+            "model_step_count": 0,
         }
         claim = self.conversations.claim_turn(
             session_id=command.session_id,
@@ -146,7 +155,10 @@ class AgentRuntime:
             lease_seconds=self.turn_lease_seconds,
         )
         if claim.disposition == "busy":
+            wait_deadline = time.monotonic() + self.busy_wait_timeout
             while claim.disposition == "busy":
+                if time.monotonic() >= wait_deadline:
+                    raise TimeoutError("busy turn wait deadline exceeded")
                 await asyncio.sleep(min(0.01, self.turn_lease_seconds))
                 claim = self.conversations.claim_turn(
                     session_id=command.session_id,
@@ -174,6 +186,11 @@ class AgentRuntime:
                 reason="reconciliation_required",
                 status="reconciliation_required",
             ):
+                yield event
+            return
+        if state.get("phase") == "failure_finalizing":
+            self._persist_failure_finalizing(command, owner_id, state)
+            for event in events:
                 yield event
             return
         if state.get("phase") == "finalizing":
@@ -229,7 +246,7 @@ class AgentRuntime:
                     failed = True
             if failed:
                 return
-        for _ in range(self.max_model_steps):
+        while int(state.get("model_step_count", 0)) < self.max_model_steps:
             base_messages = list(messages)
             claimed = self.interventions.claim_pending(
                 command.run_id, boundary="before_model", owner_id=owner_id
@@ -246,6 +263,7 @@ class AgentRuntime:
                 )
             state["included_intervention_ids"] = intervention_ids
             state["phase"] = "model_running"
+            state["model_step_count"] = int(state.get("model_step_count", 0)) + 1
             state["messages"] = [self._serialize_message(message) for message in messages]
             self.conversations.save_turn_state(
                 command.session_id,
@@ -270,6 +288,9 @@ class AgentRuntime:
             except Exception as exc:
                 self.interventions.release(intervention_ids, owner_id=owner_id)
                 state["phase"] = "before_model"
+                state["model_step_count"] = max(
+                    0, int(state.get("model_step_count", 1)) - 1
+                )
                 state.pop("included_intervention_ids", None)
                 state["messages"] = [
                     self._serialize_message(message) for message in base_messages
@@ -506,7 +527,6 @@ class AgentRuntime:
                         detail=str(exc),
                     )
                     events.append(tool_failed)
-                    yield tool_failed
                     async for event in self._fail_turn(
                         command,
                         owner_id,
@@ -514,6 +534,7 @@ class AgentRuntime:
                         events,
                         reason="reconciliation_required",
                         status="reconciliation_required",
+                        yield_from_index=len(events) - 1,
                     ):
                         yield event
                     return
@@ -627,6 +648,25 @@ class AgentRuntime:
             result=[event.model_dump(mode="json") for event in events],
         )
 
+    def _persist_failure_finalizing(
+        self,
+        command: RunAgentTurn,
+        owner_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        status = str(state["terminal_status"])
+        reason = str(state["reason"])
+        events = [AgentEvent.model_validate(raw) for raw in state.get("events", [])]
+        self._save_checkpoint(command, status=status, reason=reason)
+        self.conversations.finish_turn(
+            command.session_id,
+            command.command_id,
+            owner_id=owner_id,
+            status=status,
+            state={"phase": status, "messages": [], "events": []},
+            result=[event.model_dump(mode="json") for event in events],
+        )
+
     @staticmethod
     def _has_tool_event(
         events: list[AgentEvent], kind: str, tool_call_id: str
@@ -648,21 +688,28 @@ class AgentRuntime:
         *,
         reason: str,
         status: str = "failed",
+        yield_from_index: int | None = None,
         **payload: Any,
     ) -> AsyncIterator[AgentEvent]:
+        start_index = len(events) if yield_from_index is None else yield_from_index
         failed = self._event("turn_failed", command, reason=reason, **payload)
         events.append(failed)
-        terminal_state = {"phase": status, "messages": [], "events": []}
-        self.conversations.finish_turn(
+        finalizing_state = {
+            "phase": "failure_finalizing",
+            "terminal_status": status,
+            "reason": reason,
+            "messages": [],
+            "events": [event.model_dump(mode="json") for event in events],
+        }
+        self.conversations.save_turn_state(
             command.session_id,
             command.command_id,
             owner_id=owner_id,
-            status=status,
-            state=terminal_state,
-            result=[event.model_dump(mode="json") for event in events],
+            state=finalizing_state,
         )
-        self._save_checkpoint(command, status=status, reason=reason)
-        yield failed
+        self._persist_failure_finalizing(command, owner_id, finalizing_state)
+        for event in events[start_index:]:
+            yield event
 
     async def _retryable_failure(
         self,

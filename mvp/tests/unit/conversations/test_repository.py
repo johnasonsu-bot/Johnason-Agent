@@ -205,3 +205,25 @@ def test_continuation_state_survives_repository_restart(tmp_path: Path) -> None:
     assert ConversationRepository(database).load_continuation_state("session-1") == {
         "reasoning_content": "private"
     }
+
+
+def test_v6_migration_removes_legacy_unscoped_continuation_once(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    repository = ConversationRepository(database)
+    repository.save_continuation_state(
+        "session-1", {"reasoning_content": "legacy-private"}
+    )
+    with repository.store.connect() as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, 0)"
+        )
+
+    reopened = ConversationRepository(database)
+    assert reopened.load_continuation_state("session-1") is None
+    reopened.save_continuation_state("session-1", {"reasoning_content": "current"})
+    assert ConversationRepository(database).load_continuation_state("session-1") == {
+        "reasoning_content": "current"
+    }
