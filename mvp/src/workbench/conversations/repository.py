@@ -36,9 +36,9 @@ class ConversationRepository:
             existing = connection.execute(
                 """
                 SELECT record_json FROM conversation_messages
-                WHERE command_id = ?
+                WHERE session_id = ? AND command_id = ?
                 """,
-                (message.command_id,),
+                (message.session_id, message.command_id),
             ).fetchone()
             if existing is not None:
                 connection.commit()

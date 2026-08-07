@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 3
+PHASE1_SCHEMA_VERSION = 4
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -107,9 +107,10 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS conversation_messages (
             message_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
-            command_id TEXT NOT NULL UNIQUE,
+            command_id TEXT NOT NULL,
             sequence INTEGER NOT NULL,
             record_json TEXT NOT NULL,
+            UNIQUE (session_id, command_id),
             UNIQUE (session_id, sequence),
             FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
         );
@@ -120,7 +121,61 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    _upgrade_conversation_command_scope(connection)
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, unixepoch('subsec'))",
         (PHASE1_SCHEMA_VERSION,),
     )
+
+
+def _upgrade_conversation_command_scope(connection: sqlite3.Connection) -> None:
+    """Replace the v3 global command constraint while retaining every message."""
+    if not _has_global_conversation_command_constraint(connection):
+        return
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            "ALTER TABLE conversation_messages RENAME TO conversation_messages_v3"
+        )
+        connection.execute(
+            """
+            CREATE TABLE conversation_messages (
+                message_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                command_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                UNIQUE (session_id, command_id),
+                UNIQUE (session_id, sequence),
+                FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO conversation_messages(
+                message_id, session_id, command_id, sequence, record_json
+            )
+            SELECT message_id, session_id, command_id, sequence, record_json
+            FROM conversation_messages_v3
+            """
+        )
+        connection.execute("DROP TABLE conversation_messages_v3")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _has_global_conversation_command_constraint(connection: sqlite3.Connection) -> bool:
+    indexes = connection.execute("PRAGMA index_list(conversation_messages)").fetchall()
+    for index in indexes:
+        if not index["unique"]:
+            continue
+        columns = connection.execute(
+            f"PRAGMA index_info({index['name']!r})"
+        ).fetchall()
+        if [column["name"] for column in columns] == ["command_id"]:
+            return True
+    return False

@@ -1,6 +1,8 @@
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from workbench.conversations.models import agent_message
+from workbench.conversations.models import ConversationSession, agent_message
 from workbench.conversations.repository import ConversationRepository
 
 
@@ -54,6 +56,128 @@ def test_append_message_is_idempotent_for_a_command_id(tmp_path: Path) -> None:
     assert first.message_id == second.message_id
     assert first.sequence == second.sequence == 1
     assert repository.list_messages("session-1") == [first]
+
+
+def test_message_command_ids_are_idempotent_within_each_session(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "conversation.sqlite")
+
+    first = repository.append_message(
+        agent_message(
+            session_id="session-1", content="first", command_id="shared-command"
+        )
+    )
+    second = repository.append_message(
+        agent_message(
+            session_id="session-2", content="second", command_id="shared-command"
+        )
+    )
+
+    assert first.session_id == "session-1"
+    assert second.session_id == "session-2"
+    assert second.content == "second"
+    assert [message.content for message in repository.list_messages("session-1")] == [
+        "first"
+    ]
+    assert [message.content for message in repository.list_messages("session-2")] == [
+        "second"
+    ]
+
+
+def test_concurrent_distinct_commands_have_continuous_unique_sequences(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    repository = ConversationRepository(database)
+
+    def append(index: int) -> None:
+        repository.append_message(
+            agent_message(content=f"message-{index}", command_id=f"command-{index}")
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(append, range(16)))
+
+    messages = ConversationRepository(database).list_messages("session-1")
+    assert len(messages) == 16
+    assert [message.sequence for message in messages] == list(range(1, 17))
+
+
+def test_concurrent_duplicate_command_persists_one_message(tmp_path: Path) -> None:
+    database = tmp_path / "conversation.sqlite"
+
+    def append(_: int):
+        return ConversationRepository(database).append_message(
+            agent_message(content="answer", command_id="same-command")
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        returned = list(pool.map(append, range(16)))
+
+    assert {message.message_id for message in returned} == {returned[0].message_id}
+    assert ConversationRepository(database).list_messages("session-1") == [returned[0]]
+
+
+def test_v3_global_command_constraint_is_upgraded_without_losing_messages(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "conversation.sqlite"
+    legacy = agent_message(
+        session_id="session-1", content="legacy", command_id="shared-command"
+    ).model_copy(update={"sequence": 1})
+    session = ConversationSession(session_id="session-1")
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
+            );
+            INSERT INTO schema_migrations(version, applied_at) VALUES (3, 0);
+            CREATE TABLE conversation_sessions (
+                session_id TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL
+            );
+            CREATE TABLE conversation_messages (
+                message_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                command_id TEXT NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL,
+                record_json TEXT NOT NULL,
+                UNIQUE (session_id, sequence),
+                FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO conversation_sessions(session_id, record_json) VALUES (?, ?)",
+            (session.session_id, session.model_dump_json()),
+        )
+        connection.execute(
+            """
+            INSERT INTO conversation_messages(
+                message_id, session_id, command_id, sequence, record_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                legacy.message_id,
+                legacy.session_id,
+                legacy.command_id,
+                legacy.sequence,
+                legacy.model_dump_json(),
+            ),
+        )
+
+    repository = ConversationRepository(database)
+    appended = repository.append_message(
+        agent_message(
+            session_id="session-2", content="new", command_id="shared-command"
+        )
+    )
+
+    assert repository.list_messages("session-1") == [legacy]
+    assert appended.session_id == "session-2"
+    assert appended.content == "new"
+    assert repository.list_messages("session-2") == [appended]
 
 
 def test_continuation_state_survives_repository_restart(tmp_path: Path) -> None:
