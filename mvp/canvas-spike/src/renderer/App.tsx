@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { artifacts } from "./artifacts";
 import { ProviderCenter } from "./providers/ProviderCenter";
 import { registry } from "./renderers";
+import { ConversationWorkspace } from "./conversations/ConversationWorkspace";
 import "./styles.css";
 
 const workspaces = [
@@ -43,6 +44,7 @@ function StatusPanel({ title, children }: { title: string; children: string }) {
 }
 
 function WorkspaceContent({ view }: { view: Workspace }) {
+  if (view === "conversations") return <ConversationWorkspace />;
   if (view === "artifacts") return <>{artifacts.map((artifact) => {
     const Renderer = registry.resolve(artifact.kind);
     return <Renderer key={artifact.id} artifact={artifact} />;
@@ -50,7 +52,6 @@ function WorkspaceContent({ view }: { view: Workspace }) {
 
   const content: Record<Exclude<Workspace, "artifacts">, string> = {
     home: "主页工作区正在建设中。这里将汇总最近活动、运行状态和快捷入口。",
-    conversations: "会话工作区正在建设中。你将能够在这里浏览和继续对话。",
     agents: "Agent 工作区正在建设中。你将能够在这里管理和启动 Agent。",
     tasks: "任务工作区正在建设中。你将能够在这里跟踪执行中的工作。",
   };
