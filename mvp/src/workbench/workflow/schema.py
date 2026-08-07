@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 6
+PHASE1_SCHEMA_VERSION = 7
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:

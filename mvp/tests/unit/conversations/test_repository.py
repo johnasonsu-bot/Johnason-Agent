@@ -207,7 +207,7 @@ def test_continuation_state_survives_repository_restart(tmp_path: Path) -> None:
     }
 
 
-def test_v6_migration_removes_legacy_unscoped_continuation_once(
+def test_v7_migration_removes_v6_unscoped_continuation_once(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "conversation.sqlite"
@@ -216,9 +216,9 @@ def test_v6_migration_removes_legacy_unscoped_continuation_once(
         "session-1", {"reasoning_content": "legacy-private"}
     )
     with repository.store.connect() as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
         connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, 0)"
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, 0)"
         )
 
     reopened = ConversationRepository(database)

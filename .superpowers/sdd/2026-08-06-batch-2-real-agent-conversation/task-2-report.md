@@ -31,7 +31,7 @@ also observed failing before heartbeat and retryable-release support.
 A pre-review crash-window audit added a second RED round for multi-tool partial
 completion, final-answer finalization, committed tool-event recovery, command
 identity conflicts, and intervention leases expiring during a long model call.
-Those tests failed before the v6 state-machine changes and pass afterward.
+Those tests failed before the v7 state-machine changes and pass afterward.
 
 The final review loop added RED cancellation/checkpoint fault injection. It
 proved that a consumer could previously cancel after observing `tool_failed`
@@ -63,7 +63,7 @@ were covered in the same round.
   `tool_finished`, protocol messages, and the next index commit atomically.
   Final answers enter a resumable `finalizing` phase before public projection,
   checkpoint, and terminal sealing.
-- Schema v6 binds every command to its original run and prompt digest; a reused
+- Schema v7 binds every command to its original run and prompt digest; a reused
   command cannot replay events into another run or silently change its prompt.
 - Human interventions have one durable claimant and a stale-claim lease. They
   enter requests only at `before_model`, are acknowledged only after a valid
@@ -81,7 +81,7 @@ were covered in the same round.
 - Turn leases must be finite and at least 10 ms. Busy duplicate waits have a
   configurable finite deadline, and the model-step count is part of turn state
   so restart cannot reset the maximum-step budget.
-- The v6 migration removes legacy session-wide continuation data once; current
+- The v7 migration removes legacy v6 session-wide continuation data once; current
   turn-scoped private protocol state remains authoritative.
 - The assistant message and safe checkpoint are persisted before
   `turn_finished` is yielded.
@@ -93,7 +93,7 @@ were covered in the same round.
 Review-fix focused runtime/integration tests:
 
 ```text
-48 passed, 1 warning in 1.16s
+48 passed, 1 warning in 1.21s
 ```
 
 Expanded persistence/workflow set:
@@ -105,7 +105,7 @@ Expanded persistence/workflow set:
 Full Python suite:
 
 ```text
-227 passed, 4 skipped, 1 warning in 73.47s
+227 passed, 4 skipped, 1 warning in 73.27s
 ```
 
 The skipped tests are environment-gated live probes. The warning is the
