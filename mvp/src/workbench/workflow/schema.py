@@ -171,11 +171,20 @@ def _upgrade_conversation_command_scope(connection: sqlite3.Connection) -> None:
 def _has_global_conversation_command_constraint(connection: sqlite3.Connection) -> bool:
     indexes = connection.execute("PRAGMA index_list(conversation_messages)").fetchall()
     for index in indexes:
-        if not index["unique"]:
+        if not _pragma_value(index, "unique", 2):
             continue
         columns = connection.execute(
-            f"PRAGMA index_info({index['name']!r})"
+            f"PRAGMA index_info({_pragma_value(index, 'name', 1)!r})"
         ).fetchall()
-        if [column["name"] for column in columns] == ["command_id"]:
+        if [_pragma_value(column, "name", 2) for column in columns] == [
+            "command_id"
+        ]:
             return True
     return False
+
+
+def _pragma_value(row: sqlite3.Row | tuple[object, ...], name: str, index: int) -> object:
+    """Read pragma output from either WorkflowStore rows or plain connections."""
+    if isinstance(row, sqlite3.Row):
+        return row[name]
+    return row[index]

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from workbench.conversations.models import ConversationSession, agent_message
 from workbench.conversations.repository import ConversationRepository
+from workbench.workflow.schema import PHASE1_SCHEMA_VERSION, migrate_phase1
 
 
 def test_messages_and_provider_state_are_separate(tmp_path: Path) -> None:
@@ -18,6 +19,18 @@ def test_messages_and_provider_state_are_separate(tmp_path: Path) -> None:
     message = repository.list_messages("session-1")[0]
     assert message.content == "answer"
     assert "private" not in message.model_dump_json()
+
+
+def test_migrate_phase1_supports_plain_sqlite_connections(tmp_path: Path) -> None:
+    database = tmp_path / "conversation.sqlite"
+
+    with sqlite3.connect(database) as connection:
+        migrate_phase1(connection)
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()
+
+    assert version == (PHASE1_SCHEMA_VERSION,)
 
 
 def test_messages_receive_monotonic_session_sequences_after_restart(
