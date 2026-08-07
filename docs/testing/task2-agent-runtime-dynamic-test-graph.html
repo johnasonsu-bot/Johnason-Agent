@@ -646,13 +646,13 @@ const NODES=[
   },
   {
     "id": "D9",
-    "label": "Schema v6 Migration",
+    "label": "Schema v7 Migration",
     "group": "storage",
-    "desc": "从旧 SQLite schema 加法升级 Turn、Tool、介入 claim 与 command prompt digest 字段并保留数据。",
+    "desc": "从旧 SQLite schema 加法升级 Turn、Tool、介入 claim 与 command prompt digest 字段；v6→v7 一次性清理遗留私有 continuation。",
     "props": [
       [
         "版本",
-        "v4 → v6"
+        "v4 → v7 / v6 → v7"
       ],
       [
         "门禁",
@@ -936,7 +936,7 @@ const NODES=[
     "id": "A8",
     "label": "迁移无数据损失",
     "group": "assertion",
-    "desc": "v4→v5 升级保留会话、continuation、旧消息和索引约束。",
+    "desc": "v4→v7 升级保留会话与旧消息；v6→v7 仅清理一次遗留私有 continuation，后续 v7 重开不重复清理。",
     "props": [
       [
         "检查",
@@ -956,7 +956,7 @@ const NODES=[
     "props": [
       [
         "当前基线",
-        "39 focused passed"
+        "48 expanded passed"
       ],
       [
         "命令",
@@ -972,11 +972,11 @@ const NODES=[
     "props": [
       [
         "最近结果",
-        "218 passed / 4 skipped"
+        "227 passed / 4 skipped"
       ],
       [
         "状态",
-        "最终复审中"
+        "Task 2 已通过"
       ]
     ]
   }
