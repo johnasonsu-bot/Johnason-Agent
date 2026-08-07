@@ -12,7 +12,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.api.agui import stream_run_events
 from workbench.api.commands import CreateRunRequest, InterventionRequest
+from workbench.api.conversations import ConversationAPI, conversation_router
 from workbench.api.providers import provider_router, vault_router
+from workbench.conversations.repository import ConversationRepository
 from workbench.credentials.vault import CredentialVault
 from workbench.credentials.service import VaultService
 from workbench.domain.models import RunRecord
@@ -91,6 +93,15 @@ def create_app(settings: AppSettings) -> FastAPI:
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
     event_store = EventStore(settings.database)
+    app.include_router(
+        conversation_router(
+            ConversationAPI(
+                conversations=ConversationRepository(settings.database),
+                events=event_store,
+                runner=settings.runner,
+            )
+        )
+    )
     app.include_router(
         provider_router(
             ProviderRepository(settings.database), settings.vault, settings.gateway
