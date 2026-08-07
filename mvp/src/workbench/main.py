@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import socket
 import sys
 from pathlib import Path
@@ -82,6 +83,13 @@ def _read_bootstrap() -> tuple[str, str]:
     return capability, instance_id
 
 
+def _configure_listener(listener: socket.socket) -> None:
+    if os.name == "nt":
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 async def _serve_electron_backend(
     settings: WorkbenchSettings, capability: str, instance_id: str
 ) -> None:
@@ -89,7 +97,7 @@ async def _serve_electron_backend(
     if settings.host != "127.0.0.1":
         raise SystemExit("Electron backend must bind IPv4 loopback")
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _configure_listener(listener)
     listener.bind((settings.host, settings.port))
     bound_port = int(listener.getsockname()[1])
     resolved = settings.model_copy(update={"port": bound_port})
