@@ -495,6 +495,12 @@ def test_session_rejects_a_foreign_lifecycle_run_with_the_internal_identifier(
     response = client.post("/api/sessions", json={"session_id": session_id})
 
     assert response.status_code == 409
+    blocked = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "must not run"},
+    )
+    assert blocked.status_code == 404
 
 
 def test_completed_message_command_replays_without_calling_runner_again(tmp_path: Path) -> None:
@@ -530,3 +536,37 @@ def test_sse_composite_cursor_replays_later_projections_of_the_same_event(
 
     ids = [frame.splitlines()[0].removeprefix("id: ") for frame in replay.text.strip().split("\n\n")]
     assert ids == ["2:1", "3:0", "3:1"]
+
+
+def test_concurrent_duplicate_message_runs_the_runner_once(tmp_path: Path) -> None:
+    runner = ConversationRunner()
+    with _client(tmp_path / "conversation.sqlite", runner) as client:
+        _start_session(client)
+
+        def send(_: int) -> int:
+            return client.post(
+                "/api/sessions/session-1/messages",
+                headers={"Idempotency-Key": "message-1"},
+                json={"content": "hello"},
+            ).status_code
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert list(pool.map(send, (1, 2))) == [200, 200]
+
+    assert runner.calls == 1
+
+
+def test_retry_success_duplicate_replays_only_the_successful_attempt(tmp_path: Path) -> None:
+    client = _client(tmp_path / "conversation.sqlite", RetryRunner())
+    _start_session(client)
+    first = client.post(
+        "/api/sessions/session-1/messages",
+        headers={"Idempotency-Key": "message-1"},
+        json={"content": "recover"},
+    )
+    successful = _send_message(client, "session-1", "recover", "message-1")
+    duplicate = _send_message(client, "session-1", "recover", "message-1")
+
+    assert first.status_code == 503
+    assert duplicate == successful
+    assert all(event.get("name") != "turn_retryable" for event in duplicate["events"])

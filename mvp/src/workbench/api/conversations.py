@@ -78,10 +78,9 @@ class ConversationAPI:
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
     def create_session(self, session_id: str) -> ConversationSession:
-        session = self.conversations.create_session(session_id)
         if self.engine is not None:
             self._ensure_lifecycle_run(session_id)
-        return session
+        return self.conversations.create_session(session_id)
 
     async def run_message(
         self,
@@ -92,6 +91,7 @@ class ConversationAPI:
         model: str,
     ) -> dict[str, Any]:
         self._require_session(session_id)
+        self._require_lifecycle_ownership(session_id)
         reservation_id = self._reserve(
             session_id, command_id, "message", {"content": content, "model": model}
         )
@@ -99,6 +99,10 @@ class ConversationAPI:
         if terminal is not None:
             return terminal
         async with self._session_lock(session_id):
+            terminal = self._terminal_response(session_id, command_id, reservation_id)
+            if terminal is not None:
+                return terminal
+            self._require_lifecycle_ownership(session_id)
             if self._status(session_id) == "paused":
                 raise SessionPausedError(session_id)
             if not isinstance(self.runner, TurnRunner):
@@ -131,6 +135,7 @@ class ConversationAPI:
         payload: ConversationInterventionRequest,
     ) -> dict[str, Any]:
         self._require_session(session_id)
+        self._require_lifecycle_ownership(session_id)
         values = {
             "kind": payload.kind,
             "content": payload.content,
@@ -165,6 +170,7 @@ class ConversationAPI:
         self, *, session_id: str, command_id: str, status: Literal["paused", "running"]
     ) -> dict[str, Any]:
         self._require_session(session_id)
+        self._require_lifecycle_ownership(session_id)
         reservation_id = self._reserve(
             session_id, command_id, status, {"status": status}
         )
@@ -354,6 +360,15 @@ class ConversationAPI:
         )
         if terminal is None:
             return None
+        last_retry = max(
+            (
+                index
+                for index, event in enumerate(events)
+                if event.event_type == "conversation.turn.retryable"
+            ),
+            default=-1,
+        )
+        final_attempt = events[last_retry + 1 :]
         return {
             "session_id": session_id,
             "command_id": command_id,
@@ -362,7 +377,7 @@ class ConversationAPI:
             else "failed",
             "events": [
                 projected
-                for event in events
+                for event in final_attempt
                 for projected in map_domain_event(event)
             ],
         }
@@ -386,6 +401,10 @@ class ConversationAPI:
         if record.mission_id != mission_id or record.epoch_id != epoch_id:
             raise ValueError("conversation lifecycle identity conflict")
         return True
+
+    def _require_lifecycle_ownership(self, session_id: str) -> None:
+        if self.engine is not None and not self._has_lifecycle_run(session_id):
+            raise ValueError("conversation lifecycle is unavailable")
 
     def _ensure_lifecycle_run(self, session_id: str) -> None:
         """Bind a standalone conversation to stable lifecycle records once."""
