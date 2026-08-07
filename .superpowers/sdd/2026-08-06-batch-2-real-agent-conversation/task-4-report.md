@@ -51,6 +51,14 @@ SQLite durable turn evidence → 4 completed turns for provider_id=deepseek-prim
 Multi-Agent UI → group picker created a collaboration session with at least three selected Agents and rendered the avatar stack.
 Provider state after the pass → LM Studio and DeepSeek both enabled.
 ```
+
+Follow-up fix for group-session creation:
+
+```text
+RED → new regression failed because group creation only changed the in-memory Agent list; no new session button or session ID appeared.
+GREEN → group creation now persists/loads a `ui-group-*` session, appends it to the sidebar, selects it, and resets the picker.
+Verification → isolated Electron regression suite: 24 passed (34.6s).
+```
 ```
 
 ## Concerns / follow-up
