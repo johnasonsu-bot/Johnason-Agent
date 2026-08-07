@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import sys
+import threading
 from pathlib import Path
 from uuid import UUID
 
@@ -90,6 +91,23 @@ def _configure_listener(listener: socket.socket) -> None:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
 
+async def _watch_parent_liveness(server: uvicorn.Server) -> None:
+    """Request shutdown shortly after Electron closes the bounded stdin pipe."""
+    loop = asyncio.get_running_loop()
+    parent_closed = asyncio.Event()
+
+    def wait_for_eof() -> None:
+        while sys.stdin.read(1) != "":
+            pass
+        loop.call_soon_threadsafe(parent_closed.set)
+
+    threading.Thread(target=wait_for_eof, daemon=True).start()
+    await parent_closed.wait()
+    # Let the just-announced backend complete an in-flight health check.
+    await asyncio.sleep(0.25)
+    server.should_exit = True
+
+
 async def _serve_electron_backend(
     settings: WorkbenchSettings, capability: str, instance_id: str
 ) -> None:
@@ -115,6 +133,7 @@ async def _serve_electron_backend(
         )
     )
     serving = asyncio.create_task(server.serve(sockets=[listener]))
+    liveness: asyncio.Task[None] | None = None
     try:
         while not server.started:
             if serving.done():
@@ -132,8 +151,15 @@ async def _serve_electron_backend(
             ),
             flush=True,
         )
+        liveness = asyncio.create_task(_watch_parent_liveness(server))
         await serving
     finally:
+        if liveness is not None and not liveness.done():
+            liveness.cancel()
+            try:
+                await liveness
+            except asyncio.CancelledError:
+                pass
         if not serving.done():
             serving.cancel()
         try:

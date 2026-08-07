@@ -24,7 +24,10 @@ interface BackendProcess {
 let mainWindow: BrowserWindow | null = null;
 let trustedDocumentUrl = "";
 let backend: BackendProcess | null = null;
+let startingBackend: Promise<void> | null = null;
+let startingChild: ChildProcessWithoutNullStreams | null = null;
 let stoppingBackend: Promise<void> | null = null;
+let stoppingAndExiting: Promise<void> | null = null;
 let quitAfterCleanup = false;
 let quitting = false;
 
@@ -158,6 +161,9 @@ async function verifyBackendIdentity(owned: BackendProcess): Promise<void> {
 
 async function startBackend(): Promise<void> {
   if (backend !== null) return;
+  if (startingBackend !== null) return startingBackend;
+
+  const pending = (async () => {
   const capability = randomBytes(32).toString("base64url");
   const instanceId = randomUUID();
   const child = spawn(
@@ -171,8 +177,9 @@ async function startBackend(): Promise<void> {
     ],
     { env: childEnvironment(), stdio: ["pipe", "pipe", "pipe"] },
   );
+  startingChild = child;
   child.stderr.resume();
-  child.stdin.end(`${JSON.stringify({ capability, instance_id: instanceId })}\n`);
+  child.stdin.write(`${JSON.stringify({ capability, instance_id: instanceId })}\n`);
   try {
     const handshake = await readHandshake(child, instanceId);
     child.stdout.resume();
@@ -183,16 +190,31 @@ async function startBackend(): Promise<void> {
       instanceId,
     };
     await verifyBackendIdentity(owned);
+    if (startingChild !== child) throw new Error("Workbench backend startup was cancelled");
     backend = owned;
+    startingChild = null;
     child.once("exit", () => {
       if (backend?.child === child) {
         backend = null;
-        if (!quitting) app.quit();
+        if (!quitting) void stopAndExit(1);
       }
     });
   } catch (error) {
-    child.kill();
+    if (startingChild === child) startingChild = null;
+    if (!child.stdin.destroyed) child.stdin.end();
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    if (!await waitForExit(child, 3_000)) {
+      child.kill("SIGKILL");
+      await waitForExit(child, 2_000);
+    }
     throw error;
+  }
+  })();
+  startingBackend = pending;
+  try {
+    await pending;
+  } finally {
+    if (startingBackend === pending) startingBackend = null;
   }
 }
 
@@ -207,21 +229,41 @@ function waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): 
 async function stopBackend(): Promise<void> {
   if (stoppingBackend !== null) return stoppingBackend;
   const owned = backend;
+  const pending = startingChild;
   backend = null;
-  if (owned === null) return;
+  startingChild = null;
+  if (owned === null && pending === null) return;
   stoppingBackend = (async () => {
-    try {
-      await authenticatedBackendRequest(owned, "/api/vault/lock", { method: "POST" }, 1_000);
-    } catch {
-      // The process lifespan also locks the vault; termination remains mandatory.
+    if (owned !== null) {
+      try {
+        await authenticatedBackendRequest(owned, "/api/vault/lock", { method: "POST" }, 1_000);
+      } catch {
+        // The process lifespan also locks the vault; termination remains mandatory.
+      }
     }
-    if (owned.child.exitCode === null && owned.child.signalCode === null) owned.child.kill();
-    if (!await waitForExit(owned.child, 3_000)) {
-      owned.child.kill("SIGKILL");
-      await waitForExit(owned.child, 2_000);
+    for (const child of new Set([owned?.child, pending])) {
+      if (child === null || child === undefined) continue;
+      if (!child.stdin.destroyed) child.stdin.end();
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      if (!await waitForExit(child, 3_000)) {
+        child.kill("SIGKILL");
+        await waitForExit(child, 2_000);
+      }
     }
   })().finally(() => { stoppingBackend = null; });
   return stoppingBackend;
+}
+
+async function stopAndExit(code: number): Promise<void> {
+  if (stoppingAndExiting !== null) return stoppingAndExiting;
+  stoppingAndExiting = (async () => {
+    await stopBackend();
+    quitting = true;
+    quitAfterCleanup = true;
+    process.exitCode = code;
+    app.quit();
+  })();
+  return stoppingAndExiting;
 }
 
 ipcMain.handle("api.request", async (event, request: unknown) => {
@@ -289,7 +331,7 @@ function createWindow(): BrowserWindow {
     if (!sameTrustedDocument(target)) event.preventDefault();
   });
   window.webContents.on("render-process-gone", () => {
-    void stopBackend().finally(() => { if (!quitting) app.quit(); });
+    if (!quitting) void stopAndExit(1);
   });
   window.on("closed", () => {
     if (mainWindow === window) mainWindow = null;
@@ -300,17 +342,26 @@ function createWindow(): BrowserWindow {
 }
 
 async function ready(): Promise<void> {
-  await startBackend();
-  createWindow();
+  try {
+    await startBackend();
+    createWindow();
+  } catch {
+    await stopAndExit(1);
+  }
 }
 
-void app.whenReady().then(ready).catch(() => {
-  void stopBackend().finally(() => app.exit(1));
-});
+void app.whenReady().then(ready).catch(() => { void stopAndExit(1); });
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    void startBackend().then(() => createWindow()).catch(() => app.exit(1));
+    void (async () => {
+      try {
+        await startBackend();
+        createWindow();
+      } catch {
+        await stopAndExit(1);
+      }
+    })();
   }
 });
 
