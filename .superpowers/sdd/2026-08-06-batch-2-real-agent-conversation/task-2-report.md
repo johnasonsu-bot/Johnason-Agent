@@ -28,6 +28,11 @@ tool execution, premature intervention acknowledgement, continuation leakage,
 and missing failure terminals. Short-lease concurrency and retry tests were
 also observed failing before heartbeat and retryable-release support.
 
+A pre-review crash-window audit added a second RED round for multi-tool partial
+completion, final-answer finalization, committed tool-event recovery, command
+identity conflicts, and intervention leases expiring during a long model call.
+Those tests failed before the v6 state-machine changes and pass afterward.
+
 ## Design decisions
 
 - `RunAgentTurn`, `AgentEvent`, `AgentTool`, checkpoint, and intervention ports
@@ -47,10 +52,18 @@ also observed failing before heartbeat and retryable-release support.
 - Active model/tool calls renew a fenced turn lease. Busy duplicate callers wait
   for the owner and replay its terminal result; restart resumes the saved legal
   protocol sequence rather than rebuilding it from public messages.
+- Multi-tool turns persist the pending call list and next call index. Tool result,
+  `tool_finished`, protocol messages, and the next index commit atomically.
+  Final answers enter a resumable `finalizing` phase before public projection,
+  checkpoint, and terminal sealing.
+- Schema v6 binds every command to its original run and prompt digest; a reused
+  command cannot replay events into another run or silently change its prompt.
 - Human interventions have one durable claimant and a stale-claim lease. They
   enter requests only at `before_model`, are acknowledged only after a valid
   provider response, and are released on provider/protocol failure. The
   lifecycle engine no longer consumes them before the runtime.
+  The model-call heartbeat renews both the turn and every claimed intervention,
+  preventing a second runtime from stealing an intervention during a long call.
 - Unknown tools produce a controlled `tool_failed` result for model correction;
   tool exceptions, empty responses, and max-step exhaustion persist explicit
   `turn_failed` outcomes and failure checkpoints.
@@ -64,7 +77,7 @@ also observed failing before heartbeat and retryable-release support.
 Review-fix focused runtime/integration tests:
 
 ```text
-23 passed, 1 warning in 0.75s
+39 passed, 1 warning in 1.01s
 ```
 
 Expanded persistence/workflow set:
@@ -76,7 +89,7 @@ Expanded persistence/workflow set:
 Full Python suite:
 
 ```text
-213 passed, 4 skipped, 1 warning in 72.71s
+218 passed, 4 skipped, 1 warning in 73.78s
 ```
 
 The skipped tests are environment-gated live probes. The warning is the

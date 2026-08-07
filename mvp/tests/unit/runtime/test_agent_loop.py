@@ -13,7 +13,12 @@ from workbench.domain.models import (
     ProjectRecord,
     RunRecord,
 )
-from workbench.models.contracts import ModelResponse, ToolCall, ToolDefinition
+from workbench.models.contracts import (
+    ModelMessage,
+    ModelResponse,
+    ToolCall,
+    ToolDefinition,
+)
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.runtime.agent_loop import AgentTool, RunAgentTurn
 from workbench.workflow.repository import WorkflowRepository
@@ -78,6 +83,9 @@ class BoundaryInterventions:
 
     def release(self, intervention_ids: list[str], *, owner_id: str) -> None:
         self.released.extend(intervention_ids)
+
+    def renew(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        return None
 
 
 def profile() -> ProviderProfileRecord:
@@ -535,3 +543,241 @@ def _workflow_with_intervention(database: Path) -> WorkflowRepository:
         )
     )
     return repository
+
+
+class SimulatedCrash(BaseException):
+    pass
+
+
+class CrashAfterFirstToolRepository(ConversationRepository):
+    def __init__(self, database: Path) -> None:
+        super().__init__(database)
+        self.crash = True
+
+    def complete_tool_effect(self, **kwargs) -> None:
+        super().complete_tool_effect(**kwargs)
+        if self.crash:
+            self.crash = False
+            raise SimulatedCrash("after first tool commit")
+
+
+@pytest.mark.asyncio
+async def test_restart_executes_remaining_tools_and_replays_committed_tool_event(
+    tmp_path: Path,
+) -> None:
+    operations: list[str] = []
+    gateway = SequencedGateway()
+    gateway.responses = [
+        ModelResponse(
+            tool_calls=[
+                ToolCall(id="call-1", name="list_files", arguments={}),
+                ToolCall(id="call-2", name="list_files", arguments={}),
+            ]
+        ),
+        ModelResponse(text="both complete"),
+    ]
+    repository = CrashAfterFirstToolRepository(tmp_path / "runtime.sqlite")
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="run both",
+    )
+    runtime = AgentRuntime(
+        gateway=gateway,
+        profile=profile(),
+        conversations=repository,
+        tools=[RecordingTool(operations)],
+        turn_lease_seconds=0.01,
+    )
+
+    with pytest.raises(SimulatedCrash):
+        await _collect(runtime, command)
+    await asyncio.sleep(0.02)
+    events = await _collect(runtime, command)
+
+    assert operations == ["tool", "tool"]
+    assert [event.kind for event in events].count("tool_finished") == 2
+    assert events[-1].kind == "turn_finished"
+
+
+class CrashBeforeFinishRepository(ConversationRepository):
+    def __init__(self, database: Path) -> None:
+        super().__init__(database)
+        self.crash = True
+
+    def finish_turn(self, *args, **kwargs) -> None:
+        if self.crash and kwargs.get("status") == "completed":
+            self.crash = False
+            raise SimulatedCrash("before terminal commit")
+        super().finish_turn(*args, **kwargs)
+
+
+class SingleAnswerGateway:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, request, profile):
+        self.calls += 1
+        if self.calls > 1:
+            raise AssertionError("finalizing restart must not call the provider")
+        return ModelResponse(text="durable answer")
+
+
+@pytest.mark.asyncio
+async def test_restart_from_finalizing_finishes_without_calling_provider_again(
+    tmp_path: Path,
+) -> None:
+    repository = CrashBeforeFinishRepository(tmp_path / "runtime.sqlite")
+    gateway = SingleAnswerGateway()
+    runtime = AgentRuntime(
+        gateway=gateway,
+        profile=profile(),
+        conversations=repository,
+        turn_lease_seconds=0.01,
+    )
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="answer",
+    )
+
+    with pytest.raises(SimulatedCrash):
+        await _collect(runtime, command)
+    await asyncio.sleep(0.02)
+    events = await _collect(runtime, command)
+
+    assert gateway.calls == 1
+    assert events[-2].kind == "text_delta"
+    assert events[-1].kind == "turn_finished"
+
+
+@pytest.mark.asyncio
+async def test_existing_uncertain_effect_is_a_replayable_reconciliation_terminal(
+    tmp_path: Path,
+) -> None:
+    repository = ConversationRepository(tmp_path / "runtime.sqlite")
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="list",
+    )
+    assistant = ModelMessage(
+        role="assistant",
+        tool_calls=[ToolCall(id="call-1", name="list_files", arguments={})],
+    )
+    state = {
+        "phase": "after_model",
+        "messages": [
+            ModelMessage(role="user", content="list").model_dump(mode="json"),
+            assistant.model_dump(mode="json"),
+        ],
+        "events": [],
+    }
+    repository.claim_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="local",
+        model="default",
+        prompt="list",
+        owner_id="old-owner",
+        initial_state=state,
+        lease_seconds=0,
+    )
+    repository.claim_tool_effect(
+        session_id="session-1",
+        command_id="turn-1",
+        tool_call_id="call-1",
+        tool_name="list_files",
+        arguments={},
+        owner_id="old-owner",
+    )
+    repository.mark_tool_uncertain(
+        session_id="session-1",
+        command_id="turn-1",
+        tool_call_id="call-1",
+        owner_id="old-owner",
+    )
+    repository.release_turn(
+        "session-1", "turn-1", owner_id="old-owner", state=state
+    )
+    runtime = AgentRuntime(
+        gateway=SequencedGateway(),
+        profile=profile(),
+        conversations=repository,
+        tools=[RecordingTool([])],
+    )
+
+    first = await _collect(runtime, command)
+    second = await _collect(runtime, command)
+
+    assert first[-1].payload["reason"] == "reconciliation_required"
+    assert second == first
+
+
+@pytest.mark.asyncio
+async def test_command_identity_rejects_run_or_prompt_changes(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "runtime.sqlite")
+    runtime = AgentRuntime(
+        gateway=SingleAnswerGateway(),
+        profile=profile(),
+        conversations=repository,
+    )
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="original",
+    )
+    await _collect(runtime, command)
+
+    with pytest.raises(ValueError, match="turn identity cannot change"):
+        await _collect(runtime, command.model_copy(update={"run_id": "run-2"}))
+    with pytest.raises(ValueError, match="turn identity cannot change"):
+        await _collect(runtime, command.model_copy(update={"prompt": "changed"}))
+
+
+class BlockingAnswerGateway:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def complete(self, request, profile):
+        self.entered.set()
+        await self.release.wait()
+        return ModelResponse(text="done")
+
+
+@pytest.mark.asyncio
+async def test_model_heartbeat_renews_claimed_interventions(tmp_path: Path) -> None:
+    workflow = _workflow_with_intervention(tmp_path / "runtime.sqlite")
+    gateway = BlockingAnswerGateway()
+    runtime = AgentRuntime(
+        gateway=gateway,
+        profile=profile(),
+        conversations=ConversationRepository(workflow.store.path),
+        interventions=WorkflowInterventions(workflow, lease_seconds=0.01),
+        turn_lease_seconds=0.01,
+    )
+    command = RunAgentTurn(
+        session_id="session-1",
+        run_id="run-1",
+        command_id="turn-1",
+        prompt="hello",
+    )
+    running = asyncio.create_task(_collect(runtime, command))
+    await gateway.entered.wait()
+    await asyncio.sleep(0.03)
+
+    stolen = workflow.claim_pending_interventions(
+        "run-1", owner_id="owner-2", lease_seconds=0.01
+    )
+    gateway.release.set()
+    events = await running
+
+    assert stolen == []
+    assert events[-1].kind == "turn_finished"
+    assert workflow.list_pending_interventions("run-1") == []

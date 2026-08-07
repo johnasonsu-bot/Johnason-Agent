@@ -15,6 +15,7 @@ from workbench.models.contracts import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ToolCall,
 )
 from workbench.models.gateway import ModelGateway
 from workbench.models.profiles import ProviderProfileRecord
@@ -40,12 +41,18 @@ class _NoInterventions:
     def release(self, intervention_ids: list[str], *, owner_id: str) -> None:
         return None
 
+    def renew(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        return None
+
 
 class WorkflowInterventions:
     """Acknowledge queued human input only when the loop reaches a safe boundary."""
 
-    def __init__(self, repository: WorkflowRepository) -> None:
+    def __init__(
+        self, repository: WorkflowRepository, *, lease_seconds: float = 30
+    ) -> None:
         self.repository = repository
+        self.lease_seconds = lease_seconds
 
     def claim_pending(
         self, run_id: str, *, boundary: str, owner_id: str
@@ -55,7 +62,7 @@ class WorkflowInterventions:
         return [
             (record.intervention_id, record.content)
             for record in self.repository.claim_pending_interventions(
-                run_id, owner_id=owner_id
+                run_id, owner_id=owner_id, lease_seconds=self.lease_seconds
             )
         ]
 
@@ -66,6 +73,11 @@ class WorkflowInterventions:
 
     def release(self, intervention_ids: list[str], *, owner_id: str) -> None:
         self.repository.release_claimed_interventions(
+            intervention_ids, owner_id=owner_id
+        )
+
+    def renew(self, intervention_ids: list[str], *, owner_id: str) -> None:
+        self.repository.renew_claimed_interventions(
             intervention_ids, owner_id=owner_id
         )
 
@@ -128,6 +140,7 @@ class AgentRuntime:
             run_id=command.run_id,
             provider_id=profile.id,
             model=command.model,
+            prompt=command.prompt,
             owner_id=owner_id,
             initial_state=initial_state,
             lease_seconds=self.turn_lease_seconds,
@@ -141,6 +154,7 @@ class AgentRuntime:
                     run_id=command.run_id,
                     provider_id=profile.id,
                     model=command.model,
+                    prompt=command.prompt,
                     owner_id=owner_id,
                     initial_state=initial_state,
                     lease_seconds=self.turn_lease_seconds,
@@ -162,6 +176,11 @@ class AgentRuntime:
             ):
                 yield event
             return
+        if state.get("phase") == "finalizing":
+            self._persist_finalizing(command, owner_id, state)
+            for event in events:
+                yield event
+            return
         if not events:
             started = self._event("turn_started", command)
             events.append(started)
@@ -173,11 +192,20 @@ class AgentRuntime:
                 state=state,
             )
             yield started
+        else:
+            for event in events:
+                yield event
 
         messages = [self._deserialize_message(raw) for raw in state["messages"]]
-        if state.get("phase") == "after_model":
+        if state.get("phase") in {"after_model", "tools_pending"}:
             pending = messages[-1] if messages else None
-            if pending is None or not pending.tool_calls:
+            pending_calls = state.get("pending_tool_calls")
+            calls = (
+                [ToolCall.model_validate(raw) for raw in pending_calls]
+                if pending_calls is not None
+                else (pending.tool_calls if pending is not None else [])
+            )
+            if not calls:
                 async for event in self._fail_turn(
                     command,
                     owner_id,
@@ -190,7 +218,7 @@ class AgentRuntime:
             failed = False
             async for event in self._execute_tools(
                 command,
-                ModelResponse(tool_calls=pending.tool_calls),
+                ModelResponse(tool_calls=calls),
                 messages,
                 state,
                 events,
@@ -237,6 +265,7 @@ class AgentRuntime:
                     ),
                     command,
                     owner_id,
+                    intervention_ids=intervention_ids,
                 )
             except Exception as exc:
                 self.interventions.release(intervention_ids, owner_id=owner_id)
@@ -291,6 +320,21 @@ class AgentRuntime:
                 continue
 
             answer = response.text or ""
+            delta = self._event("text_delta", command, text=answer)
+            finished = self._event("turn_finished", command)
+            events.extend([delta, finished])
+            state = {
+                "phase": "finalizing",
+                "answer": answer,
+                "messages": [],
+                "events": [event.model_dump(mode="json") for event in events],
+            }
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
+            )
             self.conversations.append_message(
                 ConversationMessage(
                     session_id=command.session_id,
@@ -299,19 +343,14 @@ class AgentRuntime:
                     content=answer,
                 )
             )
-            delta = self._event("text_delta", command, text=answer)
-            events.append(delta)
             yield delta
             self._save_checkpoint(command)
-            finished = self._event("turn_finished", command)
-            events.append(finished)
-            state = {"phase": "completed", "messages": [], "events": []}
             self.conversations.finish_turn(
                 command.session_id,
                 command.command_id,
                 owner_id=owner_id,
                 status="completed",
-                state=state,
+                state={"phase": "completed", "messages": [], "events": []},
                 result=[event.model_dump(mode="json") for event in events],
             )
             yield finished
@@ -357,7 +396,22 @@ class AgentRuntime:
         events: list[AgentEvent],
         owner_id: str,
     ) -> AsyncIterator[AgentEvent]:
-        for call in response.tool_calls:
+        if "pending_tool_calls" not in state:
+            state["pending_tool_calls"] = [
+                call.model_dump(mode="json") for call in response.tool_calls
+            ]
+            state["next_tool_index"] = 0
+            state["phase"] = "tools_pending"
+            self.conversations.save_turn_state(
+                command.session_id,
+                command.command_id,
+                owner_id=owner_id,
+                state=state,
+            )
+        calls = [ToolCall.model_validate(raw) for raw in state["pending_tool_calls"]]
+        start_index = int(state.get("next_tool_index", 0))
+        for index in range(start_index, len(calls)):
+            call = calls[index]
             started = self._event(
                 "tool_started",
                 command,
@@ -365,15 +419,18 @@ class AgentRuntime:
                 tool_name=call.name,
                 arguments=call.arguments,
             )
-            events.append(started)
-            state["events"] = [event.model_dump(mode="json") for event in events]
-            self.conversations.save_turn_state(
-                command.session_id,
-                command.command_id,
-                owner_id=owner_id,
-                state=state,
-            )
-            yield started
+            if not self._has_tool_event(events, "tool_started", call.id):
+                events.append(started)
+                state["events"] = [
+                    event.model_dump(mode="json") for event in events
+                ]
+                self.conversations.save_turn_state(
+                    command.session_id,
+                    command.command_id,
+                    owner_id=owner_id,
+                    state=state,
+                )
+                yield started
             tool = self.tools.get(call.name)
             if tool is None:
                 result = f"Unknown tool: {call.name}"
@@ -396,6 +453,7 @@ class AgentRuntime:
                 state["messages"] = [
                     self._serialize_message(message) for message in messages
                 ]
+                state["next_tool_index"] = index + 1
                 state["events"] = [event.model_dump(mode="json") for event in events]
                 self.conversations.save_turn_state(
                     command.session_id,
@@ -468,7 +526,20 @@ class AgentRuntime:
                 )
             )
             state["messages"] = [self._serialize_message(message) for message in messages]
-            state["phase"] = "after_tool"
+            finished = self._event(
+                "tool_finished",
+                command,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                result=result,
+            )
+            if not self._has_tool_event(events, "tool_finished", call.id):
+                events.append(finished)
+            state["events"] = [event.model_dump(mode="json") for event in events]
+            state["next_tool_index"] = index + 1
+            state["phase"] = (
+                "after_tool" if index + 1 == len(calls) else "tools_pending"
+            )
             if effect.disposition == "execute":
                 self.conversations.complete_tool_effect(
                     session_id=command.session_id,
@@ -478,22 +549,23 @@ class AgentRuntime:
                     result=result,
                     turn_state=state,
                 )
-            finished = self._event(
-                "tool_finished",
-                command,
-                tool_call_id=call.id,
-                tool_name=call.name,
-                result=result,
-            )
-            events.append(finished)
-            state["events"] = [event.model_dump(mode="json") for event in events]
-            self.conversations.save_turn_state(
-                command.session_id,
-                command.command_id,
-                owner_id=owner_id,
-                state=state,
-            )
+            else:
+                self.conversations.save_turn_state(
+                    command.session_id,
+                    command.command_id,
+                    owner_id=owner_id,
+                    state=state,
+                )
             yield finished
+        state.pop("pending_tool_calls", None)
+        state.pop("next_tool_index", None)
+        state["phase"] = "after_tool"
+        self.conversations.save_turn_state(
+            command.session_id,
+            command.command_id,
+            owner_id=owner_id,
+            state=state,
+        )
 
     def _model_messages(self, session_id: str) -> list[ModelMessage]:
         messages = [
@@ -528,6 +600,41 @@ class AgentRuntime:
                     **({"reason": reason} if reason is not None else {}),
                 },
             )
+
+    def _persist_finalizing(
+        self,
+        command: RunAgentTurn,
+        owner_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        answer = str(state.get("answer", ""))
+        events = [AgentEvent.model_validate(raw) for raw in state.get("events", [])]
+        self.conversations.append_message(
+            ConversationMessage(
+                session_id=command.session_id,
+                command_id=f"{command.command_id}:assistant",
+                role="assistant",
+                content=answer,
+            )
+        )
+        self._save_checkpoint(command)
+        self.conversations.finish_turn(
+            command.session_id,
+            command.command_id,
+            owner_id=owner_id,
+            status="completed",
+            state={"phase": "completed", "messages": [], "events": []},
+            result=[event.model_dump(mode="json") for event in events],
+        )
+
+    @staticmethod
+    def _has_tool_event(
+        events: list[AgentEvent], kind: str, tool_call_id: str
+    ) -> bool:
+        return any(
+            event.kind == kind and event.payload.get("tool_call_id") == tool_call_id
+            for event in events
+        )
 
     def _resolve_profile(self) -> ProviderProfileRecord:
         return self._profile() if callable(self._profile) else self._profile
@@ -583,6 +690,8 @@ class AgentRuntime:
         awaitable: Awaitable[Any],
         command: RunAgentTurn,
         owner_id: str,
+        *,
+        intervention_ids: list[str] | None = None,
     ) -> Any:
         task = asyncio.ensure_future(awaitable)
         interval = max(0.001, self.turn_lease_seconds / 3)
@@ -595,6 +704,9 @@ class AgentRuntime:
                     command.command_id,
                     owner_id=owner_id,
                     lease_seconds=self.turn_lease_seconds,
+                )
+                self.interventions.renew(
+                    intervention_ids or [], owner_id=owner_id
                 )
 
     @staticmethod

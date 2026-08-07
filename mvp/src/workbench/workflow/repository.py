@@ -329,6 +329,23 @@ class WorkflowRepository:
                 (owner_id, *intervention_ids),
             )
 
+    def renew_claimed_interventions(
+        self, intervention_ids: list[str], *, owner_id: str, clock: Any = time.time
+    ) -> None:
+        if not intervention_ids:
+            return
+        placeholders = ",".join("?" for _ in intervention_ids)
+        with self.store.connect() as connection:
+            result = connection.execute(
+                f"""
+                UPDATE lifecycle_interventions SET claimed_at = ?
+                WHERE claimed_by = ? AND intervention_id IN ({placeholders})
+                """,
+                (clock(), owner_id, *intervention_ids),
+            )
+        if result.rowcount != len(intervention_ids):
+            raise RuntimeError("intervention claim is no longer owned")
+
     def _insert(self, sql: str, params: tuple[Any, ...]) -> None:
         with self.store.connect() as connection:
             connection.execute(sql, params)

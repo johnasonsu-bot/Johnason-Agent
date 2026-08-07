@@ -1,6 +1,7 @@
 """SQLite repository for durable public conversation messages."""
 
 import json
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,6 +137,7 @@ class ConversationRepository:
         run_id: str,
         provider_id: str,
         model: str,
+        prompt: str,
         owner_id: str,
         initial_state: dict[str, Any],
         lease_seconds: float = 30,
@@ -143,6 +145,7 @@ class ConversationRepository:
         """Atomically claim a new/stale turn or return its durable terminal result."""
         self.create_session(session_id)
         now = time.time()
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -156,9 +159,10 @@ class ConversationRepository:
                 connection.execute(
                     """
                     INSERT INTO conversation_turns(
-                        session_id, command_id, run_id, provider_id, model, status,
+                        session_id, command_id, run_id, provider_id, model,
+                        prompt_digest, status,
                         owner_id, lease_expires_at, state_json, result_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL, ?)
                     """,
                     (
                         session_id,
@@ -166,6 +170,7 @@ class ConversationRepository:
                         run_id,
                         provider_id,
                         model,
+                        prompt_digest,
                         owner_id,
                         now + lease_seconds,
                         json.dumps(initial_state, sort_keys=True),
@@ -174,8 +179,21 @@ class ConversationRepository:
                 )
                 connection.commit()
                 return TurnClaim("owned", initial_state)
+            if (
+                row["run_id"] != run_id
+                or (row["prompt_digest"] is not None and row["prompt_digest"] != prompt_digest)
+            ):
+                raise ValueError("turn identity cannot change")
             if row["provider_id"] != provider_id or row["model"] != model:
                 raise ValueError("turn provider/model cannot change")
+            if row["prompt_digest"] is None:
+                connection.execute(
+                    """
+                    UPDATE conversation_turns SET prompt_digest = ?
+                    WHERE session_id = ? AND command_id = ?
+                    """,
+                    (prompt_digest, session_id, command_id),
+                )
             state = json.loads(row["state_json"])
             if row["status"] in TERMINAL_TURN_STATES:
                 result = json.loads(row["result_json"] or "[]")

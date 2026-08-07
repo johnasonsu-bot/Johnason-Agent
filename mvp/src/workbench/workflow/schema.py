@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 5
+PHASE1_SCHEMA_VERSION = 6
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -125,6 +125,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             run_id TEXT NOT NULL,
             provider_id TEXT NOT NULL,
             model TEXT NOT NULL,
+            prompt_digest TEXT,
             status TEXT NOT NULL,
             owner_id TEXT,
             lease_expires_at REAL NOT NULL,
@@ -155,6 +156,9 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(
         connection, "lifecycle_interventions", "claimed_at", "REAL"
+    )
+    _add_column_if_missing(
+        connection, "conversation_turns", "prompt_digest", "TEXT"
     )
     _upgrade_conversation_command_scope(connection)
     connection.execute(
