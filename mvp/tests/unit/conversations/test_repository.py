@@ -117,9 +117,10 @@ def test_concurrent_distinct_commands_have_continuous_unique_sequences(
 
 def test_concurrent_duplicate_command_persists_one_message(tmp_path: Path) -> None:
     database = tmp_path / "conversation.sqlite"
+    repository = ConversationRepository(database)
 
     def append(_: int):
-        return ConversationRepository(database).append_message(
+        return repository.append_message(
             agent_message(content="answer", command_id="same-command")
         )
 
@@ -127,7 +128,7 @@ def test_concurrent_duplicate_command_persists_one_message(tmp_path: Path) -> No
         returned = list(pool.map(append, range(16)))
 
     assert {message.message_id for message in returned} == {returned[0].message_id}
-    assert ConversationRepository(database).list_messages("session-1") == [returned[0]]
+    assert repository.list_messages("session-1") == [returned[0]]
 
 
 def test_v3_global_command_constraint_is_upgraded_without_losing_messages(
