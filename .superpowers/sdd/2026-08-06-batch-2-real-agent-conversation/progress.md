@@ -27,3 +27,4 @@ Task 4: fix round 1 connected the renderer through constrained conversation IPC,
 Task 4: local live smoke passed against LM Studio `gemma-4-31b-it` (two durable turns; 1 passed, 1 deselected); DeepSeek live turn remains pending just-in-time API key.
 Task 4: Electron UI live pass completed with stored Provider Center vault: DeepSeek connection online (1515 ms), two explicit cloud turns (`CLOUD_READY`/`CLOUD_CONFIRMED`), 4 completed DeepSeek durable turns total, and multi-Agent picker/avatar-stack evidence; both providers restored enabled.
 Task 4: follow-up bug fix added durable group-session creation, sidebar insertion, automatic selection, and picker reset; RED→GREEN regression plus isolated full Electron suite 24 passed.
+Task 4: follow-up feedback fix added immediate running/completed/fallback status and disabled send state; RED→GREEN regression plus isolated full Electron suite 24 passed.

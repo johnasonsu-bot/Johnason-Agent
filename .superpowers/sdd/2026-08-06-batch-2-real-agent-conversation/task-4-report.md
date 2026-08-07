@@ -59,6 +59,14 @@ RED → new regression failed because group creation only changed the in-memory 
 GREEN → group creation now persists/loads a `ui-group-*` session, appends it to the sidebar, selects it, and resets the picker.
 Verification → isolated Electron regression suite: 24 passed (34.6s).
 ```
+
+Follow-up fix for missing immediate feedback:
+
+```text
+Root cause → the renderer awaited the full message POST without exposing a running state.
+Fix → added `执行中 · Running` / `已完成 · Completed` / `本地替身 · Fixture` status, live region, and disabled `发送中…` button.
+Verification → isolated Electron regression suite: 24 passed (47.6s).
+```
 ```
 
 ## Concerns / follow-up
