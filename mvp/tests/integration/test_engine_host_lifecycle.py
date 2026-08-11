@@ -212,6 +212,39 @@ async def test_cancelling_one_of_two_start_waiters_keeps_handshake_alive() -> No
 
 
 @pytest.mark.asyncio
+async def test_last_cancelled_waiter_closes_a_ready_host_before_new_start() -> None:
+    client = EngineHostClient(fake_host_command("normal"), shutdown_timeout=0.1)
+    await client.start()
+    assert client._start_task is not None
+    client._start_waiters = 1
+    await client._finish_start_waiter(client._start_task, cancelled=True)
+    with pytest.raises(HostUnavailable, match="closed"):
+        await client.start()
+    await wait_for_reap(client)
+
+
+@pytest.mark.asyncio
+async def test_close_admission_blocks_first_start_before_supervisor_runs() -> None:
+    client = EngineHostClient(
+        fake_host_command("ignore_hello"), request_timeout=0.4, shutdown_timeout=0.05
+    )
+    await client._close_lock.acquire()
+    try:
+        closing = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0)
+        starting = asyncio.create_task(client.start())
+        await asyncio.sleep(0)
+    finally:
+        client._close_lock.release()
+    started_at = monotonic()
+    await closing
+    assert monotonic() - started_at < 0.2
+    with pytest.raises(HostUnavailable, match="closed"):
+        await starting
+    assert client._process is None
+
+
+@pytest.mark.asyncio
 async def test_reader_error_reaps_when_ready_precedes_start_task_completion() -> None:
     client = EngineHostClient(
         fake_host_command("delayed_close_stdout_after_ready"), shutdown_timeout=0.1

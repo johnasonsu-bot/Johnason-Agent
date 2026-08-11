@@ -317,19 +317,27 @@ class EngineHostClient:
             should_close = (
                 cancelled
                 and self._start_waiters == 0
-                and not start_task.done()
                 and self._start_failure is None
             )
-        if should_close:
-            await self._ensure_close_task(cancel_start=True)
+            if should_close:
+                await self._ensure_close_task_locked(cancel_start=True)
 
     async def _ensure_close_task(
         self, *, cancel_start: bool = False
     ) -> asyncio.Task[None]:
+        async with self._start_lock:
+            return await self._ensure_close_task_locked(cancel_start=cancel_start)
+
+    async def _ensure_close_task_locked(
+        self, *, cancel_start: bool = False
+    ) -> asyncio.Task[None]:
+        self._closed = True
+        if cancel_start:
+            self._close_cancels_start = True
         async with self._close_lock:
             start_task = self._start_task
             if (
-                cancel_start
+                self._close_cancels_start
                 and self._start_failure is None
                 and start_task is not None
                 and not start_task.done()
