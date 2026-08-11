@@ -3,64 +3,44 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 
 PROTOCOL_V1 = "workbench.engine-host/v1"
 
-_SENSITIVE_PAYLOAD_FIELD_PARTS = frozenset(
-    {
-        "apikey",
-        "authorization",
-        "bearer",
-        "credential",
-        "hiddenreasoning",
-        "password",
-        "privatekey",
-        "secret",
-        "token",
-        "vault",
-    }
-)
 
-
-class FrozenJsonDict(dict[str, Any]):
+class FrozenJsonMapping(Mapping[str, Any]):
     """A JSON object that cannot be changed after protocol validation."""
 
+    __slots__ = ("_values",)
+
     def __init__(self, values: Mapping[str, Any]) -> None:
-        dict.__init__(self, values)
+        object.__setattr__(self, "_values", MappingProxyType(dict(values)))
 
-    def __delitem__(self, key: str) -> None:
+    def __getitem__(self, key: str) -> Any:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("engine-host payload is immutable")
 
-    def __ior__(self, other: object) -> "FrozenJsonDict":
-        raise TypeError("engine-host payload is immutable")
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        raise TypeError("engine-host payload is immutable")
-
-    def clear(self) -> None:
-        raise TypeError("engine-host payload is immutable")
-
-    def pop(self, key: str, default: Any = None) -> Any:
-        raise TypeError("engine-host payload is immutable")
-
-    def popitem(self) -> tuple[str, Any]:
-        raise TypeError("engine-host payload is immutable")
-
-    def setdefault(self, key: str, default: Any = None) -> Any:
-        raise TypeError("engine-host payload is immutable")
-
-    def update(self, *args: Any, **kwargs: Any) -> None:
-        raise TypeError("engine-host payload is immutable")
-
-
-def _normalized_field_name(field_name: str) -> str:
-    return "".join(
-        character for character in field_name.casefold() if character.isalnum()
-    )
 
 
 def _freeze_json_value(value: Any) -> Any:
@@ -69,11 +49,8 @@ def _freeze_json_value(value: Any) -> Any:
         for field_name, nested_value in value.items():
             if not isinstance(field_name, str):
                 raise ValueError("payload keys must be strings")
-            normalized = _normalized_field_name(field_name)
-            if any(part in normalized for part in _SENSITIVE_PAYLOAD_FIELD_PARTS):
-                raise ValueError("payload contains a sensitive field")
             frozen[field_name] = _freeze_json_value(nested_value)
-        return FrozenJsonDict(frozen)
+        return FrozenJsonMapping(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json_value(item) for item in value)
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -81,9 +58,82 @@ def _freeze_json_value(value: Any) -> Any:
     raise ValueError("payload must contain only JSON values")
 
 
-def freeze_json_payload(payload: Mapping[str, Any]) -> FrozenJsonDict:
+def freeze_json_payload(payload: Mapping[str, Any]) -> FrozenJsonMapping:
     """Validate one safe JSON payload and return an immutable representation."""
     return _freeze_json_value(payload)
+
+
+def _serialize_json_value(value: Any) -> Any:
+    if isinstance(value, FrozenJsonMapping):
+        return {key: _serialize_json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_serialize_json_value(item) for item in value]
+    return value
+
+
+class _PayloadSchema(BaseModel):
+    """Closed, safe payload schema base; new messages register here explicitly."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _EmptyPayload(_PayloadSchema):
+    pass
+
+
+class _HostHelloClientPayload(_PayloadSchema):
+    build: str = Field(min_length=1, max_length=128)
+
+
+class _HostHelloCommandPayload(_PayloadSchema):
+    supported_protocols: tuple[Literal["workbench.engine-host/v1"], ...] | None = (
+        None
+    )
+    client_build: str | None = Field(default=None, min_length=1, max_length=128)
+    client: _HostHelloClientPayload | None = None
+
+
+class _HostHelloResponsePayload(_PayloadSchema):
+    protocol: Literal["workbench.engine-host/v1"]
+    build: str = Field(min_length=1, max_length=128)
+
+
+class _HostCapabilitiesPayload(_PayloadSchema):
+    model: bool
+    tools: bool
+    skills: bool
+    workspace: bool
+    agui: bool
+    max_frame_bytes: int = Field(ge=1)
+
+
+class _AgentMessageDeltaPayload(_PayloadSchema):
+    content: str
+    token_count: int | None = Field(default=None, ge=0)
+
+
+# Add a closed schema here before introducing a new protocol (kind, name) pair.
+_PAYLOAD_SCHEMAS: dict[tuple[str, str], type[_PayloadSchema]] = {
+    ("command", "host.hello"): _HostHelloCommandPayload,
+    ("command", "host.capabilities"): _EmptyPayload,
+    ("response", "host.hello"): _HostHelloResponsePayload,
+    ("response", "host.capabilities"): _HostCapabilitiesPayload,
+    ("event", "run.started"): _EmptyPayload,
+    ("event", "agent.message.delta"): _AgentMessageDeltaPayload,
+}
+
+
+def _validate_payload_schema(
+    kind: str, name: str, payload: Mapping[str, Any]
+) -> FrozenJsonMapping:
+    schema = _PAYLOAD_SCHEMAS.get((kind, name))
+    if schema is None:
+        raise ValueError("payload schema is not registered")
+    try:
+        validated = schema.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError("payload contains a sensitive or unsupported field") from exc
+    return freeze_json_payload(validated.model_dump(exclude_none=True))
 
 
 class HostProtocolError(Exception):
@@ -110,8 +160,18 @@ class HostEnvelope(BaseModel):
 
     @field_validator("payload")
     @classmethod
-    def validate_payload(cls, payload: dict[str, Any]) -> FrozenJsonDict:
-        return freeze_json_payload(payload)
+    def validate_payload(
+        cls, payload: dict[str, Any], info: ValidationInfo
+    ) -> FrozenJsonMapping:
+        kind = info.data.get("kind")
+        name = info.data.get("name")
+        if not isinstance(kind, str) or not isinstance(name, str):
+            raise ValueError("payload schema cannot be resolved")
+        return _validate_payload_schema(kind, name, payload)
+
+    @field_serializer("payload")
+    def serialize_payload(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return _serialize_json_value(payload)
 
     @model_validator(mode="after")
     def validate_shape(self) -> "HostEnvelope":
@@ -122,6 +182,16 @@ class HostEnvelope(BaseModel):
         if self.kind == "response" and self.correlation_id is None:
             raise ValueError("response requires correlation_id")
         return self
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        """Revalidate every copy so updates cannot bypass payload safeguards."""
+        _ = deep
+        values = self.model_dump()
+        if update is not None:
+            values.update(update)
+        return type(self).model_validate(values)
 
 
 class HostCapabilities(BaseModel):

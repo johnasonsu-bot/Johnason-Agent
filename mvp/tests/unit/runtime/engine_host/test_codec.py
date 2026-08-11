@@ -42,7 +42,7 @@ def test_codec_rejects_sensitive_nested_payload_during_encoding() -> None:
         message_id="command-sensitive-encode",
         kind="command",
         name="host.hello",
-        payload={"nested": {"token": "redacted"}},
+        payload={"accessKey": "redacted"},
     )
 
     with pytest.raises(HostProtocolError, match="sensitive"):
@@ -53,8 +53,7 @@ def test_codec_rejects_sensitive_nested_payload_during_decoding() -> None:
     with pytest.raises(HostProtocolError, match="sensitive"):
         decode_frame(
             b'{"message_id":"command-sensitive-decode","kind":"command",'
-            b'"name":"host.hello","payload":{"nested":'
-            b'{"authorization":"redacted"}}}\n'
+            b'"name":"host.hello","payload":{"access_key":"redacted"}}\n'
         )
 
 

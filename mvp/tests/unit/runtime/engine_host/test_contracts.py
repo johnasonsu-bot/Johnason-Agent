@@ -99,7 +99,7 @@ def test_contract_rejects_nested_sensitive_payload_fields(field_name: str) -> No
             message_id="command-sensitive",
             kind="command",
             name="host.hello",
-            payload={"nested": {field_name: "redacted"}},
+            payload={field_name: "redacted"},
         )
 
 
@@ -108,11 +108,11 @@ def test_payload_rejects_top_level_mutation() -> None:
         message_id="command-immutable-top",
         kind="command",
         name="host.hello",
-        payload={"safe": True},
+        payload={"client_build": "workbench-mvp"},
     )
 
     with pytest.raises(TypeError):
-        envelope.payload["safe"] = False
+        envelope.payload["client_build"] = "changed"
 
 
 def test_default_payload_rejects_mutation() -> None:
@@ -131,11 +131,11 @@ def test_payload_rejects_nested_mutation() -> None:
         message_id="command-immutable-nested",
         kind="command",
         name="host.hello",
-        payload={"nested": {"safe": True}},
+        payload={"client": {"build": "workbench-mvp"}},
     )
 
     with pytest.raises(TypeError):
-        envelope.payload["nested"]["safe"] = False
+        envelope.payload["client"]["build"] = "changed"
 
 
 def test_payload_rejects_nested_list_mutation() -> None:
@@ -143,8 +143,92 @@ def test_payload_rejects_nested_list_mutation() -> None:
         message_id="command-immutable-list",
         kind="command",
         name="host.hello",
-        payload={"items": [{"safe": True}]},
+        payload={"supported_protocols": [PROTOCOL_V1]},
     )
 
     with pytest.raises(AttributeError):
-        envelope.payload["items"].append({"safe": False})
+        envelope.payload["supported_protocols"].append(PROTOCOL_V1)
+
+
+@pytest.mark.parametrize("field_name", ["access_key", "accessKey", "x_access_key"])
+def test_contract_rejects_access_key_naming_variants(field_name: str) -> None:
+    with pytest.raises(ValidationError, match="sensitive"):
+        HostEnvelope(
+            message_id="command-access-key",
+            kind="command",
+            name="host.hello",
+            payload={field_name: "redacted"},
+        )
+
+
+def test_contract_allows_explicit_safe_token_count() -> None:
+    envelope = HostEnvelope(
+        message_id="event-token-count",
+        kind="event",
+        name="agent.message.delta",
+        run_id="run-1",
+        sequence=1,
+        payload={"content": "中文", "token_count": 2},
+    )
+
+    assert envelope.payload["token_count"] == 2
+
+
+def test_contract_rejects_unregistered_message_payload_schema() -> None:
+    with pytest.raises(ValidationError, match="schema"):
+        HostEnvelope(
+            message_id="command-unregistered",
+            kind="command",
+            name="host.unregistered",
+            payload={},
+        )
+
+
+def test_payload_rejects_dict_setitem_bypass() -> None:
+    envelope = HostEnvelope(
+        message_id="command-dict-setitem",
+        kind="command",
+        name="host.hello",
+        payload={"client_build": "workbench-mvp"},
+    )
+
+    with pytest.raises(TypeError):
+        dict.__setitem__(envelope.payload, "client_build", "changed")
+
+
+def test_payload_rejects_dict_update_bypass() -> None:
+    envelope = HostEnvelope(
+        message_id="command-dict-update",
+        kind="command",
+        name="host.hello",
+        payload={"client_build": "workbench-mvp"},
+    )
+
+    with pytest.raises(TypeError):
+        dict.update(envelope.payload, {"client_build": "changed"})
+
+
+def test_model_copy_revalidates_payload_updates() -> None:
+    envelope = HostEnvelope(
+        message_id="command-model-copy",
+        kind="command",
+        name="host.hello",
+    )
+
+    with pytest.raises(ValidationError, match="sensitive"):
+        envelope.model_copy(update={"payload": {"items": []}})
+
+
+def test_model_copy_freezes_valid_payload_updates() -> None:
+    envelope = HostEnvelope(
+        message_id="command-model-copy-safe",
+        kind="command",
+        name="host.hello",
+    )
+
+    copied = envelope.model_copy(
+        update={"payload": {"client": {"build": "workbench-next"}}}
+    )
+
+    with pytest.raises(TypeError):
+        copied.payload["client"]["build"] = "changed"
