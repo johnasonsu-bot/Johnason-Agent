@@ -79,3 +79,72 @@ def test_status_exposes_immutable_capabilities() -> None:
     assert status.capabilities == capabilities
     with pytest.raises(ValidationError):
         status.state = "unavailable"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "api_key",
+        "token",
+        "password",
+        "Vault",
+        "authorization",
+        "secret",
+        "hidden_reasoning",
+    ],
+)
+def test_contract_rejects_nested_sensitive_payload_fields(field_name: str) -> None:
+    with pytest.raises(ValidationError, match="sensitive"):
+        HostEnvelope(
+            message_id="command-sensitive",
+            kind="command",
+            name="host.hello",
+            payload={"nested": {field_name: "redacted"}},
+        )
+
+
+def test_payload_rejects_top_level_mutation() -> None:
+    envelope = HostEnvelope(
+        message_id="command-immutable-top",
+        kind="command",
+        name="host.hello",
+        payload={"safe": True},
+    )
+
+    with pytest.raises(TypeError):
+        envelope.payload["safe"] = False
+
+
+def test_default_payload_rejects_mutation() -> None:
+    envelope = HostEnvelope(
+        message_id="command-immutable-default",
+        kind="command",
+        name="host.hello",
+    )
+
+    with pytest.raises(TypeError):
+        envelope.payload["safe"] = True
+
+
+def test_payload_rejects_nested_mutation() -> None:
+    envelope = HostEnvelope(
+        message_id="command-immutable-nested",
+        kind="command",
+        name="host.hello",
+        payload={"nested": {"safe": True}},
+    )
+
+    with pytest.raises(TypeError):
+        envelope.payload["nested"]["safe"] = False
+
+
+def test_payload_rejects_nested_list_mutation() -> None:
+    envelope = HostEnvelope(
+        message_id="command-immutable-list",
+        kind="command",
+        name="host.hello",
+        payload={"items": [{"safe": True}]},
+    )
+
+    with pytest.raises(AttributeError):
+        envelope.payload["items"].append({"safe": False})
