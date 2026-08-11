@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import asyncio
+from time import monotonic
 
 import pytest
 
@@ -17,6 +18,14 @@ FIXTURE = Path(__file__).parents[1] / "fixtures" / "fake_engine_host.py"
 
 def fake_host_command(mode: str) -> tuple[str, ...]:
     return (sys.executable, str(FIXTURE), mode)
+
+
+async def wait_for_reap(client: EngineHostClient) -> None:
+    async def reaped() -> None:
+        while client.returncode is None:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(reaped(), timeout=1.0)
 
 
 @pytest.mark.asyncio
@@ -134,8 +143,88 @@ async def test_cancelled_close_still_reaps_host() -> None:
     closing.cancel()
     with pytest.raises(asyncio.CancelledError):
         await closing
-    await asyncio.sleep(0.25)
+    await client.aclose()
     assert client.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_during_start_still_reaps_the_host() -> None:
+    client = EngineHostClient(fake_host_command("delayed_hello"), shutdown_timeout=0.1)
+    starting = asyncio.create_task(client.start())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(starting), timeout=0.02)
+    closing = asyncio.create_task(client.aclose())
+    await asyncio.sleep(0)
+    supervised_close = client._close_task
+    assert supervised_close is not None
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    await client.aclose()
+    assert client._close_task is supervised_close
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert client.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_close_during_unresponsive_hello_honors_shutdown_budget() -> None:
+    client = EngineHostClient(
+        fake_host_command("ignore_hello"), request_timeout=0.4, shutdown_timeout=0.05
+    )
+    starting = asyncio.create_task(client.start())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(starting), timeout=0.02)
+    started_at = monotonic()
+    await client.aclose()
+    assert monotonic() - started_at < 0.2
+    assert client.returncode is not None
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+
+@pytest.mark.asyncio
+async def test_reader_eof_after_handshake_reaps_the_still_running_host() -> None:
+    client = EngineHostClient(
+        fake_host_command("close_stdout_after_ready"), shutdown_timeout=0.1
+    )
+    await client.start()
+    await wait_for_reap(client)
+    assert client.status.state == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_capabilities_waits_for_delayed_hello_without_an_early_command() -> None:
+    client = EngineHostClient(fake_host_command("delayed_hello"))
+    starting = asyncio.create_task(client.start())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(starting), timeout=0.02)
+    capabilities = await client.capabilities()
+    assert capabilities.model is True
+    await starting
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_drain_before_ready_does_not_write_to_the_host() -> None:
+    client = EngineHostClient(fake_host_command("delayed_hello"))
+    starting = asyncio.create_task(client.start())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(starting), timeout=0.02)
+    with pytest.raises(HostUnavailable, match="ready"):
+        await client.drain(0.1)
+    await starting
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_environment_allowlist_omits_parent_secret_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENGINE_HOST_TEST_SECRET", "must-not-reach-child")
+    client = EngineHostClient(fake_host_command("environment_guard"))
+    await client.start()
+    await client.aclose()
 
 
 @pytest.mark.asyncio
