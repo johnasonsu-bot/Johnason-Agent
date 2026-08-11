@@ -53,11 +53,12 @@ class _RunStream:
     last_sequence: int = 0
     failure: Exception | None = None
     terminal_name: str | None = None
+    terminal_envelope: HostEnvelope | None = None
     accepted: bool = False
     consumer_closed: bool = False
     closed: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_received: asyncio.Event = field(default_factory=asyncio.Event)
-    start_sent: bool = False
+    start_write_attempted: bool = False
     admission_known: bool = False
     admission_task: asyncio.Task[HostEnvelope] | None = None
     cancel_task: asyncio.Task[HostEnvelope] | None = None
@@ -99,6 +100,7 @@ EVENT_KIND = {
 TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 MAX_RESPONSE_TOMBSTONES = 512
 MAX_TERMINAL_TOMBSTONES = 256
+MAX_ACTIVE_RUNS = 256
 CANCEL_REASON_CODES = {
     "user_requested",
     "consumer_closed",
@@ -260,10 +262,9 @@ class EngineHostClient:
             raise ValueError("drain deadline must be positive")
         if self._status.state != "ready":
             raise HostUnavailable("engine-host must be ready before drain")
+        deadline = asyncio.get_running_loop().time() + deadline_seconds
         try:
-            await asyncio.wait_for(
-                self._request("host.drain", {}), timeout=deadline_seconds
-            )
+            await self._request("host.drain", {}, deadline=deadline)
         except TimeoutError as exc:
             self._mark_unavailable()
             await self._close_after_request_failure()
@@ -285,10 +286,14 @@ class EngineHostClient:
             raise HostRunRejected("engine-host run id is already terminated")
         if command.run_id in self._active_runs:
             raise HostRunRejected("engine-host run is already active")
+        if len(self._active_runs) >= MAX_ACTIVE_RUNS:
+            raise HostRunRejected("engine-host active run capacity reached")
         if (
             len(self._terminal_tombstones) + len(self._active_runs)
             >= MAX_TERMINAL_TOMBSTONES
         ):
+            if self._active_runs:
+                raise HostRunRejected("engine-host lifecycle run capacity reached")
             failure = HostUnavailable(
                 "engine-host terminal history capacity reached"
             )
@@ -323,11 +328,13 @@ class EngineHostClient:
             )
             stream.consumer_closed = True
             stream.closed.set()
-            if should_cancel:
-                await self.cancel(command.run_id, "consumer_closed")
-            if stream.terminal_name is not None:
-                self._remember_terminal(command.run_id, stream.terminal_name)
-            self._active_runs.pop(command.run_id, None)
+            try:
+                if should_cancel:
+                    await self.cancel(command.run_id, "consumer_closed")
+            finally:
+                if stream.terminal_name is not None:
+                    self._remember_terminal(command.run_id, stream.terminal_name)
+                self._active_runs.pop(command.run_id, None)
 
     async def _await_admission(
         self, admission_task: asyncio.Task[HostEnvelope]
@@ -362,10 +369,12 @@ class EngineHostClient:
                     "trace": {"traceparent": command.command_id},
                 },
                 run_id=command.run_id,
-                on_sent=lambda: setattr(stream, "start_sent", True),
+                on_write_attempt=lambda: setattr(
+                    stream, "start_write_attempted", True
+                ),
             )
-        except TimeoutError as exc:
-            if not stream.start_sent:
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            if not stream.start_write_attempted:
                 raise
             failure = HostAdmissionUnknown("engine-host run admission is unknown")
             self._mark_unavailable()
@@ -411,7 +420,7 @@ class EngineHostClient:
                 "run.cancel",
                 {"reason": reason},
                 run_id=run_id,
-                timeout=self._remaining(deadline),
+                deadline=deadline,
             )
         except TimeoutError as exc:
             failure = HostUnavailable(
@@ -423,9 +432,8 @@ class EngineHostClient:
             raise failure from exc
         stream.cancel_expected_terminal = str(response.payload["terminal"])
         try:
-            await asyncio.wait_for(
-                stream.terminal_received.wait(), timeout=self._remaining(deadline)
-            )
+            async with asyncio.timeout_at(deadline):
+                await stream.terminal_received.wait()
         except TimeoutError as exc:
             failure = HostUnavailable("engine-host cancel terminal timed out")
             self._mark_unavailable()
@@ -453,8 +461,8 @@ class EngineHostClient:
         payload: dict[str, Any],
         *,
         run_id: str | None = None,
-        on_sent: Callable[[], None] | None = None,
-        timeout: float | None = None,
+        on_write_attempt: Callable[[], None] | None = None,
+        deadline: float | None = None,
     ) -> HostEnvelope:
         process = self._process
         if process is None or process.returncode is not None:
@@ -465,22 +473,25 @@ class EngineHostClient:
         self._pending_names[message_id] = name
         if run_id is not None:
             self._pending_run_ids[message_id] = run_id
+        request_deadline = (
+            asyncio.get_running_loop().time() + self.request_timeout
+            if deadline is None
+            else deadline
+        )
         try:
-            await self._write(
-                HostEnvelope(
-                    message_id=message_id,
-                    kind="command",
-                    name=name,
-                    run_id=run_id,
-                    payload=payload,
+            if on_write_attempt is not None:
+                on_write_attempt()
+            async with asyncio.timeout_at(request_deadline):
+                await self._write(
+                    HostEnvelope(
+                        message_id=message_id,
+                        kind="command",
+                        name=name,
+                        run_id=run_id,
+                        payload=payload,
+                    )
                 )
-            )
-            if on_sent is not None:
-                on_sent()
-            response = await asyncio.wait_for(
-                future,
-                timeout=self.request_timeout if timeout is None else timeout,
-            )
+                response = await future
             if response.name != name:
                 raise HostProtocolError("engine-host response name does not match request")
             return response
@@ -586,8 +597,12 @@ class EngineHostClient:
             except (HostUnavailable, HostProtocolError, HostFrameTooLarge):
                 pass
             try:
-                await asyncio.wait_for(
-                    self._request("host.shutdown", {}), timeout=self.shutdown_timeout
+                await self._request(
+                    "host.shutdown",
+                    {},
+                    deadline=(
+                        asyncio.get_running_loop().time() + self.shutdown_timeout
+                    ),
                 )
             except (HostUnavailable, HostProtocolError, HostFrameTooLarge, TimeoutError):
                 pass
@@ -722,6 +737,8 @@ class EngineHostClient:
 
     def _fail_runs(self, error: Exception) -> None:
         for stream in tuple(self._active_runs.values()):
+            if stream.terminal_envelope is not None:
+                continue
             if stream.failure is None:
                 stream.failure = error
             stream.consumer_closed = True
@@ -791,15 +808,12 @@ class EngineHostClient:
                 self._mark_degraded()
                 self._fail_runs(error)
                 return
+            stream.terminal_envelope = envelope
         await stream.put(envelope)
 
     def _remember_terminal(self, run_id: str, terminal_name: str) -> None:
         self._terminal_tombstones[run_id] = terminal_name
         self._terminal_tombstones.move_to_end(run_id)
-
-    @staticmethod
-    def _remaining(deadline: float) -> float:
-        return max(deadline - asyncio.get_running_loop().time(), 0.0)
 
     @staticmethod
     def _agent_event(command: RunAgentTurn, envelope: HostEnvelope) -> AgentEvent:

@@ -72,6 +72,28 @@ async def test_run_stream_maps_monotonic_host_events_to_agent_events() -> None:
     assert events[1].payload == {"text": "fake: hello"}
 
 
+@pytest.mark.asyncio
+async def test_authoritative_terminal_survives_immediate_host_eof() -> None:
+    client = EngineHostClient(
+        fake_host_command("terminal_then_eof"), shutdown_timeout=0.05
+    )
+    await client.start()
+    stream = client.run_turn(turn())
+    try:
+        first = await anext(stream)
+        await _wait_until_unavailable(client)
+        events = [first, *(await _collect(stream))]
+        assert [event.kind for event in events] == [
+            "turn_started",
+            "text_delta",
+            "turn_finished",
+        ]
+        assert client.status.state == "unavailable"
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
 @pytest.mark.parametrize("mode", ["duplicate_sequence", "out_of_order"])
 @pytest.mark.asyncio
 async def test_run_rejects_non_contiguous_sequence(mode: str) -> None:
@@ -218,6 +240,48 @@ async def test_terminal_history_capacity_ends_host_lifecycle_without_eviction() 
 
 
 @pytest.mark.asyncio
+async def test_active_run_capacity_rejects_only_new_admission() -> None:
+    client = EngineHostClient(
+        fake_host_command("blocking_run"),
+        request_timeout=0.5,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    streams = []
+    try:
+        for index in range(256):
+            stream = client.run_turn(
+                turn(
+                    session_id=f"session-{index}",
+                    run_id=f"run-{index}",
+                    command_id=f"command-{index}",
+                )
+            )
+            assert (await anext(stream)).kind == "turn_started"
+            streams.append(stream)
+
+        with pytest.raises(HostRunRejected, match="active run capacity"):
+            await _collect(
+                client.run_turn(
+                    turn(
+                        session_id="session-over-capacity",
+                        run_id="run-over-capacity",
+                        command_id="command-over-capacity",
+                    )
+                )
+            )
+
+        assert client.status.state == "ready"
+        assert len(client._active_runs) == 256
+        assert all(stream.failure is None for stream in client._active_runs.values())
+    finally:
+        await client.aclose()
+        await asyncio.gather(
+            *(stream.aclose() for stream in streams), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
 async def test_cancel_is_idempotent_and_emits_one_terminal() -> None:
     client = EngineHostClient(fake_host_command("blocking_run"))
     await client.start()
@@ -295,6 +359,7 @@ async def test_consumer_close_does_not_swallow_cancel_terminal_timeout() -> None
         assert (await anext(stream)).kind == "turn_started"
         with pytest.raises(HostUnavailable, match="cancel terminal timed out"):
             await stream.aclose()
+        assert "run-1" not in client._active_runs
         assert client.status.state == "unavailable"
         assert client.returncode is not None
     finally:
@@ -528,6 +593,80 @@ async def test_unknown_admission_after_start_write_reaps_host() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_start_deadline_includes_blocked_stdin_write() -> None:
+    client = EngineHostClient(
+        fake_host_command("blocking_run"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    await client._write_lock.acquire()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_request_pending(client, "run.start")
+        with pytest.raises(HostAdmissionUnknown, match="admission is unknown"):
+            await asyncio.wait_for(asyncio.shield(consumer), timeout=0.5)
+        assert client.status.state == "unavailable"
+        await _wait_until_reaped(client)
+    finally:
+        if client._write_lock.locked():
+            client._write_lock.release()
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancel_during_run_start_write_is_admission_unknown() -> None:
+    client = EngineHostClient(
+        fake_host_command("blocking_run"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    await client._write_lock.acquire()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_request_pending(client, "run.start")
+        consumer.cancel()
+        with pytest.raises(HostAdmissionUnknown, match="admission is unknown"):
+            await asyncio.wait_for(consumer, timeout=0.5)
+        assert client.status.state == "unavailable"
+        await _wait_until_reaped(client)
+    finally:
+        if client._write_lock.locked():
+            client._write_lock.release()
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_deadline_includes_blocked_stdin_write() -> None:
+    client = EngineHostClient(
+        fake_host_command("blocking_run"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    stream = client.run_turn(turn())
+    assert (await anext(stream)).kind == "turn_started"
+    await client._write_lock.acquire()
+    try:
+        with pytest.raises(HostUnavailable, match="cancel timed out"):
+            await asyncio.wait_for(
+                client.cancel("run-1", "user_requested"), timeout=0.5
+            )
+        assert client.status.state == "unavailable"
+        await _wait_until_reaped(client)
+    finally:
+        if client._write_lock.locked():
+            client._write_lock.release()
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_consumer_cancel_with_unknown_admission_raises_typed_failure() -> None:
     client = EngineHostClient(
         fake_host_command("ignore_run_start"),
@@ -648,3 +787,11 @@ async def _wait_until_reaped(client: EngineHostClient) -> None:
             await asyncio.sleep(0)
 
     await asyncio.wait_for(reaped(), timeout=1.0)
+
+
+async def _wait_until_unavailable(client: EngineHostClient) -> None:
+    async def unavailable() -> None:
+        while client.status.state != "unavailable":
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(unavailable(), timeout=1.0)

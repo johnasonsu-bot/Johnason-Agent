@@ -295,6 +295,8 @@ def respond(command: dict[str, object], mode: str) -> bool:
         )
         terminal_sequence = delta_sequence + 1
         write(event(run_id, terminal_sequence, "run.completed", {}))
+        if mode == "terminal_then_eof":
+            return True
         if mode == "duplicate_terminal":
             write(
                 event(
