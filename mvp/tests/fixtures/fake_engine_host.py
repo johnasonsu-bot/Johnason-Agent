@@ -318,6 +318,15 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     {"reason": "user_requested"},
                 )
             )
+        if mode == "duplicate_sequence_after_terminal":
+            write(
+                event(
+                    run_id,
+                    terminal_sequence,
+                    "run.cancelled",
+                    {"reason": "user_requested"},
+                )
+            )
         if mode == "immediate_event_after_terminal":
             write(
                 event(
@@ -325,6 +334,15 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     terminal_sequence + 1,
                     "agent.message.delta",
                     {"content": "late"},
+                )
+            )
+        if mode == "snapshot_after_terminal":
+            write(
+                event(
+                    run_id,
+                    terminal_sequence + 1,
+                    "run.state.snapshot",
+                    {},
                 )
             )
     elif name == "run.cancel":

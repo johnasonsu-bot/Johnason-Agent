@@ -800,6 +800,14 @@ class EngineHostClient:
             self._mark_degraded()
             await stream.put(error)
             return
+        if stream.terminal_name is not None:
+            error = HostTerminalError(
+                f"engine-host emitted {envelope.name} after terminal "
+                f"{stream.terminal_name}"
+            )
+            stream.failure = error
+            self._mark_degraded()
+            return
         expected_sequence = stream.last_sequence + 1
         if envelope.sequence != expected_sequence:
             error = HostSequenceError(
@@ -815,14 +823,6 @@ class EngineHostClient:
             stream.failure = error
             self._mark_degraded()
             await stream.put(error)
-            return
-        if stream.terminal_name is not None:
-            error = HostTerminalError(
-                f"engine-host emitted terminal {envelope.name} after "
-                f"{stream.terminal_name}"
-            )
-            stream.failure = error
-            self._mark_degraded()
             return
         if envelope.name in TERMINAL_EVENTS:
             stream.terminal_name = envelope.name

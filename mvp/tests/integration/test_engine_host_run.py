@@ -144,6 +144,27 @@ async def test_first_terminal_is_yielded_before_late_event_failure() -> None:
 
 
 @pytest.mark.parametrize(
+    "mode", ["duplicate_sequence_after_terminal", "snapshot_after_terminal"]
+)
+@pytest.mark.asyncio
+async def test_terminal_state_precedes_all_late_event_validation(mode: str) -> None:
+    client = EngineHostClient(fake_host_command(mode))
+    await client.start()
+    try:
+        events, failure = await _collect_prefix_and_error(client.run_turn(turn()))
+        assert isinstance(failure, HostTerminalError)
+        assert [event.kind for event in events] == [
+            "turn_started",
+            "text_delta",
+            "turn_finished",
+        ]
+        assert events[1].payload == {"text": "fake: hello"}
+        assert client.status.state == "degraded"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
     "mode", ["delayed_duplicate_terminal", "event_after_terminal"]
 )
 @pytest.mark.asyncio
