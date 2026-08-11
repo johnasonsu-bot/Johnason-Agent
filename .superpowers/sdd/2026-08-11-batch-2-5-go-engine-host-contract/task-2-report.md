@@ -2,7 +2,7 @@
 
 ## Status
 
-Complete. Commit SHA: pending commit.
+Complete. Commit SHA: 2d3fc350311400ffbc67aa1e61111d7cdd58ba0b (amended below to include this final report value).
 
 ## Change summary
 
