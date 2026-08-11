@@ -47,8 +47,11 @@ class EngineHostClient:
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._start_task: asyncio.Task[None] | None = None
+        self._start_waiters = 0
+        self._start_failure: BaseException | None = None
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+        self._close_cancels_start = False
         self._closed = False
         self._status = HostStatus(enabled=True, state="starting")
         self._diagnostics = ""
@@ -76,7 +79,17 @@ class EngineHostClient:
             if self._start_task is None:
                 self._start_task = asyncio.create_task(self._start_handshake())
             start_task = self._start_task
-        await asyncio.shield(start_task)
+            self._start_waiters += 1
+        try:
+            await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            await self._finish_start_waiter(start_task, cancelled=True)
+            raise
+        except BaseException:
+            await self._finish_start_waiter(start_task, cancelled=False)
+            raise
+        else:
+            await self._finish_start_waiter(start_task, cancelled=False)
 
     async def _start_handshake(self) -> None:
         self._status = HostStatus(enabled=True, state="starting")
@@ -111,10 +124,13 @@ class EngineHostClient:
                 capabilities=capabilities,
             )
         except OSError as exc:
+            failure = HostUnavailable("engine-host failed to start")
+            self._start_failure = failure
             self._mark_unavailable()
             await self._close_start_failure()
-            raise HostUnavailable("engine-host failed to start") from exc
-        except BaseException:
+            raise failure from exc
+        except BaseException as exc:
+            self._start_failure = exc
             self._mark_unavailable()
             await self._close_start_failure()
             raise
@@ -150,7 +166,7 @@ class EngineHostClient:
 
     async def aclose(self) -> None:
         """Drain, stop, and reap the child exactly once."""
-        close_task = await self._ensure_close_task()
+        close_task = await self._ensure_close_task(cancel_start=True)
         await asyncio.shield(close_task)
 
     async def _request(self, name: str, payload: dict[str, Any]) -> HostEnvelope:
@@ -212,19 +228,16 @@ class EngineHostClient:
                 error = HostUnavailable("engine-host output closed")
             self._mark_unavailable()
             self._fail_pending(error)
-            if self._start_task is None or self._start_task.done():
-                self._schedule_reader_close()
+            self._schedule_reader_close()
         except asyncio.LimitOverrunError:
             error = HostFrameTooLarge("engine-host frame exceeds 1 MiB")
             self._mark_unavailable()
             self._fail_pending(error)
-            if self._start_task is None or self._start_task.done():
-                self._schedule_reader_close()
+            self._schedule_reader_close()
         except (HostProtocolError, HostFrameTooLarge) as exc:
             self._mark_unavailable()
             self._fail_pending(exc)
-            if self._start_task is None or self._start_task.done():
-                self._schedule_reader_close()
+            self._schedule_reader_close()
         except asyncio.CancelledError:
             raise
 
@@ -296,8 +309,33 @@ class EngineHostClient:
         if close_task is not asyncio.current_task():
             await asyncio.shield(close_task)
 
-    async def _ensure_close_task(self) -> asyncio.Task[None]:
+    async def _finish_start_waiter(
+        self, start_task: asyncio.Task[None], *, cancelled: bool
+    ) -> None:
+        async with self._start_lock:
+            self._start_waiters -= 1
+            should_close = (
+                cancelled
+                and self._start_waiters == 0
+                and not start_task.done()
+                and self._start_failure is None
+            )
+        if should_close:
+            await self._ensure_close_task(cancel_start=True)
+
+    async def _ensure_close_task(
+        self, *, cancel_start: bool = False
+    ) -> asyncio.Task[None]:
         async with self._close_lock:
+            start_task = self._start_task
+            if (
+                cancel_start
+                and self._start_failure is None
+                and start_task is not None
+                and not start_task.done()
+            ):
+                self._close_cancels_start = True
+                start_task.cancel()
             close_task = self._close_task
             if close_task is None:
                 close_task = asyncio.create_task(self._supervise_close())
@@ -309,7 +347,11 @@ class EngineHostClient:
         self._closed = True
         start_task = self._start_task
         if start_task is not None and start_task is not asyncio.current_task():
-            if not start_task.done():
+            if (
+                self._close_cancels_start
+                and self._start_failure is None
+                and not start_task.done()
+            ):
                 start_task.cancel()
             try:
                 await asyncio.shield(start_task)

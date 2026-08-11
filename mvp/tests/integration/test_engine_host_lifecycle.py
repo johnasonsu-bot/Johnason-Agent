@@ -184,6 +184,62 @@ async def test_close_during_unresponsive_hello_honors_shutdown_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancelling_only_start_waiter_reaps_the_host_without_aclose() -> None:
+    client = EngineHostClient(fake_host_command("ignore_hello"), shutdown_timeout=0.1)
+    starting = asyncio.create_task(client.start())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(starting), timeout=0.02)
+    starting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    await wait_for_reap(client)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_of_two_start_waiters_keeps_handshake_alive() -> None:
+    client = EngineHostClient(fake_host_command("delayed_hello"))
+    first = asyncio.create_task(client.start())
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(asyncio.shield(first), timeout=0.02)
+    second = asyncio.create_task(client.start())
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await second
+    assert client.status.state == "ready"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_reader_error_reaps_when_ready_precedes_start_task_completion() -> None:
+    client = EngineHostClient(
+        fake_host_command("delayed_close_stdout_after_ready"), shutdown_timeout=0.1
+    )
+    await client.start()
+
+    async def complete_after_reader_error() -> None:
+        await asyncio.sleep(0.2)
+
+    client._start_task = asyncio.create_task(complete_after_reader_error())
+    await wait_for_reap(client)
+    assert client.status.state == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_preserves_incompatible_protocol_error() -> None:
+    client = EngineHostClient(fake_host_command("bad_protocol"), shutdown_timeout=0.1)
+    starting = asyncio.create_task(client.start())
+    while client.status.state != "unavailable":
+        await asyncio.sleep(0)
+    closing = asyncio.create_task(client.aclose())
+    with pytest.raises(HostProtocolError, match="incompatible protocol"):
+        await starting
+    await closing
+    assert client.returncode is not None
+
+
+@pytest.mark.asyncio
 async def test_reader_eof_after_handshake_reaps_the_still_running_host() -> None:
     client = EngineHostClient(
         fake_host_command("close_stdout_after_ready"), shutdown_timeout=0.1

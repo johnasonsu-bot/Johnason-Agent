@@ -63,6 +63,11 @@ def respond(command: dict[str, object], mode: str) -> bool:
             os.close(sys.stdout.fileno())
             while True:
                 time.sleep(60)
+        if mode == "delayed_close_stdout_after_ready":
+            time.sleep(0.15)
+            os.close(sys.stdout.fileno())
+            while True:
+                time.sleep(60)
     elif name == "host.drain":
         if mode == "wrong_drain_response_name":
             write(response(command, "host.shutdown", {}))
