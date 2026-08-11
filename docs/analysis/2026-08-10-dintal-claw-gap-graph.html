@@ -1,0 +1,441 @@
+Your user’s .npmrc file (${HOME}/.npmrc)
+has a `globalconfig` and/or a `prefix` setting, which are incompatible with nvm.
+Run `nvm use --delete-prefix v22.20.0 --silent` to unset it.
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generic Agent × DinTal Claw · 架构差距动态图谱</title>
+<style>
+:root{
+  --ink:#0E1422; --line:#25304A;
+  --serif:"Songti SC",Georgia,"Times New Roman",serif;
+  --sans:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:#C6CFE2;font-family:var(--sans);-webkit-font-smoothing:antialiased}
+header{padding:20px 22px 4px;max-width:1100px;margin:0 auto}
+header h1{font-size:18px;margin:0 0 4px;font-weight:700;color:#EAEEF7}
+header p{margin:0;color:#8B96AE;font-size:13px;line-height:1.6}
+.stage{margin:16px auto;max-width:1100px;background:radial-gradient(120% 130% at 50% 0%,#161D2E 0%,#0C111C 80%);
+  border:1px solid var(--line);border-radius:16px;overflow:hidden;position:relative}
+#graph-box{position:relative;height:780px;overflow:hidden}
+@media(max-width:680px){#graph-box{height:620px}}
+#graph-svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+
+/* ----- 五层横带（仅 layered 模式） ----- */
+.gband-line{stroke:#22304C;stroke-width:1;stroke-dasharray:4 7;stroke-opacity:.7}
+.gband-cap{fill:#5E6E92;font-family:var(--mono);font-size:11px;letter-spacing:.06em}
+.gband-sub{fill:#9AA7C4;font-family:var(--sans);font-size:13px;font-weight:600}
+.gband-band:nth-child(odd){fill:#121A2B} .gband-band{fill:#0E1626;opacity:.5}
+
+/* ----- 节点 / 连线 / 标签 ----- */
+.gnode{cursor:grab}.gnode.dragging{cursor:grabbing}
+.gnode,.glink,.gelabel{transition:opacity .22s ease}
+.gnode.dim{opacity:.12}.glink.dim{opacity:.04}.gelabel.dim{opacity:0}
+.gn-core{transition:transform .2s cubic-bezier(.34,1.56,.64,1);transform-box:fill-box;transform-origin:center}
+.gnode.pop .gn-core{transform:scale(1.28)}
+.glabel{fill:#C6CFE2;paint-order:stroke;stroke:#0B1018;stroke-width:3px;stroke-linejoin:round;
+  font-size:10px;font-family:var(--sans)}
+.gnode.pop .glabel{fill:#fff;font-weight:700;font-size:11.5px}
+.gelabel{fill:#8B96AE;font-size:8.5px;font-family:var(--mono);opacity:0}
+
+/* ----- 工具条 / 图例 / 详情 ----- */
+.toolbar{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:6}
+.tb-btn{font-size:12px;font-family:var(--mono);color:#C6CFE2;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:6px 11px;cursor:pointer}
+.tb-btn:hover{background:#1E2A44;color:#fff}
+#g-search{flex:1 1 130px;min-width:120px;font-size:12.5px;color:#E6EBF5;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:7px 11px;font-family:var(--sans)}
+#g-search::placeholder{color:#7782A0}
+.legend{display:flex;flex-wrap:wrap;gap:7px;padding:14px;border-top:1px solid #25304A;background:#0E1421}
+.lg{display:flex;align-items:center;gap:6px;font-size:11.5px;color:#AEB8CE;cursor:pointer;
+  padding:4px 9px;border-radius:18px;border:1px solid transparent}
+.lg:hover{border-color:#2A3650}
+.lg.active{background:#1A2336;border-color:#3A4E6E;color:#fff}
+.lg .sw{width:11px;height:11px;border-radius:50%}
+.g-pop{position:absolute;z-index:8;background:#161D2E;border:1px solid #2C3A58;border-radius:11px;
+  box-shadow:0 10px 34px rgba(0,0,0,.5);padding:11px 13px;font-size:12.5px;color:#D4DAE8;
+  pointer-events:none;max-width:250px;line-height:1.55}
+.g-pop b{color:#fff}
+#g-detail{padding:16px 18px;border-top:1px solid #25304A;background:#0E1421;min-height:64px;font-size:13.5px}
+#g-detail .ph{color:#7E8AA6;font-family:var(--mono);font-size:11.5px}
+#g-detail .nm{font-family:var(--serif);font-size:18px;color:#fff;margin:2px 0 6px}
+#g-detail .gp{font-size:11px;font-family:var(--mono);padding:2px 8px;border-radius:12px;margin-left:8px;vertical-align:middle}
+#g-detail .ds{color:#B6C0D6;margin:6px 0 4px}
+#g-detail .pr{display:flex;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:1px solid #1E2840;font-size:12.5px}
+#g-detail .pr span{color:#828FAB} #g-detail .pr b{color:#DCE2EF}
+#g-detail .nbtit{margin-top:12px;color:#7E8AA6;font-size:11.5px;font-family:var(--mono)}
+#g-detail .nb{display:inline-block;margin:4px 4px 0 0;padding:3px 9px;border-radius:8px;font-size:12px;cursor:pointer}
+@media (prefers-reduced-motion: reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Generic Agent × DinTal Claw · 架构差距动态图谱</h1>
+  <p>五层对比：DinTal 报告能力 → 当前已实现 → 当前已设计 → 实际缺口 → 推荐组件。颜色代表证据类别；点击节点查看依据、优先级与建议。默认分层布局，也可切换为力导向布局。</p>
+</header>
+
+<div class="stage">
+  <div id="graph-box">
+    <div class="toolbar">
+      <input id="g-search" type="text" placeholder="搜索节点…" autocomplete="off">
+      <button class="tb-btn" id="g-mode">切换布局</button>
+      <button class="tb-btn" id="g-reset">重置视图</button>
+      <button class="tb-btn" id="g-relayout">重新布局</button>
+    </div>
+    <svg id="graph-svg"></svg>
+  </div>
+  <div class="legend" id="g-legend"></div>
+  <div id="g-detail"></div>
+</div>
+
+<script>
+/* ============================================================
+   1) 布局模式： "layered"（纵向分层横带） | "force"（自由力导向）
+   ============================================================ */
+let LAYOUT="layered";
+
+/* ============================================================
+   2) 数据 —— 换成你自己的领域数据
+   - GROUPS：颜色分组（决定节点颜色 + 图例 + 高亮筛选维度）
+   - LAYERS：纵向层带（仅 layered 模式生效）。每层声明它包含哪些 group。
+             颜色仍按 GROUPS，层带只决定纵向位置 → 颜色与结构是两个独立维度。
+   - NODES ：id 唯一；group 必须是 GROUPS 里的 id；desc/props 用于详情面板。
+   - EDGES ：[source, target, relation] 三元组；source/target 必须是节点 id。
+   下面是一份与具体业务无关的「系统架构」示例数据，仅作占位演示。
+   ============================================================ */
+const GROUPS=[
+  {id:"benchmark",label:"DinTal 报告能力",color:"#E8B84B"},
+  {id:"current",label:"当前已实现",color:"#5FB87A"},
+  {id:"planned",label:"当前已设计",color:"#5B8FF0"},
+  {id:"gap",label:"实际能力缺口",color:"#E0574F"},
+  {id:"adopt",label:"组件与路线建议",color:"#34B3C7"}
+];
+
+const LAYERS=[
+  {key:1,label:"DinTal 基准层",en:"Reported benchmark",groups:["benchmark"]},
+  {key:2,label:"当前已实现层",en:"Implemented",groups:["current"]},
+  {key:3,label:"当前设计层",en:"Designed, not implemented",groups:["planned"]},
+  {key:4,label:"实际差距层",en:"Capability gaps",groups:["gap"]},
+  {key:5,label:"组件与路线层",en:"Adoption decisions",groups:["adopt"]}
+];
+
+const NODES=[
+  {id:"D_RT",label:"DinTal Agent Runtime",group:"benchmark",desc:"报告列出的 cliagent dispatcher、runtime、task、promptbuild、artifact 与 upstream 运行链路。",props:[["证据","附件架构报告"],["性质","报告声明，未在本次工作区复验"],["比较重点","运行时广度"]]},
+  {id:"D_MCP",label:"MCP Gateway",group:"benchmark",desc:"DinTal 报告包含 MCP Gateway，作为工具与外部能力的通用入口。",props:[["证据","附件架构报告"],["能力","工具协议 / 外部服务"]]},
+  {id:"D_MSG",label:"消息 Channel Hub",group:"benchmark",desc:"报告列出 OpenIM、钉钉、飞书、Slack、Discord、Telegram、企业微信等消息入口。",props:[["证据","附件架构报告"],["能力","多渠道接入"]]},
+  {id:"D_COLLAB",label:"TipTap 协作文档",group:"benchmark",desc:"附件中的 TipTap Collab 快照描述 Hocuspocus、Yjs、REST CRUD、导出和流式协作。",props:[["证据","附件附带的独立快照"],["限制","与主报告关系需仓库复验"]]},
+  {id:"D_KNOW",label:"知识同步与 Graphify",group:"benchmark",desc:"报告列出 ksync、graphify、noosphere 等知识同步和关系化组件。",props:[["证据","附件架构报告"],["能力","知识同步 / 图谱"]]},
+  {id:"D_INFRA",label:"Gateway / IAM / Config",group:"benchmark",desc:"报告列出 APISIX、Keycloak、ConfigCenter 等服务化基础设施。",props:[["证据","附件架构报告"],["能力","网关 / 身份 / 配置"]]},
+  {id:"D_SCHED",label:"Scheduler 与 Workspace",group:"benchmark",desc:"报告描述调度器、工作空间与多种运行入口。",props:[["证据","附件架构报告"],["能力","调度 / 工作区"]]},
+
+  {id:"C_RUNTIME",label:"AgentRuntime 工具循环",group:"current",desc:"当前实现模型→工具→模型循环、检查点和安全介入边界；单次 turn 有步数上限。",props:[["状态","已实现"],["证据","mvp/src/workbench/runtime"],["优势","安全边界清晰"]]},
+  {id:"C_WORKER",label:"持久化 Worker",group:"current",desc:"当前具备租约、重试、幂等、重启恢复和 queued→running→terminal 状态迁移。",props:[["状态","已验证"],["证据","persistent-worker-validation.md"],["优势","恢复语义较强"]]},
+  {id:"C_EVENT",label:"Event Store + AG-UI",group:"current",desc:"业务事件持久化并映射到 AG-UI，通过 SSE cursor 支持恢复与重放。",props:[["状态","已实现"],["优势","前后端状态可追溯"]]},
+  {id:"C_MODEL",label:"Model Gateway + Vault",group:"current",desc:"支持 LM Studio、DeepSeek 和 OpenAI-compatible 适配器，供应商配置加密保存。",props:[["状态","已实现"],["优势","本地/云模型切换"]]},
+  {id:"C_ART",label:"内容寻址 Artifact",group:"current",desc:"已有内容寻址字节存储和原子替换，但没有逻辑版本、锁和冲突处理。",props:[["状态","部分实现"],["缺口","版本 / 冲突 / 回滚"]]},
+  {id:"C_SKILL",label:"Skill Pin Registry",group:"current",desc:"当前可发现 Skill 并以摘要 pin 固定版本，但不负责执行、安装或权限交集。",props:[["状态","只读发现"],["缺口","运行与权限"]]},
+  {id:"C_DP",label:"Data Platform 特例",group:"current",desc:"已有 API 与 CDP 只读关联调试能力，但仍是专用连接器。",props:[["状态","已实现特例"],["缺口","尚未通用协议化"]]},
+  {id:"C_UI",label:"React / Electron UX",group:"current",desc:"已有多角色选择、会话与 Artifacts 界面，但多角色选择尚未对应真实后端多 Agent 图。",props:[["状态","前端已具备入口"],["缺口","后端仍是单 turn"]]},
+
+  {id:"P_GRAPH",label:"ExecutionGraph",group:"planned",desc:"设计文档规定按 @ 顺序执行的多 Agent 图，并为未来解决方案模板保留扩展点。",props:[["状态","已设计，未落地"],["优先级","P0"]]},
+  {id:"P_CONTEXT",label:"Agent 私有上下文",group:"planned",desc:"设计区分 Agent 独立线程、项目共享上下文和用户持续介入。",props:[["状态","已设计"],["优先级","P0"]]},
+  {id:"P_REVIEW",label:"Supervisor / Verifier",group:"planned",desc:"设计支持监督、验证、审批与自动返工，未通过时返回前一节点。",props:[["状态","已设计"],["优先级","P0"]]},
+  {id:"P_CONNECT",label:"Connector Runtime",group:"planned",desc:"设计目标是独立连接器模块，让代码产物和外部软件通信。",props:[["状态","概念已定义"],["优先级","P0"]]},
+  {id:"P_FACT",label:"Project Facts",group:"planned",desc:"设计包含项目级共享事实和长期上下文，但关系发布、检索和冲突策略尚未实现。",props:[["状态","已设计"],["优先级","P2"]]},
+  {id:"P_ARTV",label:"Artifact 版本与冲突",group:"planned",desc:"计划补齐逻辑版本、锁、冲突检测、回滚与协同编辑。",props:[["状态","待实现"],["优先级","P1"]]},
+  {id:"P_POOL",label:"Worker Pool / 调度",group:"planned",desc:"计划从单 worker 扩展到并发池、公平调度、背压和日程触发。",props:[["状态","待实现"],["优先级","P2"]]},
+
+  {id:"G_MULTI",label:"真多 Agent 未实现",group:"gap",desc:"当前 UI 可选多个角色，但后端仍由一个 turn/provider/model 处理，没有节点级线程、handoff 和返工图。",props:[["差距","关键阻塞"],["优先级","P0"]]},
+  {id:"G_MCP",label:"MCP 未实现",group:"gap",desc:"没有 MCP client/server/gateway，工具与连接器无法形成标准生态入口。",props:[["差距","关键平台缺口"],["优先级","P0"]]},
+  {id:"G_WS",label:"通用 Workspace 缺失",group:"gap",desc:"尚无受控文件系统、终端、Git、进程和资源限额运行面。",props:[["差距","运行时缺口"],["优先级","P1"]]},
+  {id:"G_CHANNEL",label:"外部消息通道缺失",group:"gap",desc:"没有外部 IM/协作平台的 Channel Adapter，当前只能从本地前端进入。",props:[["差距","入口广度"],["优先级","P2"]]},
+  {id:"G_COLLAB",label:"协作文档缺失",group:"gap",desc:"Artifacts 能展示内容，但不具备 CRDT、多用户光标、离线合并和协作权限。",props:[["差距","协作能力"],["优先级","P1"]]},
+  {id:"G_KNOW",label:"知识关系运行时缺失",group:"gap",desc:"尚无 ProjectFact 的发布、关系索引、检索与冲突处理运行时。",props:[["差距","长期上下文"],["优先级","P2"]]},
+  {id:"G_OBS",label:"Tracing / Metrics 缺失",group:"gap",desc:"已有业务事件但缺少跨模型、工具、节点和连接器的标准 trace 与 metrics。",props:[["差距","可观测性"],["优先级","P0"]]},
+  {id:"G_SANDBOX",label:"Tool Sandbox 缺失",group:"gap",desc:"工具执行尚未形成统一权限、超时、资源限额、审计和隔离边界。",props:[["差距","运行安全"],["优先级","P1"]]},
+  {id:"G_SCALE",label:"并发 / 背压 / 日程缺失",group:"gap",desc:"单 asyncio worker 适合 MVP，但缺少并发池、公平调度、背压与周期任务。",props:[["差距","规模化运行"],["优先级","P2"]]},
+  {id:"G_IAM",label:"多用户 IAM / 网关缺失",group:"gap",desc:"桌面 MVP 暂不需要复杂 IAM；服务化、多租户部署时才成为关键缺口。",props:[["差距","部署形态相关"],["优先级","P3"]]},
+
+  {id:"R_LANG",label:"LangGraph 决策 Spike",group:"adopt",desc:"在自研图运行时尚未落地前，用四节点审核返工场景验证持久化、恢复、HITL、SSE 和 Artifact 幂等；只能保留一个执行事实源。",props:[["决策","先验证再选择"],["时机","立即 / P0"]]},
+  {id:"R_MCP",label:"MCP Python SDK",group:"adopt",desc:"现在引入，优先支持 stdio 与 Streamable HTTP，作为 Tool/Connector Runtime 的标准适配层。",props:[["决策","推荐引入"],["时机","P0"]]},
+  {id:"R_OTEL",label:"OpenTelemetry",group:"adopt",desc:"在图、节点、模型、工具、连接器和 Artifact 边界增加 trace/metrics；业务 Event Store 仍是事实源。",props:[["决策","推荐引入"],["时机","P0"]]},
+  {id:"R_LITE",label:"LiteLLM 可选适配器",group:"adopt",desc:"可作为 ModelGateway 后面的可选供应商适配器，不替换现有 Vault、模型快照和事件语义。",props:[["决策","受控引入"],["时机","按供应商数量触发"]]},
+  {id:"R_TIP",label:"Tiptap + Yjs + Hocuspocus",group:"adopt",desc:"仅当 Artifact 进入真正多人协作编辑时引入，可先用 sidecar 与 SQLite 持久化。",props:[["决策","条件式引入"],["时机","P1"]]},
+  {id:"R_TEMP",label:"Temporal 暂缓",group:"adopt",desc:"等远程、多进程、长周期工作流超过 SQLite worker 能力时再评估，避免出现第二套事件历史。",props:[["决策","暂缓"],["时机","规模触发"]]},
+  {id:"R_IAM",label:"APISIX / Keycloak 暂缓",group:"adopt",desc:"本地桌面 MVP 不应复制整套微服务基础设施；远程多租户部署后再引入。",props:[["决策","暂缓"],["时机","P3"]]},
+  {id:"R_GRAPH",label:"SQLite 事实关系先行",group:"adopt",desc:"先用 ProjectFact 与 relation 表实现发布、关系和检索，再根据规模决定是否引入图数据库。",props:[["决策","先轻量实现"],["时机","P2"]]}
+];
+
+const EDGES=[
+  ["D_RT","C_RUNTIME","运行时对照"],["D_RT","G_MULTI","能力差距"],
+  ["D_MCP","G_MCP","当前缺失"],["D_MSG","G_CHANNEL","当前缺失"],
+  ["D_COLLAB","G_COLLAB","当前缺失"],["D_KNOW","G_KNOW","当前缺失"],
+  ["D_INFRA","G_IAM","部署差距"],["D_SCHED","G_SCALE","规模差距"],["D_SCHED","G_WS","工作区差距"],
+  ["C_RUNTIME","P_GRAPH","扩展为"],["C_WORKER","P_GRAPH","提供恢复基座"],["C_EVENT","P_GRAPH","记录图事件"],
+  ["C_MODEL","P_REVIEW","分配不同模型"],["C_MODEL","R_LITE","可选适配"],
+  ["C_ART","P_ARTV","补齐版本语义"],["C_SKILL","P_CONNECT","纳入统一运行时"],
+  ["C_DP","P_CONNECT","重构为 Manifest"],["C_UI","G_MULTI","前端先于后端"],
+  ["P_GRAPH","G_MULTI","尚未实现"],["P_CONTEXT","G_MULTI","节点线程所需"],["P_REVIEW","G_MULTI","审核循环所需"],
+  ["P_CONNECT","G_MCP","缺标准协议"],["P_CONNECT","G_WS","需要运行面"],
+  ["P_FACT","G_KNOW","尚未实现"],["P_ARTV","G_COLLAB","协作前置"],["P_POOL","G_SCALE","尚未实现"],
+  ["G_MULTI","R_LANG","决策验证"],["G_MCP","R_MCP","立即补齐"],["G_OBS","R_OTEL","立即补齐"],
+  ["G_WS","R_MCP","统一工具入口"],["G_SANDBOX","R_MCP","施加执行边界"],
+  ["G_COLLAB","R_TIP","条件式补齐"],["G_KNOW","R_GRAPH","轻量先行"],
+  ["G_SCALE","R_TEMP","规模触发"],["G_IAM","R_IAM","服务化触发"],
+  ["R_LANG","R_OTEL","Spike 需观测"],["R_MCP","R_OTEL","连接器需观测"]
+];
+
+/* ============================================================
+   3) 引擎 —— 一般无需改动
+   ============================================================ */
+const NS="http://www.w3.org/2000/svg";
+const COLOR=Object.fromEntries(GROUPS.map(g=>[g.id,g.color]));
+const GLABEL=Object.fromEntries(GROUPS.map(g=>[g.id,g.label]));
+const G2L={};LAYERS.forEach(L=>L.groups.forEach(g=>G2L[g]=L.key));
+const CN=["一","二","三","四","五","六","七","八","九","十"];
+let _seed=20240101; function rnd(){_seed=(_seed*1103515245+12345)&0x7fffffff;return _seed/0x7fffffff;}
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+const $=s=>document.querySelector(s);
+
+const G={nodes:[],links:[],idx:{},nbr:{},alpha:0,view:{x:0,y:0,k:1},drag:null,pan:null,hover:null,
+  raf:0,W:1000,H:780,root:null,bound:false,sel:null,litGroup:null};
+
+function degree(){const d={};EDGES.forEach(e=>{d[e[0]]=(d[e[0]]||0)+1;d[e[1]]=(d[e[1]]||0)+1;});return d;}
+function nodeR(deg,n){return Math.max(8,Math.min(22,7+(deg[n.id]||1)*1.3));}
+function mkNode(n,L,by,li,r,x,y){return {...n,layer:L,by,li,color:COLOR[n.group],r,x,y,vx:0,vy:0,
+  lw:Math.min(String(n.label).length,11)*11+10};}
+
+function geom(){
+  G.LBL=G.W<560?86:150;            // 左侧层标签留白
+  G.padT=44;G.padB=28;
+  G.bandH=(G.H-G.padT-G.padB)/LAYERS.length;
+  G.x0=G.LBL+34;G.x1=G.W-66;
+}
+function bandY(L){return G.padT+G.bandH*(L-0.5);}
+
+function build(){
+  geom();
+  const deg=degree();
+  G.nodes=[];
+  if(LAYOUT==="layered"){
+    const byLayer={};for(let L=1;L<=LAYERS.length;L++)byLayer[L]=[];
+    NODES.forEach(n=>{const L=G2L[n.group]||1;(byLayer[L]||byLayer[1]).push(n);});
+    for(let L=1;L<=LAYERS.length;L++){
+      const arr=byLayer[L];
+      arr.sort((p,q)=>p.group<q.group?-1:p.group>q.group?1:(deg[q.id]||0)-(deg[p.id]||0));
+      const cy=bandY(L),n_=arr.length;
+      arr.forEach((n,i)=>{
+        const r=nodeR(deg,n),t=n_>1?i/(n_-1):.5,x=G.x0+t*(G.x1-G.x0);
+        const jit=((i%3)-1)*Math.min(34,G.bandH*0.30)*(0.45+0.55*rnd());
+        G.nodes.push(mkNode(n,L,cy,i,r,x,cy+jit));
+      });
+    }
+  }else{
+    NODES.forEach((n,i)=>{
+      const r=nodeR(deg,n),a=i*2.39996,rr=70+Math.sqrt(i+1)*34;
+      G.nodes.push(mkNode(n,G2L[n.group]||1,0,i,r,G.W/2+Math.cos(a)*rr,G.H/2+Math.sin(a)*rr*.82));
+    });
+  }
+  G.links=EDGES.map(e=>({s:e[0],t:e[1],label:e[2]}));
+  G.idx=Object.fromEntries(G.nodes.map(n=>[n.id,n]));
+  G.nbr={};G.links.forEach(l=>{(G.nbr[l.s]||(G.nbr[l.s]=new Set())).add(l.t);(G.nbr[l.t]||(G.nbr[l.t]=new Set())).add(l.s);});
+}
+
+function dom(svg){
+  svg.innerHTML="";const root=el("g",{});G.root=root;
+  const gb=el("g",{}),gl=el("g",{}),gn=el("g",{});
+  if(LAYOUT==="layered"){
+    for(let L=1;L<=LAYERS.length;L++){
+      const top=G.padT+G.bandH*(L-1),cy=bandY(L);
+      gb.appendChild(el("rect",{class:"gband-band",x:0,y:top,width:G.W,height:G.bandH}));
+      gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:top,x2:G.W-10,y2:top}));
+      const cap=el("text",{class:"gband-cap",x:22,y:cy-7});cap.textContent="第"+(CN[L-1]||L)+"层";gb.appendChild(cap);
+      const sub=el("text",{class:"gband-sub",x:22,y:cy+13});sub.textContent=LAYERS[L-1].label;gb.appendChild(sub);
+      if(LAYERS[L-1].en){const en=el("text",{class:"gband-cap",x:22,y:cy+30});en.textContent=LAYERS[L-1].en;gb.appendChild(en);}
+    }
+    gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:G.padT+G.bandH*LAYERS.length,x2:G.W-10,y2:G.padT+G.bandH*LAYERS.length}));
+  }
+  G.links.forEach(l=>{
+    l.el=el("line",{class:"glink",stroke:"#5A6B8C","stroke-width":1.1,"stroke-opacity":.30});gl.appendChild(l.el);
+    l.elt=el("text",{class:"gelabel","text-anchor":"middle"});l.elt.textContent=l.label;gl.appendChild(l.elt);
+  });
+  G.nodes.forEach(n=>{
+    const g=el("g",{class:"gnode","data-id":n.id});
+    const core=el("g",{class:"gn-core"});
+    core.appendChild(el("circle",{r:n.r+5,fill:n.color,"fill-opacity":.16}));      // 光晕
+    const c=el("circle",{r:n.r,fill:n.color,"fill-opacity":.92,stroke:"#0B1018","stroke-width":1.5});
+    core.appendChild(c);n.elc=c;g.appendChild(core);
+    const below=(n.li%2===0);                                                      // 交错上下，缓解标签拥挤
+    const lb=el("text",{class:"glabel","text-anchor":"middle",y:below?n.r+14:-(n.r+7)});lb.textContent=n.label;g.appendChild(lb);
+    n.el=g;gn.appendChild(g);
+  });
+  root.appendChild(gb);root.appendChild(gl);root.appendChild(gn);svg.appendChild(root);applyView();markSel();
+}
+function applyView(){if(G.root)G.root.setAttribute("transform",`translate(${G.view.x},${G.view.y}) scale(${G.view.k})`);}
+function kick(a){G.alpha=Math.max(G.alpha,a);if(!G.raf)G.raf=requestAnimationFrame(loop);}
+function loop(){G.raf=0;step();draw();if(G.alpha>0.012||G.drag)G.raf=requestAnimationFrame(loop);}
+function step(){LAYOUT==="layered"?stepLayered():stepForce();}
+
+function stepForce(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const dx=t.x-s.x,dy=t.y-s.y,d=Math.hypot(dx,dy)||1,f=(d-112)*0.015*a,fx=dx/d*f,fy=dy/d*f;
+    s.vx+=fx;s.vy+=fy;t.vx-=fx;t.vy-=fy;}
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<30000){const f=1250*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    let minD=p.r+q.r+16;if(Math.abs(dy)<32)minD=Math.max(minD,(p.lw+q.lw)*0.40);
+    if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+      if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+      if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}
+  }
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vx+=(G.W/2-n.x)*0.006*a;n.vy+=(G.H/2-n.y)*0.006*a;
+    n.x+=n.vx*=.86;n.y+=n.vy*=.86;}
+  G.alpha*=G.drag?1:.965;
+}
+
+function stepLayered(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const fx=(t.x-s.x)*0.0011*a;s.vx+=fx;t.vx-=fx;}                 // 仅横向对齐
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<32000){const f=1080*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    if(p.layer===q.layer){let minD=p.r+q.r+16;if(Math.abs(dy)<34)minD=Math.max(minD,(p.lw+q.lw)*0.44);
+      if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+        if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+        if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}}
+  }
+  const yIn=Math.min(40,G.bandH*0.34);
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vy+=(n.by-n.y)*0.085*a;                                       // 回吸到本层中线
+    n.x+=n.vx*=.85;n.y+=n.vy*=.85;
+    if(n.x<G.x0)n.x=G.x0;if(n.x>G.x1)n.x=G.x1;                      // 横向夹在画布内
+    if(n.y<n.by-yIn)n.y=n.by-yIn;if(n.y>n.by+yIn)n.y=n.by+yIn;       // 纵向夹在本层带内
+  }
+  G.alpha*=G.drag?1:.965;
+}
+
+function draw(){
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t||!l.el)continue;
+    l.el.setAttribute("x1",s.x.toFixed(1));l.el.setAttribute("y1",s.y.toFixed(1));
+    l.el.setAttribute("x2",t.x.toFixed(1));l.el.setAttribute("y2",t.y.toFixed(1));
+    if(l.elt){l.elt.setAttribute("x",((s.x+t.x)/2).toFixed(1));l.elt.setAttribute("y",((s.y+t.y)/2-3).toFixed(1));}}
+  for(const n of G.nodes)n.el.setAttribute("transform",`translate(${n.x.toFixed(1)},${n.y.toFixed(1)})`);
+}
+function pt(box,ev){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+  const px=(ev.clientX-r.left)*sx,py=(ev.clientY-r.top)*sx;
+  return {x:(px-G.view.x)/G.view.k,y:(py-G.view.y)/G.view.k,px,py};}
+function bind(svg,box){
+  svg.addEventListener("pointerdown",ev=>{
+    const g=ev.target.closest?ev.target.closest(".gnode"):null;
+    if(g){const n=G.idx[g.dataset.id];if(!n)return;G.drag={node:n,moved:0};
+      try{svg.setPointerCapture(ev.pointerId)}catch(e){}n.el.classList.add("dragging");kick(.7);hidePop();}
+    else{G.pan={x:ev.clientX,y:ev.clientY,vx:G.view.x,vy:G.view.y};try{svg.setPointerCapture(ev.pointerId)}catch(e){}}
+  });
+  svg.addEventListener("pointermove",ev=>{
+    if(G.drag){const p=pt(box,ev),n=G.drag.node;G.drag.moved+=Math.abs(p.x-n.x)+Math.abs(p.y-n.y);
+      n.x=p.x;n.y=p.y;n.vx=0;n.vy=0;kick(.5);}
+    else if(G.pan){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+      G.view.x=G.pan.vx+(ev.clientX-G.pan.x)*sx;G.view.y=G.pan.vy+(ev.clientY-G.pan.y)*sx;applyView();}
+    else{const g=ev.target.closest?ev.target.closest(".gnode"):null;hov(g?g.dataset.id:null,box,ev);}
+  });
+  const end=()=>{if(G.drag){G.drag.node.el.classList.remove("dragging");
+    if(G.drag.moved<5){G.sel=G.drag.node.id;markSel();detail(G.drag.node.id);}G.drag=null;kick(.3);}G.pan=null;};
+  svg.addEventListener("pointerup",end);svg.addEventListener("pointercancel",end);
+  svg.addEventListener("pointerleave",()=>{hov(null);G.pan=null;});
+  svg.addEventListener("wheel",ev=>{ev.preventDefault();const p=pt(box,ev);
+    const k2=Math.max(.4,Math.min(3,G.view.k*Math.exp(-ev.deltaY*0.0016)));
+    G.view.x=p.px-p.x*k2;G.view.y=p.py-p.y*k2;G.view.k=k2;applyView();},{passive:false});
+}
+function markSel(){for(const n of G.nodes){const on=G.sel===n.id;
+  n.elc.setAttribute("stroke",on?"#fff":"#0B1018");n.elc.setAttribute("stroke-width",on?2.5:1.5);}}
+function applyGroupLit(){
+  if(!G.litGroup){for(const n of G.nodes)n.el.classList.remove("dim");
+    for(const l of G.links)l.el.classList.remove("dim");return;}
+  for(const n of G.nodes)n.el.classList.toggle("dim",n.group!==G.litGroup);
+  for(const l of G.links){const a=G.idx[l.s].group===G.litGroup||G.idx[l.t].group===G.litGroup;
+    l.el.classList.toggle("dim",!a);}
+}
+function hov(id,box,ev){
+  if(G.litGroup)return;
+  if(G.hover===id){if(id&&ev)posPop(box,ev);return;}G.hover=id;
+  if(!id){for(const n of G.nodes)n.el.classList.remove("dim","pop");
+    for(const l of G.links){l.el.classList.remove("dim");if(l.elt)l.elt.classList.remove("dim");l.elt.style.opacity=0;}
+    hidePop();return;}
+  const nb=G.nbr[id]||new Set();
+  for(const n of G.nodes){const on=n.id===id||nb.has(n.id);n.el.classList.toggle("dim",!on);n.el.classList.toggle("pop",n.id===id);}
+  for(const l of G.links){const a=l.s===id||l.t===id;l.el.classList.toggle("dim",!a);
+    if(l.elt){l.elt.classList.toggle("dim",!a);l.elt.style.opacity=a?1:0;}}
+  showPop(G.idx[id],box,ev);
+}
+let popEl=null;
+function showPop(n,box,ev){hidePop();if(!n)return;popEl=document.createElement("div");popEl.className="g-pop";
+  popEl.innerHTML=`<b>${esc(n.label)}</b> <span style="color:${n.color}">· ${esc(GLABEL[n.group])}</span>
+    <div style="color:#9AA6BE;margin-top:5px">${esc(n.desc||"")}</div>
+    <div style="color:#6E7A96;margin-top:6px;font-size:11px">点击查看详情</div>`;
+  box.appendChild(popEl);if(ev)posPop(box,ev);}
+function posPop(box,ev){if(!popEl)return;const r=box.getBoundingClientRect();
+  let x=ev.clientX-r.left+14,y=ev.clientY-r.top+12;
+  if(x+popEl.offsetWidth>r.width-8)x=ev.clientX-r.left-popEl.offsetWidth-12;
+  if(y+popEl.offsetHeight>r.height-8)y=ev.clientY-r.top-popEl.offsetHeight-12;
+  popEl.style.left=Math.max(4,x)+"px";popEl.style.top=Math.max(4,y)+"px";}
+function hidePop(){if(popEl){popEl.remove();popEl=null;}}
+function detail(id){
+  const n=G.idx[id],box=$("#g-detail");
+  const nb=[...(G.nbr[id]||[])].map(x=>G.idx[x]).filter(Boolean);
+  box.innerHTML=`<span class="ph">${esc(GLABEL[n.group])}</span>
+    <div class="nm">${esc(n.label)}<span class="gp" style="background:${n.color}22;color:${n.color}">${esc(GLABEL[n.group])}</span></div>
+    <div class="ds">${esc(n.desc||"")}</div>
+    ${(n.props||[]).map(p=>`<div class="pr"><span>${esc(p[0])}</span><b>${esc(p[1])}</b></div>`).join("")}
+    <div class="nbtit">关联节点（${nb.length}）— 点击跳转</div>
+    <div>${nb.map(x=>`<span class="nb" data-go="${x.id}" style="background:${x.color}22;color:${x.color}">${esc(x.label)}</span>`).join("")}</div>`;
+  box.querySelectorAll(".nb").forEach(b=>b.addEventListener("click",()=>{
+    G.sel=b.dataset.go;markSel();detail(b.dataset.go);focusNode(b.dataset.go);}));
+}
+function focusNode(id){const n=G.idx[id];if(!n)return;
+  G.view.k=Math.max(G.view.k,1.1);G.view.x=G.W/2-n.x*G.view.k;G.view.y=G.H/2-n.y*G.view.k;applyView();kick(.2);}
+function legend(){
+  const box=$("#g-legend");box.innerHTML="";
+  GROUPS.forEach(g=>{const d=document.createElement("div");d.className="lg";d.dataset.g=g.id;
+    d.innerHTML=`<span class="sw" style="background:${g.color}"></span>${g.label}`;
+    d.addEventListener("click",()=>{
+      const on=G.litGroup===g.id;G.litGroup=on?null:g.id;
+      box.querySelectorAll(".lg").forEach(x=>x.classList.toggle("active",!on&&x.dataset.g===g.id));
+      if(G.litGroup){hov(null);}applyGroupLit();});
+    box.appendChild(d);});
+}
+function init(){
+  const svg=$("#graph-svg"),box=$("#graph-box");
+  G.W=Math.max(box.clientWidth||0,640);G.H=Math.max(box.clientHeight||0,560);
+  svg.setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+  build();dom(svg);legend();if(!G.bound){bind(svg,box);G.bound=true;}kick(1);
+  $("#g-mode").addEventListener("click",()=>{LAYOUT=LAYOUT==="layered"?"force":"layered";
+    _seed=20240101;G.view={x:0,y:0,k:1};applyView();build();dom(svg);kick(1);});
+  $("#g-reset").addEventListener("click",()=>{G.view={x:0,y:0,k:1};applyView();G.sel=null;markSel();
+    G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));applyGroupLit();
+    $("#g-detail").innerHTML="";$("#g-search").value="";});
+  $("#g-relayout").addEventListener("click",()=>{_seed=(Date.now()&0x7fffffff);build();dom(svg);kick(1);});
+  $("#g-search").addEventListener("input",e=>{
+    const q=e.target.value.trim();if(!q){hov(null);return;}
+    const hit=G.nodes.find(n=>n.label.includes(q)||n.id.toLowerCase()===q.toLowerCase());
+    if(hit){G.sel=hit.id;markSel();detail(hit.id);focusNode(hit.id);
+      G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));
+      hov(hit.id,box,null);}});
+}
+if("requestIdleCallback"in window)requestIdleCallback(init);else setTimeout(init,80);
+window.addEventListener("resize",()=>{const box=$("#graph-box");if(!box)return;
+  const w=Math.max(box.clientWidth||0,640),h=Math.max(box.clientHeight||0,560);
+  if(Math.abs(w-G.W)>40){G.W=w;G.H=h;$("#graph-svg").setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+    build();dom($("#graph-svg"));kick(.8);}});
+</script>
+</body>
+</html>
