@@ -51,6 +51,7 @@ class EngineHostClient:
         self._start_failure: BaseException | None = None
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+        self._reader_close_task: asyncio.Task[None] | None = None
         self._close_cancels_start = False
         self._closed = False
         self._status = HostStatus(enabled=True, state="starting")
@@ -368,7 +369,11 @@ class EngineHostClient:
         await self._close_process()
 
     def _schedule_reader_close(self) -> None:
-        asyncio.create_task(self._close_after_request_failure())
+        self._closed = True
+        if self._reader_close_task is None:
+            self._reader_close_task = asyncio.create_task(
+                self._close_after_request_failure()
+            )
 
     async def _await_reader_tasks(self) -> None:
         tasks = [task for task in (self._stdout_task, self._stderr_task) if task]

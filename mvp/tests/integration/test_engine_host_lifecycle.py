@@ -245,6 +245,40 @@ async def test_close_admission_blocks_first_start_before_supervisor_runs() -> No
 
 
 @pytest.mark.asyncio
+async def test_reader_error_blocks_start_before_close_wrapper_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = EngineHostClient(
+        fake_host_command("delayed_close_stdout_after_ready"), shutdown_timeout=0.1
+    )
+    close_wrapper_started = asyncio.Event()
+    allow_close_wrapper = asyncio.Event()
+    scheduled_close: asyncio.Task[None] | None = None
+    close_after_request_failure = client._close_after_request_failure
+
+    async def blocked_close_after_request_failure() -> None:
+        nonlocal scheduled_close
+        scheduled_close = asyncio.current_task()
+        close_wrapper_started.set()
+        await allow_close_wrapper.wait()
+        await close_after_request_failure()
+
+    monkeypatch.setattr(
+        client, "_close_after_request_failure", blocked_close_after_request_failure
+    )
+    await client.start()
+    try:
+        await asyncio.wait_for(close_wrapper_started.wait(), timeout=1.0)
+        assert client.status.state == "unavailable"
+        with pytest.raises(HostUnavailable, match="closed"):
+            await client.start()
+        assert client._reader_close_task is scheduled_close
+    finally:
+        allow_close_wrapper.set()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reader_error_reaps_when_ready_precedes_start_task_completion() -> None:
     client = EngineHostClient(
         fake_host_command("delayed_close_stdout_after_ready"), shutdown_timeout=0.1
