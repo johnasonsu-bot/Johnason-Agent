@@ -54,10 +54,12 @@ class _RunStream:
     failure: Exception | None = None
     terminal_name: str | None = None
     terminal_envelope: HostEnvelope | None = None
+    terminal_delivered: bool = False
     accepted: bool = False
     consumer_closed: bool = False
     closed: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_received: asyncio.Event = field(default_factory=asyncio.Event)
+    terminal_available: asyncio.Event = field(default_factory=asyncio.Event)
     start_write_attempted: bool = False
     admission_known: bool = False
     admission_task: asyncio.Task[HostEnvelope] | None = None
@@ -84,6 +86,34 @@ class _RunStream:
         finally:
             closed_task.cancel()
             await asyncio.gather(closed_task, return_exceptions=True)
+
+    async def get(self) -> HostEnvelope | Exception:
+        """Read queued data before the independently retained terminal."""
+        while True:
+            try:
+                return self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if self.terminal_envelope is not None and not self.terminal_delivered:
+                self.terminal_delivered = True
+                return self.terminal_envelope
+
+            queue_task = asyncio.create_task(self.queue.get())
+            terminal_task = asyncio.create_task(self.terminal_available.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (queue_task, terminal_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if queue_task in done:
+                    return queue_task.result()
+            finally:
+                for task in (queue_task, terminal_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    queue_task, terminal_task, return_exceptions=True
+                )
 
 
 EVENT_KIND = {
@@ -311,7 +341,7 @@ class EngineHostClient:
             await self._await_admission(admission_task)
 
             while True:
-                envelope = await stream.queue.get()
+                envelope = await stream.get()
                 if isinstance(envelope, Exception):
                     raise envelope
                 yield self._agent_event(command, envelope)
@@ -737,15 +767,14 @@ class EngineHostClient:
 
     def _fail_runs(self, error: Exception) -> None:
         for stream in tuple(self._active_runs.values()):
-            if stream.terminal_envelope is not None:
-                continue
-            if stream.failure is None:
-                stream.failure = error
             stream.consumer_closed = True
             stream.closed.set()
-            while not stream.queue.empty():
-                stream.queue.get_nowait()
-            stream.queue.put_nowait(stream.failure)
+            if stream.terminal_envelope is None:
+                if stream.failure is None:
+                    stream.failure = error
+                while not stream.queue.empty():
+                    stream.queue.get_nowait()
+                stream.queue.put_nowait(stream.failure)
 
     async def _route_run_event(self, envelope: HostEnvelope) -> None:
         run_id = envelope.run_id or ""
@@ -809,6 +838,8 @@ class EngineHostClient:
                 self._fail_runs(error)
                 return
             stream.terminal_envelope = envelope
+            stream.terminal_available.set()
+            return
         await stream.put(envelope)
 
     def _remember_terminal(self, run_id: str, terminal_name: str) -> None:

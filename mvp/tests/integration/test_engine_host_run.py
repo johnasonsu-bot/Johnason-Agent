@@ -457,6 +457,42 @@ async def test_host_close_unblocks_reader_waiting_on_full_run_queue() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_close_unblocks_full_queue_and_preserves_blocked_terminal() -> None:
+    client = EngineHostClient(
+        fake_host_command("backpressure_terminal"),
+        request_timeout=0.1,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    stream = client.run_turn(turn())
+    first = await anext(stream)
+    run_stream = client._active_runs["run-1"]
+
+    async def terminal_is_blocked_behind_full_queue() -> None:
+        while (
+            run_stream.queue.qsize() < 256
+            or run_stream.terminal_envelope is None
+        ):
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(terminal_is_blocked_behind_full_queue(), timeout=1.0)
+    try:
+        await asyncio.wait_for(client.aclose(), timeout=0.5)
+        assert client.returncode is not None
+
+        events = [first, *(await asyncio.wait_for(_collect(stream), timeout=1.0))]
+        assert len(events) == 258
+        assert events[0].kind == "turn_started"
+        assert [event.kind for event in events].count("text_delta") == 256
+        assert [event.kind for event in events].count("turn_finished") == 1
+        assert events[-1].kind == "turn_finished"
+    finally:
+        run_stream.closed.set()
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
 async def test_g1_rejects_secret_bearing_provider_before_run_admission() -> None:
     client = EngineHostClient(fake_host_command("normal"))
     await client.start()

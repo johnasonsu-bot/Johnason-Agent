@@ -274,6 +274,18 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     )
                 )
             return False
+        if mode == "backpressure_terminal":
+            for sequence in range(2, 258):
+                write(
+                    event(
+                        run_id,
+                        sequence,
+                        "agent.message.delta",
+                        {"content": f"chunk-{sequence}"},
+                    )
+                )
+            write(event(run_id, 258, "run.completed", {}))
+            return False
         if mode in {
             "blocking_run",
             "ignore_cancel",
