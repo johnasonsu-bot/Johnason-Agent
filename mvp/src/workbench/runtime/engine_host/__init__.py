@@ -11,6 +11,7 @@ from .contracts import (
 from .codec import MAX_FRAME_BYTES, decode_frame, encode_frame
 from .client import (
     EngineHostClient,
+    HostAdmissionUnknown,
     HostRunRejected,
     HostSequenceError,
     HostTerminalError,
@@ -28,6 +29,7 @@ __all__ = [
     "decode_frame",
     "encode_frame",
     "EngineHostClient",
+    "HostAdmissionUnknown",
     "HostRunRejected",
     "HostSequenceError",
     "HostTerminalError",

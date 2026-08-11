@@ -146,11 +146,15 @@ class _RunStartCommandPayload(_PayloadSchema):
 
 class _RunStartResponsePayload(_PayloadSchema):
     accepted: bool
-    reason: str | None = Field(default=None, min_length=1, max_length=1024)
+    reason: Literal[
+        "capacity_unavailable", "capability_unavailable", "policy_rejected"
+    ] | None = None
 
 
 class _RunCancelCommandPayload(_PayloadSchema):
-    reason: str = Field(min_length=1, max_length=1024)
+    reason: Literal[
+        "user_requested", "consumer_closed", "deadline_exceeded", "shutdown"
+    ]
 
 
 class _RunCancelResponsePayload(_PayloadSchema):
@@ -158,7 +162,16 @@ class _RunCancelResponsePayload(_PayloadSchema):
 
 
 class _RunTerminalPayload(_PayloadSchema):
-    reason: str | None = Field(default=None, min_length=1, max_length=1024)
+    reason: Literal[
+        "user_requested",
+        "consumer_closed",
+        "deadline_exceeded",
+        "shutdown",
+        "provider_error",
+        "tool_error",
+        "internal_error",
+        "capability_unavailable",
+    ] | None = None
 
 
 class _AgentToolStartedPayload(_PayloadSchema):
@@ -171,7 +184,7 @@ class _AgentToolCompletedPayload(_AgentToolStartedPayload):
 
 
 class _AgentToolFailedPayload(_AgentToolStartedPayload):
-    reason: str = Field(min_length=1, max_length=1024)
+    reason: Literal["denied", "tool_error", "capability_unavailable"]
 
 
 # Add a closed schema here before introducing a new protocol (kind, name) pair.

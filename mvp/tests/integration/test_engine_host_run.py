@@ -12,6 +12,7 @@ import pytest
 from workbench.runtime.agent_loop import RunAgentTurn
 from workbench.runtime.engine_host import (
     EngineHostClient,
+    HostAdmissionUnknown,
     HostProtocolError,
     HostRunRejected,
     HostSequenceError,
@@ -96,6 +97,39 @@ async def test_first_terminal_wins_and_quarantines_duplicate_terminal_host() -> 
         await client.aclose()
 
 
+@pytest.mark.parametrize(
+    "mode", ["delayed_duplicate_terminal", "event_after_terminal"]
+)
+@pytest.mark.asyncio
+async def test_late_event_after_terminal_uses_terminal_tombstone(mode: str) -> None:
+    client = EngineHostClient(fake_host_command(mode))
+    await client.start()
+    second: asyncio.Task[list[Any]] | None = None
+    try:
+        first = await _collect(client.run_turn(turn()))
+        assert first[-1].kind == "turn_finished"
+        second = asyncio.create_task(
+            _collect(
+                client.run_turn(
+                    turn(
+                        session_id="session-2",
+                        run_id="run-2",
+                        command_id="command-2",
+                    )
+                )
+            )
+        )
+        await _wait_until_host_started(client, "run-2")
+        with pytest.raises(HostTerminalError, match="after terminal"):
+            await asyncio.wait_for(second, timeout=1.0)
+        assert client.status.state == "degraded"
+    finally:
+        if second is not None:
+            second.cancel()
+            await asyncio.gather(second, return_exceptions=True)
+        await client.aclose()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_runs_are_isolated_by_run_id() -> None:
     client = EngineHostClient(fake_host_command("interleaved_runs"))
@@ -129,6 +163,58 @@ async def test_concurrent_runs_are_isolated_by_run_id() -> None:
     ]
     assert first[1].payload == {"text": "fake: hello"}
     assert second[1].payload == {"text": "fake: world"}
+
+
+@pytest.mark.asyncio
+async def test_terminated_run_cancel_is_idempotent_and_run_id_cannot_be_reused() -> None:
+    client = EngineHostClient(fake_host_command("normal"))
+    await client.start()
+    try:
+        events = await _collect(client.run_turn(turn()))
+        assert events[-1].kind == "turn_finished"
+        await client.cancel("run-1", "user_requested")
+        with pytest.raises(HostRunRejected, match="already terminated"):
+            await _collect(client.run_turn(turn(command_id="command-reused")))
+        assert client.status.state == "ready"
+        assert client._active_runs == {}
+        assert len(client._terminal_tombstones) == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_terminal_history_capacity_ends_host_lifecycle_without_eviction() -> None:
+    client = EngineHostClient(
+        fake_host_command("normal"), request_timeout=0.5, shutdown_timeout=0.1
+    )
+    await client.start()
+    try:
+        for index in range(256):
+            events = await _collect(
+                client.run_turn(
+                    turn(
+                        session_id=f"session-{index}",
+                        run_id=f"run-{index}",
+                        command_id=f"command-{index}",
+                    )
+                )
+            )
+            assert events[-1].kind == "turn_finished"
+        with pytest.raises(HostUnavailable, match="terminal history capacity"):
+            await _collect(
+                client.run_turn(
+                    turn(
+                        session_id="session-over-capacity",
+                        run_id="run-over-capacity",
+                        command_id="command-over-capacity",
+                    )
+                )
+            )
+        assert len(client._terminal_tombstones) == 256
+        assert client.status.state == "unavailable"
+        await _wait_until_reaped(client)
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -174,6 +260,85 @@ async def test_cancel_timeout_fails_run_and_reaps_unavailable_host() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_ack_without_terminal_times_out_and_reaps_host() -> None:
+    client = EngineHostClient(
+        fake_host_command("ack_without_terminal"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_host_started(client, "run-1")
+        with pytest.raises(HostUnavailable, match="cancel terminal timed out"):
+            await client.cancel("run-1", "user_requested")
+        with pytest.raises(HostUnavailable, match="cancel terminal timed out"):
+            await asyncio.wait_for(consumer, timeout=1.0)
+        assert client.status.state == "unavailable"
+        assert client.returncode is not None
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_consumer_close_does_not_swallow_cancel_terminal_timeout() -> None:
+    client = EngineHostClient(
+        fake_host_command("ack_without_terminal"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    stream = client.run_turn(turn())
+    try:
+        assert (await anext(stream)).kind == "turn_started"
+        with pytest.raises(HostUnavailable, match="cancel terminal timed out"):
+            await stream.aclose()
+        assert client.status.state == "unavailable"
+        assert client.returncode is not None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_ack_must_match_terminal_event() -> None:
+    client = EngineHostClient(fake_host_command("cancel_terminal_mismatch"))
+    await client.start()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_host_started(client, "run-1")
+        with pytest.raises(HostTerminalError, match="cancel terminal mismatch"):
+            await client.cancel("run-1", "user_requested")
+        with pytest.raises(HostTerminalError, match="cancel terminal mismatch"):
+            await asyncio.wait_for(consumer, timeout=1.0)
+        assert client.status.state == "degraded"
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_unregistered_reason_before_writing_to_host() -> None:
+    client = EngineHostClient(fake_host_command("blocking_run"))
+    await client.start()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_host_started(client, "run-1")
+        with pytest.raises(ValueError, match="predefined reason code"):
+            await client.cancel("run-1", "token=must-not-cross-boundary")
+        assert not consumer.done()
+        await client.cancel("run-1", "user_requested")
+        events = await asyncio.wait_for(consumer, timeout=1.0)
+        assert "must-not-cross-boundary" not in repr(events)
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_run_queue_applies_backpressure_and_early_close_cleans_up() -> None:
     client = EngineHostClient(
         fake_host_command("backpressure"),
@@ -197,7 +362,7 @@ async def test_run_queue_applies_backpressure_and_early_close_cleans_up() -> Non
 
     await asyncio.wait_for(stream.aclose(), timeout=1.0)
     assert "run-1" not in client._active_runs
-    assert "run-1" in client._cancel_responses
+    await client.cancel("run-1", "user_requested")
     await asyncio.wait_for(client.aclose(), timeout=1.0)
 
 
@@ -270,6 +435,119 @@ async def test_run_event_before_acceptance_is_a_protocol_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_uncorrelated_response_fails_all_active_runs() -> None:
+    client = EngineHostClient(
+        fake_host_command("bad_correlation_multi"),
+        request_timeout=0.3,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    first = asyncio.create_task(_collect(client.run_turn(turn())))
+    second = asyncio.create_task(
+        _collect(
+            client.run_turn(
+                turn(
+                    session_id="session-2",
+                    run_id="run-2",
+                    command_id="command-2",
+                )
+            )
+        )
+    )
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(first, second, return_exceptions=True), timeout=1.0
+        )
+        assert all(isinstance(result, HostProtocolError) for result in results)
+        assert client.status.state == "unavailable"
+        await _wait_until_reaped(client)
+        assert client.returncode is not None
+    finally:
+        first.cancel()
+        second.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["wrong_run_response_id", "wrong_run_response_name", "duplicate_run_response"],
+)
+@pytest.mark.asyncio
+async def test_run_response_must_match_name_run_id_and_be_unique(mode: str) -> None:
+    client = EngineHostClient(
+        fake_host_command(mode), request_timeout=0.3, shutdown_timeout=0.05
+    )
+    await client.start()
+    try:
+        with pytest.raises(HostProtocolError):
+            await asyncio.wait_for(_collect(client.run_turn(turn())), timeout=1.0)
+        assert client.status.state == "unavailable"
+        await _wait_until_reaped(client)
+        assert client.returncode is not None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancel_during_delayed_admission_cleans_accepted_run() -> None:
+    client = EngineHostClient(
+        fake_host_command("delayed_run_accept"),
+        request_timeout=0.3,
+        shutdown_timeout=0.1,
+    )
+    await client.start()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_request_pending(client, "run.start")
+        consumer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await consumer
+        assert "run-1" not in client._active_runs
+        await client.cancel("run-1", "user_requested")
+        assert client.status.state == "ready"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_admission_after_start_write_reaps_host() -> None:
+    client = EngineHostClient(
+        fake_host_command("ignore_run_start"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    try:
+        with pytest.raises(HostAdmissionUnknown, match="admission is unknown"):
+            await _collect(client.run_turn(turn()))
+        assert client.status.state == "unavailable"
+        assert client.returncode is not None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancel_with_unknown_admission_raises_typed_failure() -> None:
+    client = EngineHostClient(
+        fake_host_command("ignore_run_start"),
+        request_timeout=0.05,
+        shutdown_timeout=0.05,
+    )
+    await client.start()
+    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    try:
+        await _wait_until_request_pending(client, "run.start")
+        consumer.cancel()
+        with pytest.raises(HostAdmissionUnknown, match="admission is unknown"):
+            await consumer
+        assert client.status.state == "unavailable"
+        assert client.returncode is not None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_registered_but_unmapped_run_event_is_not_silently_dropped() -> None:
     client = EngineHostClient(fake_host_command("unknown_event"))
     await client.start()
@@ -290,6 +568,20 @@ async def test_unregistered_event_schema_failure_reaches_active_consumer() -> No
     try:
         with pytest.raises(HostProtocolError, match="invalid engine-host frame"):
             await asyncio.wait_for(_collect(client.run_turn(turn())), timeout=1.0)
+        assert client.status.state == "unavailable"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("mode", ["secret_reject_reason", "secret_terminal_reason"])
+@pytest.mark.asyncio
+async def test_secret_shaped_host_reason_is_rejected_without_exposure(mode: str) -> None:
+    client = EngineHostClient(fake_host_command(mode), shutdown_timeout=0.1)
+    await client.start()
+    try:
+        with pytest.raises(HostProtocolError) as failure:
+            await _collect(client.run_turn(turn()))
+        assert "must-not-persist" not in str(failure.value)
         assert client.status.state == "unavailable"
     finally:
         await client.aclose()
@@ -340,3 +632,19 @@ async def _wait_until_host_started(client: EngineHostClient, run_id: str) -> Non
             await asyncio.sleep(0)
 
     await asyncio.wait_for(started(), timeout=1.0)
+
+
+async def _wait_until_request_pending(client: EngineHostClient, name: str) -> None:
+    async def pending() -> None:
+        while name not in client._pending_names.values():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(pending(), timeout=1.0)
+
+
+async def _wait_until_reaped(client: EngineHostClient) -> None:
+    async def reaped() -> None:
+        while client.returncode is None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(reaped(), timeout=1.0)

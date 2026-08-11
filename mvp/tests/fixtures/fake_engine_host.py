@@ -6,7 +6,7 @@ import json
 import os
 from queue import Empty, Queue
 import sys
-from threading import Thread
+from threading import Lock, Thread
 import time
 from typing import Any
 
@@ -15,15 +15,21 @@ PROTOCOL = "workbench.engine-host/v1"
 MAX_FRAME_BYTES = 1_048_576
 INTERLEAVED_RUNS: list[tuple[str, str]] = []
 CANCEL_COUNTS: dict[str, int] = {}
+PENDING_STARTS: list[dict[str, object]] = []
+LATE_EVENT_RUNS: list[str] = []
+WRITE_LOCK = Lock()
 
 
 def write(frame: dict[str, object]) -> None:
-    sys.stdout.buffer.write(json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n")
-    sys.stdout.buffer.flush()
+    with WRITE_LOCK:
+        sys.stdout.buffer.write(
+            json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
+        )
+        sys.stdout.buffer.flush()
 
 
 def response(command: dict[str, object], name: str, payload: dict[str, object]) -> dict[str, object]:
-    return {
+    frame = {
         "protocol": PROTOCOL,
         "message_id": f"response-{command['message_id']}",
         "kind": "response",
@@ -31,6 +37,9 @@ def response(command: dict[str, object], name: str, payload: dict[str, object]) 
         "correlation_id": command["message_id"],
         "payload": payload,
     }
+    if "run_id" in command:
+        frame["run_id"] = command["run_id"]
+    return frame
 
 
 def event(
@@ -102,18 +111,88 @@ def respond(command: dict[str, object], mode: str) -> bool:
         run_id = str(command["run_id"])
         payload = command["payload"]
         prompt = str(payload["messages"][0]["content"])
+        if mode == "ignore_run_start":
+            return False
+        if mode == "bad_correlation_multi":
+            PENDING_STARTS.append(command)
+            if len(PENDING_STARTS) == 2:
+                invalid = response(
+                    PENDING_STARTS[0], "run.start", {"accepted": True}
+                )
+                invalid["correlation_id"] = "unknown-command"
+                write(invalid)
+            return False
+        if mode == "delayed_run_accept":
+            time.sleep(0.05)
         if mode == "reject_run":
             write(
                 response(
                     command,
                     "run.start",
-                    {"accepted": False, "reason": "capacity unavailable"},
+                    {"accepted": False, "reason": "capacity_unavailable"},
+                )
+            )
+            return False
+        if mode == "secret_reject_reason":
+            write(
+                response(
+                    command,
+                    "run.start",
+                    {"accepted": False, "reason": "password=must-not-persist"},
                 )
             )
             return False
         if mode == "event_before_accept":
             write(event(run_id, 1, "run.started", {}))
-        write(response(command, "run.start", {"accepted": True}))
+        start_response = response(command, "run.start", {"accepted": True})
+        if mode == "wrong_run_response_id":
+            start_response["run_id"] = "wrong-run"
+        if mode == "wrong_run_response_name":
+            start_response = response(
+                command,
+                "run.cancel",
+                {"terminal": "run.cancelled"},
+            )
+        write(start_response)
+        if mode == "duplicate_run_response":
+            write(start_response)
+        if mode in {"delayed_duplicate_terminal", "event_after_terminal"}:
+            LATE_EVENT_RUNS.append(run_id)
+            write(event(run_id, 1, "run.started", {}))
+            if len(LATE_EVENT_RUNS) == 1:
+                write(
+                    event(
+                        run_id,
+                        2,
+                        "agent.message.delta",
+                        {"content": f"fake: {prompt}"},
+                    )
+                )
+                write(event(run_id, 3, "run.completed", {}))
+
+                def write_late_event() -> None:
+                    time.sleep(0.05)
+                    if mode == "delayed_duplicate_terminal":
+                        write(
+                            event(
+                                run_id,
+                                4,
+                                "run.cancelled",
+                                {"reason": "user_requested"},
+                            )
+                        )
+                    else:
+                        write(
+                            event(
+                                run_id,
+                                4,
+                                "agent.message.delta",
+                                {"content": "late"},
+                            )
+                        )
+
+                Thread(target=write_late_event, daemon=True).start()
+            return False
         if mode == "interleaved_runs":
             INTERLEAVED_RUNS.append((run_id, prompt))
             if len(INTERLEAVED_RUNS) == 2:
@@ -135,6 +214,16 @@ def respond(command: dict[str, object], mode: str) -> bool:
             write(event(run_id, 1, "run.started", {}))
         if mode == "unregistered_event":
             write(event(run_id, 2, "run.unregistered", {}))
+            return False
+        if mode == "secret_terminal_reason":
+            write(
+                event(
+                    run_id,
+                    2,
+                    "run.failed",
+                    {"reason": "token=must-not-persist"},
+                )
+            )
             return False
         if mode == "unknown_event":
             write(event(run_id, 2, "run.state.snapshot", {}))
@@ -185,7 +274,13 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     )
                 )
             return False
-        if mode in {"blocking_run", "ignore_cancel"}:
+        if mode in {
+            "blocking_run",
+            "ignore_cancel",
+            "delayed_run_accept",
+            "ack_without_terminal",
+            "cancel_terminal_mismatch",
+        }:
             return False
         delta_sequence = 1 if mode == "duplicate_sequence" else 2
         if mode == "out_of_order":
@@ -206,7 +301,7 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     run_id,
                     terminal_sequence + 1,
                     "run.cancelled",
-                    {"reason": "duplicate"},
+                    {"reason": "user_requested"},
                 )
             )
     elif name == "run.cancel":
@@ -221,6 +316,11 @@ def respond(command: dict[str, object], mode: str) -> bool:
                 {"terminal": "run.cancelled"},
             )
         )
+        if mode == "ack_without_terminal":
+            return False
+        terminal_name = (
+            "run.failed" if mode == "cancel_terminal_mismatch" else "run.cancelled"
+        )
         write(
             event(
                 run_id,
@@ -231,8 +331,14 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     if mode == "unknown_event"
                     else 1 + CANCEL_COUNTS[run_id]
                 ),
-                "run.cancelled",
-                {"reason": str(command["payload"]["reason"])},
+                terminal_name,
+                {
+                    "reason": (
+                        "internal_error"
+                        if mode == "cancel_terminal_mismatch"
+                        else str(command["payload"]["reason"])
+                    )
+                },
             )
         )
     return False
