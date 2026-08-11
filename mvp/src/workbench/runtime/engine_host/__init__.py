@@ -9,6 +9,7 @@ from .contracts import (
     HostStatus,
 )
 from .codec import MAX_FRAME_BYTES, decode_frame, encode_frame
+from .client import EngineHostClient, HostUnavailable
 
 __all__ = [
     "PROTOCOL_V1",
@@ -20,4 +21,6 @@ __all__ = [
     "MAX_FRAME_BYTES",
     "decode_frame",
     "encode_frame",
+    "EngineHostClient",
+    "HostUnavailable",
 ]

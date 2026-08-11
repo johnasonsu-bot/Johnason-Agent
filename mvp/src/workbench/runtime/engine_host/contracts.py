@@ -94,7 +94,7 @@ class _HostHelloCommandPayload(_PayloadSchema):
 
 
 class _HostHelloResponsePayload(_PayloadSchema):
-    protocol: Literal["workbench.engine-host/v1"]
+    protocol: str = Field(min_length=1, max_length=128)
     build: str = Field(min_length=1, max_length=128)
 
 
@@ -116,8 +116,12 @@ class _AgentMessageDeltaPayload(_PayloadSchema):
 _PAYLOAD_SCHEMAS: dict[tuple[str, str], type[_PayloadSchema]] = {
     ("command", "host.hello"): _HostHelloCommandPayload,
     ("command", "host.capabilities"): _EmptyPayload,
+    ("command", "host.drain"): _EmptyPayload,
+    ("command", "host.shutdown"): _EmptyPayload,
     ("response", "host.hello"): _HostHelloResponsePayload,
     ("response", "host.capabilities"): _HostCapabilitiesPayload,
+    ("response", "host.drain"): _EmptyPayload,
+    ("response", "host.shutdown"): _EmptyPayload,
     ("event", "run.started"): _EmptyPayload,
     ("event", "agent.message.delta"): _AgentMessageDeltaPayload,
 }
