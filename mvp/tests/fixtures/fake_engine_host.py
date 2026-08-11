@@ -13,6 +13,8 @@ from typing import Any
 
 PROTOCOL = "workbench.engine-host/v1"
 MAX_FRAME_BYTES = 1_048_576
+INTERLEAVED_RUNS: list[tuple[str, str]] = []
+CANCEL_COUNTS: dict[str, int] = {}
 
 
 def write(frame: dict[str, object]) -> None:
@@ -27,6 +29,20 @@ def response(command: dict[str, object], name: str, payload: dict[str, object]) 
         "kind": "response",
         "name": name,
         "correlation_id": command["message_id"],
+        "payload": payload,
+    }
+
+
+def event(
+    run_id: str, sequence: int, name: str, payload: dict[str, object]
+) -> dict[str, object]:
+    return {
+        "protocol": PROTOCOL,
+        "message_id": f"event-{run_id}-{sequence}-{name}",
+        "kind": "event",
+        "name": name,
+        "run_id": run_id,
+        "sequence": sequence,
         "payload": payload,
     }
 
@@ -82,6 +98,143 @@ def respond(command: dict[str, object], mode: str) -> bool:
             return True
         while True:
             time.sleep(60)
+    elif name == "run.start":
+        run_id = str(command["run_id"])
+        payload = command["payload"]
+        prompt = str(payload["messages"][0]["content"])
+        if mode == "reject_run":
+            write(
+                response(
+                    command,
+                    "run.start",
+                    {"accepted": False, "reason": "capacity unavailable"},
+                )
+            )
+            return False
+        if mode == "event_before_accept":
+            write(event(run_id, 1, "run.started", {}))
+        write(response(command, "run.start", {"accepted": True}))
+        if mode == "interleaved_runs":
+            INTERLEAVED_RUNS.append((run_id, prompt))
+            if len(INTERLEAVED_RUNS) == 2:
+                for pending_run_id, _ in INTERLEAVED_RUNS:
+                    write(event(pending_run_id, 1, "run.started", {}))
+                for pending_run_id, pending_prompt in reversed(INTERLEAVED_RUNS):
+                    write(
+                        event(
+                            pending_run_id,
+                            2,
+                            "agent.message.delta",
+                            {"content": f"fake: {pending_prompt}"},
+                        )
+                    )
+                for pending_run_id, _ in INTERLEAVED_RUNS:
+                    write(event(pending_run_id, 3, "run.completed", {}))
+            return False
+        if mode != "event_before_accept":
+            write(event(run_id, 1, "run.started", {}))
+        if mode == "unregistered_event":
+            write(event(run_id, 2, "run.unregistered", {}))
+            return False
+        if mode == "unknown_event":
+            write(event(run_id, 2, "run.state.snapshot", {}))
+            return False
+        if mode == "tool_run":
+            write(
+                event(
+                    run_id,
+                    2,
+                    "agent.tool.started",
+                    {"tool_call_id": "tool-1", "name": "lookup"},
+                )
+            )
+            write(
+                event(
+                    run_id,
+                    3,
+                    "agent.tool.completed",
+                    {
+                        "tool_call_id": "tool-1",
+                        "name": "lookup",
+                        "public_result": "public result",
+                    },
+                )
+            )
+            write(
+                event(
+                    run_id,
+                    4,
+                    "agent.tool.failed",
+                    {
+                        "tool_call_id": "tool-2",
+                        "name": "write",
+                        "reason": "denied",
+                    },
+                )
+            )
+            write(event(run_id, 5, "run.completed", {}))
+            return False
+        if mode == "backpressure":
+            for sequence in range(2, 302):
+                write(
+                    event(
+                        run_id,
+                        sequence,
+                        "agent.message.delta",
+                        {"content": f"chunk-{sequence}"},
+                    )
+                )
+            return False
+        if mode in {"blocking_run", "ignore_cancel"}:
+            return False
+        delta_sequence = 1 if mode == "duplicate_sequence" else 2
+        if mode == "out_of_order":
+            delta_sequence = 3
+        write(
+            event(
+                run_id,
+                delta_sequence,
+                "agent.message.delta",
+                {"content": f"fake: {prompt}"},
+            )
+        )
+        terminal_sequence = delta_sequence + 1
+        write(event(run_id, terminal_sequence, "run.completed", {}))
+        if mode == "duplicate_terminal":
+            write(
+                event(
+                    run_id,
+                    terminal_sequence + 1,
+                    "run.cancelled",
+                    {"reason": "duplicate"},
+                )
+            )
+    elif name == "run.cancel":
+        run_id = str(command["run_id"])
+        CANCEL_COUNTS[run_id] = CANCEL_COUNTS.get(run_id, 0) + 1
+        if mode == "ignore_cancel":
+            return False
+        write(
+            response(
+                command,
+                "run.cancel",
+                {"terminal": "run.cancelled"},
+            )
+        )
+        write(
+            event(
+                run_id,
+                (
+                    302
+                    if mode == "backpressure"
+                    else 3
+                    if mode == "unknown_event"
+                    else 1 + CANCEL_COUNTS[run_id]
+                ),
+                "run.cancelled",
+                {"reason": str(command["payload"]["reason"])},
+            )
+        )
     return False
 
 

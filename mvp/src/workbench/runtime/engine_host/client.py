@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
+
+from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 
 from .codec import MAX_FRAME_BYTES, decode_frame, encode_frame
 from .contracts import (
@@ -21,6 +24,69 @@ from .contracts import (
 
 class HostUnavailable(Exception):
     """Raised when the supervised Engine Host is unavailable."""
+
+
+class HostRunRejected(Exception):
+    """Raised when a Run cannot be admitted by the Engine Host."""
+
+
+class HostSequenceError(HostProtocolError):
+    """Raised when a Run event sequence is duplicate or non-contiguous."""
+
+
+class HostTerminalError(HostProtocolError):
+    """Raised when an Engine Host emits more than one Run terminal."""
+
+
+@dataclass
+class _RunStream:
+    """One bounded event route owned by the shared stdout reader."""
+
+    queue: asyncio.Queue[HostEnvelope | Exception] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=256)
+    )
+    last_sequence: int = 0
+    failure: Exception | None = None
+    terminal_name: str | None = None
+    accepted: bool = False
+    consumer_closed: bool = False
+    closed: asyncio.Event = field(default_factory=asyncio.Event)
+    terminal_received: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def put(self, item: HostEnvelope | Exception) -> None:
+        if self.consumer_closed:
+            return
+        try:
+            self.queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            pass
+        put_task = asyncio.create_task(self.queue.put(item))
+        closed_task = asyncio.create_task(self.closed.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (put_task, closed_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if put_task not in done:
+                put_task.cancel()
+                await asyncio.gather(put_task, return_exceptions=True)
+        finally:
+            closed_task.cancel()
+            await asyncio.gather(closed_task, return_exceptions=True)
+
+
+EVENT_KIND = {
+    "run.started": "turn_started",
+    "agent.message.delta": "text_delta",
+    "agent.tool.started": "tool_started",
+    "agent.tool.completed": "tool_finished",
+    "agent.tool.failed": "tool_failed",
+    "run.completed": "turn_finished",
+    "run.failed": "turn_failed",
+    "run.cancelled": "turn_failed",
+}
+
+TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 
 
 class EngineHostClient:
@@ -44,6 +110,10 @@ class EngineHostClient:
         self._stderr_task: asyncio.Task[None] | None = None
         self._pending: dict[str, asyncio.Future[HostEnvelope]] = {}
         self._pending_names: dict[str, str] = {}
+        self._pending_run_ids: dict[str, str] = {}
+        self._active_runs: dict[str, _RunStream] = {}
+        self._cancel_tasks: dict[str, asyncio.Task[HostEnvelope]] = {}
+        self._cancel_responses: dict[str, HostEnvelope] = {}
         self._write_lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._start_task: asyncio.Task[None] | None = None
@@ -165,12 +235,107 @@ class EngineHostClient:
             await self._close_after_request_failure()
             raise
 
+    async def run_turn(
+        self, command: RunAgentTurn
+    ) -> AsyncIterator[AgentEvent]:
+        """Start one accepted G1 Run and stream its public Agent events."""
+        if command.provider_id != "lmstudio":
+            raise HostRunRejected("secret-bearing provider is unavailable in G1")
+        if self._status.state != "ready":
+            raise HostUnavailable("engine-host must be ready before run")
+        if command.run_id in self._active_runs:
+            raise HostRunRejected("engine-host run is already active")
+
+        stream = _RunStream()
+        self._active_runs[command.run_id] = stream
+        try:
+            response = await self._request(
+                "run.start",
+                {
+                    "command_id": command.command_id,
+                    "attempt": 0,
+                    "agent": {"id": command.owner_id or "agent", "role": "worker"},
+                    "provider": {"id": "lmstudio", "model": command.model},
+                    "messages": [{"role": "user", "content": command.prompt}],
+                    "tool_manifest": [],
+                    "skill_pins": [],
+                    "workspace_grant": None,
+                    "deadline_ms": 120_000,
+                    "trace": {"traceparent": command.command_id},
+                },
+                run_id=command.run_id,
+            )
+            if response.payload["accepted"] is not True:
+                raise HostRunRejected(
+                    str(response.payload.get("reason", "engine-host rejected run"))
+                )
+            stream.accepted = True
+
+            while True:
+                envelope = await stream.queue.get()
+                if isinstance(envelope, Exception):
+                    raise envelope
+                yield self._agent_event(command, envelope)
+                if envelope.name in TERMINAL_EVENTS:
+                    await asyncio.sleep(0)
+                    if stream.failure is not None:
+                        raise stream.failure
+                    return
+        finally:
+            should_cancel = (
+                stream.accepted
+                and stream.terminal_name is None
+                and stream.failure is None
+                and self._status.state == "ready"
+            )
+            stream.consumer_closed = True
+            stream.closed.set()
+            if should_cancel:
+                try:
+                    await self.cancel(command.run_id, "consumer_closed")
+                    await asyncio.wait_for(
+                        stream.terminal_received.wait(), timeout=self.request_timeout
+                    )
+                except (HostUnavailable, TimeoutError):
+                    pass
+            self._active_runs.pop(command.run_id, None)
+
+    async def cancel(self, run_id: str, reason: str) -> None:
+        """Cancel one Run once and reuse its correlated acknowledgement."""
+        if not run_id:
+            raise ValueError("run id must not be empty")
+        if not reason:
+            raise ValueError("cancel reason must not be empty")
+        if run_id in self._cancel_responses:
+            return
+        task = self._cancel_tasks.get(run_id)
+        if task is None:
+            task = asyncio.create_task(self._cancel_once(run_id, reason))
+            self._cancel_tasks[run_id] = task
+        await asyncio.shield(task)
+
+    async def _cancel_once(self, run_id: str, reason: str) -> HostEnvelope:
+        try:
+            response = await self._request(
+                "run.cancel", {"reason": reason}, run_id=run_id
+            )
+        except TimeoutError as exc:
+            failure = HostUnavailable("engine-host cancel timed out")
+            self._mark_unavailable()
+            self._fail_runs(failure)
+            await self._close_after_request_failure()
+            raise failure from exc
+        self._cancel_responses[run_id] = response
+        return response
+
     async def aclose(self) -> None:
         """Drain, stop, and reap the child exactly once."""
         close_task = await self._ensure_close_task(cancel_start=True)
         await asyncio.shield(close_task)
 
-    async def _request(self, name: str, payload: dict[str, Any]) -> HostEnvelope:
+    async def _request(
+        self, name: str, payload: dict[str, Any], *, run_id: str | None = None
+    ) -> HostEnvelope:
         process = self._process
         if process is None or process.returncode is not None:
             raise HostUnavailable("engine-host is not running")
@@ -178,12 +343,15 @@ class EngineHostClient:
         future: asyncio.Future[HostEnvelope] = asyncio.get_running_loop().create_future()
         self._pending[message_id] = future
         self._pending_names[message_id] = name
+        if run_id is not None:
+            self._pending_run_ids[message_id] = run_id
         try:
             await self._write(
                 HostEnvelope(
                     message_id=message_id,
                     kind="command",
                     name=name,
+                    run_id=run_id,
                     payload=payload,
                 )
             )
@@ -194,6 +362,7 @@ class EngineHostClient:
         finally:
             self._pending.pop(message_id, None)
             self._pending_names.pop(message_id, None)
+            self._pending_run_ids.pop(message_id, None)
 
     async def _write(self, envelope: HostEnvelope) -> None:
         process = self._process
@@ -218,9 +387,21 @@ class EngineHostClient:
                 frame = await process.stdout.readuntil(b"\n")
                 envelope = decode_frame(frame)
                 if envelope.kind == "response":
-                    future = self._pending.get(envelope.correlation_id or "")
+                    correlation_id = envelope.correlation_id or ""
+                    future = self._pending.get(correlation_id)
+                    if (
+                        self._pending_names.get(correlation_id) == "run.start"
+                        and envelope.name == "run.start"
+                        and envelope.payload.get("accepted") is True
+                    ):
+                        run_id = self._pending_run_ids.get(correlation_id, "")
+                        stream = self._active_runs.get(run_id)
+                        if stream is not None:
+                            stream.accepted = True
                     if future is not None and not future.done():
                         future.set_result(envelope)
+                elif envelope.kind == "event":
+                    await self._route_run_event(envelope)
         except asyncio.IncompleteReadError as exc:
             error: Exception
             if exc.partial:
@@ -229,15 +410,18 @@ class EngineHostClient:
                 error = HostUnavailable("engine-host output closed")
             self._mark_unavailable()
             self._fail_pending(error)
+            self._fail_runs(error)
             self._schedule_reader_close()
         except asyncio.LimitOverrunError:
             error = HostFrameTooLarge("engine-host frame exceeds 1 MiB")
             self._mark_unavailable()
             self._fail_pending(error)
+            self._fail_runs(error)
             self._schedule_reader_close()
         except (HostProtocolError, HostFrameTooLarge) as exc:
             self._mark_unavailable()
             self._fail_pending(exc)
+            self._fail_runs(exc)
             self._schedule_reader_close()
         except asyncio.CancelledError:
             raise
@@ -277,6 +461,7 @@ class EngineHostClient:
 
     async def _close_process(self) -> None:
         self._closed = True
+        self._fail_runs(HostUnavailable("engine-host closed"))
         process = self._process
         if process is None:
             self._mark_unavailable()
@@ -383,10 +568,100 @@ class EngineHostClient:
     def _mark_unavailable(self) -> None:
         self._status = HostStatus(enabled=True, state="unavailable")
 
+    def _mark_degraded(self) -> None:
+        self._status = HostStatus(
+            enabled=True,
+            state="degraded",
+            protocol=self._status.protocol,
+            capabilities=self._status.capabilities,
+        )
+
     def _fail_pending(self, error: Exception) -> None:
         for future in tuple(self._pending.values()):
             if not future.done():
                 future.set_exception(error)
+
+    def _fail_runs(self, error: Exception) -> None:
+        for stream in tuple(self._active_runs.values()):
+            if stream.failure is None:
+                stream.failure = error
+            stream.consumer_closed = True
+            stream.closed.set()
+            while not stream.queue.empty():
+                stream.queue.get_nowait()
+            stream.queue.put_nowait(stream.failure)
+
+    async def _route_run_event(self, envelope: HostEnvelope) -> None:
+        stream = self._active_runs.get(envelope.run_id or "")
+        if stream is None:
+            raise HostProtocolError("engine-host event does not match an active run")
+        if stream.failure is not None:
+            return
+        if not stream.accepted:
+            error = HostProtocolError(
+                "engine-host emitted an event before run acceptance"
+            )
+            stream.failure = error
+            self._mark_degraded()
+            await stream.put(error)
+            return
+        expected_sequence = stream.last_sequence + 1
+        if envelope.sequence != expected_sequence:
+            error = HostSequenceError(
+                f"engine-host sequence must be {expected_sequence}"
+            )
+            stream.failure = error
+            self._mark_degraded()
+            await stream.put(error)
+            return
+        stream.last_sequence = expected_sequence
+        if envelope.name not in EVENT_KIND:
+            error = HostProtocolError("engine-host emitted an unknown run event")
+            stream.failure = error
+            self._mark_degraded()
+            await stream.put(error)
+            return
+        if stream.terminal_name is not None:
+            error = HostTerminalError(
+                f"engine-host emitted terminal {envelope.name} after "
+                f"{stream.terminal_name}"
+            )
+            stream.failure = error
+            self._mark_degraded()
+            await stream.put(error)
+            return
+        if envelope.name in TERMINAL_EVENTS:
+            stream.terminal_name = envelope.name
+            stream.terminal_received.set()
+        await stream.put(envelope)
+
+    @staticmethod
+    def _agent_event(command: RunAgentTurn, envelope: HostEnvelope) -> AgentEvent:
+        event_kind = EVENT_KIND.get(envelope.name)
+        if event_kind is None:
+            raise HostProtocolError("engine-host emitted an unknown run event")
+        payload: dict[str, Any] = {}
+        if envelope.name == "agent.message.delta":
+            payload = {"text": envelope.payload["content"]}
+        elif envelope.name.startswith("agent.tool."):
+            payload = {
+                "tool_call_id": envelope.payload["tool_call_id"],
+                "tool_name": envelope.payload["name"],
+            }
+            if envelope.name == "agent.tool.completed" and (
+                public_result := envelope.payload.get("public_result")
+            ) is not None:
+                payload["public_result"] = public_result
+            if envelope.name == "agent.tool.failed":
+                payload["reason"] = envelope.payload["reason"]
+        elif envelope.name in {"run.failed", "run.cancelled"}:
+            payload = {"reason": envelope.payload.get("reason", envelope.name)}
+        return AgentEvent(
+            kind=event_kind,
+            session_id=command.session_id,
+            run_id=command.run_id,
+            payload=payload,
+        )
 
     @staticmethod
     def _safe_environment() -> Mapping[str, str]:

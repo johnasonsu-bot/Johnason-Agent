@@ -21,6 +21,7 @@ class RunAgentTurn(BaseModel):
     model: str = "default"
     provider_id: str | None = None
     owner_id: str | None = None
+    runner_mode: Literal["python", "engine_host"] | None = None
 
 
 class AgentEvent(BaseModel):

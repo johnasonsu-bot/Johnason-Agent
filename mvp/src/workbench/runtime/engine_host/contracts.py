@@ -112,6 +112,68 @@ class _AgentMessageDeltaPayload(_PayloadSchema):
     token_count: int | None = Field(default=None, ge=0)
 
 
+class _RunAgentPayload(_PayloadSchema):
+    id: str = Field(min_length=1, max_length=256)
+    role: Literal["worker"]
+
+
+class _RunProviderPayload(_PayloadSchema):
+    id: Literal["lmstudio"]
+    model: str = Field(min_length=1, max_length=256)
+
+
+class _RunMessagePayload(_PayloadSchema):
+    role: Literal["user"]
+    content: str
+
+
+class _RunTracePayload(_PayloadSchema):
+    traceparent: str = Field(min_length=1, max_length=256)
+
+
+class _RunStartCommandPayload(_PayloadSchema):
+    command_id: str = Field(min_length=1, max_length=256)
+    attempt: Literal[0]
+    agent: _RunAgentPayload
+    provider: _RunProviderPayload
+    messages: tuple[_RunMessagePayload, ...] = Field(min_length=1, max_length=1)
+    tool_manifest: tuple[()] = ()
+    skill_pins: tuple[()] = ()
+    workspace_grant: None = None
+    deadline_ms: int = Field(gt=0)
+    trace: _RunTracePayload
+
+
+class _RunStartResponsePayload(_PayloadSchema):
+    accepted: bool
+    reason: str | None = Field(default=None, min_length=1, max_length=1024)
+
+
+class _RunCancelCommandPayload(_PayloadSchema):
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class _RunCancelResponsePayload(_PayloadSchema):
+    terminal: Literal["run.completed", "run.failed", "run.cancelled"]
+
+
+class _RunTerminalPayload(_PayloadSchema):
+    reason: str | None = Field(default=None, min_length=1, max_length=1024)
+
+
+class _AgentToolStartedPayload(_PayloadSchema):
+    tool_call_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+
+
+class _AgentToolCompletedPayload(_AgentToolStartedPayload):
+    public_result: str | None = Field(default=None, max_length=4096)
+
+
+class _AgentToolFailedPayload(_AgentToolStartedPayload):
+    reason: str = Field(min_length=1, max_length=1024)
+
+
 # Add a closed schema here before introducing a new protocol (kind, name) pair.
 _PAYLOAD_SCHEMAS: dict[tuple[str, str], type[_PayloadSchema]] = {
     ("command", "host.hello"): _HostHelloCommandPayload,
@@ -122,8 +184,19 @@ _PAYLOAD_SCHEMAS: dict[tuple[str, str], type[_PayloadSchema]] = {
     ("response", "host.capabilities"): _HostCapabilitiesPayload,
     ("response", "host.drain"): _EmptyPayload,
     ("response", "host.shutdown"): _EmptyPayload,
+    ("command", "run.start"): _RunStartCommandPayload,
+    ("response", "run.start"): _RunStartResponsePayload,
+    ("command", "run.cancel"): _RunCancelCommandPayload,
+    ("response", "run.cancel"): _RunCancelResponsePayload,
     ("event", "run.started"): _EmptyPayload,
     ("event", "agent.message.delta"): _AgentMessageDeltaPayload,
+    ("event", "agent.tool.started"): _AgentToolStartedPayload,
+    ("event", "agent.tool.completed"): _AgentToolCompletedPayload,
+    ("event", "agent.tool.failed"): _AgentToolFailedPayload,
+    ("event", "run.state.snapshot"): _EmptyPayload,
+    ("event", "run.completed"): _EmptyPayload,
+    ("event", "run.failed"): _RunTerminalPayload,
+    ("event", "run.cancelled"): _RunTerminalPayload,
 }
 
 
