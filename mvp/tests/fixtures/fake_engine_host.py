@@ -318,6 +318,15 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     {"reason": "user_requested"},
                 )
             )
+        if mode == "immediate_event_after_terminal":
+            write(
+                event(
+                    run_id,
+                    terminal_sequence + 1,
+                    "agent.message.delta",
+                    {"content": "late"},
+                )
+            )
     elif name == "run.cancel":
         run_id = str(command["run_id"])
         CANCEL_COUNTS[run_id] = CANCEL_COUNTS.get(run_id, 0) + 1

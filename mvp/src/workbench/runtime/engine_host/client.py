@@ -823,10 +823,11 @@ class EngineHostClient:
             )
             stream.failure = error
             self._mark_degraded()
-            await stream.put(error)
             return
         if envelope.name in TERMINAL_EVENTS:
             stream.terminal_name = envelope.name
+            stream.terminal_envelope = envelope
+            stream.terminal_available.set()
             stream.terminal_received.set()
             if (
                 stream.cancel_expected_terminal is not None
@@ -837,8 +838,6 @@ class EngineHostClient:
                 self._mark_degraded()
                 self._fail_runs(error)
                 return
-            stream.terminal_envelope = envelope
-            stream.terminal_available.set()
             return
         await stream.put(envelope)
 

@@ -112,8 +112,32 @@ async def test_first_terminal_wins_and_quarantines_duplicate_terminal_host() -> 
     client = EngineHostClient(fake_host_command("duplicate_terminal"))
     await client.start()
     try:
-        with pytest.raises(HostTerminalError):
-            _ = [event async for event in client.run_turn(turn())]
+        events, failure = await _collect_prefix_and_error(client.run_turn(turn()))
+        assert isinstance(failure, HostTerminalError)
+        assert [event.kind for event in events] == [
+            "turn_started",
+            "text_delta",
+            "turn_finished",
+        ]
+        assert events[1].payload == {"text": "fake: hello"}
+        assert client.status.state == "degraded"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_first_terminal_is_yielded_before_late_event_failure() -> None:
+    client = EngineHostClient(fake_host_command("immediate_event_after_terminal"))
+    await client.start()
+    try:
+        events, failure = await _collect_prefix_and_error(client.run_turn(turn()))
+        assert isinstance(failure, HostTerminalError)
+        assert [event.kind for event in events] == [
+            "turn_started",
+            "text_delta",
+            "turn_finished",
+        ]
+        assert events[1].payload == {"text": "fake: hello"}
         assert client.status.state == "degraded"
     finally:
         await client.aclose()
@@ -370,13 +394,21 @@ async def test_consumer_close_does_not_swallow_cancel_terminal_timeout() -> None
 async def test_cancel_ack_must_match_terminal_event() -> None:
     client = EngineHostClient(fake_host_command("cancel_terminal_mismatch"))
     await client.start()
-    consumer = asyncio.create_task(_collect(client.run_turn(turn())))
+    consumer = asyncio.create_task(
+        _collect_prefix_and_error(client.run_turn(turn()))
+    )
     try:
         await _wait_until_host_started(client, "run-1")
         with pytest.raises(HostTerminalError, match="cancel terminal mismatch"):
             await client.cancel("run-1", "user_requested")
-        with pytest.raises(HostTerminalError, match="cancel terminal mismatch"):
-            await asyncio.wait_for(consumer, timeout=1.0)
+        events, failure = await asyncio.wait_for(consumer, timeout=1.0)
+        assert isinstance(failure, HostTerminalError)
+        assert "cancel terminal mismatch" in str(failure)
+        assert [event.kind for event in events] == [
+            "turn_started",
+            "turn_failed",
+        ]
+        assert events[-1].payload == {"reason": "agent_error"}
         assert client.status.state == "degraded"
     finally:
         consumer.cancel()
@@ -796,6 +828,16 @@ async def test_tool_events_map_only_public_payload_fields() -> None:
 
 async def _collect(stream: Any) -> list[Any]:
     return [event async for event in stream]
+
+
+async def _collect_prefix_and_error(stream: Any) -> tuple[list[Any], Exception]:
+    events = []
+    try:
+        async for event in stream:
+            events.append(event)
+    except Exception as error:
+        return events, error
+    raise AssertionError("stream completed without the expected failure")
 
 
 async def _wait_until_host_started(client: EngineHostClient, run_id: str) -> None:
