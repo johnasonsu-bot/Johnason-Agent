@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-11
 **阶段：** Phase 2 / Batch 2.5 / G0–G1
-**状态：** 方案 A 已确认，待书面规格复核
+**状态：** 方案 A 与书面规格已确认
 
 ## 1. 结论
 
@@ -215,6 +215,8 @@ Batch 2.5 首个实现计划限定为：
 - `mvp/tests/unit/runtime/engine_host/`：解析、顺序、取消和错误测试；
 - `mvp/tests/integration/test_engine_host_lifecycle.py`：进程启动、崩溃、drain 和关闭；
 - `mvp/tests/acceptance/test_engine_host_contract.py`：LM Studio 之前的离线 G1 门禁。
+- `mvp/src/workbench/api/engine_host.py`：只读 status/capabilities 诊断接口；
+- `mvp/canvas-spike/src/renderer/agents/EngineHostStatus.tsx`：设置区只读运行时状态，不接受可执行路径或凭据输入。
 
 真实 Go Host 放在后续独立目录 `engine-host/`，其 `go.mod` 精确 pin 正式 `engine-core` tag，只引用 `pkg/*`。在源码/tag 可访问前不创建伪造的 replace 路径。
 
@@ -232,6 +234,7 @@ G1 必须同时满足：
 8. Fake Host conformance 在 macOS、Windows 和 Linux 的 CI 命令一致；
 9. 源码、日志、事件、测试结果和协议帧的凭据扫描为零；
 10. feature flag 关闭时应用行为与 Batch 2 回滚提交一致。
+11. 设置区可以显示 disabled、starting、ready、degraded 或 unavailable，以及协商后的协议版本和安全 capability 摘要。
 
 ## 13. 后续接入真实 Go Engine 的前置条件
 

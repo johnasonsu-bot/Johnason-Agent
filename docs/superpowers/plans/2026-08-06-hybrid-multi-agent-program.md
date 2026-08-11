@@ -22,7 +22,7 @@
 
 1. [Batch 1 — Provider Center](2026-08-06-batch-1-provider-center.md)
 2. [Batch 2 — Real Agent Conversation](2026-08-06-batch-2-real-agent-conversation.md)
-3. [Batch 2.5 — Go Engine Host Contract Design](../specs/2026-08-11-go-engine-host-contract-design.md)
+3. [Batch 2.5 — Go Engine Host Contract](2026-08-11-batch-2-5-go-engine-host-contract.md) ([design](../specs/2026-08-11-go-engine-host-contract-design.md))
 4. [Batch 3 — Sequential Multi-Agent Review Loops](2026-08-10-sequential-multi-agent-review-loops.md)
 5. G2 — Read-only Engine Shadow, only after Batch 3 preserves a single durable execution graph
 6. G3/G4 — Single-Agent then per-node Go cutover, with Python control-plane rollback
@@ -30,7 +30,7 @@
 8. [Batch 5 — Supervisor, Recovery, and Release Gate](2026-08-06-batch-5-supervisor-recovery.md)
 9. G6 — Control-plane re-evaluation only after independent Go durable-execution evidence
 
-Batch 2.5 G0/G1 is the next implementation unit. Its detailed implementation plan is generated after the written design review required by the project workflow.
+Batch 2.5 G0/G1 is the next implementation unit. Its implementation plan establishes the protocol and Fake Host conformance before any real Go source is linked.
 
 ## Program Completion Gate
 
