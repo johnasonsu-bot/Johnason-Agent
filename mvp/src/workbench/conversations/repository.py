@@ -22,6 +22,22 @@ class TurnClaim:
 
 
 @dataclass(frozen=True)
+class TurnStatus:
+    session_id: str
+    command_id: str
+    run_id: str
+    provider_id: str
+    model: str
+    prompt: str | None
+    status: str
+    owner_id: str | None
+    lease_expires_at: float
+    state: dict[str, Any]
+    result: list[dict[str, Any]] | None
+    updated_at: float
+
+
+@dataclass(frozen=True)
 class ToolEffectClaim:
     disposition: str
     result: str | None = None
@@ -129,6 +145,265 @@ class ConversationRepository:
                 (session_id,),
             )
 
+    def enqueue_turn(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        run_id: str,
+        provider_id: str,
+        model: str,
+        prompt: str,
+        initial_state: dict[str, Any],
+    ) -> TurnStatus:
+        """Persist a new queued turn or replay its existing identity."""
+        self.create_session(session_id)
+        now = time.time()
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?
+                """,
+                (session_id, command_id),
+            ).fetchone()
+            if row is not None:
+                self._validate_turn_identity(
+                    row,
+                    run_id=run_id,
+                    provider_id=provider_id,
+                    model=model,
+                    prompt_digest=prompt_digest,
+                )
+                connection.commit()
+                return self._turn_status(row)
+            connection.execute(
+                """
+                INSERT INTO conversation_turns(
+                    session_id, command_id, run_id, provider_id, model, prompt,
+                    prompt_digest, status, owner_id, lease_expires_at,
+                    state_json, result_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, NULL, ?)
+                """,
+                (
+                    session_id,
+                    command_id,
+                    run_id,
+                    provider_id,
+                    model,
+                    prompt,
+                    prompt_digest,
+                    json.dumps(initial_state, sort_keys=True),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?
+                """,
+                (session_id, command_id),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._turn_status(row)
+
+    def claim_next_turn(
+        self, *, owner_id: str, lease_seconds: float = 30
+    ) -> TurnStatus | None:
+        """Atomically claim the oldest queued/retryable turn."""
+        now = time.time()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_turns
+                WHERE status IN ('queued', 'retryable')
+                  AND (owner_id IS NULL OR lease_expires_at <= ?)
+                ORDER BY updated_at, session_id, command_id
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if row is None:
+                connection.commit()
+                return None
+            changed = connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = 'running', owner_id = ?, lease_expires_at = ?, updated_at = ?
+                WHERE session_id = ? AND command_id = ?
+                  AND status IN ('queued', 'retryable')
+                  AND (owner_id IS NULL OR lease_expires_at <= ?)
+                """,
+                (
+                    owner_id,
+                    now + lease_seconds,
+                    now,
+                    row["session_id"],
+                    row["command_id"],
+                    now,
+                ),
+            )
+            if changed.rowcount != 1:
+                connection.commit()
+                return None
+            claimed = connection.execute(
+                """
+                SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?
+                """,
+                (row["session_id"], row["command_id"]),
+            ).fetchone()
+            connection.commit()
+        assert claimed is not None
+        return self._turn_status(claimed)
+
+    def recover_expired_turns(self, *, now: float | None = None) -> list[tuple[str, str]]:
+        """Release leases left by a stopped Worker and make them retryable."""
+        current = time.time() if now is None else now
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT session_id, command_id FROM conversation_turns
+                WHERE status = 'running' AND lease_expires_at <= ?
+                ORDER BY updated_at, session_id, command_id
+                """,
+                (current,),
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = 'retryable', owner_id = NULL,
+                    lease_expires_at = 0, updated_at = ?
+                WHERE status = 'running' AND lease_expires_at <= ?
+                """,
+                (current, current),
+            )
+            connection.commit()
+        return [(row["session_id"], row["command_id"]) for row in rows]
+
+    def recover_owned_turns(self, owner_id: str) -> list[tuple[str, str]]:
+        """Release turns owned by a Worker that is stopping after cancellation."""
+        now = time.time()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT session_id, command_id FROM conversation_turns
+                WHERE status = 'running' AND owner_id = ?
+                ORDER BY updated_at, session_id, command_id
+                """,
+                (owner_id,),
+            ).fetchall()
+            connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = 'retryable', owner_id = NULL,
+                    lease_expires_at = 0, updated_at = ?
+                WHERE status = 'running' AND owner_id = ?
+                """,
+                (now, owner_id),
+            )
+            connection.commit()
+        return [(row["session_id"], row["command_id"]) for row in rows]
+
+    def mark_retryable(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        owner_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        with self.store.connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = 'retryable', owner_id = NULL,
+                    lease_expires_at = 0, state_json = ?, updated_at = ?
+                WHERE session_id = ? AND command_id = ? AND owner_id = ?
+                  AND status = 'running'
+                """,
+                (
+                    json.dumps(state, sort_keys=True),
+                    time.time(),
+                    session_id,
+                    command_id,
+                    owner_id,
+                ),
+            )
+        if result.rowcount != 1:
+            raise RuntimeError("turn claim is no longer owned")
+
+    def mark_retryable_unowned(
+        self, session_id: str, command_id: str, *, state: dict[str, Any]
+    ) -> None:
+        """Seal a runtime-released turn as retryable without reclaiming it."""
+        with self.store.connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = 'retryable', lease_expires_at = 0,
+                    state_json = ?, updated_at = ?
+                WHERE session_id = ? AND command_id = ?
+                  AND owner_id IS NULL AND status = 'running'
+                """,
+                (json.dumps(state, sort_keys=True), time.time(), session_id, command_id),
+            )
+        if result.rowcount != 1:
+            raise RuntimeError("released turn is no longer retryable")
+
+    def load_turn_status(
+        self, session_id: str, command_id: str
+    ) -> TurnStatus | None:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?
+                """,
+                (session_id, command_id),
+            ).fetchone()
+        return self._turn_status(row) if row is not None else None
+
+    @staticmethod
+    def _validate_turn_identity(
+        row: Any,
+        *,
+        run_id: str,
+        provider_id: str,
+        model: str,
+        prompt_digest: str,
+    ) -> None:
+        if (
+            row["run_id"] != run_id
+            or row["provider_id"] != provider_id
+            or row["model"] != model
+            or (row["prompt_digest"] is not None and row["prompt_digest"] != prompt_digest)
+        ):
+            raise ValueError("turn identity cannot change")
+
+    @staticmethod
+    def _turn_status(row: Any) -> TurnStatus:
+        return TurnStatus(
+            session_id=row["session_id"],
+            command_id=row["command_id"],
+            run_id=row["run_id"],
+            provider_id=row["provider_id"],
+            model=row["model"],
+            prompt=row["prompt"],
+            status=row["status"],
+            owner_id=row["owner_id"],
+            lease_expires_at=float(row["lease_expires_at"]),
+            state=json.loads(row["state_json"]),
+            result=json.loads(row["result_json"]) if row["result_json"] else None,
+            updated_at=float(row["updated_at"]),
+        )
+
     def claim_turn(
         self,
         *,
@@ -158,11 +433,11 @@ class ConversationRepository:
             if row is None:
                 connection.execute(
                     """
-                    INSERT INTO conversation_turns(
-                        session_id, command_id, run_id, provider_id, model,
+                INSERT INTO conversation_turns(
+                        session_id, command_id, run_id, provider_id, model, prompt,
                         prompt_digest, status,
                         owner_id, lease_expires_at, state_json, result_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL, ?)
                     """,
                     (
                         session_id,
@@ -170,6 +445,7 @@ class ConversationRepository:
                         run_id,
                         provider_id,
                         model,
+                        prompt,
                         prompt_digest,
                         owner_id,
                         now + lease_seconds,

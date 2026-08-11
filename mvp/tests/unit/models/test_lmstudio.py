@@ -169,3 +169,42 @@ async def test_completion_resolves_saved_model_aliases() -> None:
 
     assert response.text == "ready"
     await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completion_resolves_local_agent_placeholder_to_first_loaded_model() -> None:
+    """The UI placeholder must not be sent as a literal LM Studio model id."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "gemma-4-31b-it"}]})
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content)["model"] == "gemma-4-31b-it"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ready"}}]}
+        )
+
+    provider = _provider(handler)
+    profile = ProviderProfileRecord(
+        id="lmstudio",
+        name="LM Studio",
+        protocol="lmstudio",
+        base_url="http://lmstudio.test",
+        model_aliases={},
+    )
+
+    response = await provider.complete(
+        ModelRequest(model="local-agent", messages=[]), profile
+    )
+
+    assert response.text == "ready"
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_timeout_allows_slow_local_generation() -> None:
+    provider = LMStudioProvider()
+
+    assert provider._client.timeout.read >= 300
+
+    await provider.aclose()

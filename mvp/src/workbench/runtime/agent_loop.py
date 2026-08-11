@@ -19,6 +19,8 @@ class RunAgentTurn(BaseModel):
     command_id: str
     prompt: str
     model: str = "default"
+    provider_id: str | None = None
+    owner_id: str | None = None
 
 
 class AgentEvent(BaseModel):

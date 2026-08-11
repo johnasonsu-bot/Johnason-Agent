@@ -1,6 +1,7 @@
 """LM Studio adapter using its OpenAI-compatible local API."""
 
 import json
+import math
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -26,16 +27,29 @@ class ProviderResponseError(RuntimeError):
     """Raised when LM Studio returns an invalid response."""
 
 
+DEFAULT_TIMEOUT_SECONDS = 300.0
+
+
 class LMStudioProvider:
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:1234",
         *,
         client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("LM Studio timeout must be finite and positive")
         self.base_url = base_url.rstrip("/")
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=60)
+        timeout = httpx.Timeout(
+            timeout_seconds,
+            connect=min(10.0, timeout_seconds),
+            write=min(30.0, timeout_seconds),
+            pool=min(30.0, timeout_seconds),
+        )
+        self._client = client or httpx.AsyncClient(timeout=timeout)
+        self._auto_model_cache: dict[str, str] = {}
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -88,7 +102,27 @@ class LMStudioProvider:
         self, request: ModelRequest, profile: ProviderProfileRecord
     ) -> ModelResponse:
         """Adapt the legacy LM Studio probe to the provider-neutral gateway."""
-        return await self.complete_with_tools(request, profile)
+        resolved_profile = await self._resolve_placeholder_model(request, profile)
+        return await self.complete_with_tools(request, resolved_profile)
+
+    async def _resolve_placeholder_model(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> ProviderProfileRecord:
+        if request.model not in {"default", "local-agent"}:
+            return profile
+        if profile.model_aliases.get(request.model) or profile.model_aliases.get("default"):
+            return profile
+        cache_key = _base_url(self, profile)
+        model = self._auto_model_cache.get(cache_key)
+        if model is None:
+            models = await self.list_models(profile)
+            if not models:
+                raise ProviderUnavailable("LM Studio has no loaded model")
+            model = models[0]
+            self._auto_model_cache[cache_key] = model
+        return profile.model_copy(
+            update={"model_aliases": {**profile.model_aliases, "default": model, request.model: model}}
+        )
 
     async def stream_with_tools(
         self, request: ModelRequest, profile: ProviderProfileRecord | None = None
@@ -150,11 +184,14 @@ def _request_body(
     *,
     stream: bool,
 ) -> dict[str, Any]:
-    model = (
-        profile.model_aliases.get(request.model, request.model)
-        if profile is not None
-        else request.model
-    )
+    model = request.model
+    if profile is not None:
+        model = profile.model_aliases.get(
+            request.model,
+            profile.model_aliases.get("default", request.model)
+            if request.model in {"default", "local-agent"}
+            else request.model,
+        )
     return {
         "model": model,
         "messages": [_message_body(message) for message in request.messages],

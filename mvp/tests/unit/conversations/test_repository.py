@@ -1,10 +1,59 @@
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from workbench.conversations.models import ConversationSession, agent_message
 from workbench.conversations.repository import ConversationRepository
 from workbench.workflow.schema import PHASE1_SCHEMA_VERSION, migrate_phase1
+
+
+def _enqueue(repository: ConversationRepository, *, command_id: str = "turn-1") -> None:
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id=command_id,
+        run_id="run-1",
+        provider_id="lmstudio",
+        model="local-agent",
+        prompt="hello",
+        initial_state={"phase": "before_model", "messages": [], "events": []},
+    )
+
+
+def test_enqueue_turn_is_visible_as_queued(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "queue.sqlite")
+
+    _enqueue(repository)
+
+    status = repository.load_turn_status("session-1", "turn-1")
+    assert status is not None
+    assert status.status == "queued"
+
+
+def test_only_one_worker_claims_a_queued_turn(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "queue.sqlite")
+    _enqueue(repository)
+
+    first = repository.claim_next_turn(owner_id="worker-a", lease_seconds=30)
+    second = repository.claim_next_turn(owner_id="worker-b", lease_seconds=30)
+
+    assert first is not None
+    assert first.session_id == "session-1"
+    assert first.command_id == "turn-1"
+    assert second is None
+
+
+def test_expired_running_turn_becomes_retryable(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "queue.sqlite")
+    _enqueue(repository)
+    repository.claim_next_turn(owner_id="worker-a", lease_seconds=0.001)
+    time.sleep(0.01)
+
+    recovered = repository.recover_expired_turns(now=time.time())
+
+    assert recovered == [("session-1", "turn-1")]
+    assert repository.load_turn_status("session-1", "turn-1").status == "retryable"
 
 
 def test_messages_and_provider_state_are_separate(tmp_path: Path) -> None:

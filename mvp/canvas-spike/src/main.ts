@@ -37,12 +37,14 @@ function isApiRequest(value: unknown): value is ApiRequest {
   if ((request.method !== "GET" && request.method !== "POST" && request.method !== "DELETE") || typeof request.path !== "string") return false;
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
     const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
-    const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events))?)?$/.exec(request.path);
+    const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events|interventions|pause|resume))?)?$/.exec(request.path);
     if (!providerPath && !conversationPath) return false;
     if (conversationPath) {
       const operation = conversationPath[1];
       return (operation === "events" && request.method === "GET")
         || (operation === "messages" && request.method === "POST")
+        || (operation === "interventions" && request.method === "POST")
+        || ((operation === "pause" || operation === "resume") && request.method === "POST")
         || (!operation && request.method === "POST");
     }
     if (!providerPath) return false;
@@ -157,6 +159,15 @@ async function authenticatedBackendRequest(
     redirect: "error",
     signal: AbortSignal.timeout(timeoutMs),
   });
+}
+
+function apiRequestTimeout(pathname: string, method: string): number {
+  // Conversation POSTs only enqueue a durable turn. Keep this control-plane
+  // request short; model/provider work continues in the Python Worker and is
+  // consumed through the cursor-based events endpoint.
+  if (method === "POST" && /^\/api\/sessions\/[^/]+\/messages$/.test(pathname)) return 15_000;
+  if (method === "GET" && /^\/api\/sessions\/[^/]+\/events$/.test(pathname)) return 30_000;
+  return 5_000;
 }
 
 async function verifyBackendIdentity(owned: BackendProcess): Promise<void> {
@@ -287,7 +298,7 @@ ipcMain.handle("api.request", async (event, request: unknown) => {
     method: request.method,
     headers: { ...(request.body === undefined ? {} : { "content-type": "application/json" }), ...(request.headers ?? {}) },
     body: request.body === undefined ? undefined : JSON.stringify(request.body),
-  });
+  }, apiRequestTimeout(`/api${request.path}`, request.method));
   const responseText = await response.text();
   if (responseText.length > 1_048_576) throw new Error("local API response is too large");
   let body: unknown = null;

@@ -1,111 +1,45 @@
-import { useEffect, useState } from "react";
-import { artifacts } from "./artifacts";
+import { useState } from "react";
 import { ProviderCenter } from "./providers/ProviderCenter";
-import { registry } from "./renderers";
+import { AgentCenter } from "./agents/AgentCenter";
 import { ConversationWorkspace } from "./conversations/ConversationWorkspace";
+import { WorkspacePage } from "./workspace/WorkspacePage";
 import "./styles.css";
 
-const workspaces = [
-  ["home", "主页"],
-  ["conversations", "会话"],
-  ["agents", "Agent"],
-  ["tasks", "任务"],
-  ["artifacts", "Artifacts"],
-] as const;
+type Page = "home" | "conversations" | "tasks" | "artifacts" | "workspace" | "providers" | "agents" | "connectors" | "skills" | "settings";
 
-const settings = [
-  ["providers", "模型供应商"],
-  ["connectors", "连接器"],
-  ["skills", "Skills"],
-  ["settings", "设置"],
-] as const;
+const railItems: Array<{ id: Page; icon: string; label: string }> = [
+  { id: "home", icon: "⌂", label: "主页" },
+  { id: "conversations", icon: "◌", label: "会话" },
+  { id: "tasks", icon: "☷", label: "任务" },
+  { id: "artifacts", icon: "▤", label: "画布" },
+  { id: "workspace", icon: "⌘", label: "Workspace" },
+];
 
-type Workspace = typeof workspaces[number][0];
-type Setting = typeof settings[number][0];
-type View = Workspace | Setting;
-
-const workspaceIds = new Set<Workspace>(workspaces.map(([id]) => id));
-const settingIds = new Set<Setting>(settings.map(([id]) => id));
-
-function readView(): View {
-  const hash = window.location.hash.slice(1);
-  if (workspaceIds.has(hash as Workspace) || settingIds.has(hash as Setting)) return hash as View;
-  return "artifacts";
-}
-
-function StatusPanel({ title, children }: { title: string; children: string }) {
-  return (
-    <section className="status-panel" aria-labelledby={`${title}-title`}>
-      <p className="eyebrow">工作区</p>
-      <h2 id={`${title}-title`}>{title}</h2>
-      <p>{children}</p>
-    </section>
-  );
-}
-
-function WorkspaceContent({ view }: { view: Workspace }) {
-  if (view === "conversations") return <ConversationWorkspace />;
-  if (view === "artifacts") return <>{artifacts.map((artifact) => {
-    const Renderer = registry.resolve(artifact.kind);
-    return <Renderer key={artifact.id} artifact={artifact} />;
-  })}</>;
-
-  const content: Record<Exclude<Workspace, "artifacts">, string> = {
-    home: "主页工作区正在建设中。这里将汇总最近活动、运行状态和快捷入口。",
-    agents: "Agent 工作区正在建设中。你将能够在这里管理和启动 Agent。",
-    tasks: "任务工作区正在建设中。你将能够在这里跟踪执行中的工作。",
+function PlaceholderPage({ page }: { page: Page }) {
+  const content: Record<string, [string, string]> = {
+    home: ["主页 · Home", "查看最近会话、运行中的任务和可用 Workspace。"],
+    tasks: ["Agent 任务 · Tasks", "持续任务、监督 Agent 和状态机入口将在这里汇总。"],
+    artifacts: ["智能画布 · Artifacts", "来自会话的报告、运行图谱、表格、HTML 和音频产物。"],
+    connectors: ["连接器 · Connectors", "本地文件、Data Platform 和其他软件模块的连接状态。"],
+    skills: ["Skills", "管理可被 @ 调用的技能目录。"],
+    settings: ["设置 · Settings", "工作台偏好、日志和实验开关。"],
   };
-  const title = workspaces.find(([id]) => id === view)?.[1] ?? "主页";
-  return <StatusPanel title={title}>{content[view]}</StatusPanel>;
-}
-
-function SettingsContent({ view }: { view: Setting }) {
-  if (view === "providers") return <ProviderCenter />;
-  const content: Record<Exclude<Setting, "providers">, string> = {
-    connectors: "连接器管理正在建设中。可在此查看和配置外部连接。",
-    skills: "Skills 管理正在建设中。可在此查看可用技能及其状态。",
-    settings: "应用设置正在建设中。可在此调整工作台偏好。",
-  };
-  const title = settings.find(([id]) => id === view)?.[1] ?? "设置";
-  return <StatusPanel title={title}>{content[view]}</StatusPanel>;
+  const [title, description] = content[page] ?? content.home;
+  return <section className="placeholder-page"><p className="eyebrow">Agent Workbench · V4</p><h1>{title}</h1><p>{description}</p><div className="placeholder-grid"><div><strong>持续上下文</strong><span>会话级上下文与项目共享上下文分离保存。</span></div><div><strong>可观测执行</strong><span>AG-UI timeline 显示 Agent、工具、决策和状态。</span></div><div><strong>可扩展画布</strong><span>文本之外支持图形、表格、HTML 和音频产物。</span></div></div></section>;
 }
 
 export function App() {
-  const [view, setView] = useState(readView);
-  const [workspace, setWorkspace] = useState<Workspace>(() => {
-    const initial = readView();
-    return workspaceIds.has(initial as Workspace) ? initial as Workspace : "home";
-  });
-
-  useEffect(() => {
-    const updateView = () => {
-      const nextView = readView();
-      setView(nextView);
-      if (workspaceIds.has(nextView as Workspace)) setWorkspace(nextView as Workspace);
-    };
-    window.addEventListener("hashchange", updateView);
-    return () => window.removeEventListener("hashchange", updateView);
-  }, []);
-
-  const isWorkspace = workspaceIds.has(view as Workspace);
-  return (
-    <main>
-      <header className="app-header">
-        <h1>Hermes Workbench</h1>
-        <nav className="settings-navigation" aria-label="设置">
-          {settings.map(([id, label]) => <a key={id} href={`#${id}`} aria-current={view === id ? "page" : undefined}>{label}</a>)}
-        </nav>
-      </header>
-      <div className="app-layout">
-        <aside className="workspace-sidebar">
-          <nav className="workspace-navigation" aria-label="工作区">
-            {workspaces.map(([id, label]) => <a key={id} href={`#${id}`} aria-current={workspace === id ? "page" : undefined}>{label}</a>)}
-          </nav>
-        </aside>
-        <section className="app-content" aria-live="polite">
-          {isWorkspace ? <WorkspaceContent view={view as Workspace} /> : <SettingsContent view={view as Setting} />}
-        </section>
-      </div>
-    </main>
-  );
+  const [page, setPage] = useState<Page>("conversations");
+  const openPage = (next: Page) => setPage(next);
+  const renderMain = () => {
+    if (page === "workspace") return <WorkspacePage onBack={() => setPage("conversations")} />;
+    if (page === "providers") return <section className="provider-page"><ProviderCenter /></section>;
+    if (page === "agents") return <section className="provider-page"><AgentCenter /></section>;
+    if (page === "conversations" || page === "artifacts") return <ConversationWorkspace />;
+    return <PlaceholderPage page={page} />;
+  };
+  return <main className="v4-shell">
+    <header className="v4-topbar"><div className="v4-brand"><span className="v4-brand-mark">AW</span><div><strong>Generic Agent</strong><small>本地 Agent Workbench · Batch2</small></div></div><div className="v4-topbar-context"><span className="v4-connection-dot">●</span><span>Task2 Runtime · Task3 Conversation API</span></div><nav className="v4-settings-nav" aria-label="设置"><a href="#providers" className={page === "providers" ? "active" : ""} aria-current={page === "providers" ? "page" : undefined} onClick={(event) => { event.preventDefault(); openPage("providers"); }}>模型供应商</a><button type="button" className={page === "agents" ? "active" : ""} aria-current={page === "agents" ? "page" : undefined} onClick={() => openPage("agents")}>Agent 配置</button><button type="button" onClick={() => openPage("connectors")}>连接器</button><button type="button" onClick={() => openPage("skills")}>Skills</button><button type="button" onClick={() => openPage("settings")}>设置</button></nav></header>
+    <div className="v4-body"><aside className="v4-rail"><div className="v4-rail-title">WORKBENCH</div><nav className="v4-rail-nav" aria-label="主导航">{railItems.map((item) => <button key={item.id} type="button" className={page === item.id ? "active" : ""} aria-current={page === item.id ? "page" : undefined} onClick={() => openPage(item.id)}><span>{item.icon}</span><small>{item.label}</small></button>)}</nav><div className="v4-rail-bottom"><span className="v4-user-avatar">苏</span><small>本地</small></div></aside><section className="v4-content">{renderMain()}</section></div>
+  </main>;
 }

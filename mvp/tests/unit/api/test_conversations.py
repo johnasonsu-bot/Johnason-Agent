@@ -3,6 +3,7 @@ import hashlib
 import json
 import secrets
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -74,7 +75,7 @@ class RetryRunner:
                 kind="turn_failed",
                 session_id=command.session_id,
                 run_id=command.run_id,
-                payload={"reason": "provider_error", "retryable": True},
+                payload={"reason": "provider_error", "retryable": True, "detail": "provider unavailable"},
             )
             return
         yield AgentEvent(
@@ -169,8 +170,33 @@ def _send_message(
         headers={"Idempotency-Key": command_id},
         json={"content": content},
     )
-    assert response.status_code == 200, response.text
-    return response.json()
+    assert response.status_code in {200, 202}, response.text
+    if response.status_code == 200:
+        return response.json()
+    _wait_for_turn(client, session_id, command_id, "completed")
+    completed = client.post(
+        f"/api/sessions/{session_id}/messages",
+        headers={"Idempotency-Key": command_id},
+        json={"content": content},
+    )
+    assert completed.status_code == 200, completed.text
+    return completed.json()
+
+
+def _wait_for_turn(
+    client: TestClient,
+    session_id: str,
+    command_id: str,
+    expected: str,
+) -> None:
+    repository = client.app.state.conversation_worker.repository
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        turn = repository.load_turn_status(session_id, command_id)
+        if turn is not None and turn.status == expected:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"turn {session_id}/{command_id} did not reach {expected}")
 
 
 def _frames(response) -> list[tuple[int, dict]]:
@@ -186,11 +212,10 @@ def _frames(response) -> list[tuple[int, dict]]:
 
 
 def test_message_route_executes_a_public_turn_and_hides_private_state(tmp_path: Path) -> None:
-    client = _client(tmp_path / "conversation.sqlite")
-    _start_session(client)
-
-    result = _send_message(client, "session-1", "hello", "message-1")
-    replay = client.get("/api/sessions/session-1/events")
+    with _client(tmp_path / "conversation.sqlite") as client:
+        _start_session(client)
+        result = _send_message(client, "session-1", "hello", "message-1")
+        replay = client.get("/api/sessions/session-1/events")
 
     assert result["session_id"] == "session-1"
     assert result["status"] == "completed"
@@ -202,32 +227,34 @@ def test_message_route_executes_a_public_turn_and_hides_private_state(tmp_path: 
 
 
 def test_scoped_controls_and_interventions_do_not_cross_session_boundaries(tmp_path: Path) -> None:
-    client = _client(tmp_path / "conversation.sqlite")
-    _start_session(client, "session-a")
-    _start_session(client, "session-b")
+    with _client(tmp_path / "conversation.sqlite") as client:
+        _start_session(client, "session-a")
+        _start_session(client, "session-b")
 
-    intervention = client.post(
-        "/api/sessions/session-a/interventions",
-        headers={"Idempotency-Key": "intervention-a"},
-        json={"kind": "supplement", "content": "only a"},
-    )
-    paused = client.post(
-        "/api/sessions/session-a/pause", headers={"Idempotency-Key": "pause-a"}
-    )
-    blocked = client.post(
-        "/api/sessions/session-a/messages",
-        headers={"Idempotency-Key": "message-a"},
-        json={"content": "blocked"},
-    )
-    resumed = client.post(
-        "/api/sessions/session-a/resume", headers={"Idempotency-Key": "resume-a"}
-    )
-    _send_message(client, "session-b", "hello b", "message-b")
+        intervention = client.post(
+            "/api/sessions/session-a/interventions",
+            headers={"Idempotency-Key": "intervention-a"},
+            json={"kind": "supplement", "content": "only a"},
+        )
+        paused = client.post(
+            "/api/sessions/session-a/pause", headers={"Idempotency-Key": "pause-a"}
+        )
+        blocked = client.post(
+            "/api/sessions/session-a/messages",
+            headers={"Idempotency-Key": "message-a"},
+            json={"content": "blocked"},
+        )
+        resumed = client.post(
+            "/api/sessions/session-a/resume", headers={"Idempotency-Key": "resume-a"}
+        )
+        _send_message(client, "session-b", "hello b", "message-b")
+
+        session_a = client.get("/api/sessions/session-a/events").text
+        session_b = client.get("/api/sessions/session-b/events").text
 
     assert intervention.status_code == paused.status_code == resumed.status_code == 200
     assert blocked.status_code == 409
-    assert "only a" in client.get("/api/sessions/session-a/events").text
-    session_b = client.get("/api/sessions/session-b/events").text
+    assert "only a" in session_a
     assert "only a" not in session_b
     assert "paused" not in session_b
 
@@ -245,12 +272,14 @@ def test_same_session_commands_are_serialized(tmp_path: Path) -> None:
             ).status_code
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            assert list(pool.map(send, (1, 2))) == [200, 200]
+            assert list(pool.map(send, (1, 2))) == [202, 202]
+        _wait_for_turn(client, "session-1", "message-1", "completed")
+        _wait_for_turn(client, "session-1", "message-2", "completed")
 
     assert runner.maximum_active == 1
 
 
-def test_different_sessions_progress_independently(tmp_path: Path) -> None:
+def test_different_sessions_complete_with_single_durable_worker(tmp_path: Path) -> None:
     runner = ConversationRunner()
     with _client(tmp_path / "conversation.sqlite", runner) as client:
         _start_session(client, "session-a")
@@ -264,9 +293,12 @@ def test_different_sessions_progress_independently(tmp_path: Path) -> None:
             ).status_code
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            assert list(pool.map(send, ("session-a", "session-b"))) == [200, 200]
+            assert list(pool.map(send, ("session-a", "session-b"))) == [202, 202]
+        _wait_for_turn(client, "session-a", "message-session-a", "completed")
+        _wait_for_turn(client, "session-b", "message-session-b", "completed")
 
-    assert runner.maximum_active == 2
+    assert runner.maximum_active == 1
+    assert runner.calls == 2
 
 
 def test_two_real_http_turns_reuse_the_app_lifespan_loop(tmp_path: Path) -> None:
@@ -280,35 +312,49 @@ def test_two_real_http_turns_reuse_the_app_lifespan_loop(tmp_path: Path) -> None
 
 
 def test_retryable_turn_can_be_retried_with_the_same_command_id(tmp_path: Path) -> None:
-    client = _client(tmp_path / "conversation.sqlite", RetryRunner())
-    _start_session(client)
+    with _client(tmp_path / "conversation.sqlite", RetryRunner()) as client:
+        _start_session(client)
+        first = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "message-1"},
+            json={"content": "recover"},
+        )
+        _wait_for_turn(client, "session-1", "message-1", "completed")
+        second = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "message-1"},
+            json={"content": "recover"},
+        )
+        replay = client.get("/api/sessions/session-1/events").text
 
-    first = client.post(
-        "/api/sessions/session-1/messages",
-        headers={"Idempotency-Key": "message-1"},
-        json={"content": "recover"},
-    )
-    second = client.post(
-        "/api/sessions/session-1/messages",
-        headers={"Idempotency-Key": "message-1"},
-        json={"content": "recover"},
-    )
-
-    assert first.status_code == 503
+    assert first.status_code == 202
     assert second.status_code == 200
     assert second.json()["status"] == "completed"
-    replay = client.get("/api/sessions/session-1/events").text
     assert "turn_retryable" in replay
     assert "recovered" in replay
 
 
-def test_canonical_command_keys_cannot_collide_across_sessions(tmp_path: Path) -> None:
-    client = _client(tmp_path / "conversation.sqlite")
-    _start_session(client, "a:b")
-    _start_session(client, "a")
+def test_retryable_turn_exposes_provider_detail(tmp_path: Path) -> None:
+    with _client(tmp_path / "conversation.sqlite", RetryRunner()) as client:
+        _start_session(client)
+        response = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "message-detail"},
+            json={"content": "recover"},
+        )
+        _wait_for_turn(client, "session-1", "message-detail", "completed")
+        replay = client.get("/api/sessions/session-1/events").text
 
-    first = _send_message(client, "a:b", "one", "c")
-    second = _send_message(client, "a", "two", "b:c")
+    assert response.status_code == 202
+    assert "provider unavailable" in replay
+
+
+def test_canonical_command_keys_cannot_collide_across_sessions(tmp_path: Path) -> None:
+    with _client(tmp_path / "conversation.sqlite") as client:
+        _start_session(client, "a:b")
+        _start_session(client, "a")
+        first = _send_message(client, "a:b", "one", "c")
+        second = _send_message(client, "a", "two", "b:c")
 
     assert first["status"] == second["status"] == "completed"
 
@@ -336,19 +382,19 @@ def test_conflicting_message_command_never_starts_the_runner(tmp_path: Path) -> 
 def test_lifecycle_intervention_is_claimed_acknowledged_and_projected(tmp_path: Path) -> None:
     database = tmp_path / "conversation.sqlite"
     _lifecycle_run(database, "session-1")
-    client = _client(database, AcknowledgingRunner(database))
-    _start_session(client)
-    queued = client.post(
-        "/api/sessions/session-1/interventions",
-        headers={"Idempotency-Key": "intervention-1"},
-        json={"kind": "supplement", "content": "include hidden files"},
-    )
-    completed = _send_message(client, "session-1", "inspect", "message-1")
+    with _client(database, AcknowledgingRunner(database)) as client:
+        _start_session(client)
+        queued = client.post(
+            "/api/sessions/session-1/interventions",
+            headers={"Idempotency-Key": "intervention-1"},
+            json={"kind": "supplement", "content": "include hidden files"},
+        )
+        completed = _send_message(client, "session-1", "inspect", "message-1")
+        replay = client.get("/api/sessions/session-1/events").text
 
     records = WorkflowRepository(database).list_interventions(
         _conversation_run_id("session-1")
     )
-    replay = client.get("/api/sessions/session-1/events").text
     assert queued.status_code == 200
     assert completed["status"] == "completed"
     assert [record.state.value for record in records] == ["acknowledged"]
@@ -361,17 +407,11 @@ def test_active_turn_does_not_block_intervention_or_pause(tmp_path: Path) -> Non
     runner = BlockingAcknowledgingRunner(database)
     with _client(database, runner) as client:
         _start_session(client)
-        result: list[object] = []
-        request = threading.Thread(
-            target=lambda: result.append(
-                client.post(
-                    "/api/sessions/session-1/messages",
-                    headers={"Idempotency-Key": "message-1"},
-                    json={"content": "inspect"},
-                )
-            )
+        queued = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "message-1"},
+            json={"content": "inspect"},
         )
-        request.start()
         assert runner.started.wait(timeout=2)
 
         intervention = client.post(
@@ -383,7 +423,7 @@ def test_active_turn_does_not_block_intervention_or_pause(tmp_path: Path) -> Non
             "/api/sessions/session-1/pause", headers={"Idempotency-Key": "pause-1"}
         )
         runner.release.set()
-        request.join(timeout=2)
+        _wait_for_turn(client, "session-1", "message-1", "completed")
         duplicate = client.post(
             "/api/sessions/session-1/messages",
             headers={"Idempotency-Key": "message-1"},
@@ -391,10 +431,9 @@ def test_active_turn_does_not_block_intervention_or_pause(tmp_path: Path) -> Non
         )
 
     assert intervention.status_code == paused.status_code == 200
-    assert result and result[0].status_code == 200
-    assert result[0].json()["status"] == "paused"
-    assert duplicate.status_code == 200
-    assert duplicate.json() == result[0].json()
+    assert queued.status_code == 202
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["status"] == "paused"
     assert [
         item.state.value
         for item in WorkflowRepository(database).list_interventions(
@@ -572,11 +611,10 @@ def test_session_rejects_an_existing_lifecycle_mission_owned_by_another_project(
 
 def test_completed_message_command_replays_without_calling_runner_again(tmp_path: Path) -> None:
     runner = ConversationRunner()
-    client = _client(tmp_path / "conversation.sqlite", runner)
-    _start_session(client)
-
-    first = _send_message(client, "session-1", "hello", "message-1")
-    second = _send_message(client, "session-1", "hello", "message-1")
+    with _client(tmp_path / "conversation.sqlite", runner) as client:
+        _start_session(client)
+        first = _send_message(client, "session-1", "hello", "message-1")
+        second = _send_message(client, "session-1", "hello", "message-1")
 
     assert first == second
     assert runner.calls == 1
@@ -587,22 +625,22 @@ def test_sse_composite_cursor_replays_later_projections_of_the_same_event(
 ) -> None:
     import workbench.api.conversations as conversation_api
 
-    client = _client(tmp_path / "conversation.sqlite")
-    _start_session(client)
-    _send_message(client, "session-1", "hello", "message-1")
-    original = conversation_api.map_domain_event
-    monkeypatch.setattr(
-        conversation_api,
-        "map_domain_event",
-        lambda event: [*original(event), {"type": "CUSTOM", "name": "extra"}],
-    )
+    with _client(tmp_path / "conversation.sqlite") as client:
+        _start_session(client)
+        _send_message(client, "session-1", "hello", "message-1")
+        original = conversation_api.map_domain_event
+        monkeypatch.setattr(
+            conversation_api,
+            "map_domain_event",
+            lambda event: [*original(event), {"type": "CUSTOM", "name": "extra"}],
+        )
 
-    replay = client.get(
-        "/api/sessions/session-1/events", headers={"Last-Event-ID": "2:0"}
-    )
+        replay = client.get(
+            "/api/sessions/session-1/events", headers={"Last-Event-ID": "2:0"}
+        )
 
     ids = [frame.splitlines()[0].removeprefix("id: ") for frame in replay.text.strip().split("\n\n")]
-    assert ids == ["2:1", "3:0", "3:1"]
+    assert ids == ["2:1", "3:0", "3:1", "4:0", "4:1"]
 
 
 def test_concurrent_duplicate_message_runs_the_runner_once(tmp_path: Path) -> None:
@@ -618,22 +656,24 @@ def test_concurrent_duplicate_message_runs_the_runner_once(tmp_path: Path) -> No
             ).status_code
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            assert list(pool.map(send, (1, 2))) == [200, 200]
+            assert list(pool.map(send, (1, 2))) == [202, 202]
+        _wait_for_turn(client, "session-1", "message-1", "completed")
 
     assert runner.calls == 1
 
 
 def test_retry_success_duplicate_replays_only_the_successful_attempt(tmp_path: Path) -> None:
-    client = _client(tmp_path / "conversation.sqlite", RetryRunner())
-    _start_session(client)
-    first = client.post(
-        "/api/sessions/session-1/messages",
-        headers={"Idempotency-Key": "message-1"},
-        json={"content": "recover"},
-    )
-    successful = _send_message(client, "session-1", "recover", "message-1")
-    duplicate = _send_message(client, "session-1", "recover", "message-1")
+    with _client(tmp_path / "conversation.sqlite", RetryRunner()) as client:
+        _start_session(client)
+        first = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "message-1"},
+            json={"content": "recover"},
+        )
+        _wait_for_turn(client, "session-1", "message-1", "completed")
+        successful = _send_message(client, "session-1", "recover", "message-1")
+        duplicate = _send_message(client, "session-1", "recover", "message-1")
 
-    assert first.status_code == 503
+    assert first.status_code == 202
     assert duplicate == successful
     assert all(event.get("name") != "turn_retryable" for event in duplicate["events"])

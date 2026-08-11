@@ -26,6 +26,7 @@ _CUSTOM_TYPES = {
     "agent.decision.summary",
     "artifact.linked",
     "conversation.status",
+    "conversation.turn.queued",
     "conversation.turn.finished",
     "conversation.turn.failed",
     "conversation.turn.retryable",
@@ -68,6 +69,7 @@ def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
         result["delta"] = payload.get("delta", [])
     elif event.event_type in _CUSTOM_TYPES:
         result["name"] = {
+            "conversation.turn.queued": "turn_queued",
             "conversation.turn.finished": "turn_finished",
             "conversation.turn.failed": "turn_failed",
             "conversation.turn.retryable": "turn_retryable",
@@ -100,10 +102,16 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
         "supervisor.finding.created": ("finding_id", "summary", "severity"),
         "agent.decision.summary": ("summary",),
         "artifact.linked": ("artifact_id", "name", "url", "media_type"),
-        "conversation.status": ("status",),
-        "conversation.turn.finished": ("status",),
-        "conversation.turn.failed": ("reason",),
-        "conversation.turn.retryable": ("reason",),
+        "conversation.status": ("status", "command_id"),
+        "conversation.turn.queued": (
+            "command_id",
+            "status",
+            "model",
+            "provider_id",
+        ),
+        "conversation.turn.finished": ("status", "command_id"),
+        "conversation.turn.failed": ("reason", "command_id"),
+        "conversation.turn.retryable": ("reason", "detail", "command_id"),
         "agent.tool.failed": ("tool_call_id", "name", "reason"),
     }.get(event_type)
     return {key: payload[key] for key in fields or () if key in payload}

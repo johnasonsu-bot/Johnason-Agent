@@ -160,6 +160,9 @@ async def test_intervention_is_acknowledged_only_after_successful_model_request(
     recovered = [event async for event in runtime.run_turn(command)]
     assert recovered[-1].kind == "turn_finished"
     assert workflow.list_pending_interventions("run-1") == []
+    messages = ConversationRepository(database).list_messages("session-1")
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert [message.content for message in messages] == ["hello", "recovered"]
 
 
 class BlockAfterToolProvider:

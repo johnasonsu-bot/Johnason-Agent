@@ -125,6 +125,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             run_id TEXT NOT NULL,
             provider_id TEXT NOT NULL,
             model TEXT NOT NULL,
+            prompt TEXT,
             prompt_digest TEXT,
             status TEXT NOT NULL,
             owner_id TEXT,
@@ -159,6 +160,13 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(
         connection, "conversation_turns", "prompt_digest", "TEXT"
+    )
+    _add_column_if_missing(connection, "conversation_turns", "prompt", "TEXT")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_conversation_turns_queue
+        ON conversation_turns(status, lease_expires_at, updated_at)
+        """
     )
     _upgrade_conversation_command_scope(connection)
     current_version = connection.execute(

@@ -11,11 +11,11 @@ import sqlite3
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from workbench.agui.mapper import map_domain_event
-from workbench.conversations.models import ConversationSession
+from workbench.conversations.models import ConversationMessage, ConversationSession
 from workbench.conversations.repository import ConversationRepository
 from workbench.domain.models import EpochRecord, MissionRecord, ProjectRecord, RunRecord
 from workbench.protocol.events import DomainEvent
@@ -42,6 +42,7 @@ class CreateSessionRequest(BaseModel):
 class MessageRequest(BaseModel):
     content: str
     model: str = "default"
+    provider_id: str | None = None
 
 
 class ConversationInterventionRequest(BaseModel):
@@ -64,7 +65,11 @@ class SessionPausedError(RuntimeError):
 
 
 class RetryableTurnError(RuntimeError):
-    pass
+    def __init__(self, detail: str | None = None) -> None:
+        message = "agent turn is retryable"
+        if detail:
+            message += f": {detail[:1024]}"
+        super().__init__(message)
 
 
 @dataclass
@@ -82,6 +87,190 @@ class ConversationAPI:
             self._ensure_lifecycle_run(session_id)
         return self.conversations.create_session(session_id)
 
+    async def enqueue_message(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a turn and return before any model request is awaited."""
+        self._require_session(session_id)
+        self._require_lifecycle_ownership(session_id)
+        resolved_provider = self._resolve_provider_id(provider_id)
+        reservation_id = self._reserve(
+            session_id,
+            command_id,
+            "message",
+            {"content": content, "model": model, "provider_id": provider_id},
+        )
+        terminal = self._terminal_response(session_id, command_id, reservation_id)
+        if terminal is not None:
+            return terminal
+        if self._status(session_id) == "paused":
+            raise SessionPausedError(session_id)
+        self.conversations.append_message(
+            ConversationMessage(
+                session_id=session_id,
+                command_id=f"{command_id}:user",
+                role="user",
+                content=content,
+            )
+        )
+        turn = self.conversations.enqueue_turn(
+            session_id=session_id,
+            command_id=command_id,
+            run_id=self._lifecycle_run_id(session_id),
+            provider_id=resolved_provider,
+            model=model,
+            prompt=content,
+            initial_state=self._initial_turn_state(session_id),
+        )
+        queued = self._append(
+            session_id,
+            "conversation.turn.queued",
+            {
+                "command_id": command_id,
+                "status": "queued",
+                "model": model,
+                "provider_id": resolved_provider,
+            },
+            command_id,
+            ordinal=-1,
+            causation_id=reservation_id,
+        )
+        if turn.status in {"completed", "failed", "reconciliation_required"}:
+            return self._terminal_response(session_id, command_id, reservation_id) or {
+                "session_id": session_id,
+                "command_id": command_id,
+                "status": turn.status,
+                "events": [],
+            }
+        sequence = queued.get("sequence")
+        return {
+            "session_id": session_id,
+            "command_id": command_id,
+            "status": turn.status,
+            "cursor": f"{sequence}:0" if isinstance(sequence, int) else None,
+        }
+
+    async def process_queued_turn(self, session_id: str, command_id: str) -> None:
+        """Advance one Worker-owned turn and seal it if the runtime did not."""
+        turn = self.conversations.load_turn_status(session_id, command_id)
+        if turn is None or turn.status in {"completed", "failed", "reconciliation_required"}:
+            return
+        if turn.owner_id is None:
+            return
+        reservation_id = self._reservation_event_id(session_id, command_id)
+        command = RunAgentTurn(
+            session_id=session_id,
+            run_id=turn.run_id,
+            command_id=command_id,
+            prompt=turn.prompt or "",
+            model=turn.model,
+            provider_id=turn.provider_id,
+            owner_id=turn.owner_id,
+        )
+        async with self._session_lock(session_id):
+            current = self.conversations.load_turn_status(session_id, command_id)
+            if current is None or current.status in {
+                "completed",
+                "failed",
+                "reconciliation_required",
+            }:
+                return
+            projected, retryable = await self._record_turn(
+                command, reservation_id=reservation_id
+            )
+            current = self.conversations.load_turn_status(session_id, command_id)
+            if current is None or retryable or current.status == "retryable":
+                if (
+                    current is not None
+                    and current.status == "running"
+                    and current.owner_id == command.owner_id
+                ):
+                    state = dict(current.state)
+                    state.update({"phase": "before_model", "retryable": True})
+                    self.conversations.mark_retryable(
+                        session_id,
+                        command_id,
+                        owner_id=command.owner_id or "",
+                        state=state,
+                    )
+                elif current is not None and retryable and current.status == "running" and current.owner_id is None:
+                    state = dict(current.state)
+                    state.update({"phase": "before_model", "retryable": True})
+                    self.conversations.mark_retryable_unowned(
+                        session_id, command_id, state=state
+                    )
+                return
+            if current.status != "running" or current.owner_id != command.owner_id:
+                return
+            terminal_name = next(
+                (item.get("name") for item in reversed(projected)
+                 if item.get("name") in {"turn_finished", "turn_failed"}),
+                "turn_failed",
+            )
+            self.conversations.finish_turn(
+                session_id,
+                command_id,
+                owner_id=command.owner_id or "",
+                status="completed" if terminal_name == "turn_finished" else "failed",
+                state={
+                    "phase": "completed" if terminal_name == "turn_finished" else "failed",
+                    "messages": [],
+                    "events": [],
+                },
+                result=projected,
+            )
+
+    def record_worker_retryable(
+        self, session_id: str, command_id: str, *, detail: str
+    ) -> None:
+        """Publish a safe worker-level retry event without exposing exception text."""
+        reservation_id = self._reservation_event_id(session_id, command_id)
+        attempt = sum(
+            event.event_type == "conversation.turn.retryable"
+            and event.causation_id == reservation_id
+            for event in self.events.read_stream(f"run:{session_id}")
+        )
+        self._append(
+            session_id,
+            "conversation.turn.retryable",
+            {
+                "command_id": command_id,
+                "reason": "worker_error",
+                "detail": detail[:128],
+            },
+            command_id,
+            ordinal=-2,
+            attempt=attempt,
+            causation_id=reservation_id,
+        )
+
+    def _resolve_provider_id(self, provider_id: str | None) -> str:
+        resolver = getattr(self.runner, "_resolve_profile", None)
+        if callable(resolver):
+            profile = resolver(provider_id)
+            return str(profile.id)
+        return provider_id or "default"
+
+    def _initial_turn_state(self, session_id: str) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
+        model_messages = getattr(self.runner, "_model_messages", None)
+        if callable(model_messages):
+            for message in model_messages(session_id):
+                if hasattr(message, "model_dump"):
+                    messages.append(message.model_dump(mode="json"))
+        return {
+            "phase": "before_model",
+            "messages": messages,
+            "events": [],
+            "model_step_count": 0,
+        }
+
     async def run_message(
         self,
         *,
@@ -89,11 +278,32 @@ class ConversationAPI:
         command_id: str,
         content: str,
         model: str,
+        provider_id: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.enqueue_message(
+            session_id=session_id,
+            command_id=command_id,
+            content=content,
+            model=model,
+            provider_id=provider_id,
+        )
+
+    async def _run_message_synchronously(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None = None,
     ) -> dict[str, Any]:
         self._require_session(session_id)
         self._require_lifecycle_ownership(session_id)
         reservation_id = self._reserve(
-            session_id, command_id, "message", {"content": content, "model": model}
+            session_id,
+            command_id,
+            "message",
+            {"content": content, "model": model, "provider_id": provider_id},
         )
         terminal = self._terminal_response(session_id, command_id, reservation_id)
         if terminal is not None:
@@ -114,11 +324,18 @@ class ConversationAPI:
                     command_id=command_id,
                     prompt=content,
                     model=model,
+                    provider_id=provider_id,
                 ),
                 reservation_id=reservation_id,
             )
         if retryable:
-            raise RetryableTurnError("agent turn is retryable")
+            retry_event = next(
+                (event for event in reversed(projected) if event.get("name") == "turn_retryable"),
+                None,
+            )
+            value = retry_event.get("value", {}) if retry_event else {}
+            detail = value.get("detail") if isinstance(value, dict) else None
+            raise RetryableTurnError(detail if isinstance(detail, str) else None)
         terminal = self._terminal_response(session_id, command_id, reservation_id)
         if terminal is not None:
             return terminal
@@ -243,6 +460,7 @@ class ConversationAPI:
         try:
             async for event in self.runner.run_turn(command):  # type: ignore[union-attr]
                 domain_type, payload = _public_turn_event(event)
+                payload["command_id"] = command.command_id
                 retryable = retryable or domain_type == "conversation.turn.retryable"
                 if domain_type in {
                     "conversation.turn.finished",
@@ -582,6 +800,17 @@ class ConversationAPI:
         result = self.events.append(event, command_id=key)
         return result.event_id
 
+    def _reservation_event_id(self, session_id: str, command_id: str) -> str:
+        key = self._reservation_id(session_id, command_id)
+        with self.events.store.connect() as connection:
+            row = connection.execute(
+                "SELECT event_id FROM command_results WHERE command_id = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("conversation command reservation is unavailable")
+        return str(row["event_id"])
+
     @staticmethod
     def _digest(value: dict[str, Any]) -> str:
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -657,7 +886,12 @@ def _public_turn_event(event: AgentEvent) -> tuple[str, dict[str, Any]]:
         return "conversation.turn.finished", {"status": "completed"}
     if payload.get("retryable") is True:
         return "conversation.turn.retryable", {
-            "reason": str(payload.get("reason", "provider_error"))
+            "reason": str(payload.get("reason", "provider_error")),
+            **(
+                {"detail": str(payload["detail"])[:1024]}
+                if payload.get("detail") is not None
+                else {}
+            ),
         }
     return "conversation.turn.failed", {
         "reason": str(payload.get("reason", "agent_error"))
@@ -696,12 +930,16 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         if not idempotency_key:
             raise HTTPException(400, "Idempotency-Key header is required")
         try:
-            return await api.run_message(
+            result = await api.enqueue_message(
                 session_id=session_id,
                 command_id=idempotency_key,
                 content=payload.content,
                 model=payload.model,
+                provider_id=payload.provider_id,
             )
+            if result.get("status") in {"queued", "running", "retryable"}:
+                return JSONResponse(status_code=202, content=result)
+            return result
         except KeyError as exc:
             raise HTTPException(404, "session not found") from exc
         except SessionPausedError as exc:

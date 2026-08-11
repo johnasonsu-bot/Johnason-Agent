@@ -49,11 +49,22 @@ def build_app(
     )
     providers = ProviderRepository(resolved.database)
 
-    def active_profile():
-        try:
-            return next(profile for profile in providers.list() if profile.enabled)
-        except StopIteration as exc:
-            raise ValueError("no enabled model provider is configured") from exc
+    def active_profile(provider_id: str | None = None):
+        enabled = [profile for profile in providers.list() if profile.enabled]
+        if provider_id is not None:
+            try:
+                return next(profile for profile in enabled if profile.id == provider_id)
+            except StopIteration:
+                # The frontend may use a stable protocol selector (for
+                # example ``deepseek``) while a saved provider has a user
+                # supplied id such as ``deepseek-primary``.
+                matching_protocol = [profile for profile in enabled if profile.protocol == provider_id]
+                if matching_protocol:
+                    return matching_protocol[0]
+                raise ValueError(f"enabled model provider not found: {provider_id}")
+        if enabled:
+            return enabled[0]
+        raise ValueError("no enabled model provider is configured")
 
     workflow = WorkflowRepository(resolved.database)
     agent_runtime = AgentRuntime(

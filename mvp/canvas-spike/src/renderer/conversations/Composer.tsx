@@ -1,20 +1,51 @@
-import { FormEvent, useState } from "react";
+import { useRef, useState } from "react";
+import type React from "react";
+import { ContextMenu } from "./ContextMenu";
+import { MentionMenu } from "./MentionMenu";
 
-export function Composer({ onSend, pending = false }: { onSend: (prompt: string) => void; pending?: boolean }) {
+type ModelOption = { id: string; providerId: string; model: string; label: string };
+
+export function Composer({ onSend, onIntervene, pending = false, paused = false, model = "default", providerId = "", modelOptions = [], onModelChange }: { onSend: (prompt: string, contexts: string[]) => void; onIntervene?: (prompt: string) => void; pending?: boolean; paused?: boolean; model?: string; providerId?: string; modelOptions?: ModelOption[]; onModelChange?: (providerId: string, model: string) => void }) {
   const [prompt, setPrompt] = useState("");
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
+  const [contexts, setContexts] = useState<string[]>([]);
+  const [contextOpen, setContextOpen] = useState(false);
+  const [mentionOpen, setMentionOpen] = useState(false);
+  const [pendingMentionAt, setPendingMentionAt] = useState<number | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const insertMention = (token: string) => {
+    const input = inputRef.current;
+    const cursor = input?.selectionStart ?? prompt.length;
+    const hasPendingAt = pendingMentionAt !== null && prompt[pendingMentionAt] === "@";
+    const start = hasPendingAt ? pendingMentionAt! : cursor;
+    const end = hasPendingAt ? pendingMentionAt! + 1 : cursor;
+    const next = `${prompt.slice(0, start)}${token}${prompt.slice(end)}`;
+    setPrompt(next);
+    setPendingMentionAt(null);
+    setMentionOpen(false);
+    requestAnimationFrame(() => { inputRef.current?.focus(); const position = start + token.length; inputRef.current?.setSelectionRange(position, position); });
+  };
+  const submit = () => {
     const value = prompt.trim();
-    if (!value) return;
-    onSend(value);
+    if (!value || pending) return;
+    onSend(value, contexts);
     setPrompt("");
+    setContexts([]);
+    setMentionOpen(false);
+    setContextOpen(false);
+    setPendingMentionAt(null);
+  };
+  const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); submit(); return; }
+    if (event.key === "@") { const cursor = inputRef.current?.selectionStart ?? prompt.length; setTimeout(() => { setPendingMentionAt(cursor); setMentionOpen(true); setContextOpen(false); }, 0); }
   };
 
-  return <form className="conversation-composer" onSubmit={submit} aria-label="人工介入 composer" style={{ borderTop: "1px solid #e6e5e2", padding: "14px 18px", background: "#fff" }}>
-    <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-      <textarea aria-label="输入消息或介入要求" placeholder="输入消息或介入要求" value={prompt} onChange={(event) => setPrompt(event.target.value)} rows={2} style={{ flex: 1, resize: "vertical", border: "1px solid #d9dce1", borderRadius: 10, padding: 10, font: "inherit" }} />
-      <button type="submit" disabled={pending}>{pending ? "发送中…" : "发送"}</button>
-    </div>
-    <small style={{ color: "#6b7280" }}>Human intervention · 补充、纠正或约束当前执行</small>
+  return <form className="v4-composer" aria-label="独立会话输入区" onSubmit={(event) => { event.preventDefault(); submit(); }}>
+    {contexts.length > 0 && <div className="context-chips" data-testid="context-chips">{contexts.map((context) => <span className="context-chip" key={context}>{context}<button type="button" aria-label={`移除 ${context}`} onClick={() => setContexts((current) => current.filter((item) => item !== context))}>×</button></span>)}</div>}
+    <textarea ref={inputRef} aria-label="会话消息" placeholder="发送消息… 使用 @ 指定 Agent、Skill 或 Tool" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={handleKeyDown} rows={2} />
+    <div className="composer-toolbar"><div className="composer-actions"><button type="button" className={`composer-icon ${contextOpen ? "active" : ""}`} aria-label="添加到本轮上下文" onClick={() => { setContextOpen((open) => !open); setMentionOpen(false); }}>＋</button><button type="button" className={`composer-icon ${mentionOpen ? "active" : ""}`} aria-label="提及 Agent、Skill 或 Tool" onClick={() => { setMentionOpen((open) => !open); setContextOpen(false); setPendingMentionAt(null); }}>@</button><small>Enter 发送 · Shift+Enter 换行</small></div><div className="composer-submit">{modelOptions.length > 0 ? <select className="model-select" aria-label="当前模型" value={`${providerId}/${model}`} onChange={(event) => { const [nextProvider, ...rest] = event.target.value.split("/"); onModelChange?.(nextProvider, rest.join("/")); }}>{modelOptions.map((option) => <option key={option.id} value={`${option.providerId}/${option.model}`}>{option.label}</option>)}</select> : <span className="model-badge" aria-label="当前模型">{model} <span>⌄</span></span>}{onIntervene && <button type="button" className="quiet" disabled={!prompt.trim() || paused} onClick={() => { const value = prompt.trim(); if (!value) return; onIntervene(value); setPrompt(""); }}>介入</button>}<button type="submit" className="send-button" aria-label="发送" disabled={pending || paused}>{pending ? "…" : "➤"}</button></div></div>
+    {paused && <small className="composer-note">当前会话已暂停，恢复后才能发送新消息。</small>}
+    <ContextMenu open={contextOpen} onSelect={(value) => { setContexts((current) => current.includes(value) ? current : [...current, value]); setContextOpen(false); }} />
+    <MentionMenu open={mentionOpen} onSelect={insertMention} />
   </form>;
 }

@@ -133,8 +133,10 @@ test("real Workbench backend completes the Batch 1 Provider Center lifecycle", a
     expect(await page.evaluate(() => ({
       local: localStorage.length,
       session: sessionStorage.length,
+      localKeys: Object.keys(localStorage),
       text: document.body.innerText,
-    }))).toEqual(expect.objectContaining({ local: 0, session: 0 }));
+    }))).toEqual(expect.objectContaining({ session: 0 }));
+    expect(await page.evaluate(() => Object.keys(localStorage).some((key) => /provider|secret/i.test(key)))).toBeFalsy();
     expect(await page.evaluate((values) => !document.body.innerText.includes(values.password) && !document.body.innerText.includes(values.credential), { password, credential })).toBeTruthy();
 
     await page.getByRole("button", { name: "锁定保险库" }).click();

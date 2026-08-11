@@ -15,6 +15,7 @@ from workbench.api.commands import CreateRunRequest, InterventionRequest
 from workbench.api.conversations import ConversationAPI, conversation_router
 from workbench.api.providers import provider_router, vault_router
 from workbench.conversations.repository import ConversationRepository
+from workbench.conversations.worker import ConversationTaskWorker
 from workbench.credentials.vault import CredentialVault
 from workbench.credentials.service import VaultService
 from workbench.domain.models import RunRecord
@@ -54,17 +55,36 @@ def create_app(settings: AppSettings) -> FastAPI:
     if settings.capability_token is not None and len(settings.capability_token) < 43:
         raise ValueError("capability token must contain at least 256 bits")
 
+    engine = SingleAgentEngine(
+        settings.database, runner=settings.runner, owner_id=settings.owner_id
+    )
+    event_store = EventStore(settings.database)
+    conversation_api = ConversationAPI(
+        conversations=ConversationRepository(settings.database),
+        events=event_store,
+        runner=settings.runner,
+        engine=engine,
+    )
+    conversation_worker = ConversationTaskWorker(
+        conversation_api.conversations, conversation_api
+    )
+
     @asynccontextmanager
-    async def lifespan(_app: FastAPI):
+    async def lifespan(app: FastAPI):
+        app.state.conversation_worker = conversation_worker
+        await conversation_worker.start()
         try:
             yield
         finally:
             try:
-                if settings.close_gateway and settings.gateway is not None:
-                    await settings.gateway.aclose()
+                await conversation_worker.stop()
             finally:
-                if settings.vault is not None:
-                    settings.vault.lock()
+                try:
+                    if settings.close_gateway and settings.gateway is not None:
+                        await settings.gateway.aclose()
+                finally:
+                    if settings.vault is not None:
+                        settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
 
@@ -89,20 +109,7 @@ def create_app(settings: AppSettings) -> FastAPI:
                 )
         return await call_next(request)
 
-    engine = SingleAgentEngine(
-        settings.database, runner=settings.runner, owner_id=settings.owner_id
-    )
-    event_store = EventStore(settings.database)
-    app.include_router(
-        conversation_router(
-            ConversationAPI(
-                conversations=ConversationRepository(settings.database),
-                events=event_store,
-                runner=settings.runner,
-                engine=engine,
-            )
-        )
-    )
+    app.include_router(conversation_router(conversation_api))
     app.include_router(
         provider_router(
             ProviderRepository(settings.database), settings.vault, settings.gateway

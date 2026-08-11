@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -91,7 +92,7 @@ class AgentRuntime:
         self,
         *,
         gateway: ModelGateway,
-        profile: ProviderProfileRecord | Callable[[], ProviderProfileRecord],
+        profile: ProviderProfileRecord | Callable[..., ProviderProfileRecord],
         conversations: ConversationRepository,
         tools: Sequence[AgentTool] = (),
         skills: Sequence[str] = (),
@@ -124,8 +125,8 @@ class AgentRuntime:
     async def run_turn(
         self, command: RunAgentTurn
     ) -> AsyncIterator[AgentEvent]:
-        owner_id = str(uuid4())
-        profile = self._resolve_profile()
+        owner_id = command.owner_id or str(uuid4())
+        profile = self._resolve_profile(command.provider_id)
         self.conversations.append_message(
             ConversationMessage(
                 session_id=command.session_id,
@@ -300,7 +301,7 @@ class AgentRuntime:
                     owner_id,
                     state,
                     reason="provider_error",
-                    detail=str(exc),
+                    detail=_exception_detail(exc),
                 ):
                     yield event
                 return
@@ -676,8 +677,22 @@ class AgentRuntime:
             for event in events
         )
 
-    def _resolve_profile(self) -> ProviderProfileRecord:
-        return self._profile() if callable(self._profile) else self._profile
+    def _resolve_profile(self, provider_id: str | None = None) -> ProviderProfileRecord:
+        if not callable(self._profile):
+            return self._profile
+        try:
+            parameters = inspect.signature(self._profile).parameters.values()
+            accepts_argument = any(
+                parameter.kind in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    inspect.Parameter.VAR_POSITIONAL,
+                }
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_argument = True
+        return self._profile(provider_id) if accepts_argument else self._profile()
 
     async def _fail_turn(
         self,
@@ -780,3 +795,11 @@ class AgentRuntime:
             run_id=command.run_id,
             payload=payload,
         )
+
+
+def _exception_detail(error: Exception) -> str:
+    """Keep provider failures diagnosable even when an exception has no text."""
+    detail = str(error).strip()
+    if detail:
+        return detail[:1024]
+    return type(error).__name__

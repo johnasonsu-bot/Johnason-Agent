@@ -3,6 +3,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import pytest
 
 from workbench.adapters.hermes.runtime import AgentRuntime, WorkflowInterventions
@@ -97,6 +98,44 @@ def profile() -> ProviderProfileRecord:
         base_url="http://127.0.0.1:1234",
         model_aliases={"default": "qwen-local"},
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_routes_turn_to_requested_provider(tmp_path: Path) -> None:
+    local = profile()
+    cloud = local.model_copy(update={"id": "cloud", "name": "Cloud", "protocol": "deepseek", "base_url": "https://api.deepseek.com", "thinking_enabled": True})
+
+    class OneShotGateway:
+        def __init__(self) -> None:
+            self.profile_ids: list[str] = []
+
+        async def complete(self, request, selected_profile):
+            self.profile_ids.append(selected_profile.id)
+            return ModelResponse(text="routed")
+
+    gateway = OneShotGateway()
+    runtime = AgentRuntime(
+        gateway=gateway,
+        profile=lambda provider_id: {"local": local, "cloud": cloud}[provider_id or "local"],
+        conversations=ConversationRepository(tmp_path / "routing.sqlite"),
+    )
+
+    events = [
+        event
+        async for event in runtime.run_turn(
+            RunAgentTurn(
+                session_id="session-routing",
+                run_id="run-routing",
+                command_id="turn-routing",
+                prompt="route this",
+                model="deepseek-v4-flash",
+                provider_id="cloud",
+            )
+        )
+    ]
+
+    assert events[-1].kind == "turn_finished"
+    assert gateway.profile_ids == ["cloud"]
 
 
 @pytest.mark.asyncio
@@ -286,6 +325,34 @@ def test_duplicate_tool_names_are_rejected(tmp_path: Path) -> None:
 class EmptyGateway:
     async def complete(self, request, profile):
         return ModelResponse()
+
+
+class TimeoutGateway:
+    async def complete(self, request, profile):
+        raise httpx.ReadTimeout("")
+
+
+@pytest.mark.asyncio
+async def test_retryable_provider_timeout_exposes_exception_type(tmp_path: Path) -> None:
+    runtime = AgentRuntime(
+        gateway=TimeoutGateway(),
+        profile=profile(),
+        conversations=ConversationRepository(tmp_path / "runtime.sqlite"),
+    )
+
+    events = await _collect(
+        runtime,
+        RunAgentTurn(
+            session_id="session-1",
+            run_id="run-1",
+            command_id="turn-1",
+            prompt="slow local generation",
+        ),
+    )
+
+    assert events[-1].kind == "turn_failed"
+    assert events[-1].payload["retryable"] is True
+    assert events[-1].payload["detail"] == "ReadTimeout"
 
 
 @pytest.mark.asyncio

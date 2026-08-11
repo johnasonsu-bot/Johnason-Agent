@@ -1,38 +1,49 @@
 import { useState } from "react";
+import { AgentPicker, type AgentPickerResult, agents } from "./AgentPicker";
 
-const roles = ["产品经理", "架构师", "工程师", "测试工程师", "敏捷教练", "DevOps", "数智员工导师"];
-const initialSessions = [
-  { id: "ui-session-0", title: "Jira 看板配置修复指引", status: "14:38 · 运行完成" },
-  { id: "ui-session-1", title: "方案评审 · Architecture review", status: "昨日 · archived" },
-  { id: "ui-session-2", title: "本地文件整理", status: "昨日 · archived" },
+type Session = { id: string; title: string; status: string; group: string[] };
+const SESSION_STORAGE_KEY = "hermes.v4.session-index";
+
+const initialSessions: Session[] = [
+  { id: "ui-session-0", title: "Jira 看板配置修复指引", status: "14:38 · 运行完成", group: ["产品经理", "架构师", "工程师"] },
+  { id: "ui-session-1", title: "方案评审 · Architecture review", status: "昨日 · 等待人工补充", group: ["架构师"] },
+  { id: "ui-session-2", title: "本地文件整理", status: "昨日 · archived", group: ["工程师"] },
+  { id: "ui-session-3", title: "数据平台任务调试", status: "周二 · 157 条结果", group: ["产品经理", "工程师"] },
 ];
 
-export function SessionSidebar({ onCreateGroup, onSessionChange, activeSessionId, group }: { onCreateGroup: (roles: string[]) => { sessionId: string; title: string }; onSessionChange: (sessionId: string) => void; activeSessionId: string; group: string[] }) {
+export function SessionSidebar({ onCreateGroup, onSessionChange, activeSessionId, group }: { onCreateGroup: (roles: string[], mode: "single" | "multi") => { sessionId: string; title: string }; onSessionChange: (sessionId: string) => void; activeSessionId: string; group: string[] }) {
+  const [sessions, setSessions] = useState<Session[]>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) ?? "[]") as Session[];
+      return [...initialSessions, ...saved.filter((item) => item && !initialSessions.some((seed) => seed.id === item.id))];
+    } catch {
+      return initialSessions;
+    }
+  });
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [role, setRole] = useState("产品经理");
-  const [roleMenu, setRoleMenu] = useState(false);
-  const [agentPicker, setAgentPicker] = useState(false);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [history, setHistory] = useState(false);
-  const [sessions, setSessions] = useState(initialSessions);
-  const toggle = (value: string) => setSelected((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value]);
-
-  return <aside aria-label="会话与任务" style={{ display: "flex", flexDirection: "column", minWidth: 218, borderRight: "1px solid #e6e5e2", background: "#fff", position: "relative" }}>
-    <div style={{ padding: "18px 14px 12px", borderBottom: "1px solid #eef0f2" }}>
-      <strong>会话 · Conversations</strong>
-      <div style={{ display: "flex", gap: 8, marginTop: 12 }}><button className="quiet" type="button" onClick={() => setAgentPicker(true)}>选择 Agent</button><button className="quiet" type="button" onClick={() => setHistory(true)} aria-label="任务历史">历史</button></div>
-    </div>
-    <nav aria-label="会话列表" style={{ display: "grid", gap: 3, padding: 10 }}>
-      {sessions.map((session) => <button key={session.id} type="button" className="quiet" onClick={() => onSessionChange(session.id)} style={{ textAlign: "left", border: 0, padding: "10px 8px", background: activeSessionId === session.id ? "#eaf7fd" : "transparent" }}>{session.title}<small style={{ display: "block", color: "#6b7280", marginTop: 4 }}>{session.status}</small></button>)}
-    </nav>
-    <div style={{ marginTop: "auto", borderTop: "1px solid #eef0f2", padding: 12 }}>
-      <button type="button" className="quiet" aria-label={`当前角色 ${role}`} onClick={() => setRoleMenu((open) => !open)} style={{ width: "100%", textAlign: "left" }}>◉ {role}<small style={{ display: "block", marginLeft: 19, color: "#6b7280" }}>Current Claw</small></button>
-      {roleMenu && <div role="menu" aria-label="角色与设置菜单" style={{ position: "absolute", bottom: 72, left: 12, width: 244, padding: 8, background: "#fff", border: "1px solid #d9dce1", borderRadius: 10, boxShadow: "0 10px 28px rgba(0,0,0,.13)", zIndex: 4 }}>
-        {roles.map((candidate) => <button key={candidate} type="button" role="menuitem" className="quiet" onClick={() => { setRole(candidate); setRoleMenu(false); }} style={{ width: "100%", border: 0, textAlign: "left" }}>{candidate}</button>)}
-        <hr style={{ border: 0, borderTop: "1px solid #eef0f2" }} />
-        {["角色市场", "配置当前 Claw", "换头像", "深色外观", "打开工作空间", "上传/导出日志"].map((item) => <button key={item} type="button" role="menuitem" className="quiet" disabled title="该入口将在后续批次接入" style={{ width: "100%", border: 0, textAlign: "left" }}>{item} · 即将推出</button>)}
-      </div>}
-    </div>
-    {agentPicker && <div role="dialog" aria-label="选择多个 Agent" style={{ position: "fixed", inset: 0, display: "grid", placeItems: "center", background: "rgba(5,28,44,.24)", zIndex: 8 }}><section style={{ width: "min(500px, 92vw)", background: "#fff", borderRadius: 12, padding: 24, boxShadow: "0 18px 60px rgba(0,0,0,.2)" }}><h2 style={{ fontSize: 21 }}>选择 Agent · Create group chat</h2><p style={{ color: "#6b7280" }}>选择至少三名角色创建多 Agent 会话。</p><div style={{ display: "grid", gap: 8 }}>{roles.map((candidate) => <label key={candidate} style={{ display: "flex", alignItems: "center", gap: 9, fontWeight: 500 }}><input type="checkbox" aria-label={candidate} checked={selected.includes(candidate)} onChange={() => toggle(candidate)} />{candidate}</label>)}</div><div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 20 }}><button type="button" className="quiet" onClick={() => setAgentPicker(false)}>取消</button><button type="button" disabled={selected.length < 3} onClick={() => { const created = onCreateGroup(selected); setSessions((current) => [...current, { id: created.sessionId, title: created.title, status: "刚刚创建 · active" }]); setSelected([]); setAgentPicker(false); }}>创建群聊</button></div></section></div>}
-    {history && <div role="dialog" aria-label="单任务历史" style={{ position: "fixed", right: 22, top: 82, width: 340, background: "#fff", border: "1px solid #d9dce1", borderRadius: 10, padding: 18, boxShadow: "0 10px 28px rgba(0,0,0,.13)", zIndex: 7 }}><div style={{ display: "flex", justifyContent: "space-between" }}><strong>任务历史</strong><button type="button" className="quiet" onClick={() => setHistory(false)}>关闭</button></div><p style={{ margin: "16px 0 5px" }}>Jira 看板配置修复指引</p><small style={{ color: "#6b7280" }}>14:38 · 已完成 8m 22s</small><p style={{ margin: "16px 0 5px" }}>群聊会话管理</p><small style={{ color: "#6b7280" }}>{group.length ? `${group.length} Agents` : "尚未创建"}</small></div>}
+  const [roleOpen, setRoleOpen] = useState(false);
+  const create = (result: AgentPickerResult) => {
+    const names = result.selected.map((agent) => agent.name);
+    const title = result.mode === "single" ? `${names[0]} · 新任务` : `${names.slice(0, 3).join("、")}${names.length > 3 ? " 等" : ""} · 协同会话`;
+    const created = onCreateGroup(names, result.mode);
+    const session = { id: created.sessionId, title, status: "刚刚创建 · ready", group: names };
+    setSessions((current) => [session, ...current.filter((item) => item.id !== session.id)]);
+    try {
+      const saved = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) ?? "[]") as Session[];
+      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify([session, ...saved.filter((item) => item.id !== session.id)]));
+    } catch {
+      // The backend remains the source of truth for events if browser storage is unavailable.
+    }
+    onSessionChange(created.sessionId);
+  };
+  return <aside className="session-sidebar" aria-label="会话与任务">
+    <div className="session-sidebar-head"><p className="eyebrow">Agent Workbench · V4</p><h2>会话 · Conversations</h2><button type="button" className="new-session-button" onClick={() => setPickerOpen(true)}>＋ 新建会话</button><div className="session-sidebar-actions"><button type="button" className="quiet" onClick={() => setPickerOpen(true)}>选择 Agent</button><button type="button" className="quiet" aria-label="任务历史" onClick={() => setHistoryOpen((open) => !open)}>历史</button></div></div>
+    <div className="session-filter"><button type="button" className="filter-pill active">全部</button><button type="button" className="filter-pill">进行中</button><button type="button" className="filter-pill">已归档</button></div>
+    <nav className="session-list" aria-label="会话列表">{sessions.map((session) => <button key={session.id} type="button" className={`session-list-item ${session.id === activeSessionId ? "active" : ""}`} onClick={() => onSessionChange(session.id)}><strong>{session.title}</strong><small>{session.status}</small></button>)}</nav>
+    <div className="role-switcher"><button type="button" className="role-current" aria-label={`当前角色 ${role}`} onClick={() => setRoleOpen((open) => !open)}>◉ {role}<small>Current Claw · 本地工作台</small></button>{roleOpen && <div className="role-menu" role="menu" aria-label="角色与设置菜单">{agents.map((agent) => <button key={agent.id} type="button" className="quiet" role="menuitem" onClick={() => { setRole(agent.name); setRoleOpen(false); }}>{agent.name}</button>)}<hr />{["角色市场", "配置当前 Claw", "换头像", "深色外观", "打开工作空间", "上传/导出日志"].map((item) => <button key={item} type="button" className="quiet" role="menuitem" disabled>{item}</button>)}</div>}</div>
+    {historyOpen && <div className="history-popover" role="dialog" aria-label="任务历史"><div className="history-head"><strong>任务历史</strong><button type="button" className="quiet" onClick={() => setHistoryOpen(false)}>关闭</button></div><p>Jira 看板配置修复指引</p><small>14:38 · 已完成 8m 22s</small><p>多 Agent 协同会话</p><small>{group.length ? `${group.length} Agents · active` : "尚未创建"}</small></div>}
+    <AgentPicker open={pickerOpen} onClose={() => setPickerOpen(false)} onCreate={create} />
   </aside>;
 }

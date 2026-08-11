@@ -4,6 +4,7 @@ export type TimelineEntry = {
   title: string;
   content: string;
   agent?: string;
+  status?: string;
 };
 
 const kindLabel: Record<TimelineEntry["kind"], string> = {
@@ -15,29 +16,9 @@ const kindLabel: Record<TimelineEntry["kind"], string> = {
   agent: "Agent",
 };
 
-export function Timeline({ entries, provider = "LM Studio", model = "local-agent", group }: { entries: TimelineEntry[]; provider?: string; model?: string; group: string[] }) {
-  return <section aria-label="AG-UI conversation timeline" style={{ minWidth: 0, overflow: "auto", padding: "20px 22px", background: "#fbfbfa" }}>
-    <header style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 20 }}>
-      <div>
-        <p className="eyebrow">AG-UI Timeline</p>
-        <h2 style={{ fontSize: 20, marginBottom: 0 }}>项目实施讨论 · Project execution</h2>
-      </div>
-      <div style={{ display: "flex", alignItems: "flex-start", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
-        <span data-testid="model-badge" style={{ border: "1px solid #b7d6e8", color: "#07557b", background: "#eef9ff", borderRadius: 999, padding: "5px 9px", fontSize: 12 }}>{provider} · {model}</span>
-        <span style={{ borderRadius: 999, padding: "5px 9px", background: "#eaf7fd", color: "#07557b", fontSize: 12 }}>● 已完成 · completed</span>
-      </div>
-    </header>
-    <div style={{ borderLeft: "2px solid #dce5e9", marginLeft: 8, paddingLeft: 18, display: "grid", gap: 13 }}>
-      {entries.map((entry) => <article key={entry.id} style={{ position: "relative", border: "1px solid #e5e7eb", borderRadius: 10, background: "#fff", padding: "12px 14px" }}>
-        <span aria-hidden="true" style={{ position: "absolute", left: -25, top: 17, width: 11, height: 11, borderRadius: "50%", background: entry.kind === "tool" ? "#00a9f4" : "#0e2841" }} />
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}><strong>{entry.title}</strong><small style={{ color: "#6b7280" }}>{kindLabel[entry.kind]}</small></div>
-        {entry.agent && <p style={{ margin: "7px 0 0", color: "#07557b", fontSize: 13 }}>{entry.agent}</p>}
-        <p style={{ margin: "7px 0 0", color: "#374151", whiteSpace: "pre-wrap", lineHeight: 1.55 }}>{entry.content}</p>
-      </article>)}
-      {group.slice(1).map((agent) => <article key={agent} style={{ position: "relative", border: "1px solid #e5e7eb", borderRadius: 10, background: "#fff", padding: "12px 14px" }}>
-        <span aria-hidden="true" style={{ position: "absolute", left: -25, top: 17, width: 11, height: 11, borderRadius: "50%", background: "#0e2841" }} />
-        <strong>{agent}</strong><p style={{ margin: "7px 0 0", color: "#374151" }}>已加入协作会话，等待分配下一步。</p>
-      </article>)}
-    </div>
+export function Timeline({ entries, provider = "LM Studio", model = "local-agent", group, status }: { entries: TimelineEntry[]; provider?: string; model?: string; group: string[]; status: string }) {
+  return <section className="timeline" aria-label="AG-UI conversation timeline">
+    <header className="timeline-header"><div><p className="eyebrow">AG-UI Timeline</p><h2>项目实施讨论 · Project execution</h2></div><div className="timeline-badges"><span data-testid="model-badge" className="model-pill">{provider} · {model}</span><span className={`status-pill ${status.includes("执行") ? "running" : ""}`}>● {status}</span></div></header>
+    <div className="timeline-track"><div className="timeline-day">今天 · 持续上下文已恢复</div>{entries.map((entry) => <article key={entry.id} className="timeline-event"><span className={`timeline-node ${entry.kind}`} aria-hidden="true" /><div className={`timeline-card ${entry.kind === "user" ? "user" : ""}`}><div className="timeline-meta"><strong>{entry.title}</strong><span>{entry.status ?? kindLabel[entry.kind]}</span></div>{entry.agent && <p className="timeline-agent">{entry.agent}</p>}<p className="timeline-content">{entry.content}</p></div></article>)}{group.slice(1).map((agent) => <article key={`agent-${agent}`} className="timeline-event"><span className="timeline-node agent" aria-hidden="true" /><div className="timeline-card"><div className="timeline-meta"><strong>{agent} · Agent</strong><span>协作成员</span></div><p className="timeline-content">已加入协作会话，等待分配下一步。</p></div></article>)}</div>
   </section>;
 }
