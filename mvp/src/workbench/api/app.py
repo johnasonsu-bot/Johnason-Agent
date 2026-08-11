@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from pathlib import Path
 from secrets import compare_digest
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -31,6 +32,12 @@ from workbench.workflow.engine import (
 from workbench.workflow.event_store import EventStore
 
 
+class RunnerLifecycle(Protocol):
+    async def start(self) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+
 @dataclass(frozen=True)
 class AppSettings:
     database: Path
@@ -41,6 +48,7 @@ class AppSettings:
     close_gateway: bool = False
     capability_token: str | None = field(default=None, repr=False)
     service_instance_id: str | None = None
+    runner_lifecycle: RunnerLifecycle | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -72,19 +80,30 @@ def create_app(settings: AppSettings) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.conversation_worker = conversation_worker
-        await conversation_worker.start()
+        lifecycle_started = False
+        worker_started = False
         try:
+            if settings.runner_lifecycle is not None:
+                await settings.runner_lifecycle.start()
+                lifecycle_started = True
+            await conversation_worker.start()
+            worker_started = True
             yield
         finally:
             try:
-                await conversation_worker.stop()
+                if worker_started:
+                    await conversation_worker.stop()
             finally:
                 try:
-                    if settings.close_gateway and settings.gateway is not None:
-                        await settings.gateway.aclose()
+                    if lifecycle_started and settings.runner_lifecycle is not None:
+                        await settings.runner_lifecycle.aclose()
                 finally:
-                    if settings.vault is not None:
-                        settings.vault.lock()
+                    try:
+                        if settings.close_gateway and settings.gateway is not None:
+                            await settings.gateway.aclose()
+                    finally:
+                        if settings.vault is not None:
+                            settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
 

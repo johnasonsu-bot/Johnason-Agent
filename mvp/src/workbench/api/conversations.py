@@ -119,6 +119,16 @@ class ConversationAPI:
                 content=content,
             )
         )
+        initial_state = self._initial_turn_state(session_id)
+        mode_for = getattr(self.runner, "mode_for", None)
+        runner_mode = (
+            mode_for(session_id, resolved_provider, model)
+            if callable(mode_for)
+            else "python"
+        )
+        if runner_mode not in {"python", "engine_host"}:
+            raise ValueError("runner selector returned an invalid mode")
+        initial_state["runner_mode"] = runner_mode
         turn = self.conversations.enqueue_turn(
             session_id=session_id,
             command_id=command_id,
@@ -126,7 +136,7 @@ class ConversationAPI:
             provider_id=resolved_provider,
             model=model,
             prompt=content,
-            initial_state=self._initial_turn_state(session_id),
+            initial_state=initial_state,
         )
         queued = self._append(
             session_id,
@@ -164,6 +174,18 @@ class ConversationAPI:
         if turn.owner_id is None:
             return
         reservation_id = self._reservation_event_id(session_id, command_id)
+        runner_mode = turn.state.get("runner_mode", "python")
+        if runner_mode not in {"python", "engine_host"}:
+            raise ValueError("invalid persisted runner mode")
+        if "runner_mode" not in turn.state:
+            state = dict(turn.state)
+            state["runner_mode"] = "python"
+            self.conversations.save_turn_state(
+                session_id,
+                command_id,
+                owner_id=turn.owner_id,
+                state=state,
+            )
         command = RunAgentTurn(
             session_id=session_id,
             run_id=turn.run_id,
@@ -172,6 +194,7 @@ class ConversationAPI:
             model=turn.model,
             provider_id=turn.provider_id,
             owner_id=turn.owner_id,
+            runner_mode=runner_mode,
         )
         async with self._session_lock(session_id):
             current = self.conversations.load_turn_status(session_id, command_id)
@@ -213,16 +236,20 @@ class ConversationAPI:
                  if item.get("name") in {"turn_finished", "turn_failed"}),
                 "turn_failed",
             )
+            terminal_state = {
+                "phase": (
+                    "completed" if terminal_name == "turn_finished" else "failed"
+                ),
+                "messages": [],
+                "events": [],
+                "runner_mode": runner_mode,
+            }
             self.conversations.finish_turn(
                 session_id,
                 command_id,
                 owner_id=command.owner_id or "",
                 status="completed" if terminal_name == "turn_finished" else "failed",
-                state={
-                    "phase": "completed" if terminal_name == "turn_finished" else "failed",
-                    "messages": [],
-                    "events": [],
-                },
+                state=terminal_state,
                 result=projected,
             )
 

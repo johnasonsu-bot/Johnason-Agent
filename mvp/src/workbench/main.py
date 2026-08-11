@@ -25,6 +25,8 @@ from workbench.models.gateway import ModelGateway
 from workbench.models.lmstudio import LMStudioProvider
 from workbench.models.openai_compatible import OpenAICompatibleProvider
 from workbench.providers.repository import ProviderRepository
+from workbench.runtime.engine_host.client import EngineHostClient
+from workbench.runtime.engine_host.selector import RunnerSelector
 from workbench.settings import WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
 
@@ -37,6 +39,8 @@ def build_app(
     runner: AgentStepRunner | None = None,
 ) -> FastAPI:
     resolved = settings or WorkbenchSettings()
+    if resolved.engine_host_enabled and not resolved.engine_host_command:
+        raise ValueError("engine host command is required when enabled")
     resolved.runtime_dir.mkdir(parents=True, exist_ok=True)
     vault = VaultService(resolved.vault_path)
     gateway = ModelGateway(
@@ -74,16 +78,29 @@ def build_app(
         checkpoints=workflow,
         interventions=WorkflowInterventions(workflow),
     )
+    python_runner = runner or agent_runtime
+    selected_runner = python_runner
+    runner_lifecycle = None
+    if resolved.engine_host_enabled:
+        host_runner = EngineHostClient(resolved.engine_host_command)
+        selected_runner = RunnerSelector(
+            python_runner,
+            host_runner,
+            enabled=True,
+            provider_allowlist=resolved.engine_host_provider_allowlist,
+        )
+        runner_lifecycle = selected_runner
     app = create_app(
         AppSettings(
             database=resolved.database,
-            runner=runner or agent_runtime,
+            runner=selected_runner,
             owner_id=resolved.owner_id,
             vault=vault,
             gateway=gateway,
             close_gateway=True,
             capability_token=capability_token,
             service_instance_id=service_instance_id,
+            runner_lifecycle=runner_lifecycle,
         )
     )
     app.state.agent_runtime = agent_runtime

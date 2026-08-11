@@ -14,6 +14,9 @@ class WorkbenchSettings(BaseModel):
     openai_credential_env: str = "OPENAI_API_KEY"
     anthropic_credential_env: str = "ANTHROPIC_API_KEY"
     data_platform_credential_env: str = "DATA_PLATFORM_TOKEN"
+    engine_host_enabled: bool = False
+    engine_host_command: tuple[str, ...] = ()
+    engine_host_provider_allowlist: tuple[str, ...] = ("lmstudio",)
 
     @property
     def database(self) -> Path:
