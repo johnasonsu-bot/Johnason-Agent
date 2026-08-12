@@ -88,6 +88,25 @@ export const providerApi = {
   delete: (id: string) => request<{ id: string; status: string; secret_cleanup: string }>(`/providers/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };
 
+export type EngineHostStatus = {
+  enabled: boolean;
+  state: "disabled" | "starting" | "ready" | "degraded" | "unavailable";
+  protocol: string | null;
+  capabilities: null | {
+    model: boolean;
+    tools: boolean;
+    skills: boolean;
+    workspace: boolean;
+    agui: boolean;
+    max_frame_bytes: number;
+  };
+  runner_mode: "python" | "engine_host";
+};
+
+export const engineHostApi = {
+  status: () => request<EngineHostStatus>("/engine-host/status"),
+};
+
 export type ConversationEvent = { type?: string; name?: string; delta?: string; result?: string; toolCallName?: string; value?: Record<string, unknown>; runId?: string; sequence?: number; eventId?: string; cursor?: string };
 
 export type ConversationResponse = { session_id: string; command_id: string; status: string; cursor?: string | null; events?: ConversationEvent[] };

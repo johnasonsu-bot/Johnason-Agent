@@ -7,6 +7,7 @@ import {
   type AgentModelProfile,
   type ProviderId,
 } from "../models/agentConfig";
+import { EngineHostStatus } from "./EngineHostStatus";
 
 const providerOptions: ProviderId[] = ["lmstudio", "deepseek", "openai_compatible", "openai_chat"];
 
@@ -30,6 +31,7 @@ export function AgentCenter() {
       <button type="button" className="quiet" onClick={() => { setProfiles(defaultAgentModelProfiles.map((profile) => ({ ...profile }))); setMessage("已恢复默认配置"); }}>恢复默认</button>
     </header>
     {message && <p role="status" className="notice">{message}</p>}
+    <EngineHostStatus />
     <div className="agent-center-note"><strong>路由说明</strong><span>Provider 需要先在“模型供应商”中配置并启用；此处只保存 provider/model 标识，不保存 API Key。</span></div>
     <div className="agent-config-grid">{profiles.map((profile) => <article className="agent-config-card" key={profile.id}>
       <div className="agent-config-card-heading"><span className="agent-avatar agent-avatar-blue">{profile.name.slice(0, 1)}</span><div><h2>{profile.name}</h2><p>{profile.role}</p></div><label className="agent-enabled"><input type="checkbox" checked={profile.enabled} onChange={(event) => update(profile.id, { enabled: event.target.checked })} />启用</label></div>

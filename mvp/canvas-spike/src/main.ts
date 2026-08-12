@@ -10,6 +10,7 @@ const CAPABILITY_HEADER = "X-Workbench-Capability";
 const allowedApiRequests = new Set([
   "GET /api/vault/status", "POST /api/vault/create", "POST /api/vault/unlock", "POST /api/vault/lock", "POST /api/vault/recover",
   "GET /api/providers", "POST /api/providers",
+  "GET /api/engine-host/status",
 ]);
 
 interface ApiRequest { method: "GET" | "POST" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }

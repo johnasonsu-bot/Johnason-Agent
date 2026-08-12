@@ -14,6 +14,7 @@ from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.api.agui import stream_run_events
 from workbench.api.commands import CreateRunRequest, InterventionRequest
 from workbench.api.conversations import ConversationAPI, conversation_router
+from workbench.api.engine_host import engine_host_router
 from workbench.api.providers import provider_router, vault_router
 from workbench.conversations.repository import ConversationRepository
 from workbench.conversations.worker import ConversationTaskWorker
@@ -132,6 +133,12 @@ def create_app(settings: AppSettings) -> FastAPI:
         return await call_next(request)
 
     app.include_router(conversation_router(conversation_api))
+    lifecycle_status_source = getattr(
+        settings.runner_lifecycle, "host_runner", settings.runner_lifecycle
+    )
+    if not hasattr(lifecycle_status_source, "status"):
+        lifecycle_status_source = None
+    app.include_router(engine_host_router(lifecycle_status_source))
     app.include_router(
         provider_router(
             ProviderRepository(settings.database), settings.vault, settings.gateway

@@ -2,7 +2,11 @@
 
 ## Decision
 
-`GO_G1_DIAGNOSTIC_UI`
+`GO_REAL_GO_HOST_INPUT_REQUIRED`
+
+The versioned Contract G1, durable recovery boundary, and read-only diagnostic
+surface are complete. A real `engine-core` repository or versioned semver tag is
+required before implementing and validating the Go binary.
 
 ## Verified commands
 
@@ -17,6 +21,18 @@ From `mvp/`:
 TASK5_SCAN_ROOT="$(mktemp -d /tmp/hermes-task5-leak.XXXXXX)"
 .venv/bin/python -m pytest tests/acceptance/test_engine_host_contract.py::test_protocol_artifacts_do_not_contain_sensitive_values -q --basetemp="$TASK5_SCAN_ROOT"
 ! rg -n -i 'sentinel|reasoning_content|api_key|password' "$TASK5_SCAN_ROOT"
+.venv/bin/python -m pytest tests/unit/api/test_engine_host.py -v
+
+# From mvp/canvas-spike/
+npm test -- --grep "Engine Host contract state"
+npm test
+
+# From the repository root
+rg -n --hidden --glob '!mvp/.venv/**' --glob '!mvp/canvas-spike/node_modules/**' \
+  --glob '!docs/superpowers/reports/2026-08-11-engine-host-contract-validation.md' \
+  'github_pat_[A-Za-z0-9_]+|DATA_PLATFORM_TOKEN[[:space:]]*=|sk-[A-Za-z0-9_-]{16,}' \
+  mvp docs
+git diff --check
 ```
 
 ## Results
@@ -24,9 +40,13 @@ TASK5_SCAN_ROOT="$(mktemp -d /tmp/hermes-task5-leak.XXXXXX)"
 - Offline Engine Host acceptance: 22 passed.
 - Focused Host contract, lifecycle, worker, and exception regression: 103 passed.
 - Related Engine Host, queue, worker, repository, and AG-UI regression: 179 passed.
-- Backend unit, integration, and acceptance suites: 453 passed, 6 skipped.
+- Engine Host diagnostic API: 3 passed.
+- Engine Host focused Electron diagnostic: 1 passed.
+- Backend unit, integration, and acceptance suites: 456 passed, 6 skipped.
+- Complete Electron and Playwright suite: 33 passed.
 - Python compile check: passed.
 - Isolated artifact leak acceptance: 1 passed; the strict follow-up scan found no matches in the metadata-only NDJSON artifact.
+- Repository credential-pattern scan found no matches; diff whitespace check passed.
 - Existing upstream warning: one Starlette `httpx` deprecation warning.
 
 ## Protocol and capabilities
@@ -41,6 +61,10 @@ TASK5_SCAN_ROOT="$(mktemp -d /tmp/hermes-task5-leak.XXXXXX)"
 - The active Host generation and unfinished write-tool identifiers are persisted while a Turn runs; expired leases and Worker shutdown classify those facts atomically before releasing ownership.
 - Reconciliation clears every stale retry gate, and a shared Host failure is independently classified for each concurrent Run.
 - Protocol capture records metadata only: message names and identifiers, sequence, direction, and byte count.
+- `GET /api/engine-host/status` reports only the five bounded lifecycle states,
+  protocol, safe capabilities, and active runner mode. The Electron card permits
+  refresh only and provides no executable path, command, environment, or
+  credential editor.
 
 ## Known limitations
 
