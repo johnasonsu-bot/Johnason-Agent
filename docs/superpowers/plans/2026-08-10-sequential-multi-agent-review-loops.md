@@ -1,5 +1,7 @@
 # Sequential Multi-Agent Review Loops Implementation Plan
 
+> **Superseded execution document:** This plan is retained for history. Execute the cumulative Batch 3 sequence instead: [3.0 runtime gate](2026-08-12-batch-3-0-langgraph-runtime-gate.md) → [3.1 sequential baseline](2026-08-12-batch-3-1-sequential-multi-agent-baseline.md) → [3.2 research graph](2026-08-12-batch-3-1-research-graph-blueprint.md) → [3.3 development graph](2026-08-12-batch-3-2-development-graph-blueprint.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build durable `@Agent`-ordered execution with independent model bindings, structured Supervisor/Verifier decisions, automatic rework loops, declarative progress, restart recovery, and HTML Artifact preview.

@@ -23,14 +23,17 @@
 1. [Batch 1 — Provider Center](2026-08-06-batch-1-provider-center.md)
 2. [Batch 2 — Real Agent Conversation](2026-08-06-batch-2-real-agent-conversation.md)
 3. [Batch 2.5 — Go Engine Host Contract](2026-08-11-batch-2-5-go-engine-host-contract.md) ([design](../specs/2026-08-11-go-engine-host-contract-design.md))
-4. [Batch 3 — Sequential Multi-Agent Review Loops](2026-08-10-sequential-multi-agent-review-loops.md)
-5. G2 — Read-only Engine Shadow, only after Batch 3 preserves a single durable execution graph
-6. G3/G4 — Single-Agent then per-node Go cutover, with Python control-plane rollback
-7. [Batch 4 — Artifacts and Real Tools](2026-08-06-batch-4-artifacts-and-tools.md)
-8. [Batch 5 — Supervisor, Recovery, and Release Gate](2026-08-06-batch-5-supervisor-recovery.md)
-9. G6 — Control-plane re-evaluation only after independent Go durable-execution evidence
+4. [Batch 3.0 — LangGraph Runtime Gate](2026-08-12-batch-3-0-langgraph-runtime-gate.md)
+5. [Batch 3.1 — Sequential Multi-Agent Baseline](2026-08-12-batch-3-1-sequential-multi-agent-baseline.md)
+6. [Batch 3.2 — Research Graph Blueprint](2026-08-12-batch-3-1-research-graph-blueprint.md)
+7. [Batch 3.3 — Development Graph Blueprint](2026-08-12-batch-3-2-development-graph-blueprint.md)
+8. G2 — Read-only Engine Shadow, only after Batch 3 preserves a single durable execution graph
+9. G3/G4 — Single-Agent then per-node Go cutover, with Python control-plane rollback
+10. [Batch 4 — Artifacts and Real Tools](2026-08-06-batch-4-artifacts-and-tools.md)
+11. [Batch 5 — Supervisor, Recovery, and Release Gate](2026-08-06-batch-5-supervisor-recovery.md)
+12. G6 — Control-plane re-evaluation only after independent Go durable-execution evidence
 
-Batch 2.5 G0/G1 is the next implementation unit. Its implementation plan establishes the protocol and Fake Host conformance before any real Go source is linked.
+Batch 2.5 G0/G1 is complete. The next implementation unit is Batch 3.0; each Batch 3 gate is cumulative, so later Graph Blueprint work must retain the complete sequential Agent context, Handoff, review, rework, progress, recovery, Artifact, and template-compiler baseline established in Batch 3.1.
 
 ## Program Completion Gate
 

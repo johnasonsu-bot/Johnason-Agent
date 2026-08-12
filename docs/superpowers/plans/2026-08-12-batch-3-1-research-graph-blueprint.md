@@ -1,16 +1,17 @@
-# Batch 3.1 Research Graph Blueprint Implementation Plan
+# Batch 3.2 Research Graph Blueprint Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a user-approved Planner/Template research graph that dynamically fans out research, comparison, fact-checking, and gap analysis, locally verifies branches, arbitrates conflicts, merges evidence, globally verifies the report, and survives replanning and restart.
 
-**Architecture:** Planner A and Template B emit the same immutable `ExecutionPlan`. The validated plan compiles to the Batch 3.0 LangGraph runtime; Workbench provides Agent bindings, isolated context, evidence and Artifact stores, approvals, REST/SSE projections, and a visual plan/run UI.
+**Architecture:** Planner A and Template B emit the same immutable `ExecutionPlan`. The validated plan compiles to the Batch 3.0 LangGraph runtime and reuses Batch 3.1 context, Handoff, review, progress, recovery, and Artifact contracts; Workbench provides evidence stores, approvals, REST/SSE projections, and a visual plan/run UI.
 
-**Tech Stack:** Python 3.11–3.13, pinned LangGraph runtime from Batch 3.0, Pydantic 2, FastAPI, SQLite, existing model gateway and Agent Runner, React, TypeScript, Electron, Playwright.
+**Tech Stack:** Python 3.11–3.13, pinned LangGraph runtime from Batch 3.0, Batch 3.1 sequential orchestration contracts, Pydantic 2, FastAPI, SQLite, existing model gateway and Agent Runner, React, TypeScript, Electron, Playwright.
 
 ## Global Constraints
 
-- Start only after Batch 3.0 reports `GO_LANGGRAPH_RUNTIME`.
+- Start only after Batch 3.1 reports `GO_RESEARCH_GRAPH`.
+- Preserve every Batch 3.1 capability; parallel planning cannot bypass independent contexts, Handoffs, Supervisor/Verifier decisions, rework history, progress, restart recovery, or Artifact publication.
 - Planner never executes a plan; user approval is mandatory.
 - Planner prefers configured Agents and may only suggest temporary Workers.
 - Template output is deterministic for the same template version, inputs, and binding snapshot.
@@ -19,6 +20,7 @@
 - Agent private context and hidden reasoning never enter shared Handoffs, events, checkpoints, reports, or UI.
 - All evidence references must be resolvable; unverifiable claims remain explicit uncertainty.
 - No fixed rework-loop ceiling; no-progress warns without terminating.
+- Every research run includes an overall Supervisor node that may request branch rework or a new plan version but cannot mutate the approved graph in place.
 
 ---
 
@@ -57,11 +59,11 @@ Run: `cd mvp && .venv/bin/python -m pytest tests/unit/orchestration/test_plannin
 
 - [ ] **Step 3: Implement strict plan schema and validator**
 
-Require Goal, at least two Worker branches, one local verifier per Worker, optional arbitration, one Merge, one global verifier, one Artifact contract, Agent/Provider/Model snapshot, Tool/Skill allowlist, concurrency proposal, and connected edges. Reject unknown Agents, unauthorized tools, unreachable nodes, cycles without a verifier-controlled return edge, and secret-like fields.
+Require Goal, at least two Worker branches, one local verifier per Worker, one overall Supervisor, optional arbitration, one Merge, one global verifier, one Artifact contract, Agent/Provider/Model snapshot, Tool/Skill allowlist, concurrency proposal, and connected edges. Reject unknown Agents, unauthorized tools, unreachable nodes, cycles without a verifier-controlled return edge, and secret-like fields.
 
 - [ ] **Step 4: Implement deterministic research template**
 
-The built-in `research-blueprint@1.0.0` produces research, compare, fact-check, and gap-analysis branches followed by local verification, arbitration, merge, and global verification. Node IDs derive from UUID5 over template/version/input digest.
+The built-in `research-blueprint@1.0.0` produces research, compare, fact-check, and gap-analysis branches followed by local verification, overall supervision, arbitration, merge, and global verification. Node IDs derive from UUID5 over template/version/input digest.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -132,7 +134,7 @@ git commit -m "feat: approve and replan graph versions"
 
 **Interfaces:**
 - Produces `ContextResolver.build(node, public_context, private_context, handoffs) -> AgentContextPackage`.
-- Produces strict `WorkerResult`, `ReviewDecision`, `ArbitrationDecision`, `MergeResult`, and `GlobalReviewDecision` parsers.
+- Produces strict `WorkerResult`, `ReviewDecision`, `SupervisorDecision`, `ArbitrationDecision`, `MergeResult`, and `GlobalReviewDecision` parsers.
 - Compiles a validated plan to the existing `LangGraphRuntimeAdapter`.
 
 - [ ] **Step 1: Write isolation and two-level review RED tests**
@@ -149,6 +151,7 @@ async def test_local_rework_arbitration_and_global_review(harness):
     result = await harness.run(research_plan_with_conflict())
     assert result.attempts["fact-check"] == 2
     assert result.attempts["research"] == 1
+    assert result.supervisor.decision == "continue_to_merge"
     assert result.arbitration.decision == "resolved"
     assert result.global_review.decision == "approved"
 ```
@@ -159,11 +162,11 @@ Run: `cd mvp && .venv/bin/python -m pytest tests/unit/orchestration/test_context
 
 - [ ] **Step 3: Implement safe context and structured output parsers**
 
-Each parser accepts one JSON object, validates node/attempt/evidence ownership, and rejects free-text-only routing decisions. A rejected local review requires findings, evidence and rework instructions. Arbitration uses `resolved | insufficient_evidence | requires_preference`. Merge includes claim-to-evidence mapping, exclusions, uncertainty and Artifact reference.
+Each parser accepts one JSON object, validates node/attempt/evidence ownership, and rejects free-text-only routing decisions. A rejected local review requires findings, evidence and rework instructions. Supervisor uses `continue_to_merge | rework_branch | request_replan` and must identify evidence and an allowed target. Arbitration uses `resolved | insufficient_evidence | requires_preference`. Merge includes claim-to-evidence mapping, exclusions, uncertainty and Artifact reference.
 
 - [ ] **Step 4: Implement graph routing**
 
-Fan out Workers with `Send`; loop each rejected branch locally; route conflicting approved results to Arbitration; interrupt on insufficient evidence or preference; merge only approved/resolved results; allow Global Verifier to return to Merge, one Worker, or replan approval.
+Fan out Workers with `Send`; loop each rejected branch locally; run overall Supervisor after local approvals; route conflicts to Arbitration; interrupt on insufficient evidence or preference; merge only supervised and approved/resolved results; allow Global Verifier to return to Merge, one Worker, or replan approval.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -317,6 +320,7 @@ The harness covers temporary Worker approval, user-adjusted concurrency, one loc
 ```bash
 cd mvp
 .venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q
+.venv/bin/python scripts/run_sequential_multi_agent_baseline.py
 .venv/bin/python scripts/run_research_graph_acceptance.py
 cd canvas-spike
 npm test
@@ -331,4 +335,4 @@ git add mvp/tests/acceptance/test_research_graph_blueprint.py mvp/scripts/run_re
 git commit -m "test: validate research graph blueprint"
 ```
 
-Expected: scan has no matches and decision is `GO_DEVELOPMENT_GRAPH`.
+Expected: scan has no matches; the cumulative sequential gate remains `GO_RESEARCH_GRAPH`; the research decision is `GO_DEVELOPMENT_GRAPH`.

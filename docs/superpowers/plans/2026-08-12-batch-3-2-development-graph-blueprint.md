@@ -1,16 +1,17 @@
-# Batch 3.2 Development Graph Blueprint Implementation Plan
+# Batch 3.3 Development Graph Blueprint Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Execute an approved software-development graph in isolated Git worktrees, verify each branch independently, merge only approved commits into a temporary integration branch, run global regression, and stop at user release approval.
 
-**Architecture:** The Batch 3.1 Planner emits repository-aware code Worker nodes with explicit ownership and tests. Workbench owns all Git and command side effects through a durable idempotency ledger; LangGraph owns scheduling, branch review, arbitration, merge flow, and approval interrupts. No graph node mutates the target branch directly.
+**Architecture:** The Batch 3.2 Planner emits repository-aware code Worker nodes with explicit ownership and tests. Workbench owns all Git and command side effects through a durable idempotency ledger; LangGraph owns scheduling, branch review, arbitration, merge flow, and approval interrupts. No graph node mutates the target branch directly, and all Batch 3.1 context/review/recovery/Artifact contracts remain active.
 
 **Tech Stack:** Existing pinned LangGraph runtime, Python 3.11–3.13, Git CLI, Pydantic 2, SQLite, FastAPI, React, Electron, Playwright.
 
 ## Global Constraints
 
-- Start only after Batch 3.1 reports `GO_DEVELOPMENT_GRAPH`.
+- Start only after Batch 3.2 reports `GO_DEVELOPMENT_GRAPH`.
+- Preserve every Batch 3.1 and 3.2 capability; development nodes extend the same Handoff, review, progress, recovery, Artifact, Planner, and Template contracts.
 - Every code Worker uses a separate Git worktree and branch based on an immutable base commit.
 - Planner declares repository, base commit, owned files, dependencies, allowed commands, tests, and output commit.
 - A Worker cannot modify files outside its approved ownership without a new plan version.
@@ -260,6 +261,8 @@ The fixture repository contains independent backend, frontend and test files plu
 ```bash
 cd mvp
 .venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q
+.venv/bin/python scripts/run_sequential_multi_agent_baseline.py
+.venv/bin/python scripts/run_research_graph_acceptance.py
 .venv/bin/python scripts/run_development_graph_acceptance.py
 cd canvas-spike
 npm test
@@ -273,14 +276,14 @@ git diff --check
 git status --short
 ```
 
-Expected: no secret matches, full suites pass, target branch remains unchanged, and the decision is `GO_RELEASE_APPROVAL`.
+Expected: no secret matches; sequential and research cumulative gates remain green; full suites pass; target branch remains unchanged; and the decision is `GO_RELEASE_APPROVAL`.
 
 ```bash
 git add mvp/tests/acceptance/test_development_graph_blueprint.py mvp/scripts/run_development_graph_acceptance.py docs/superpowers/reports/2026-08-12-development-graph-validation.md
 git commit -m "test: validate development graph blueprint"
 ```
 
-## Batch 3.2 Exit Gate
+## Batch 3.3 Exit Gate
 
 - At least three isolated Worker worktrees and branches are used.
 - Ownership violations are blocked before commit.

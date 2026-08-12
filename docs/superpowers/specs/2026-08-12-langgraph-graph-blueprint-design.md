@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-12
 
-**阶段：** Phase 2 / Batch 3.0–3.2
+**阶段：** Phase 2 / Batch 3.0–3.3
 
 **状态：** 已完成交互式设计确认，待书面规格审核
 
@@ -19,11 +19,14 @@
 
 两条通道都输出同一版本化 `ExecutionPlan`。计划必须先展示给用户确认，确认后才创建 `GraphRun`。执行中需要扩图时不得静默修改当前图，必须生成新计划版本并再次等待用户批准。
 
-本阶段分三个独立验收批次：
+本阶段采用**能力累加**而非能力替换，分四个独立验收批次：
 
 - **Batch 3.0：LangGraph 取舍门**；
-- **Batch 3.1：只读研究 Graph Blueprint**；
-- **Batch 3.2：隔离 Worktree 的软件开发 Graph Blueprint**。
+- **Batch 3.1：顺序多 Agent、Supervisor/Verifier 与 HTML Artifact 基线**；
+- **Batch 3.2：只读研究 Graph Blueprint**；
+- **Batch 3.3：隔离 Worktree 的软件开发 Graph Blueprint**。
+
+后续批次必须保留前序批次全部能力。Graph Blueprint 只能扩展顺序多 Agent 基线，不得减少或绕过 Agent 独立上下文、结构化 Handoff、Supervisor/Verifier 审核、自动返工、声明式进度、持久化恢复、HTML Artifact 和 Solution Template 编译接口。
 
 ## 2. 目标与非目标
 
@@ -46,7 +49,7 @@
 - 不让 Workbench 再维护一套可独立推进的节点状态机；
 - 不展示模型隐藏思维链；
 - 不在未经用户批准时合并到目标分支、推送代码或创建正式 PR；
-- 不在 Batch 3.0 通过前直接建设完整研究或开发编排。
+- 不在 Batch 3.0 通过前建设顺序多 Agent，不在 Batch 3.1 通过前建设完整研究编排，不在 Batch 3.2 通过前建设开发编排。
 
 ## 3. 架构选择
 
@@ -436,11 +439,35 @@ Worker 4 ─ Local Verify 4 ─┘
 - 版本被 lockfile 固定；
 - 不满足任一条件则停止采用 LangGraph，回到自研 DAG 重新设计，不进入 3.1。
 
-### 13.2 Batch 3.1：只读研究验收
+### 13.2 Batch 3.1：顺序多 Agent 基线验收
+
+固定用户输入：
+
+```text
+@产品经理 写一篇200字小说
+@Supervisor 审核小说是否约200字且故事完整，不通过则打回产品经理
+@架构师 改写成一个动画html
+@Verifier 验证HTML可独立打开且包含可见动画，不通过则打回架构师
+```
+
+验收：
+
+- `MentionSequenceCompiler` 按 `@Agent` 出现顺序生成不可变计划；
+- `SolutionTemplateCompiler` 保留等价图编译扩展接口；
+- 产品经理、Supervisor、架构师、Verifier 使用各自独立上下文和 Provider/Model 快照；
+- 上游仅通过结构化 Handoff 发布结果，下游无法读取上游私有历史；
+- Supervisor 和 Verifier 均能拒绝、定向打回前一执行节点、产生新 Attempt 后再批准；
+- 返工历史、审核证据和修改要求完整保留，不设固定循环上限；
+- 节点发布声明式阶段、进度、Attempt 和审核轮次；
+- 服务或客户端重启后从 LangGraph Checkpoint 恢复，已批准节点不重复执行；
+- 最终动画 HTML 通过 Artifact Store 发布，并在沙箱画布中预览和下载；
+- 父 Conversation 只有一个终态事件。
+
+### 13.3 Batch 3.2：只读研究验收
 
 固定用户目标：针对一个可公开核验的主题形成带证据分析报告。
 
-Planner 至少拆出：研究、比较、核验、寻找缺口四个并行 Worker。每个分支经局部 Verifier；冲突进入 Arbitration；Merge 生成报告；Global Verifier 检查引用、遗漏和目标覆盖。
+Planner 至少拆出：研究、比较、核验、寻找缺口四个并行 Worker。每个分支经局部 Verifier；整体 Supervisor 检查计划覆盖、分支停滞和返工质量；冲突进入 Arbitration；Merge 生成报告；Global Verifier 检查引用、遗漏和目标覆盖。
 
 验收同时覆盖：
 
@@ -452,8 +479,9 @@ Planner 至少拆出：研究、比较、核验、寻找缺口四个并行 Worke
 - 执行中漏项生成 v2 并再次审批；
 - 已验证且未受影响节点复用；
 - 最终报告包含结论、证据映射、限制和未决问题。
+- 完整重跑 Batch 3.1 四 Agent 顺序审核、重启恢复和 HTML Artifact 验收，结果仍为 `GO_RESEARCH_GRAPH`。
 
-### 13.3 Batch 3.2：软件开发验收
+### 13.4 Batch 3.3：软件开发验收
 
 固定目标选择一个可在本仓库完成、能同时修改后端、前端和测试的功能切片。
 
@@ -467,6 +495,7 @@ Planner 至少拆出：研究、比较、核验、寻找缺口四个并行 Worke
 - 临时集成分支通过完整后端和 Electron/Playwright 回归；
 - Global Verifier 审核目标覆盖与测试证据；
 - 最终停在 `release_approval`，未经用户批准不进入目标分支。
+- 完整重跑 Batch 3.1 顺序基线和 Batch 3.2 研究图验收，证明新增 Git 执行能力没有削弱上下文、Handoff、审核返工、恢复、Artifact 或模板能力。
 
 ## 14. 成功指标
 
