@@ -660,13 +660,13 @@ async def test_host_retry_waits_for_restart_and_preserves_fifo_snapshot(
         (HostUnavailable("offline"), "retryable", "engine_host_unavailable"),
         (
             HostAdmissionUnknown("unknown"),
-            "reconciliation_required",
-            "engine_host_admission_unknown",
+            "retryable",
+            "engine_host_unavailable",
         ),
         (
             HostExecutionUnknown("unknown"),
-            "reconciliation_required",
-            "engine_host_execution_unknown",
+            "retryable",
+            "engine_host_unavailable",
         ),
         (
             HostProtocolError("bad frame"),

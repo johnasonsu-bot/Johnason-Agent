@@ -25,8 +25,7 @@ from workbench.models.contracts import ModelMessage
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 from workbench.runtime.engine_host.client import (
-    HostAdmissionUnknown,
-    HostExecutionUnknown,
+    HostExecutionError,
     HostRunRejected,
     HostUnavailable,
 )
@@ -263,9 +262,14 @@ class ConversationAPI:
                     state = dict(current.state)
                     state.update({"phase": "before_model", "retryable": True})
                     if projected:
-                        state["reason"] = projected[-1].get("value", {}).get(
+                        projected_value = projected[-1].get("value", {})
+                        state["reason"] = projected_value.get(
                             "reason", "engine_host_unavailable"
                         )
+                        if projected_value.get("failure_phase") is not None:
+                            state["host_failure_phase"] = projected_value[
+                                "failure_phase"
+                            ]
                     self._apply_host_retry_gate(state)
                     self.conversations.mark_retryable(
                         session_id,
@@ -277,9 +281,14 @@ class ConversationAPI:
                     state = dict(current.state)
                     state.update({"phase": "before_model", "retryable": True})
                     if projected:
-                        state["reason"] = projected[-1].get("value", {}).get(
+                        projected_value = projected[-1].get("value", {})
+                        state["reason"] = projected_value.get(
                             "reason", "engine_host_unavailable"
                         )
+                        if projected_value.get("failure_phase") is not None:
+                            state["host_failure_phase"] = projected_value[
+                                "failure_phase"
+                            ]
                     self._apply_host_retry_gate(state)
                     self.conversations.mark_retryable_unowned(
                         session_id, command_id, state=state
@@ -303,6 +312,7 @@ class ConversationAPI:
                 in {
                     "engine_host_admission_unknown",
                     "engine_host_execution_unknown",
+                    "engine_host_unknown_write_effect",
                     "engine_host_protocol_error",
                 }
                 else ("completed" if terminal_name == "turn_finished" else "failed")
@@ -323,6 +333,12 @@ class ConversationAPI:
                 and state.get("message_snapshot_frozen") is True
             ):
                 terminal_state["message_snapshot_frozen"] = True
+            if terminal_status == "reconciliation_required" and projected:
+                failure_phase = projected[-1].get("value", {}).get(
+                    "failure_phase"
+                )
+                if failure_phase is not None:
+                    terminal_state["host_failure_phase"] = failure_phase
             if runner_mode == "engine_host" and terminal_status == "completed":
                 answer = "".join(
                     str(item.get("delta", ""))
@@ -676,36 +692,43 @@ class ConversationAPI:
                         attempt=attempt,
                     )
                 )
-        except HostAdmissionUnknown:
-            projected.append(
-                self._append(
-                    command.session_id,
-                    "conversation.turn.failed",
-                    {
-                        "reason": "engine_host_admission_unknown",
-                        "response_status": "reconciliation_required",
-                    },
-                    command.command_id,
-                    ordinal=len(projected),
-                    causation_id=reservation_id,
-                    attempt=attempt,
+        except HostExecutionError as error:
+            if error.retryable:
+                retryable = True
+                projected.append(
+                    self._append(
+                        command.session_id,
+                        "conversation.turn.retryable",
+                        {
+                            "reason": "engine_host_unavailable",
+                            "failure_phase": error.phase,
+                        },
+                        command.command_id,
+                        ordinal=len(projected),
+                        causation_id=reservation_id,
+                        attempt=attempt,
+                    )
                 )
-            )
-        except HostExecutionUnknown:
-            projected.append(
-                self._append(
-                    command.session_id,
-                    "conversation.turn.failed",
-                    {
-                        "reason": "engine_host_execution_unknown",
-                        "response_status": "reconciliation_required",
-                    },
-                    command.command_id,
-                    ordinal=len(projected),
-                    causation_id=reservation_id,
-                    attempt=attempt,
+            else:
+                projected.append(
+                    self._append(
+                        command.session_id,
+                        "conversation.turn.failed",
+                        {
+                            "reason": (
+                                "engine_host_unknown_write_effect"
+                                if error.phase == "unknown_write_effect"
+                                else "engine_host_protocol_error"
+                            ),
+                            "failure_phase": error.phase,
+                            "response_status": "reconciliation_required",
+                        },
+                        command.command_id,
+                        ordinal=len(projected),
+                        causation_id=reservation_id,
+                        attempt=attempt,
+                    )
                 )
-            )
         except HostProtocolError:
             projected.append(
                 self._append(

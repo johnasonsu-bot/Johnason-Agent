@@ -11,6 +11,7 @@ from workbench.conversations.repository import (
     TurnSnapshotCorruption,
     TurnStatus,
 )
+from workbench.runtime.engine_host.client import HostExecutionError
 
 
 class ConversationTaskAPI(Protocol):
@@ -88,6 +89,8 @@ class ConversationTaskWorker:
                 raise
             except TurnSnapshotCorruption:
                 self._fail_corrupt(turn)
+            except HostExecutionError as error:
+                self._mark_host_failure(turn, error)
             except Exception as error:
                 self._mark_retryable(turn, error)
                 await asyncio.sleep(self.poll_interval)
@@ -124,4 +127,46 @@ class ConversationTaskWorker:
             turn.command_id,
             owner_id=self.owner_id,
             state=state,
+        )
+
+    def _mark_host_failure(
+        self, turn: TurnStatus, error: HostExecutionError
+    ) -> None:
+        current = self.repository.load_turn_status(turn.session_id, turn.command_id)
+        if (
+            current is None
+            or current.owner_id != self.owner_id
+            or current.status != "running"
+        ):
+            return
+        state = dict(current.state)
+        state["host_failure_phase"] = error.phase
+        if error.retryable:
+            state.update(
+                {
+                    "phase": "before_model",
+                    "retryable": True,
+                    "reason": "engine_host_unavailable",
+                }
+            )
+            self.repository.mark_retryable(
+                turn.session_id,
+                turn.command_id,
+                owner_id=self.owner_id,
+                state=state,
+            )
+            return
+        state.update(
+            {
+                "phase": "reconciliation_required",
+                "reason": "engine_host_unknown_write_effect",
+            }
+        )
+        self.repository.finish_turn(
+            turn.session_id,
+            turn.command_id,
+            owner_id=self.owner_id,
+            status="reconciliation_required",
+            state=state,
+            result=[],
         )

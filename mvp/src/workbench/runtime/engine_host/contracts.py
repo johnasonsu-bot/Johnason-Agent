@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, TypeAlias
 
 from pydantic import (
     BaseModel,
@@ -19,6 +19,13 @@ from pydantic import (
 
 
 PROTOCOL_V1 = "workbench.engine-host/v1"
+HostFailurePhase: TypeAlias = Literal[
+    "pre_start",
+    "accepted_before_tool",
+    "read_only_effect",
+    "unknown_write_effect",
+    "protocol",
+]
 
 
 class FrozenJsonMapping(Mapping[str, Any]):
@@ -177,6 +184,7 @@ class _RunTerminalPayload(_PayloadSchema):
 class _AgentToolStartedPayload(_PayloadSchema):
     tool_call_id: str = Field(min_length=1, max_length=256)
     name: str = Field(min_length=1, max_length=256)
+    read_only: bool
 
 
 class _AgentToolCompletedPayload(_AgentToolStartedPayload):

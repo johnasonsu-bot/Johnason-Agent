@@ -17,6 +17,7 @@ from .contracts import (
     PROTOCOL_V1,
     HostCapabilities,
     HostEnvelope,
+    HostFailurePhase,
     HostFrameTooLarge,
     HostProtocolError,
     HostStatus,
@@ -27,24 +28,126 @@ class HostUnavailable(Exception):
     """Raised when the supervised Engine Host is unavailable."""
 
 
-class HostAdmissionUnknown(HostUnavailable):
+class HostExecutionError(HostUnavailable, HostProtocolError):
+    """One safe, classified failure for an incomplete Host Run."""
+
+    _SUMMARIES = {
+        "host_unavailable": "engine-host unavailable before run acceptance",
+        "host_interrupted": "engine-host interrupted before run completion",
+        "unknown_write_effect": "engine-host write effect requires reconciliation",
+        "protocol_error": "engine-host protocol failed",
+        "admission_unknown": "engine-host run admission is unknown",
+        "execution_unknown": "engine-host run execution is unknown",
+        "sequence_error": "engine-host sequence must be contiguous",
+        "terminal_after": "engine-host emitted an event after terminal",
+        "cancel_terminal_mismatch": "engine-host cancel terminal mismatch",
+        "event_before_acceptance": (
+            "engine-host emitted an event before run acceptance"
+        ),
+        "unknown_run_event": "engine-host emitted an unknown run event",
+        "invalid_frame": "invalid engine-host frame",
+        "cancel_timeout": "engine-host cancel timed out awaiting acknowledgement",
+        "cancel_terminal_timeout": "engine-host cancel terminal timed out",
+        "closed": "engine-host closed",
+    }
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        phase: HostFailurePhase,
+        retryable: bool,
+        reconciliation_required: bool,
+        _summary_code: str | None = None,
+    ) -> None:
+        expected_reconciliation = phase == "unknown_write_effect"
+        if (
+            retryable is expected_reconciliation
+            or reconciliation_required is not expected_reconciliation
+        ):
+            raise ValueError(
+                "host execution failure phase conflicts with durable outcome"
+            )
+        if code not in self._SUMMARIES:
+            raise ValueError("host execution failure code is not registered")
+        self.code = code
+        self.phase = phase
+        self.retryable = retryable
+        self.reconciliation_required = reconciliation_required
+        summary_code = code if _summary_code is None else _summary_code
+        if summary_code not in self._SUMMARIES:
+            raise ValueError("host execution failure summary is not registered")
+        self.public_summary = self._SUMMARIES[summary_code]
+        super().__init__(self.public_summary)
+
+
+class HostAdmissionUnknown(HostExecutionError):
     """Raised when a written run.start has no authoritative admission result."""
 
+    def __init__(self, _summary: str = "") -> None:
+        super().__init__(
+            code="host_unavailable",
+            phase="pre_start",
+            retryable=True,
+            reconciliation_required=False,
+            _summary_code="admission_unknown",
+        )
 
-class HostExecutionUnknown(HostUnavailable):
+
+class HostExecutionUnknown(HostExecutionError):
     """Raised when an admitted Run loses its authoritative terminal result."""
+
+    def __init__(
+        self,
+        _summary: str = "",
+        *,
+        phase: HostFailurePhase = "accepted_before_tool",
+        _summary_code: str = "execution_unknown",
+    ) -> None:
+        if phase not in {"accepted_before_tool", "read_only_effect"}:
+            raise ValueError("host execution unknown phase is not retryable")
+        super().__init__(
+            code="host_interrupted",
+            phase=phase,
+            retryable=True,
+            reconciliation_required=False,
+            _summary_code=_summary_code,
+        )
 
 
 class HostRunRejected(Exception):
     """Raised when a Run cannot be admitted by the Engine Host."""
 
 
-class HostSequenceError(HostProtocolError):
+class HostSequenceError(HostExecutionError):
     """Raised when a Run event sequence is duplicate or non-contiguous."""
 
+    def __init__(self, _summary: str = "") -> None:
+        super().__init__(
+            code="protocol_error",
+            phase="protocol",
+            retryable=True,
+            reconciliation_required=False,
+            _summary_code="sequence_error",
+        )
 
-class HostTerminalError(HostProtocolError):
+
+class HostTerminalError(HostExecutionError):
     """Raised when an Engine Host emits more than one Run terminal."""
+
+    def __init__(self, summary: str = "") -> None:
+        summary_code = (
+            "cancel_terminal_mismatch"
+            if summary == "engine-host cancel terminal mismatch"
+            else "terminal_after"
+        )
+        super().__init__(
+            code="protocol_error",
+            phase="protocol",
+            retryable=True,
+            reconciliation_required=False,
+            _summary_code=summary_code,
+        )
 
 
 @dataclass
@@ -69,6 +172,9 @@ class _RunStream:
     admission_task: asyncio.Task[HostEnvelope] | None = None
     cancel_task: asyncio.Task[HostEnvelope] | None = None
     cancel_expected_terminal: str | None = None
+    tool_started_observed: bool = False
+    read_only_tool_observed: bool = False
+    unfinished_write_tools: set[str] = field(default_factory=set)
 
     async def put(self, item: HostEnvelope | Exception) -> None:
         if self.consumer_closed:
@@ -161,6 +267,61 @@ TOOL_REASON_SUMMARIES = {
     "tool_error": "tool_error",
     "capability_unavailable": "capability_unavailable",
 }
+
+_SAFE_FAILURE_SUMMARY_CODES = {
+    "engine-host emitted an event before run acceptance": "event_before_acceptance",
+    "engine-host emitted an unknown run event": "unknown_run_event",
+    "invalid engine-host frame": "invalid_frame",
+    "engine-host cancel timed out awaiting acknowledgement": "cancel_timeout",
+    "engine-host cancel terminal timed out": "cancel_terminal_timeout",
+    "engine-host closed": "closed",
+}
+
+
+def _safe_failure_summary_code(error: Exception | None) -> str | None:
+    """Map only exact, locally-authored messages to registered public text."""
+    if error is None:
+        return None
+    return _SAFE_FAILURE_SUMMARY_CODES.get(str(error))
+
+
+def classify_failure(
+    state: _RunStream, error: Exception | None = None
+) -> HostExecutionError:
+    """Classify an incomplete Run only from observed protocol facts."""
+    if state.unfinished_write_tools:
+        return HostExecutionError(
+            code="unknown_write_effect",
+            phase="unknown_write_effect",
+            retryable=False,
+            reconciliation_required=True,
+        )
+    if isinstance(state.failure, HostExecutionError):
+        return state.failure
+    if isinstance(error, HostExecutionError):
+        return error
+    if isinstance(error, (HostProtocolError, HostFrameTooLarge)):
+        return HostExecutionError(
+            code="protocol_error",
+            phase="protocol",
+            retryable=True,
+            reconciliation_required=False,
+            _summary_code=_safe_failure_summary_code(error),
+        )
+    if state.read_only_tool_observed:
+        return HostExecutionUnknown(
+            phase="read_only_effect",
+            _summary_code=(
+                _safe_failure_summary_code(error) or "execution_unknown"
+            ),
+        )
+    if state.accepted:
+        return HostExecutionUnknown(
+            _summary_code=(
+                _safe_failure_summary_code(error) or "execution_unknown"
+            )
+        )
+    return HostAdmissionUnknown()
 
 
 class EngineHostClient:
@@ -417,17 +578,13 @@ class EngineHostClient:
                 ),
             )
         except (TimeoutError, asyncio.CancelledError) as exc:
-            if not stream.start_write_attempted:
-                raise
-            failure = HostAdmissionUnknown("engine-host run admission is unknown")
+            failure = classify_failure(stream, exc)
             self._mark_unavailable()
             self._fail_runs(failure)
             await self._close_after_request_failure()
             raise failure from exc
-        except HostUnavailable as exc:
-            if not stream.start_write_attempted:
-                raise
-            failure = HostAdmissionUnknown("engine-host run admission is unknown")
+        except (HostUnavailable, HostProtocolError, HostFrameTooLarge) as exc:
+            failure = classify_failure(stream, exc)
             self._mark_unavailable()
             self._fail_runs(failure)
             await self._close_after_request_failure()
@@ -791,15 +948,7 @@ class EngineHostClient:
             stream.consumer_closed = True
             stream.closed.set()
             if stream.terminal_envelope is None:
-                stream_error = error
-                if (
-                    stream.accepted
-                    and isinstance(error, HostUnavailable)
-                    and not isinstance(
-                        error, (HostAdmissionUnknown, HostExecutionUnknown)
-                    )
-                ):
-                    stream_error = HostExecutionUnknown(str(error))
+                stream_error = classify_failure(stream, error)
                 if stream.failure is None:
                     stream.failure = stream_error
                 while not stream.queue.empty():
@@ -826,9 +975,9 @@ class EngineHostClient:
             error = HostProtocolError(
                 "engine-host emitted an event before run acceptance"
             )
-            stream.failure = error
+            stream.failure = classify_failure(stream, error)
             self._mark_degraded()
-            await stream.put(error)
+            await stream.put(stream.failure)
             return
         if stream.terminal_name is not None:
             error = HostTerminalError(
@@ -843,17 +992,28 @@ class EngineHostClient:
             error = HostSequenceError(
                 f"engine-host sequence must be {expected_sequence}"
             )
-            stream.failure = error
+            stream.failure = classify_failure(stream, error)
             self._mark_degraded()
-            await stream.put(error)
+            await stream.put(stream.failure)
             return
         stream.last_sequence = expected_sequence
         if envelope.name not in EVENT_KIND:
             error = HostProtocolError("engine-host emitted an unknown run event")
-            stream.failure = error
+            stream.failure = classify_failure(stream, error)
             self._mark_degraded()
-            await stream.put(error)
+            await stream.put(stream.failure)
             return
+        if envelope.name == "agent.tool.started":
+            stream.tool_started_observed = True
+            tool_call_id = str(envelope.payload["tool_call_id"])
+            if envelope.payload["read_only"] is True:
+                stream.read_only_tool_observed = True
+            else:
+                stream.unfinished_write_tools.add(tool_call_id)
+        elif envelope.name in {"agent.tool.completed", "agent.tool.failed"}:
+            stream.unfinished_write_tools.discard(
+                str(envelope.payload["tool_call_id"])
+            )
         if envelope.name in TERMINAL_EVENTS:
             stream.terminal_name = envelope.name
             stream.terminal_envelope = envelope

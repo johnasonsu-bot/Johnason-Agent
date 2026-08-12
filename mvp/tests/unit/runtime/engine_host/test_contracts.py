@@ -1,12 +1,36 @@
 import pytest
 from pydantic import ValidationError
 
+from workbench.runtime.engine_host.client import HostExecutionError
 from workbench.runtime.engine_host.contracts import (
     PROTOCOL_V1,
     HostCapabilities,
     HostEnvelope,
     HostStatus,
 )
+
+
+@pytest.mark.parametrize(
+    ("phase", "retryable", "reconciliation_required"),
+    [
+        ("unknown_write_effect", True, False),
+        ("protocol", False, True),
+    ],
+)
+def test_host_execution_error_rejects_a_conflicting_durable_outcome(
+    phase: str, retryable: bool, reconciliation_required: bool
+) -> None:
+    with pytest.raises(ValueError, match="failure phase"):
+        HostExecutionError(
+            code=(
+                "unknown_write_effect"
+                if phase == "unknown_write_effect"
+                else "protocol_error"
+            ),
+            phase=phase,  # type: ignore[arg-type]
+            retryable=retryable,
+            reconciliation_required=reconciliation_required,
+        )
 
 
 def test_event_requires_positive_sequence_and_run_id() -> None:

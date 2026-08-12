@@ -18,13 +18,31 @@ CANCEL_COUNTS: dict[str, int] = {}
 PENDING_STARTS: list[dict[str, object]] = []
 LATE_EVENT_RUNS: list[str] = []
 WRITE_LOCK = Lock()
+CAPTURE_PATH: str | None = None
+
+
+def record_frame(direction: str, frame: dict[str, object], byte_count: int) -> None:
+    """Capture only protocol metadata; payload content never crosses this hook."""
+    if CAPTURE_PATH is None:
+        return
+    summary = {
+        "direction": direction,
+        "name": frame.get("name"),
+        "message_id": frame.get("message_id"),
+        "correlation_id": frame.get("correlation_id"),
+        "run_id": frame.get("run_id"),
+        "sequence": frame.get("sequence"),
+        "byte_count": byte_count,
+    }
+    with open(CAPTURE_PATH, "a", encoding="utf-8") as capture:
+        capture.write(json.dumps(summary, separators=(",", ":")) + "\n")
 
 
 def write(frame: dict[str, object]) -> None:
     with WRITE_LOCK:
-        sys.stdout.buffer.write(
-            json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
-        )
+        encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
+        record_frame("out", frame, len(encoded))
+        sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
 
 
@@ -118,6 +136,8 @@ def respond(command: dict[str, object], mode: str) -> bool:
                 + ",".join(str(message["role"]) for message in messages)
                 + f":{messages[-1]['content']}"
             )
+        if mode == "exit_before_accept":
+            return True
         if mode == "ignore_run_start":
             return False
         if mode == "bad_correlation_multi":
@@ -161,7 +181,7 @@ def respond(command: dict[str, object], mode: str) -> bool:
                 {"terminal": "run.cancelled"},
             )
         write(start_response)
-        if mode == "accepted_then_eof":
+        if mode in {"accepted_then_eof", "exit_after_accept"}:
             return True
         if mode == "duplicate_run_response":
             write(start_response)
@@ -221,6 +241,20 @@ def respond(command: dict[str, object], mode: str) -> bool:
             return False
         if mode != "event_before_accept":
             write(event(run_id, 1, "run.started", {}))
+        if mode in {"exit_after_read_tool", "exit_during_write_tool"}:
+            write(
+                event(
+                    run_id,
+                    2,
+                    "agent.tool.started",
+                    {
+                        "tool_call_id": "tool-1",
+                        "name": "offline_tool",
+                        "read_only": mode == "exit_after_read_tool",
+                    },
+                )
+            )
+            return True
         if mode == "unregistered_event":
             write(event(run_id, 2, "run.unregistered", {}))
             return False
@@ -243,7 +277,11 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     run_id,
                     2,
                     "agent.tool.started",
-                    {"tool_call_id": "tool-1", "name": "lookup"},
+                    {
+                        "tool_call_id": "tool-1",
+                        "name": "lookup",
+                        "read_only": True,
+                    },
                 )
             )
             write(
@@ -254,6 +292,7 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     {
                         "tool_call_id": "tool-1",
                         "name": "lookup",
+                        "read_only": True,
                         "public_result": "public result",
                     },
                 )
@@ -266,6 +305,7 @@ def respond(command: dict[str, object], mode: str) -> bool:
                     {
                         "tool_call_id": "tool-2",
                         "name": "write",
+                        "read_only": False,
                         "reason": "denied",
                     },
                 )
@@ -395,8 +435,12 @@ def respond(command: dict[str, object], mode: str) -> bool:
 
 
 def main() -> int:
-    mode = sys.argv[1] if len(sys.argv) == 2 else "normal"
-    if mode == "environment_guard" and "ENGINE_HOST_TEST_SECRET" in os.environ:
+    global CAPTURE_PATH
+    mode = sys.argv[1] if len(sys.argv) >= 2 else "normal"
+    CAPTURE_PATH = sys.argv[2] if len(sys.argv) >= 3 else None
+    if mode in {"environment_guard", "capture_metadata"} and (
+        "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
+    ):
         return 3
     if mode == "record_starts":
         temporary_directory = os.environ.get("TMP") or os.environ.get("TEMP")
@@ -465,6 +509,7 @@ def main() -> int:
             command: dict[str, Any] = json.loads(raw_line)
         except json.JSONDecodeError:
             return 2
+        record_frame("in", command, len(raw_line))
         if command.get("protocol") != PROTOCOL:
             return 2
         if respond(command, mode):
