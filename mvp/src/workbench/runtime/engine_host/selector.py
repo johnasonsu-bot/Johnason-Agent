@@ -8,6 +8,7 @@ from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
+from workbench.runtime.engine_host.contracts import HostStatus
 
 
 def host_run_id_for(session_id: str, command_id: str) -> str:
@@ -43,6 +44,35 @@ class RunnerSelector:
         self.provider_allowlist = provider_allowlist
         self.host_generation = host_generation or str(uuid4())
 
+    @property
+    def status(self) -> HostStatus:
+        """Expose the Host lifecycle snapshot without leaking Host configuration."""
+        snapshot = getattr(self.host_runner, "status", None)
+        if isinstance(snapshot, HostStatus):
+            return snapshot
+        state = getattr(snapshot, "state", "ready")
+        if state not in {"disabled", "starting", "ready", "degraded", "unavailable"}:
+            state = "unavailable"
+        return HostStatus(enabled=self.enabled, state=state)
+
+    @property
+    def runner_mode(self) -> Literal["python", "engine_host"]:
+        """Return the runner selected for the active/default provider."""
+        if not self.enabled or self.status.state != "ready":
+            return "python"
+        try:
+            profile = self.resolve_profile(None)
+        except (RuntimeError, ValueError):
+            return "python"
+        return "engine_host" if self._profile_is_host_eligible(profile) else "python"
+
+    def _profile_is_host_eligible(self, profile: Any) -> bool:
+        allowed = {
+            str(getattr(profile, "id", "")),
+            str(getattr(profile, "protocol", "")),
+        }.intersection(self.provider_allowlist)
+        return bool(allowed and getattr(profile, "protocol", None) == "lmstudio")
+
     def mode_for(
         self, session_id: str, provider_id: str, model: str
     ) -> Literal["python", "engine_host"]:
@@ -50,15 +80,9 @@ class RunnerSelector:
         if not self.enabled:
             return "python"
         profile = self.resolve_profile(provider_id)
-        allowed = {
-            str(getattr(profile, "id", "")),
-            str(getattr(profile, "protocol", "")),
-        }.intersection(self.provider_allowlist)
         if (
-            allowed
-            and getattr(profile, "protocol", None) == "lmstudio"
-            and getattr(getattr(self.host_runner, "status", None), "state", "ready")
-            == "ready"
+            self._profile_is_host_eligible(profile)
+            and self.status.state == "ready"
         ):
             return "engine_host"
         return "python"

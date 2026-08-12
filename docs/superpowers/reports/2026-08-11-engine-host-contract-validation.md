@@ -22,6 +22,7 @@ TASK5_SCAN_ROOT="$(mktemp -d /tmp/hermes-task5-leak.XXXXXX)"
 .venv/bin/python -m pytest tests/acceptance/test_engine_host_contract.py::test_protocol_artifacts_do_not_contain_sensitive_values -q --basetemp="$TASK5_SCAN_ROOT"
 ! rg -n -i 'sentinel|reasoning_content|api_key|password' "$TASK5_SCAN_ROOT"
 .venv/bin/python -m pytest tests/unit/api/test_engine_host.py -v
+.venv/bin/python -m pytest tests/unit/api/test_engine_host.py tests/unit/runtime/engine_host/test_selector.py tests/unit/test_main.py -q
 
 # From mvp/canvas-spike/
 npm test -- --grep "Engine Host contract state"
@@ -42,7 +43,8 @@ git diff --check
 - Related Engine Host, queue, worker, repository, and AG-UI regression: 179 passed.
 - Engine Host diagnostic API: 3 passed.
 - Engine Host focused Electron diagnostic: 1 passed.
-- Backend unit, integration, and acceptance suites: 456 passed, 6 skipped.
+- Engine Host status, selector, and composition regression: 37 passed.
+- Backend unit, integration, and acceptance suites: 460 passed, 6 skipped.
 - Complete Electron and Playwright suite: 33 passed.
 - Python compile check: passed.
 - Isolated artifact leak acceptance: 1 passed; the strict follow-up scan found no matches in the metadata-only NDJSON artifact.
@@ -65,6 +67,9 @@ git diff --check
   protocol, safe capabilities, and active runner mode. The Electron card permits
   refresh only and provides no executable path, command, environment, or
   credential editor.
+- Active runner is read from `RunnerSelector`: only a ready, enabled Host is
+  reported as `engine_host`; starting, degraded, unavailable, and disabled paths
+  report the Python runtime, matching new-Turn routing.
 
 ## Known limitations
 

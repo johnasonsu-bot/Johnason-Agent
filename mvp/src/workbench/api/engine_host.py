@@ -14,6 +14,9 @@ class EngineHostStatusSource(Protocol):
     @property
     def status(self) -> HostStatus: ...
 
+    @property
+    def runner_mode(self) -> Literal["python", "engine_host"]: ...
+
 
 class EngineHostDiagnostic(BaseModel):
     """Public status fields safe to expose to the local renderer."""
@@ -49,7 +52,7 @@ def engine_host_router(source: EngineHostStatusSource | None) -> APIRouter:
             state=snapshot.state,
             protocol=snapshot.protocol,
             capabilities=snapshot.capabilities,
-            runner_mode="engine_host" if snapshot.enabled else "python",
+            runner_mode=source.runner_mode,
         )
 
     return router

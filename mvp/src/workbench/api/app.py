@@ -133,12 +133,12 @@ def create_app(settings: AppSettings) -> FastAPI:
         return await call_next(request)
 
     app.include_router(conversation_router(conversation_api))
-    lifecycle_status_source = getattr(
-        settings.runner_lifecycle, "host_runner", settings.runner_lifecycle
-    )
-    if not hasattr(lifecycle_status_source, "status"):
-        lifecycle_status_source = None
-    app.include_router(engine_host_router(lifecycle_status_source))
+    status_source = settings.runner
+    if not (
+        hasattr(status_source, "status") and hasattr(status_source, "runner_mode")
+    ):
+        status_source = None
+    app.include_router(engine_host_router(status_source))
     app.include_router(
         provider_router(
             ProviderRepository(settings.database), settings.vault, settings.gateway
