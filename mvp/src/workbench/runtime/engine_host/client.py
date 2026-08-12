@@ -28,7 +28,7 @@ class HostUnavailable(Exception):
     """Raised when the supervised Engine Host is unavailable."""
 
 
-class HostExecutionError(HostUnavailable, HostProtocolError):
+class HostExecutionError(Exception):
     """One safe, classified failure for an incomplete Host Run."""
 
     _SUMMARIES = {
@@ -81,7 +81,7 @@ class HostExecutionError(HostUnavailable, HostProtocolError):
         super().__init__(self.public_summary)
 
 
-class HostAdmissionUnknown(HostExecutionError):
+class HostAdmissionUnknown(HostExecutionError, HostUnavailable):
     """Raised when a written run.start has no authoritative admission result."""
 
     def __init__(self, _summary: str = "") -> None:
@@ -94,7 +94,7 @@ class HostAdmissionUnknown(HostExecutionError):
         )
 
 
-class HostExecutionUnknown(HostExecutionError):
+class HostExecutionUnknown(HostExecutionError, HostUnavailable):
     """Raised when an admitted Run loses its authoritative terminal result."""
 
     def __init__(
@@ -119,7 +119,11 @@ class HostRunRejected(Exception):
     """Raised when a Run cannot be admitted by the Engine Host."""
 
 
-class HostSequenceError(HostExecutionError):
+class HostProtocolExecutionError(HostExecutionError, HostProtocolError):
+    """A classified incomplete Run caused by a protocol violation."""
+
+
+class HostSequenceError(HostProtocolExecutionError):
     """Raised when a Run event sequence is duplicate or non-contiguous."""
 
     def __init__(self, _summary: str = "") -> None:
@@ -132,7 +136,7 @@ class HostSequenceError(HostExecutionError):
         )
 
 
-class HostTerminalError(HostExecutionError):
+class HostTerminalError(HostProtocolExecutionError):
     """Raised when an Engine Host emits more than one Run terminal."""
 
     def __init__(self, summary: str = "") -> None:
@@ -289,6 +293,11 @@ def classify_failure(
     state: _RunStream, error: Exception | None = None
 ) -> HostExecutionError:
     """Classify an incomplete Run only from observed protocol facts."""
+    if (
+        isinstance(state.failure, HostExecutionError)
+        and state.failure.phase == "unknown_write_effect"
+    ):
+        return state.failure
     if state.unfinished_write_tools:
         return HostExecutionError(
             code="unknown_write_effect",
@@ -301,7 +310,7 @@ def classify_failure(
     if isinstance(error, HostExecutionError):
         return error
     if isinstance(error, (HostProtocolError, HostFrameTooLarge)):
-        return HostExecutionError(
+        return HostProtocolExecutionError(
             code="protocol_error",
             phase="protocol",
             retryable=True,
@@ -630,10 +639,21 @@ class EngineHostClient:
                 run_id=run_id,
                 deadline=deadline,
             )
-        except TimeoutError as exc:
-            failure = HostUnavailable(
-                "engine-host cancel timed out awaiting acknowledgement"
+        except (
+            TimeoutError,
+            HostUnavailable,
+            HostProtocolError,
+            HostFrameTooLarge,
+        ) as exc:
+            source = (
+                HostUnavailable(
+                    "engine-host cancel timed out awaiting acknowledgement"
+                )
+                if isinstance(exc, TimeoutError)
+                else exc
             )
+            failure = classify_failure(stream, source)
+            stream.failure = failure
             self._mark_unavailable()
             self._fail_runs(failure)
             await self._close_after_request_failure()
@@ -643,7 +663,10 @@ class EngineHostClient:
             async with asyncio.timeout_at(deadline):
                 await stream.terminal_received.wait()
         except TimeoutError as exc:
-            failure = HostUnavailable("engine-host cancel terminal timed out")
+            failure = classify_failure(
+                stream, HostUnavailable("engine-host cancel terminal timed out")
+            )
+            stream.failure = failure
             self._mark_unavailable()
             self._fail_runs(failure)
             await self._close_after_request_failure()
@@ -652,10 +675,10 @@ class EngineHostClient:
             raise stream.failure
         if stream.terminal_name != stream.cancel_expected_terminal:
             error = HostTerminalError("engine-host cancel terminal mismatch")
-            stream.failure = error
+            stream.failure = classify_failure(stream, error)
             self._mark_degraded()
-            self._fail_runs(error)
-            raise error
+            self._fail_runs(stream.failure)
+            raise stream.failure
         return response
 
     async def aclose(self) -> None:
@@ -980,11 +1003,6 @@ class EngineHostClient:
             await stream.put(stream.failure)
             return
         if stream.terminal_name is not None:
-            error = HostTerminalError(
-                f"engine-host emitted {envelope.name} after terminal "
-                f"{stream.terminal_name}"
-            )
-            stream.failure = error
             self._mark_degraded()
             return
         expected_sequence = stream.last_sequence + 1
@@ -1015,19 +1033,26 @@ class EngineHostClient:
                 str(envelope.payload["tool_call_id"])
             )
         if envelope.name in TERMINAL_EVENTS:
-            stream.terminal_name = envelope.name
-            stream.terminal_envelope = envelope
-            stream.terminal_available.set()
-            stream.terminal_received.set()
+            if stream.unfinished_write_tools:
+                stream.failure = classify_failure(stream)
+                stream.terminal_received.set()
+                self._mark_degraded()
+                await stream.put(stream.failure)
+                return
             if (
                 stream.cancel_expected_terminal is not None
                 and envelope.name != stream.cancel_expected_terminal
             ):
                 error = HostTerminalError("engine-host cancel terminal mismatch")
-                stream.failure = error
+                stream.failure = classify_failure(stream, error)
+                stream.terminal_received.set()
                 self._mark_degraded()
-                self._fail_runs(error)
+                await stream.put(stream.failure)
                 return
+            stream.terminal_name = envelope.name
+            stream.terminal_envelope = envelope
+            stream.terminal_available.set()
+            stream.terminal_received.set()
             return
         await stream.put(envelope)
 

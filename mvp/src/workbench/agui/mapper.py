@@ -110,8 +110,13 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "provider_id",
         ),
         "conversation.turn.finished": ("status", "command_id"),
-        "conversation.turn.failed": ("reason", "command_id"),
-        "conversation.turn.retryable": ("reason", "detail", "command_id"),
+        "conversation.turn.failed": ("reason", "failure_phase", "command_id"),
+        "conversation.turn.retryable": (
+            "reason",
+            "detail",
+            "failure_phase",
+            "command_id",
+        ),
         "agent.tool.failed": ("tool_call_id", "name", "reason"),
     }.get(event_type)
     return {key: payload[key] for key in fields or () if key in payload}

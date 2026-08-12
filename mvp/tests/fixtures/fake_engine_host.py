@@ -255,6 +255,45 @@ def respond(command: dict[str, object], mode: str) -> bool:
                 )
             )
             return True
+        if mode in {
+            "write_then_run_completed",
+            "write_then_run_failed",
+            "write_then_run_cancelled",
+            "write_then_ignore_cancel",
+            "write_then_ack_without_terminal",
+            "write_then_cancel_protocol_error",
+        }:
+            write(
+                event(
+                    run_id,
+                    2,
+                    "agent.tool.started",
+                    {
+                        "tool_call_id": "tool-write-1",
+                        "name": "offline_write",
+                        "read_only": False,
+                    },
+                )
+            )
+            terminal_name = {
+                "write_then_run_completed": "run.completed",
+                "write_then_run_failed": "run.failed",
+                "write_then_run_cancelled": "run.cancelled",
+            }.get(mode)
+            if terminal_name is not None:
+                terminal_payload = (
+                    {}
+                    if terminal_name == "run.completed"
+                    else {
+                        "reason": (
+                            "internal_error"
+                            if terminal_name == "run.failed"
+                            else "user_requested"
+                        )
+                    }
+                )
+                write(event(run_id, 3, terminal_name, terminal_payload))
+            return False
         if mode == "unregistered_event":
             write(event(run_id, 2, "run.unregistered", {}))
             return False
@@ -397,7 +436,16 @@ def respond(command: dict[str, object], mode: str) -> bool:
     elif name == "run.cancel":
         run_id = str(command["run_id"])
         CANCEL_COUNTS[run_id] = CANCEL_COUNTS.get(run_id, 0) + 1
-        if mode == "ignore_cancel":
+        if mode in {"ignore_cancel", "write_then_ignore_cancel"}:
+            return False
+        if mode == "write_then_cancel_protocol_error":
+            invalid = response(
+                command,
+                "run.cancel",
+                {"terminal": "run.cancelled"},
+            )
+            invalid["run_id"] = "wrong-run"
+            write(invalid)
             return False
         write(
             response(
@@ -406,7 +454,7 @@ def respond(command: dict[str, object], mode: str) -> bool:
                 {"terminal": "run.cancelled"},
             )
         )
-        if mode == "ack_without_terminal":
+        if mode in {"ack_without_terminal", "write_then_ack_without_terminal"}:
             return False
         terminal_name = (
             "run.failed" if mode == "cancel_terminal_mismatch" else "run.cancelled"

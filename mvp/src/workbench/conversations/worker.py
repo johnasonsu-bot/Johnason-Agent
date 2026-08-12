@@ -139,34 +139,10 @@ class ConversationTaskWorker:
             or current.status != "running"
         ):
             return
-        state = dict(current.state)
-        state["host_failure_phase"] = error.phase
-        if error.retryable:
-            state.update(
-                {
-                    "phase": "before_model",
-                    "retryable": True,
-                    "reason": "engine_host_unavailable",
-                }
-            )
-            self.repository.mark_retryable(
-                turn.session_id,
-                turn.command_id,
-                owner_id=self.owner_id,
-                state=state,
-            )
-            return
-        state.update(
-            {
-                "phase": "reconciliation_required",
-                "reason": "engine_host_unknown_write_effect",
-            }
-        )
-        self.repository.finish_turn(
+        self.repository.transition_host_failure(
             turn.session_id,
             turn.command_id,
             owner_id=self.owner_id,
-            status="reconciliation_required",
-            state=state,
-            result=[],
+            failure_phase=error.phase,
+            retryable=error.retryable,
         )

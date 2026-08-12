@@ -203,6 +203,56 @@ async def run_host_scenario(database: Path, mode: str) -> tuple[object, int]:
     return persisted, python_runner.calls
 
 
+async def run_cancel_scenario(database: Path, mode: str) -> tuple[Exception, object]:
+    host = EngineHostClient(
+        fake_host_command(mode), request_timeout=0.05, shutdown_timeout=0.05
+    )
+    await host.start()
+    python_runner = OfflinePythonRunner()
+    selector = RunnerSelector(
+        python_runner,
+        host,
+        enabled=True,
+        provider_allowlist=("lmstudio",),
+        host_generation="generation-1",
+    )
+    repository = ConversationRepository(database, host_generation="generation-1")
+    api = ConversationAPI(repository, EventStore(database), selector)
+    api.create_session("session-1")
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="offline contract",
+        model="local-agent",
+        provider_id="lmstudio",
+    )
+    claimed = repository.claim_next_turn(owner_id="worker-1")
+    assert claimed is not None
+    processing = asyncio.create_task(api.process_queued_turn("session-1", "turn-1"))
+
+    async def write_effect_is_pending() -> str:
+        while True:
+            for run_id, stream in host._active_runs.items():
+                if stream.unfinished_write_tools:
+                    return run_id
+            await asyncio.sleep(0)
+
+    try:
+        run_id = await asyncio.wait_for(write_effect_is_pending(), timeout=1.0)
+        with pytest.raises(Exception) as failure:
+            await host.cancel(run_id, "user_requested")
+        await asyncio.wait_for(processing, timeout=1.0)
+    finally:
+        processing.cancel()
+        await asyncio.gather(processing, return_exceptions=True)
+        await host.aclose()
+
+    persisted = repository.load_turn_status("session-1", "turn-1")
+    assert persisted is not None
+    assert python_runner.calls == 0
+    return failure.value, persisted
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_status"),
     [
@@ -225,6 +275,80 @@ async def test_host_crash_maps_to_durable_turn_status(
     assert turn_status.owner_id is None  # type: ignore[attr-defined]
     assert turn_status.lease_expires_at == 0  # type: ignore[attr-defined]
     assert turn_status.state["runner_mode"] == "engine_host"  # type: ignore[attr-defined]
+    assert python_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "write_then_run_completed",
+        "write_then_run_failed",
+        "write_then_run_cancelled",
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_terminal_cannot_hide_an_unfinished_write_effect(
+    tmp_path: Path, mode: str
+) -> None:
+    persisted, python_calls = await run_host_scenario(tmp_path / f"{mode}.sqlite", mode)
+
+    assert persisted.status == "reconciliation_required"  # type: ignore[attr-defined]
+    assert persisted.state["host_failure_phase"] == "unknown_write_effect"  # type: ignore[attr-defined]
+    terminal_outcomes = [  # type: ignore[attr-defined]
+        item
+        for item in persisted.result
+        if item.get("name") in {"turn_finished", "turn_failed"}
+    ]
+    assert len(terminal_outcomes) == 1
+    assert terminal_outcomes[0]["name"] == "turn_failed"
+    assert terminal_outcomes[0]["value"]["reason"] == (
+        "engine_host_unknown_write_effect"
+    )
+    assert python_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "write_then_ignore_cancel",
+        "write_then_ack_without_terminal",
+        "write_then_cancel_protocol_error",
+    ],
+)
+@pytest.mark.asyncio
+async def test_cancel_failure_preserves_unknown_write_precedence(
+    tmp_path: Path, mode: str
+) -> None:
+    failure, persisted = await run_cancel_scenario(
+        tmp_path / f"{mode}.sqlite", mode
+    )
+
+    assert isinstance(failure, HostExecutionError)
+    assert failure.phase == "unknown_write_effect"  # type: ignore[attr-defined]
+    assert failure.reconciliation_required is True  # type: ignore[attr-defined]
+    assert persisted.status == "reconciliation_required"  # type: ignore[attr-defined]
+    assert persisted.state["runner_mode"] == "engine_host"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_first_valid_terminal_is_the_only_durable_outcome(tmp_path: Path) -> None:
+    database = tmp_path / "terminal-sealed.sqlite"
+    persisted, python_calls = await run_host_scenario(
+        database, "immediate_event_after_terminal"
+    )
+    outcomes = [
+        event.event_type
+        for event in EventStore(database).read_stream("run:session-1")
+        if event.event_type
+        in {
+            "conversation.turn.finished",
+            "conversation.turn.failed",
+            "conversation.turn.retryable",
+        }
+    ]
+
+    assert persisted.status == "completed"  # type: ignore[attr-defined]
+    assert outcomes == ["conversation.turn.finished"]
     assert python_calls == 0
 
 

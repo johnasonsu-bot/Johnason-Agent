@@ -9,6 +9,7 @@ from workbench.api.app import AppSettings, create_app
 from workbench.conversations.repository import ConversationRepository
 from workbench.conversations.repository import TurnSnapshotCorruption
 from workbench.conversations.worker import ConversationTaskWorker
+from workbench.runtime.engine_host.client import HostExecutionUnknown
 
 
 def _enqueue(repository: ConversationRepository, command_id: str = "turn-1") -> None:
@@ -198,3 +199,33 @@ async def test_worker_fails_corrupt_snapshot_once_without_retry(tmp_path: Path) 
     assert turn.lease_expires_at == 0
     assert turn.state["reason"] == "snapshot_corrupt"
     assert api.calls == 1
+
+
+def test_worker_host_retry_waits_for_a_new_generation(tmp_path: Path) -> None:
+    database = tmp_path / "host-retry.sqlite"
+    repository = ConversationRepository(database, host_generation="generation-1")
+    _enqueue(repository)
+    worker = ConversationTaskWorker(repository, CompletingAPI(repository))
+    claimed = repository.claim_next_turn(
+        owner_id=worker.owner_id, lease_seconds=30
+    )
+    assert claimed is not None
+
+    worker._mark_host_failure(claimed, HostExecutionUnknown())
+
+    persisted = repository.load_turn_status("session-1", "turn-1")
+    assert persisted is not None
+    assert persisted.state["runner_mode"] == "engine_host"
+    assert persisted.state["failed_host_generation"] == "generation-1"
+    assert (
+        ConversationRepository(
+            database, host_generation="generation-1"
+        ).claim_next_turn(owner_id="same-generation")
+        is None
+    )
+    assert (
+        ConversationRepository(
+            database, host_generation="generation-2"
+        ).claim_next_turn(owner_id="new-generation")
+        is not None
+    )

@@ -1,13 +1,31 @@
 import pytest
 from pydantic import ValidationError
 
-from workbench.runtime.engine_host.client import HostExecutionError
+from workbench.runtime.engine_host.client import (
+    HostAdmissionUnknown,
+    HostExecutionError,
+    HostSequenceError,
+)
 from workbench.runtime.engine_host.contracts import (
     PROTOCOL_V1,
     HostCapabilities,
     HostEnvelope,
+    HostProtocolError,
     HostStatus,
 )
+
+
+def test_only_protocol_classifications_are_protocol_errors() -> None:
+    unknown_write = HostExecutionError(
+        code="unknown_write_effect",
+        phase="unknown_write_effect",
+        retryable=False,
+        reconciliation_required=True,
+    )
+
+    assert not isinstance(unknown_write, HostProtocolError)
+    assert not isinstance(HostAdmissionUnknown(), HostProtocolError)
+    assert isinstance(HostSequenceError(), HostProtocolError)
 
 
 @pytest.mark.parametrize(

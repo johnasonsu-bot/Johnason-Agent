@@ -465,6 +465,81 @@ class ConversationRepository:
         if result.rowcount != 1:
             raise RuntimeError("released turn is no longer retryable")
 
+    def transition_host_failure(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        owner_id: str,
+        failure_phase: str,
+        retryable: bool,
+    ) -> None:
+        """Atomically persist one classified Host recovery outcome."""
+        if retryable and not self.host_generation:
+            raise TurnSnapshotCorruption("Host generation is unavailable")
+        status = "retryable" if retryable else "reconciliation_required"
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT state_json FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?
+                  AND owner_id = ? AND status = 'running'
+                """,
+                (session_id, command_id, owner_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise RuntimeError("turn claim is no longer owned")
+            state = json.loads(row["state_json"])
+            persisted_runner = state.get("runner_mode")
+            if persisted_runner not in {None, "engine_host"}:
+                connection.rollback()
+                raise TurnSnapshotCorruption("turn routing metadata cannot change")
+            state.update(
+                {
+                    "runner_mode": "engine_host",
+                    "host_failure_phase": failure_phase,
+                    "phase": "before_model" if retryable else status,
+                    "reason": (
+                        "engine_host_unavailable"
+                        if retryable
+                        else "engine_host_unknown_write_effect"
+                    ),
+                }
+            )
+            if retryable:
+                state.update(
+                    {
+                        "retryable": True,
+                        "failed_host_generation": self.host_generation,
+                    }
+                )
+                state.pop("retry_not_before", None)
+                state.pop("host_retry_count", None)
+            result = connection.execute(
+                """
+                UPDATE conversation_turns
+                SET status = ?, owner_id = NULL, lease_expires_at = 0,
+                    state_json = ?, result_json = ?, updated_at = ?
+                WHERE session_id = ? AND command_id = ?
+                  AND owner_id = ? AND status = 'running'
+                """,
+                (
+                    status,
+                    json.dumps(state, sort_keys=True),
+                    None if retryable else "[]",
+                    time.time(),
+                    session_id,
+                    command_id,
+                    owner_id,
+                ),
+            )
+            if result.rowcount != 1:
+                connection.rollback()
+                raise RuntimeError("turn claim is no longer owned")
+            connection.commit()
+
     def load_turn_status(
         self, session_id: str, command_id: str
     ) -> TurnStatus | None:
