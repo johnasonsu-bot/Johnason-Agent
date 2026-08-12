@@ -15,10 +15,12 @@ from workbench.conversations.repository import (
     ConversationRepository,
     TurnSnapshotCorruption,
 )
+from workbench.conversations.models import ConversationMessage
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 from workbench.runtime.engine_host.selector import RunnerSelector, host_run_id_for
 from workbench.runtime.engine_host.client import (
     HostAdmissionUnknown,
+    HostExecutionUnknown,
     HostRunRejected,
     HostUnavailable,
 )
@@ -334,6 +336,40 @@ class CompletingHostRunner(BlockingRunner):
         )
 
 
+class RepositoryPythonRunner(CanonicalPythonRunner):
+    def __init__(
+        self, profile: ProviderProfileRecord, repository: ConversationRepository
+    ) -> None:
+        super().__init__(profile)
+        self.repository = repository
+
+    def _model_messages(self, session_id: str) -> list[ModelMessage]:
+        return [
+            ModelMessage(role=message.role, content=message.content)
+            for message in self.repository.list_messages(session_id)
+        ]
+
+
+class RetryThenCompletingHostRunner(CompletingHostRunner):
+    async def run_turn(self, command: RunAgentTurn):
+        self.calls += 1
+        self.commands.append(command)
+        if self.calls == 1:
+            raise HostUnavailable("offline before admission")
+        yield AgentEvent(
+            kind="turn_started", session_id=command.session_id, run_id=command.run_id
+        )
+        yield AgentEvent(
+            kind="text_delta",
+            session_id=command.session_id,
+            run_id=command.run_id,
+            payload={"text": "host answer"},
+        )
+        yield AgentEvent(
+            kind="turn_finished", session_id=command.session_id, run_id=command.run_id
+        )
+
+
 class FailingHostRunner:
     def __init__(self, failure: Exception) -> None:
         self.failure = failure
@@ -468,9 +504,123 @@ async def test_host_turn_receives_snapshot_and_persists_answer_for_the_next_turn
     assert [message.content for message in host_runner.commands[0].message_snapshot] == [
         "earlier",
         "context",
+        "next",
     ]
     assert host_runner.commands[0].provider_id == "lmstudio"
     assert repository.list_messages("session-1")[-1].content == "host answer"
+
+
+@pytest.mark.asyncio
+async def test_queued_host_turn_freezes_context_only_after_prior_turn_finishes(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "queued-host-context.sqlite"
+    repository = ConversationRepository(database)
+    profile = ProviderProfileRecord(
+        id="studio-primary",
+        name="Custom LM Studio",
+        protocol="lmstudio",
+        base_url="http://127.0.0.1:1234",
+    )
+    host_runner = CompletingHostRunner()
+    selector = RunnerSelector(
+        RepositoryPythonRunner(profile, repository),
+        host_runner,
+        enabled=True,
+        provider_allowlist=("lmstudio",),
+    )
+    api = ConversationAPI(repository, EventStore(database), selector)
+    api.create_session("session-1")
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="first",
+        model="local-agent",
+        provider_id="lmstudio",
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-2",
+        content="second",
+        model="local-agent",
+        provider_id="lmstudio",
+    )
+
+    first = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert first is not None and first.command_id == "turn-1"
+    await api.process_queued_turn("session-1", "turn-1")
+    second = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert second is not None and second.command_id == "turn-2"
+    await api.process_queued_turn("session-1", "turn-2")
+
+    assert [
+        (message.role, message.content)
+        for message in host_runner.commands[0].message_snapshot
+    ] == [("user", "first")]
+    assert [
+        (message.role, message.content)
+        for message in host_runner.commands[1].message_snapshot
+    ] == [
+        ("user", "first"),
+        ("assistant", "host answer"),
+        ("user", "second"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_host_retry_reuses_frozen_snapshot_and_obeys_persisted_backoff(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "host-retry-snapshot.sqlite"
+    repository = ConversationRepository(database)
+    profile = ProviderProfileRecord(
+        id="studio-primary",
+        name="Custom LM Studio",
+        protocol="lmstudio",
+        base_url="http://127.0.0.1:1234",
+    )
+    host_runner = RetryThenCompletingHostRunner()
+    selector = RunnerSelector(
+        RepositoryPythonRunner(profile, repository),
+        host_runner,
+        enabled=True,
+        provider_allowlist=("lmstudio",),
+    )
+    api = ConversationAPI(repository, EventStore(database), selector)
+    api.create_session("session-1")
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="first",
+        model="local-agent",
+        provider_id="lmstudio",
+    )
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    retryable = repository.load_turn_status("session-1", "turn-1")
+    assert retryable is not None and retryable.status == "retryable"
+    assert retryable.state["message_snapshot_frozen"] is True
+    assert retryable.state["retry_not_before"] > time.time()
+    reopened = ConversationRepository(database)
+    assert reopened.claim_next_turn(owner_id="worker", lease_seconds=30) is None
+    repository.append_message(
+        ConversationMessage(
+            session_id="session-1",
+            command_id="later:user",
+            role="user",
+            content="later mutation",
+        )
+    )
+    await asyncio.sleep(0.12)
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+    await api.process_queued_turn("session-1", "turn-1")
+
+    assert host_runner.calls == 2
+    assert host_runner.commands[1].message_snapshot == host_runner.commands[0].message_snapshot
 
 
 @pytest.mark.parametrize(
@@ -481,6 +631,11 @@ async def test_host_turn_receives_snapshot_and_persists_answer_for_the_next_turn
             HostAdmissionUnknown("unknown"),
             "reconciliation_required",
             "engine_host_admission_unknown",
+        ),
+        (
+            HostExecutionUnknown("unknown"),
+            "reconciliation_required",
+            "engine_host_execution_unknown",
         ),
         (
             HostProtocolError("bad frame"),
@@ -535,3 +690,5 @@ async def test_persisted_host_failures_never_fallback_to_python(
     assert turn.state["runner_mode"] == "engine_host"
     assert host_runner.calls == 1
     assert python_runner.calls == 0
+    if isinstance(failure, HostExecutionUnknown):
+        assert repository.claim_next_turn(owner_id="worker", lease_seconds=30) is None

@@ -254,10 +254,17 @@ class ConversationRepository:
                 SELECT * FROM conversation_turns
                 WHERE status IN ('queued', 'retryable')
                   AND (owner_id IS NULL OR lease_expires_at <= ?)
+                  AND (
+                    status = 'queued'
+                    OR COALESCE(
+                        CAST(json_extract(state_json, '$.retry_not_before') AS REAL),
+                        0
+                    ) <= ?
+                  )
                 ORDER BY updated_at, session_id, command_id
                 LIMIT 1
                 """,
-                (now,),
+                (now, now),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -269,6 +276,13 @@ class ConversationRepository:
                 WHERE session_id = ? AND command_id = ?
                   AND status IN ('queued', 'retryable')
                   AND (owner_id IS NULL OR lease_expires_at <= ?)
+                  AND (
+                    status = 'queued'
+                    OR COALESCE(
+                        CAST(json_extract(state_json, '$.retry_not_before') AS REAL),
+                        0
+                    ) <= ?
+                  )
                 """,
                 (
                     owner_id,
@@ -276,6 +290,7 @@ class ConversationRepository:
                     now,
                     row["session_id"],
                     row["command_id"],
+                    now,
                     now,
                 ),
             )

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import sqlite3
+import time
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
@@ -26,6 +27,7 @@ from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 from workbench.runtime.engine_host.client import (
     HostAdmissionUnknown,
+    HostExecutionUnknown,
     HostRunRejected,
     HostUnavailable,
 )
@@ -181,67 +183,74 @@ class ConversationAPI:
 
     async def process_queued_turn(self, session_id: str, command_id: str) -> None:
         """Advance one Worker-owned turn and seal it if the runtime did not."""
-        turn = self.conversations.load_turn_status(session_id, command_id)
-        if turn is None or turn.status in {"completed", "failed", "reconciliation_required"}:
-            return
-        if turn.owner_id is None:
-            return
         reservation_id = self._reservation_event_id(session_id, command_id)
-        runner_mode = turn.state.get("runner_mode", "python")
-        if runner_mode not in {"python", "engine_host"}:
-            raise TurnSnapshotCorruption("invalid persisted runner mode")
-        state = dict(turn.state)
-        state_changed = False
-        if "runner_mode" not in turn.state:
-            state["runner_mode"] = "python"
-            state_changed = True
-        if runner_mode == "engine_host":
-            host_run_id = state.get("host_run_id")
-            if host_run_id is None:
-                state["host_run_id"] = host_run_id_for(session_id, command_id)
-                state_changed = True
-            elif not isinstance(host_run_id, str) or not host_run_id:
-                raise TurnSnapshotCorruption("invalid persisted Host run id")
-        try:
-            raw_messages = state.get("messages", [])
-            if not isinstance(raw_messages, list):
-                raise TypeError
-            message_snapshot = tuple(
-                ModelMessage.model_validate(message) for message in raw_messages
-            )
-        except (TypeError, ValueError) as exc:
-            raise TurnSnapshotCorruption("invalid persisted messages") from exc
-        if state_changed:
-            self.conversations.save_turn_state(
-                session_id,
-                command_id,
-                owner_id=turn.owner_id,
-                state=state,
-            )
-        command = RunAgentTurn(
-            session_id=session_id,
-            run_id=turn.run_id,
-            command_id=command_id,
-            prompt=turn.prompt or "",
-            model=turn.model,
-            provider_id=turn.provider_id,
-            owner_id=turn.owner_id,
-            runner_mode=runner_mode,
-            host_run_id=(
-                str(state["host_run_id"])
-                if runner_mode == "engine_host"
-                else None
-            ),
-            message_snapshot=message_snapshot,
-        )
         async with self._session_lock(session_id):
-            current = self.conversations.load_turn_status(session_id, command_id)
-            if current is None or current.status in {
+            turn = self.conversations.load_turn_status(session_id, command_id)
+            if turn is None or turn.status in {
                 "completed",
                 "failed",
                 "reconciliation_required",
             }:
                 return
+            if turn.owner_id is None:
+                return
+            runner_mode = turn.state.get("runner_mode", "python")
+            if runner_mode not in {"python", "engine_host"}:
+                raise TurnSnapshotCorruption("invalid persisted runner mode")
+            state = dict(turn.state)
+            state_changed = False
+            if "runner_mode" not in turn.state:
+                state["runner_mode"] = "python"
+                state_changed = True
+            if runner_mode == "engine_host":
+                host_run_id = state.get("host_run_id")
+                if host_run_id is None:
+                    state["host_run_id"] = host_run_id_for(session_id, command_id)
+                    state_changed = True
+                elif not isinstance(host_run_id, str) or not host_run_id:
+                    raise TurnSnapshotCorruption("invalid persisted Host run id")
+                frozen = state.get("message_snapshot_frozen", False)
+                if not isinstance(frozen, bool):
+                    raise TurnSnapshotCorruption("invalid Host snapshot state")
+                if not frozen:
+                    if state.get("retryable") is not True:
+                        state["messages"] = self._canonical_messages_for_turn(
+                            session_id, command_id
+                        )
+                    state["message_snapshot_frozen"] = True
+                    state_changed = True
+            try:
+                raw_messages = state.get("messages", [])
+                if not isinstance(raw_messages, list):
+                    raise TypeError
+                message_snapshot = tuple(
+                    ModelMessage.model_validate(message) for message in raw_messages
+                )
+            except (TypeError, ValueError) as exc:
+                raise TurnSnapshotCorruption("invalid persisted messages") from exc
+            if state_changed:
+                self.conversations.save_turn_state(
+                    session_id,
+                    command_id,
+                    owner_id=turn.owner_id,
+                    state=state,
+                )
+            command = RunAgentTurn(
+                session_id=session_id,
+                run_id=turn.run_id,
+                command_id=command_id,
+                prompt=turn.prompt or "",
+                model=turn.model,
+                provider_id=turn.provider_id,
+                owner_id=turn.owner_id,
+                runner_mode=runner_mode,
+                host_run_id=(
+                    str(state["host_run_id"])
+                    if runner_mode == "engine_host"
+                    else None
+                ),
+                message_snapshot=message_snapshot,
+            )
             projected, retryable = await self._record_turn(
                 command, reservation_id=reservation_id
             )
@@ -258,6 +267,7 @@ class ConversationAPI:
                         state["reason"] = projected[-1].get("value", {}).get(
                             "reason", "engine_host_unavailable"
                         )
+                    self._apply_host_retry_backoff(state)
                     self.conversations.mark_retryable(
                         session_id,
                         command_id,
@@ -271,6 +281,7 @@ class ConversationAPI:
                         state["reason"] = projected[-1].get("value", {}).get(
                             "reason", "engine_host_unavailable"
                         )
+                    self._apply_host_retry_backoff(state)
                     self.conversations.mark_retryable_unowned(
                         session_id, command_id, state=state
                     )
@@ -292,17 +303,27 @@ class ConversationAPI:
                 if terminal_reason
                 in {
                     "engine_host_admission_unknown",
+                    "engine_host_execution_unknown",
                     "engine_host_protocol_error",
                 }
                 else ("completed" if terminal_name == "turn_finished" else "failed")
             )
             terminal_state = {
                 "phase": terminal_status,
-                "messages": [],
+                "messages": (
+                    state.get("messages", [])
+                    if terminal_status == "reconciliation_required"
+                    else []
+                ),
                 "events": [],
                 "runner_mode": runner_mode,
                 **({"reason": terminal_reason} if terminal_reason is not None else {}),
             }
+            if (
+                terminal_status == "reconciliation_required"
+                and state.get("message_snapshot_frozen") is True
+            ):
+                terminal_state["message_snapshot_frozen"] = True
             if runner_mode == "engine_host" and terminal_status == "completed":
                 answer = "".join(
                     str(item.get("delta", ""))
@@ -375,6 +396,76 @@ class ConversationAPI:
             "events": [],
             "model_step_count": 0,
         }
+
+    def _canonical_messages_for_turn(
+        self, session_id: str, command_id: str
+    ) -> list[dict[str, Any]]:
+        """Order durable public messages by Turn, excluding later queued Turns."""
+        canonical = [
+            ModelMessage.model_validate(message)
+            for message in self._initial_turn_state(session_id)["messages"]
+        ]
+        durable = self.conversations.list_messages(session_id)
+        current_id = f"{command_id}:user"
+        current = next(
+            (message for message in durable if message.command_id == current_id), None
+        )
+        if current is None:
+            raise TurnSnapshotCorruption("Host Turn user message is missing")
+
+        eligible_users = [
+            message
+            for message in durable
+            if message.role == "user" and message.sequence <= current.sequence
+        ]
+        eligible_ids = {
+            message.command_id.removesuffix(":user") for message in eligible_users
+        }
+        assistants: dict[str, list[ConversationMessage]] = {}
+        for message in durable:
+            if message.role != "assistant":
+                continue
+            base_id = message.command_id.removesuffix(":assistant")
+            if base_id in eligible_ids:
+                assistants.setdefault(base_id, []).append(message)
+
+        durable_counts: dict[tuple[str, str | None], int] = {}
+        for message in durable:
+            key = (message.role, message.content)
+            durable_counts[key] = durable_counts.get(key, 0) + 1
+        prefix: list[ModelMessage] = []
+        for message in canonical:
+            key = (
+                message.role,
+                message.content if isinstance(message.content, str) else None,
+            )
+            remaining = durable_counts.get(key, 0)
+            if remaining:
+                durable_counts[key] = remaining - 1
+            else:
+                prefix.append(message)
+
+        ordered = list(prefix)
+        for user_message in eligible_users:
+            ordered.append(
+                ModelMessage(role="user", content=user_message.content)
+            )
+            base_id = user_message.command_id.removesuffix(":user")
+            for assistant in assistants.get(base_id, []):
+                ordered.append(
+                    ModelMessage(role="assistant", content=assistant.content)
+                )
+        return [message.model_dump(mode="json") for message in ordered]
+
+    @staticmethod
+    def _apply_host_retry_backoff(state: dict[str, Any]) -> None:
+        if state.get("reason") != "engine_host_unavailable":
+            return
+        retry_count = max(0, int(state.get("host_retry_count", 0))) + 1
+        state["host_retry_count"] = retry_count
+        state["retry_not_before"] = time.time() + min(
+            0.05 * (2 ** min(retry_count - 1, 10)), 30.0
+        )
 
     async def run_message(
         self,
@@ -593,6 +684,21 @@ class ConversationAPI:
                     "conversation.turn.failed",
                     {
                         "reason": "engine_host_admission_unknown",
+                        "response_status": "reconciliation_required",
+                    },
+                    command.command_id,
+                    ordinal=len(projected),
+                    causation_id=reservation_id,
+                    attempt=attempt,
+                )
+            )
+        except HostExecutionUnknown:
+            projected.append(
+                self._append(
+                    command.session_id,
+                    "conversation.turn.failed",
+                    {
+                        "reason": "engine_host_execution_unknown",
                         "response_status": "reconciliation_required",
                     },
                     command.command_id,

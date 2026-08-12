@@ -31,6 +31,10 @@ class HostAdmissionUnknown(HostUnavailable):
     """Raised when a written run.start has no authoritative admission result."""
 
 
+class HostExecutionUnknown(HostUnavailable):
+    """Raised when an admitted Run loses its authoritative terminal result."""
+
+
 class HostRunRejected(Exception):
     """Raised when a Run cannot be admitted by the Engine Host."""
 
@@ -420,6 +424,14 @@ class EngineHostClient:
             self._fail_runs(failure)
             await self._close_after_request_failure()
             raise failure from exc
+        except HostUnavailable as exc:
+            if not stream.start_write_attempted:
+                raise
+            failure = HostAdmissionUnknown("engine-host run admission is unknown")
+            self._mark_unavailable()
+            self._fail_runs(failure)
+            await self._close_after_request_failure()
+            raise failure from exc
         stream.admission_known = True
         if response.payload["accepted"] is not True:
             rejection_code = response.payload.get("reason")
@@ -779,8 +791,17 @@ class EngineHostClient:
             stream.consumer_closed = True
             stream.closed.set()
             if stream.terminal_envelope is None:
+                stream_error = error
+                if (
+                    stream.accepted
+                    and isinstance(error, HostUnavailable)
+                    and not isinstance(
+                        error, (HostAdmissionUnknown, HostExecutionUnknown)
+                    )
+                ):
+                    stream_error = HostExecutionUnknown(str(error))
                 if stream.failure is None:
-                    stream.failure = error
+                    stream.failure = stream_error
                 while not stream.queue.empty():
                     stream.queue.get_nowait()
                 stream.queue.put_nowait(stream.failure)

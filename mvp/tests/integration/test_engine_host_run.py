@@ -14,6 +14,7 @@ from workbench.models.contracts import ModelMessage
 from workbench.runtime.engine_host import (
     EngineHostClient,
     HostAdmissionUnknown,
+    HostExecutionUnknown,
     HostProtocolError,
     HostRunRejected,
     HostSequenceError,
@@ -131,6 +132,20 @@ async def test_authoritative_terminal_survives_immediate_host_eof() -> None:
         assert client.status.state == "unavailable"
     finally:
         await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_accepted_run_followed_by_eof_requires_reconciliation() -> None:
+    client = EngineHostClient(
+        fake_host_command("accepted_then_eof"), shutdown_timeout=0.05
+    )
+    await client.start()
+    try:
+        with pytest.raises(HostExecutionUnknown):
+            await _collect(client.run_turn(turn()))
+        assert client.status.state == "unavailable"
+    finally:
         await client.aclose()
 
 

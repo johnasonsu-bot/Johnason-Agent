@@ -161,6 +161,8 @@ def respond(command: dict[str, object], mode: str) -> bool:
                 {"terminal": "run.cancelled"},
             )
         write(start_response)
+        if mode == "accepted_then_eof":
+            return True
         if mode == "duplicate_run_response":
             write(start_response)
         if mode in {"delayed_duplicate_terminal", "event_after_terminal"}:
