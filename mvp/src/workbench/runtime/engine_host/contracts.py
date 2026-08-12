@@ -123,7 +123,7 @@ class _RunProviderPayload(_PayloadSchema):
 
 
 class _RunMessagePayload(_PayloadSchema):
-    role: Literal["user"]
+    role: Literal["system", "user", "assistant"]
     content: str
 
 
@@ -136,7 +136,7 @@ class _RunStartCommandPayload(_PayloadSchema):
     attempt: Literal[0]
     agent: _RunAgentPayload
     provider: _RunProviderPayload
-    messages: tuple[_RunMessagePayload, ...] = Field(min_length=1, max_length=1)
+    messages: tuple[_RunMessagePayload, ...] = Field(min_length=1, max_length=256)
     tool_manifest: tuple[()] = ()
     skill_pins: tuple[()] = ()
     workspace_grant: None = None

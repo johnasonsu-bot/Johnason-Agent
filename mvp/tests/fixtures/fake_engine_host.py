@@ -110,7 +110,14 @@ def respond(command: dict[str, object], mode: str) -> bool:
     elif name == "run.start":
         run_id = str(command["run_id"])
         payload = command["payload"]
-        prompt = str(payload["messages"][0]["content"])
+        messages = payload["messages"]
+        prompt = str(messages[0]["content"])
+        if mode == "echo_context":
+            prompt = (
+                f"{len(messages)}:"
+                + ",".join(str(message["role"]) for message in messages)
+                + f":{messages[-1]['content']}"
+            )
         if mode == "ignore_run_start":
             return False
         if mode == "bad_correlation_multi":

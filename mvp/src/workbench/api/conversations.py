@@ -16,10 +16,21 @@ from pydantic import BaseModel, Field
 
 from workbench.agui.mapper import map_domain_event
 from workbench.conversations.models import ConversationMessage, ConversationSession
-from workbench.conversations.repository import ConversationRepository
+from workbench.conversations.repository import (
+    ConversationRepository,
+    TurnSnapshotCorruption,
+)
 from workbench.domain.models import EpochRecord, MissionRecord, ProjectRecord, RunRecord
+from workbench.models.contracts import ModelMessage
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
+from workbench.runtime.engine_host.client import (
+    HostAdmissionUnknown,
+    HostRunRejected,
+    HostUnavailable,
+)
+from workbench.runtime.engine_host.contracts import HostProtocolError
+from workbench.runtime.engine_host.selector import host_run_id_for
 from workbench.workflow.engine import (
     PauseRun,
     ResumeRun,
@@ -129,6 +140,8 @@ class ConversationAPI:
         if runner_mode not in {"python", "engine_host"}:
             raise ValueError("runner selector returned an invalid mode")
         initial_state["runner_mode"] = runner_mode
+        if runner_mode == "engine_host":
+            initial_state["host_run_id"] = host_run_id_for(session_id, command_id)
         turn = self.conversations.enqueue_turn(
             session_id=session_id,
             command_id=command_id,
@@ -176,10 +189,29 @@ class ConversationAPI:
         reservation_id = self._reservation_event_id(session_id, command_id)
         runner_mode = turn.state.get("runner_mode", "python")
         if runner_mode not in {"python", "engine_host"}:
-            raise ValueError("invalid persisted runner mode")
+            raise TurnSnapshotCorruption("invalid persisted runner mode")
+        state = dict(turn.state)
+        state_changed = False
         if "runner_mode" not in turn.state:
-            state = dict(turn.state)
             state["runner_mode"] = "python"
+            state_changed = True
+        if runner_mode == "engine_host":
+            host_run_id = state.get("host_run_id")
+            if host_run_id is None:
+                state["host_run_id"] = host_run_id_for(session_id, command_id)
+                state_changed = True
+            elif not isinstance(host_run_id, str) or not host_run_id:
+                raise TurnSnapshotCorruption("invalid persisted Host run id")
+        try:
+            raw_messages = state.get("messages", [])
+            if not isinstance(raw_messages, list):
+                raise TypeError
+            message_snapshot = tuple(
+                ModelMessage.model_validate(message) for message in raw_messages
+            )
+        except (TypeError, ValueError) as exc:
+            raise TurnSnapshotCorruption("invalid persisted messages") from exc
+        if state_changed:
             self.conversations.save_turn_state(
                 session_id,
                 command_id,
@@ -195,6 +227,12 @@ class ConversationAPI:
             provider_id=turn.provider_id,
             owner_id=turn.owner_id,
             runner_mode=runner_mode,
+            host_run_id=(
+                str(state["host_run_id"])
+                if runner_mode == "engine_host"
+                else None
+            ),
+            message_snapshot=message_snapshot,
         )
         async with self._session_lock(session_id):
             current = self.conversations.load_turn_status(session_id, command_id)
@@ -216,6 +254,10 @@ class ConversationAPI:
                 ):
                     state = dict(current.state)
                     state.update({"phase": "before_model", "retryable": True})
+                    if projected:
+                        state["reason"] = projected[-1].get("value", {}).get(
+                            "reason", "engine_host_unavailable"
+                        )
                     self.conversations.mark_retryable(
                         session_id,
                         command_id,
@@ -225,6 +267,10 @@ class ConversationAPI:
                 elif current is not None and retryable and current.status == "running" and current.owner_id is None:
                     state = dict(current.state)
                     state.update({"phase": "before_model", "retryable": True})
+                    if projected:
+                        state["reason"] = projected[-1].get("value", {}).get(
+                            "reason", "engine_host_unavailable"
+                        )
                     self.conversations.mark_retryable_unowned(
                         session_id, command_id, state=state
                     )
@@ -236,19 +282,47 @@ class ConversationAPI:
                  if item.get("name") in {"turn_finished", "turn_failed"}),
                 "turn_failed",
             )
+            terminal_reason = (
+                projected[-1].get("value", {}).get("reason")
+                if projected
+                else None
+            )
+            terminal_status = (
+                "reconciliation_required"
+                if terminal_reason
+                in {
+                    "engine_host_admission_unknown",
+                    "engine_host_protocol_error",
+                }
+                else ("completed" if terminal_name == "turn_finished" else "failed")
+            )
             terminal_state = {
-                "phase": (
-                    "completed" if terminal_name == "turn_finished" else "failed"
-                ),
+                "phase": terminal_status,
                 "messages": [],
                 "events": [],
                 "runner_mode": runner_mode,
+                **({"reason": terminal_reason} if terminal_reason is not None else {}),
             }
+            if runner_mode == "engine_host" and terminal_status == "completed":
+                answer = "".join(
+                    str(item.get("delta", ""))
+                    for item in projected
+                    if item.get("type") == "TEXT_MESSAGE_CONTENT"
+                )
+                if answer:
+                    self.conversations.append_message(
+                        ConversationMessage(
+                            session_id=session_id,
+                            command_id=f"{command_id}:assistant",
+                            role="assistant",
+                            content=answer,
+                        )
+                    )
             self.conversations.finish_turn(
                 session_id,
                 command_id,
                 owner_id=command.owner_id or "",
-                status="completed" if terminal_name == "turn_finished" else "failed",
+                status=terminal_status,
                 state=terminal_state,
                 result=projected,
             )
@@ -278,7 +352,9 @@ class ConversationAPI:
         )
 
     def _resolve_provider_id(self, provider_id: str | None) -> str:
-        resolver = getattr(self.runner, "_resolve_profile", None)
+        resolver = getattr(self.runner, "resolve_profile", None)
+        if not callable(resolver):
+            resolver = getattr(self.runner, "_resolve_profile", None)
         if callable(resolver):
             profile = resolver(provider_id)
             return str(profile.id)
@@ -286,7 +362,9 @@ class ConversationAPI:
 
     def _initial_turn_state(self, session_id: str) -> dict[str, Any]:
         messages: list[dict[str, Any]] = []
-        model_messages = getattr(self.runner, "_model_messages", None)
+        model_messages = getattr(self.runner, "model_messages", None)
+        if not callable(model_messages):
+            model_messages = getattr(self.runner, "_model_messages", None)
         if callable(model_messages):
             for message in model_messages(session_id):
                 if hasattr(message, "model_dump"):
@@ -508,6 +586,66 @@ class ConversationAPI:
                         attempt=attempt,
                     )
                 )
+        except HostAdmissionUnknown:
+            projected.append(
+                self._append(
+                    command.session_id,
+                    "conversation.turn.failed",
+                    {
+                        "reason": "engine_host_admission_unknown",
+                        "response_status": "reconciliation_required",
+                    },
+                    command.command_id,
+                    ordinal=len(projected),
+                    causation_id=reservation_id,
+                    attempt=attempt,
+                )
+            )
+        except HostProtocolError:
+            projected.append(
+                self._append(
+                    command.session_id,
+                    "conversation.turn.failed",
+                    {
+                        "reason": "engine_host_protocol_error",
+                        "response_status": "reconciliation_required",
+                    },
+                    command.command_id,
+                    ordinal=len(projected),
+                    causation_id=reservation_id,
+                    attempt=attempt,
+                )
+            )
+        except HostUnavailable:
+            retryable = True
+            projected.append(
+                self._append(
+                    command.session_id,
+                    "conversation.turn.retryable",
+                    {"reason": "engine_host_unavailable"},
+                    command.command_id,
+                    ordinal=len(projected),
+                    causation_id=reservation_id,
+                    attempt=attempt,
+                )
+            )
+        except HostRunRejected:
+            projected.append(
+                self._append(
+                    command.session_id,
+                    "conversation.turn.failed",
+                    {
+                        "reason": "engine_host_rejected",
+                        "response_status": self._terminal_status(
+                            command.session_id, "conversation.turn.failed"
+                        ),
+                    },
+                    command.command_id,
+                    ordinal=len(projected),
+                    causation_id=reservation_id,
+                    attempt=attempt,
+                )
+            )
         except ValueError:
             raise
         except Exception:

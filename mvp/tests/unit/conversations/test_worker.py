@@ -7,6 +7,7 @@ import pytest
 
 from workbench.api.app import AppSettings, create_app
 from workbench.conversations.repository import ConversationRepository
+from workbench.conversations.repository import TurnSnapshotCorruption
 from workbench.conversations.worker import ConversationTaskWorker
 
 
@@ -64,6 +65,15 @@ class ExplodingAPI:
 
     def record_worker_retryable(self, _session_id: str, _command_id: str, *, detail: str) -> None:
         self.retry_details.append(detail)
+
+
+class CorruptSnapshotAPI:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def process_queued_turn(self, _session_id: str, _command_id: str) -> None:
+        self.calls += 1
+        raise TurnSnapshotCorruption("invalid persisted runner mode")
 
 
 async def _wait_for(predicate, timeout: float = 1.0) -> None:
@@ -166,3 +176,25 @@ async def test_worker_exception_marks_retryable_with_type_only(tmp_path: Path) -
     await worker.stop()
 
     assert api.retry_details[0] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_worker_fails_corrupt_snapshot_once_without_retry(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "corrupt.sqlite")
+    _enqueue(repository)
+    api = CorruptSnapshotAPI()
+    worker = ConversationTaskWorker(repository, api, poll_interval=0.001)
+
+    await worker.start()
+    await _wait_for(
+        lambda: repository.load_turn_status("session-1", "turn-1").status == "failed"
+    )
+    await asyncio.sleep(0.01)
+    await worker.stop()
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None
+    assert turn.owner_id is None
+    assert turn.lease_expires_at == 0
+    assert turn.state["reason"] == "snapshot_corrupt"
+    assert api.calls == 1

@@ -12,6 +12,11 @@ from workbench.workflow.store import WorkflowStore
 
 
 TERMINAL_TURN_STATES = {"completed", "failed", "reconciliation_required"}
+TURN_ROUTING_METADATA = ("runner_mode", "host_run_id")
+
+
+class TurnSnapshotCorruption(ValueError):
+    """A durable Turn snapshot cannot be interpreted or safely retried."""
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,33 @@ class ConversationRepository:
             ).fetchone()
         assert row is not None
         return ConversationSession.model_validate_json(row["record_json"])
+
+    @staticmethod
+    def _preserve_turn_routing_metadata(
+        connection: Any,
+        session_id: str,
+        command_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        row = connection.execute(
+            """
+            SELECT state_json FROM conversation_turns
+            WHERE session_id = ? AND command_id = ?
+            """,
+            (session_id, command_id),
+        ).fetchone()
+        merged = dict(state)
+        if row is None:
+            return merged
+        persisted = json.loads(row["state_json"])
+        for key in TURN_ROUTING_METADATA:
+            if key in persisted:
+                if key in merged and merged[key] != persisted[key]:
+                    raise TurnSnapshotCorruption(
+                        "turn routing metadata cannot change"
+                    )
+                merged[key] = persisted[key]
+        return merged
 
     def append_message(self, message: ConversationMessage) -> ConversationMessage:
         self.create_session(message.session_id)
@@ -320,6 +352,9 @@ class ConversationRepository:
         state: dict[str, Any],
     ) -> None:
         with self.store.connect() as connection:
+            state = self._preserve_turn_routing_metadata(
+                connection, session_id, command_id, state
+            )
             result = connection.execute(
                 """
                 UPDATE conversation_turns
@@ -344,6 +379,9 @@ class ConversationRepository:
     ) -> None:
         """Seal a runtime-released turn as retryable without reclaiming it."""
         with self.store.connect() as connection:
+            state = self._preserve_turn_routing_metadata(
+                connection, session_id, command_id, state
+            )
             result = connection.execute(
                 """
                 UPDATE conversation_turns
@@ -544,6 +582,9 @@ class ConversationRepository:
         state: dict[str, Any],
     ) -> None:
         with self.store.connect() as connection:
+            state = self._preserve_turn_routing_metadata(
+                connection, session_id, command_id, state
+            )
             result = connection.execute(
                 """
                 UPDATE conversation_turns
@@ -597,6 +638,9 @@ class ConversationRepository:
         state: dict[str, Any],
     ) -> None:
         with self.store.connect() as connection:
+            state = self._preserve_turn_routing_metadata(
+                connection, session_id, command_id, state
+            )
             result = connection.execute(
                 """
                 UPDATE conversation_turns
@@ -628,6 +672,9 @@ class ConversationRepository:
         if status not in TERMINAL_TURN_STATES:
             raise ValueError("turn terminal status is invalid")
         with self.store.connect() as connection:
+            state = self._preserve_turn_routing_metadata(
+                connection, session_id, command_id, state
+            )
             changed = connection.execute(
                 """
                 UPDATE conversation_turns
@@ -648,6 +695,23 @@ class ConversationRepository:
             )
         if changed.rowcount != 1:
             raise RuntimeError("turn claim is no longer owned")
+
+    def fail_corrupt_turn(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        owner_id: str,
+    ) -> None:
+        """Terminate one owned corrupt snapshot without making it retryable."""
+        self.finish_turn(
+            session_id,
+            command_id,
+            owner_id=owner_id,
+            status="failed",
+            state={"phase": "failed", "reason": "snapshot_corrupt"},
+            result=[],
+        )
 
     def claim_tool_effect(
         self,
@@ -711,6 +775,9 @@ class ConversationRepository:
         now = time.time()
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            turn_state = self._preserve_turn_routing_metadata(
+                connection, session_id, command_id, turn_state
+            )
             effect = connection.execute(
                 """
                 UPDATE conversation_tool_effects

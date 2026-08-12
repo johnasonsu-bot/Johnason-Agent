@@ -6,7 +6,11 @@ import asyncio
 from typing import Protocol
 from uuid import uuid4
 
-from workbench.conversations.repository import ConversationRepository, TurnStatus
+from workbench.conversations.repository import (
+    ConversationRepository,
+    TurnSnapshotCorruption,
+    TurnStatus,
+)
 
 
 class ConversationTaskAPI(Protocol):
@@ -82,9 +86,21 @@ class ConversationTaskWorker:
                 )
             except asyncio.CancelledError:
                 raise
+            except TurnSnapshotCorruption:
+                self._fail_corrupt(turn)
             except Exception as error:
                 self._mark_retryable(turn, error)
                 await asyncio.sleep(self.poll_interval)
+
+    def _fail_corrupt(self, turn: TurnStatus) -> None:
+        current = self.repository.load_turn_status(turn.session_id, turn.command_id)
+        if current is None or current.owner_id != self.owner_id or current.status != "running":
+            return
+        self.repository.fail_corrupt_turn(
+            turn.session_id,
+            turn.command_id,
+            owner_id=self.owner_id,
+        )
 
     def _mark_retryable(self, turn: TurnStatus, error: Exception | None = None) -> None:
         current = self.repository.load_turn_status(turn.session_id, turn.command_id)

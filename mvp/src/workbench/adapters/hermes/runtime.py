@@ -604,6 +604,14 @@ class AgentRuntime:
             )
         return messages
 
+    def resolve_profile(self, provider_id: str | None = None) -> ProviderProfileRecord:
+        """Expose canonical Provider resolution to runner composition."""
+        return self._resolve_profile(provider_id)
+
+    def model_messages(self, session_id: str) -> list[ModelMessage]:
+        """Expose the canonical public conversation snapshot to a selected runner."""
+        return self._model_messages(session_id)
+
     def _save_checkpoint(
         self,
         command: RunAgentTurn,

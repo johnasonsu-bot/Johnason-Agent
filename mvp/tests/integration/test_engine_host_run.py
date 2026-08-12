@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from workbench.runtime.agent_loop import RunAgentTurn
+from workbench.models.contracts import ModelMessage
 from workbench.runtime.engine_host import (
     EngineHostClient,
     HostAdmissionUnknown,
@@ -70,6 +71,45 @@ async def test_run_stream_maps_monotonic_host_events_to_agent_events() -> None:
         "turn_finished",
     ]
     assert events[1].payload == {"text": "fake: hello"}
+
+
+@pytest.mark.asyncio
+async def test_host_lifecycle_uses_per_turn_identity_without_changing_public_run_id() -> None:
+    client = EngineHostClient(fake_host_command("normal"))
+    await client.start()
+    try:
+        first = await _collect(client.run_turn(turn(host_run_id="host-turn-1")))
+        second = await _collect(
+            client.run_turn(
+                turn(command_id="command-2", host_run_id="host-turn-2")
+            )
+        )
+    finally:
+        await client.aclose()
+
+    assert {event.run_id for event in [*first, *second]} == {"run-1"}
+
+
+@pytest.mark.asyncio
+async def test_host_run_start_receives_the_canonical_multi_turn_snapshot() -> None:
+    client = EngineHostClient(fake_host_command("echo_context"))
+    await client.start()
+    try:
+        events = await _collect(
+            client.run_turn(
+                turn(
+                    message_snapshot=(
+                        ModelMessage(role="user", content="first"),
+                        ModelMessage(role="assistant", content="answer"),
+                        ModelMessage(role="user", content="next"),
+                    )
+                )
+            )
+        )
+    finally:
+        await client.aclose()
+
+    assert events[1].payload == {"text": "fake: 3:user,assistant,user:next"}
 
 
 @pytest.mark.asyncio

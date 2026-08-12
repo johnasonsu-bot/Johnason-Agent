@@ -1,4 +1,5 @@
 import asyncio
+import json
 import socket
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,11 @@ from fastapi.testclient import TestClient
 import workbench.main as main
 from workbench.api.app import AppSettings, create_app
 from workbench.conversations.worker import ConversationTaskWorker
+from workbench.conversations.models import ConversationMessage
+from workbench.conversations.repository import ConversationRepository
+from workbench.models.profiles import ProviderProfileRecord
+from workbench.providers.repository import ProviderRepository
+from workbench.runtime.engine_host.selector import RunnerSelector
 from workbench.settings import WorkbenchSettings
 
 
@@ -154,6 +160,56 @@ def test_engine_host_settings_survive_json_round_trip(tmp_path: Path) -> None:
     assert restored.engine_host_provider_allowlist == ("lmstudio", "local-secondary")
 
 
+def test_engine_host_settings_are_parsed_from_json_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = r"C:\Program Files\Hermes Engine\engine-host.exe"
+    monkeypatch.setenv("WORKBENCH_ENGINE_HOST_ENABLED", "true")
+    monkeypatch.setenv(
+        "WORKBENCH_ENGINE_HOST_COMMAND_JSON",
+        json.dumps([executable, "--stdio", "--label=local host"]),
+    )
+    monkeypatch.setenv(
+        "WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON",
+        json.dumps(["lmstudio", "studio-primary"]),
+    )
+
+    settings = main._settings_from_environment(
+        WorkbenchSettings(runtime_dir=tmp_path)
+    )
+
+    assert settings.engine_host_enabled is True
+    assert settings.engine_host_command == (
+        executable,
+        "--stdio",
+        "--label=local host",
+    )
+    assert settings.engine_host_provider_allowlist == (
+        "lmstudio",
+        "studio-primary",
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("WORKBENCH_ENGINE_HOST_ENABLED", "sometimes"),
+        ("WORKBENCH_ENGINE_HOST_COMMAND_JSON", '"engine-host --stdio"'),
+        ("WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON", '["lmstudio", 7]'),
+    ],
+)
+def test_engine_host_environment_rejects_noncanonical_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match="engine host"):
+        main._settings_from_environment(WorkbenchSettings(runtime_dir=tmp_path))
+
+
 def test_build_app_rejects_enabled_engine_host_without_command(tmp_path: Path) -> None:
     settings = WorkbenchSettings(runtime_dir=tmp_path, engine_host_enabled=True)
 
@@ -212,6 +268,56 @@ def test_build_app_composes_enabled_host_and_selector(
     assert isinstance(app_settings, AppSettings)
     assert app_settings.runner is selector
     assert app_settings.runner_lifecycle is selector
+
+
+def test_real_build_app_selector_resolves_default_deepseek_and_context(
+    tmp_path: Path,
+) -> None:
+    settings = WorkbenchSettings(
+        runtime_dir=tmp_path,
+        engine_host_enabled=True,
+        engine_host_command=("engine-host", "--stdio"),
+        engine_host_provider_allowlist=("lmstudio",),
+    )
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    providers = ProviderRepository(settings.database)
+    providers.save(
+        ProviderProfileRecord(
+            id="studio-primary",
+            name="Local",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234",
+        )
+    )
+    providers.save(
+        ProviderProfileRecord.deepseek(
+            id="deepseek-primary",
+            secret_id="provider/" + "a" * 32,
+        )
+    )
+    conversations = ConversationRepository(settings.database)
+    conversations.create_session("session-1")
+    conversations.append_message(
+        ConversationMessage(
+            session_id="session-1",
+            command_id="earlier:user",
+            role="user",
+            content="earlier",
+        )
+    )
+
+    app = main.build_app(settings)
+    selector = app.state.execution_runner
+    selector.host_runner._status = SimpleNamespace(state="ready")
+
+    assert isinstance(selector, RunnerSelector)
+    assert selector.resolve_profile(None).id == "studio-primary"
+    assert selector.mode_for("session-1", "studio-primary", "local") == "engine_host"
+    assert selector.resolve_profile("deepseek").id == "deepseek-primary"
+    assert selector.mode_for("session-1", "deepseek-primary", "cloud") == "python"
+    assert [message.content for message in selector.model_messages("session-1")] == [
+        "earlier"
+    ]
 
 
 def test_app_starts_host_before_worker_and_closes_after_worker(

@@ -83,7 +83,12 @@ function assertTrustedSender(event: IpcMainInvokeEvent): void {
 
 function childEnvironment(): NodeJS.ProcessEnv {
   const safe: NodeJS.ProcessEnv = { PYTHONUNBUFFERED: "1" };
-  for (const name of ["PATH", "SystemRoot", "WINDIR", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "PYTHONPATH"]) {
+  for (const name of [
+    "PATH", "SystemRoot", "WINDIR", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "PYTHONPATH",
+    "WORKBENCH_ENGINE_HOST_ENABLED",
+    "WORKBENCH_ENGINE_HOST_COMMAND_JSON",
+    "WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON",
+  ]) {
     if (process.env[name] !== undefined) safe[name] = process.env[name];
   }
   return safe;

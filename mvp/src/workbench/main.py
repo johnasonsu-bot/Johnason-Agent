@@ -104,6 +104,7 @@ def build_app(
         )
     )
     app.state.agent_runtime = agent_runtime
+    app.state.execution_runner = selected_runner
     return app
 
 
@@ -224,16 +225,52 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _json_string_array(name: str, value: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"engine host {name} must be a JSON string array") from exc
+    if (
+        not isinstance(parsed, list)
+        or not parsed
+        or any(not isinstance(item, str) or not item for item in parsed)
+    ):
+        raise ValueError(f"engine host {name} must be a non-empty JSON string array")
+    return tuple(parsed)
+
+
+def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings:
+    """Apply the bounded Engine Host environment contract without shell parsing."""
+    updates: dict[str, object] = {}
+    enabled = os.environ.get("WORKBENCH_ENGINE_HOST_ENABLED")
+    if enabled is not None:
+        normalized = enabled.casefold()
+        if normalized not in {"true", "false", "1", "0"}:
+            raise ValueError("engine host enabled must be true or false")
+        updates["engine_host_enabled"] = normalized in {"true", "1"}
+    command = os.environ.get("WORKBENCH_ENGINE_HOST_COMMAND_JSON")
+    if command is not None:
+        updates["engine_host_command"] = _json_string_array("command", command)
+    allowlist = os.environ.get("WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON")
+    if allowlist is not None:
+        updates["engine_host_provider_allowlist"] = _json_string_array(
+            "provider allowlist", allowlist
+        )
+    return settings.model_copy(update=updates)
+
+
 def main() -> None:
     args = _parse_args()
     if not args.electron_owned:
         raise SystemExit("the Workbench backend must be owned by Electron")
     capability, instance_id = _read_bootstrap()
-    settings = WorkbenchSettings(
-        runtime_dir=args.runtime_dir,
-        host=args.host,
-        port=args.port,
-        local_model_base_url=args.lmstudio_base_url,
+    settings = _settings_from_environment(
+        WorkbenchSettings(
+            runtime_dir=args.runtime_dir,
+            host=args.host,
+            port=args.port,
+            local_model_base_url=args.lmstudio_base_url,
+        )
     )
     asyncio.run(_serve_electron_backend(settings, capability, instance_id))
 

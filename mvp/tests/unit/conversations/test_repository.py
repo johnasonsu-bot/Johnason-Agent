@@ -4,7 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from workbench.conversations.models import ConversationSession, agent_message
-from workbench.conversations.repository import ConversationRepository
+import pytest
+
+from workbench.conversations.repository import (
+    ConversationRepository,
+    TurnSnapshotCorruption,
+)
 from workbench.workflow.schema import PHASE1_SCHEMA_VERSION, migrate_phase1
 
 
@@ -54,6 +59,145 @@ def test_expired_running_turn_becomes_retryable(tmp_path: Path) -> None:
 
     assert recovered == [("session-1", "turn-1")]
     assert repository.load_turn_status("session-1", "turn-1").status == "retryable"
+
+
+def test_turn_routing_metadata_survives_every_state_transition(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "metadata.sqlite")
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="studio-primary",
+        model="local-agent",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "messages": [],
+            "events": [],
+            "runner_mode": "engine_host",
+            "host_run_id": "host-turn-1",
+        },
+    )
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+
+    repository.save_turn_state(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        state={"phase": "finalizing"},
+    )
+    assert repository.load_turn_status("session-1", "turn-1").state == {
+        "phase": "finalizing",
+        "runner_mode": "engine_host",
+        "host_run_id": "host-turn-1",
+    }
+
+    repository.claim_tool_effect(
+        session_id="session-1",
+        command_id="turn-1",
+        tool_call_id="tool-1",
+        tool_name="lookup",
+        arguments={},
+        owner_id="worker",
+    )
+    repository.complete_tool_effect(
+        session_id="session-1",
+        command_id="turn-1",
+        tool_call_id="tool-1",
+        owner_id="worker",
+        result="done",
+        turn_state={"phase": "after_tool"},
+    )
+    assert repository.load_turn_status("session-1", "turn-1").state["runner_mode"] == "engine_host"
+
+    repository.release_turn(
+        "session-1", "turn-1", owner_id="worker", state={"phase": "before_model"}
+    )
+    repository.mark_retryable_unowned(
+        "session-1", "turn-1", state={"phase": "before_model"}
+    )
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+    repository.mark_retryable(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        state={"phase": "before_model"},
+    )
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+    repository.finish_turn(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        status="completed",
+        state={"phase": "completed"},
+        result=[],
+    )
+
+    terminal = repository.load_turn_status("session-1", "turn-1")
+    assert terminal is not None
+    assert terminal.state == {
+        "phase": "completed",
+        "runner_mode": "engine_host",
+        "host_run_id": "host-turn-1",
+    }
+
+
+def test_turn_routing_metadata_rejects_an_attempted_change(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "immutable-metadata.sqlite")
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="studio-primary",
+        model="local-agent",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "messages": [],
+            "events": [],
+            "runner_mode": "engine_host",
+            "host_run_id": "host-turn-1",
+        },
+    )
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+
+    with pytest.raises(TurnSnapshotCorruption, match="routing metadata cannot change"):
+        repository.save_turn_state(
+            "session-1",
+            "turn-1",
+            owner_id="worker",
+            state={"phase": "before_model", "runner_mode": "python"},
+        )
+
+    current = repository.load_turn_status("session-1", "turn-1")
+    assert current is not None
+    assert current.state["runner_mode"] == "engine_host"
+
+
+def test_legacy_terminal_without_routing_metadata_remains_readable(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "legacy-terminal.sqlite")
+    _enqueue(repository)
+    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None
+
+    repository.finish_turn(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        status="failed",
+        state={"phase": "failed"},
+        result=[],
+    )
+
+    terminal = repository.load_turn_status("session-1", "turn-1")
+    assert terminal is not None
+    assert terminal.state == {"phase": "failed"}
 
 
 def test_messages_and_provider_state_are_separate(tmp_path: Path) -> None:

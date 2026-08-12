@@ -22,6 +22,11 @@ mkdirSync(runtimeDir, { recursive: true });
 const events = path.join(runtimeDir, "backend-events.log");
 const record = (event) => appendFileSync(events, event + "\\n");
 record("started");
+record("engine-host-env:" + JSON.stringify({
+  enabled: process.env.WORKBENCH_ENGINE_HOST_ENABLED,
+  command: process.env.WORKBENCH_ENGINE_HOST_COMMAND_JSON,
+  allowlist: process.env.WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON,
+}));
 let bootstrap = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => { bootstrap += chunk; });
@@ -82,6 +87,35 @@ test("backend liveness pipe stays open through normal startup", async ({}, testI
     await app.firstWindow();
     await expect.poll(async () => eventsText(events)).toContain("ready");
     await expect.poll(async () => eventsText(events)).not.toContain("stdin-eof");
+  } finally {
+    await app.close();
+  }
+});
+
+test("engine host JSON settings cross the sanitized backend environment unchanged", async ({}, testInfo) => {
+  const executable = await writeLivenessBackend(testInfo.outputPath("fixture"));
+  const runtimeDir = testInfo.outputPath("runtime");
+  const events = path.join(runtimeDir, "backend-events.log");
+  const command = JSON.stringify(["C:\\Program Files\\Hermes Engine\\engine-host.exe", "--stdio", "--label=local host"]);
+  const allowlist = JSON.stringify(["lmstudio", "studio-primary"]);
+  const app = await electron.launch({
+    args: [path.resolve(".")],
+    env: {
+      ...process.env,
+      HERMES_PYTHON: executable,
+      HERMES_RUNTIME_DIR: runtimeDir,
+      WORKBENCH_ENGINE_HOST_ENABLED: "true",
+      WORKBENCH_ENGINE_HOST_COMMAND_JSON: command,
+      WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON: allowlist,
+    },
+  });
+
+  try {
+    await app.firstWindow();
+    await expect.poll(async () => eventsText(events)).toContain("ready");
+    await expect.poll(async () => eventsText(events)).toContain(
+      `engine-host-env:${JSON.stringify({ enabled: "true", command, allowlist })}`,
+    );
   } finally {
     await app.close();
   }

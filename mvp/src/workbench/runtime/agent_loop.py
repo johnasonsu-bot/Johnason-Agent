@@ -6,7 +6,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from workbench.models.contracts import ToolDefinition
+from workbench.models.contracts import ModelMessage, ToolDefinition
 
 
 class RunAgentTurn(BaseModel):
@@ -22,6 +22,8 @@ class RunAgentTurn(BaseModel):
     provider_id: str | None = None
     owner_id: str | None = None
     runner_mode: Literal["python", "engine_host"] | None = None
+    host_run_id: str | None = None
+    message_snapshot: tuple[ModelMessage, ...] = ()
 
 
 class AgentEvent(BaseModel):

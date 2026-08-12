@@ -308,13 +308,14 @@ class EngineHostClient:
         self, command: RunAgentTurn
     ) -> AsyncIterator[AgentEvent]:
         """Start one accepted G1 Run and stream its public Agent events."""
+        host_run_id = command.host_run_id or command.run_id
         if command.provider_id != "lmstudio":
             raise HostRunRejected("secret-bearing provider is unavailable in G1")
         if self._status.state != "ready":
             raise HostUnavailable("engine-host must be ready before run")
-        if command.run_id in self._terminal_tombstones:
+        if host_run_id in self._terminal_tombstones:
             raise HostRunRejected("engine-host run id is already terminated")
-        if command.run_id in self._active_runs:
+        if host_run_id in self._active_runs:
             raise HostRunRejected("engine-host run is already active")
         if len(self._active_runs) >= MAX_ACTIVE_RUNS:
             raise HostRunRejected("engine-host active run capacity reached")
@@ -332,10 +333,10 @@ class EngineHostClient:
             raise failure
 
         stream = _RunStream()
-        self._active_runs[command.run_id] = stream
+        self._active_runs[host_run_id] = stream
         try:
             admission_task = asyncio.create_task(
-                self._admit_run(stream, command)
+                self._admit_run(stream, command, host_run_id)
             )
             stream.admission_task = admission_task
             await self._await_admission(admission_task)
@@ -360,11 +361,11 @@ class EngineHostClient:
             stream.closed.set()
             try:
                 if should_cancel:
-                    await self.cancel(command.run_id, "consumer_closed")
+                    await self.cancel(host_run_id, "consumer_closed")
             finally:
                 if stream.terminal_name is not None:
-                    self._remember_terminal(command.run_id, stream.terminal_name)
-                self._active_runs.pop(command.run_id, None)
+                    self._remember_terminal(host_run_id, stream.terminal_name)
+                self._active_runs.pop(host_run_id, None)
 
     async def _await_admission(
         self, admission_task: asyncio.Task[HostEnvelope]
@@ -381,8 +382,16 @@ class EngineHostClient:
             raise cancelled
 
     async def _admit_run(
-        self, stream: _RunStream, command: RunAgentTurn
+        self, stream: _RunStream, command: RunAgentTurn, host_run_id: str
     ) -> HostEnvelope:
+        messages = [
+            {"role": message.role, "content": message.content}
+            for message in command.message_snapshot
+            if message.role in {"system", "user", "assistant"}
+            and isinstance(message.content, str)
+        ]
+        if not messages:
+            messages = [{"role": "user", "content": command.prompt}]
         try:
             response = await self._request(
                 "run.start",
@@ -391,14 +400,14 @@ class EngineHostClient:
                     "attempt": 0,
                     "agent": {"id": command.owner_id or "agent", "role": "worker"},
                     "provider": {"id": "lmstudio", "model": command.model},
-                    "messages": [{"role": "user", "content": command.prompt}],
+                    "messages": messages,
                     "tool_manifest": [],
                     "skill_pins": [],
                     "workspace_grant": None,
                     "deadline_ms": 120_000,
                     "trace": {"traceparent": command.command_id},
                 },
-                run_id=command.run_id,
+                run_id=host_run_id,
                 on_write_attempt=lambda: setattr(
                     stream, "start_write_attempted", True
                 ),
