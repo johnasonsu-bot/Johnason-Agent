@@ -43,6 +43,7 @@ class AgentEvent(BaseModel):
     session_id: str
     run_id: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    tool_read_only: bool | None = None
 
 
 @runtime_checkable

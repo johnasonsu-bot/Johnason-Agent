@@ -201,6 +201,12 @@ class ConversationAPI:
                 state["runner_mode"] = "python"
                 state_changed = True
             if runner_mode == "engine_host":
+                active_generation = getattr(self.runner, "host_generation", None)
+                if not isinstance(active_generation, str) or not active_generation:
+                    raise TurnSnapshotCorruption("Host generation is unavailable")
+                if state.get("active_host_generation") != active_generation:
+                    state["active_host_generation"] = active_generation
+                    state_changed = True
                 host_run_id = state.get("host_run_id")
                 if host_run_id is None:
                     state["host_run_id"] = host_run_id_for(session_id, command_id)
@@ -670,6 +676,8 @@ class ConversationAPI:
         retryable = False
         try:
             async for event in self.runner.run_turn(command):  # type: ignore[union-attr]
+                if command.runner_mode == "engine_host":
+                    self._persist_host_effect_observation(command, event)
                 domain_type, payload = _public_turn_event(event)
                 payload["command_id"] = command.command_id
                 retryable = retryable or domain_type == "conversation.turn.retryable"
@@ -796,6 +804,39 @@ class ConversationAPI:
             )
         self._record_applied_interventions(command.session_id)
         return projected, retryable
+
+    def _persist_host_effect_observation(
+        self, command: RunAgentTurn, event: AgentEvent
+    ) -> None:
+        if event.kind not in {"tool_started", "tool_finished", "tool_failed"}:
+            return
+        current = self.conversations.load_turn_status(
+            command.session_id, command.command_id
+        )
+        if (
+            current is None
+            or current.status != "running"
+            or current.owner_id != command.owner_id
+        ):
+            return
+        state = dict(current.state)
+        unfinished = {
+            str(item)
+            for item in state.get("unfinished_write_tool_ids", [])
+            if str(item)
+        }
+        tool_call_id = str(event.payload.get("tool_call_id", ""))
+        if event.kind == "tool_started" and event.tool_read_only is False:
+            unfinished.add(tool_call_id)
+        elif event.kind in {"tool_finished", "tool_failed"}:
+            unfinished.discard(tool_call_id)
+        state["unfinished_write_tool_ids"] = sorted(unfinished)
+        self.conversations.save_turn_state(
+            command.session_id,
+            command.command_id,
+            owner_id=command.owner_id or "",
+            state=state,
+        )
 
     def _terminal_status(self, session_id: str, event_type: str) -> str:
         if self._status(session_id) == "paused":

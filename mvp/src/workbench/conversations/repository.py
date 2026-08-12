@@ -364,54 +364,102 @@ class ConversationRepository:
         return self._turn_status(claimed)
 
     def recover_expired_turns(self, *, now: float | None = None) -> list[tuple[str, str]]:
-        """Release leases left by a stopped Worker and make them retryable."""
+        """Classify expired leases before releasing them from a stopped Worker."""
         current = time.time() if now is None else now
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
-                SELECT session_id, command_id FROM conversation_turns
+                SELECT session_id, command_id, state_json FROM conversation_turns
                 WHERE status = 'running' AND lease_expires_at <= ?
                 ORDER BY updated_at, session_id, command_id
                 """,
                 (current,),
             ).fetchall()
-            connection.execute(
-                """
-                UPDATE conversation_turns
-                SET status = 'retryable', owner_id = NULL,
-                    lease_expires_at = 0, updated_at = ?
-                WHERE status = 'running' AND lease_expires_at <= ?
-                """,
-                (current, current),
-            )
+            for row in rows:
+                self._recover_host_or_python_turn(connection, row, current)
             connection.commit()
         return [(row["session_id"], row["command_id"]) for row in rows]
 
     def recover_owned_turns(self, owner_id: str) -> list[tuple[str, str]]:
-        """Release turns owned by a Worker that is stopping after cancellation."""
+        """Classify turns owned by a Worker that is stopping after cancellation."""
         now = time.time()
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
                 """
-                SELECT session_id, command_id FROM conversation_turns
+                SELECT session_id, command_id, state_json FROM conversation_turns
                 WHERE status = 'running' AND owner_id = ?
                 ORDER BY updated_at, session_id, command_id
                 """,
                 (owner_id,),
             ).fetchall()
-            connection.execute(
-                """
-                UPDATE conversation_turns
-                SET status = 'retryable', owner_id = NULL,
-                    lease_expires_at = 0, updated_at = ?
-                WHERE status = 'running' AND owner_id = ?
-                """,
-                (now, owner_id),
-            )
+            for row in rows:
+                self._recover_host_or_python_turn(connection, row, now)
             connection.commit()
         return [(row["session_id"], row["command_id"]) for row in rows]
+
+    def _recover_host_or_python_turn(
+        self, connection: Any, row: Any, recovered_at: float
+    ) -> None:
+        state = json.loads(row["state_json"])
+        status = "retryable"
+        result_json = None
+        if state.get("runner_mode") == "engine_host":
+            active_generation = state.get("active_host_generation")
+            if not isinstance(active_generation, str) or not active_generation:
+                active_generation = self.host_generation
+            unfinished = state.get("unfinished_write_tool_ids", [])
+            if not isinstance(unfinished, list) or unfinished:
+                status = "reconciliation_required"
+                result_json = "[]"
+                state.update(
+                    {
+                        "phase": status,
+                        "reason": "engine_host_unknown_write_effect",
+                        "host_failure_phase": "unknown_write_effect",
+                    }
+                )
+                self._clear_retry_metadata(state)
+            else:
+                if not isinstance(active_generation, str) or not active_generation:
+                    raise TurnSnapshotCorruption("Host generation is unavailable")
+                state.update(
+                    {
+                        "phase": "before_model",
+                        "reason": "engine_host_unavailable",
+                        "retryable": True,
+                        "failed_host_generation": active_generation,
+                    }
+                )
+                state.pop("retry_not_before", None)
+                state.pop("host_retry_count", None)
+        connection.execute(
+            """
+            UPDATE conversation_turns
+            SET status = ?, owner_id = NULL, lease_expires_at = 0,
+                state_json = ?, result_json = ?, updated_at = ?
+            WHERE session_id = ? AND command_id = ? AND status = 'running'
+            """,
+            (
+                status,
+                json.dumps(state, sort_keys=True),
+                result_json,
+                recovered_at,
+                row["session_id"],
+                row["command_id"],
+            ),
+        )
+
+    @staticmethod
+    def _clear_retry_metadata(state: dict[str, Any]) -> None:
+        for key in (
+            "retryable",
+            "failed_host_generation",
+            "retry_not_before",
+            "host_retry_count",
+        ):
+            state.pop(key, None)
 
     def mark_retryable(
         self,
@@ -517,6 +565,8 @@ class ConversationRepository:
                 )
                 state.pop("retry_not_before", None)
                 state.pop("host_retry_count", None)
+            else:
+                self._clear_retry_metadata(state)
             result = connection.execute(
                 """
                 UPDATE conversation_turns

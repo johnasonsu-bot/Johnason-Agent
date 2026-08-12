@@ -103,6 +103,133 @@ def test_expired_running_turn_becomes_retryable(tmp_path: Path) -> None:
     assert repository.load_turn_status("session-1", "turn-1").status == "retryable"
 
 
+def test_expired_engine_host_write_turn_requires_reconciliation(tmp_path: Path) -> None:
+    repository = ConversationRepository(
+        tmp_path / "expired-host-write.sqlite", host_generation="generation-2"
+    )
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="lmstudio",
+        model="local-agent",
+        prompt="hello",
+        initial_state={
+            "phase": "running",
+            "runner_mode": "engine_host",
+            "active_host_generation": "generation-1",
+            "unfinished_write_tool_ids": ["write-1"],
+            "retryable": True,
+            "failed_host_generation": "stale-generation",
+            "retry_not_before": 9999999999,
+            "host_retry_count": 4,
+        },
+    )
+    repository.claim_next_turn(owner_id="crashed-worker", lease_seconds=0.001)
+    time.sleep(0.01)
+
+    assert repository.recover_expired_turns(now=time.time()) == [
+        ("session-1", "turn-1")
+    ]
+
+    recovered = repository.load_turn_status("session-1", "turn-1")
+    assert recovered is not None
+    assert recovered.status == "reconciliation_required"
+    assert recovered.state["runner_mode"] == "engine_host"
+    assert recovered.state["host_failure_phase"] == "unknown_write_effect"
+    for key in (
+        "retryable",
+        "failed_host_generation",
+        "retry_not_before",
+        "host_retry_count",
+    ):
+        assert key not in recovered.state
+
+
+def test_expired_engine_host_read_only_turn_waits_for_new_generation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "expired-host-read.sqlite"
+    repository = ConversationRepository(database, host_generation="generation-1")
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="lmstudio",
+        model="local-agent",
+        prompt="hello",
+        initial_state={
+            "phase": "running",
+            "runner_mode": "engine_host",
+            "active_host_generation": "generation-1",
+            "unfinished_write_tool_ids": [],
+        },
+    )
+    repository.claim_next_turn(owner_id="crashed-worker", lease_seconds=0.001)
+    time.sleep(0.01)
+
+    repository.recover_expired_turns(now=time.time())
+
+    recovered = repository.load_turn_status("session-1", "turn-1")
+    assert recovered is not None
+    assert recovered.status == "retryable"
+    assert recovered.state["runner_mode"] == "engine_host"
+    assert recovered.state["failed_host_generation"] == "generation-1"
+    assert repository.claim_next_turn(owner_id="same-generation") is None
+    assert (
+        ConversationRepository(
+            database, host_generation="generation-2"
+        ).claim_next_turn(owner_id="new-generation")
+        is not None
+    )
+
+
+def test_reconciliation_transition_clears_stale_retry_metadata(tmp_path: Path) -> None:
+    repository = ConversationRepository(
+        tmp_path / "clear-retry.sqlite", host_generation="generation-2"
+    )
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="lmstudio",
+        model="local-agent",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "runner_mode": "engine_host",
+            "retryable": True,
+            "failed_host_generation": "generation-1",
+            "retry_not_before": 123.0,
+            "host_retry_count": 2,
+        },
+    )
+    claimed = repository.claim_next_turn(owner_id="worker")
+    assert claimed is not None
+
+    repository.transition_host_failure(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        failure_phase="unknown_write_effect",
+        retryable=False,
+    )
+
+    recovered = repository.load_turn_status("session-1", "turn-1")
+    assert recovered is not None
+    assert recovered.status == "reconciliation_required"
+    for key in (
+        "retryable",
+        "failed_host_generation",
+        "retry_not_before",
+        "host_retry_count",
+    ):
+        assert key not in recovered.state
+
+
 def test_turn_routing_metadata_survives_every_state_transition(tmp_path: Path) -> None:
     repository = ConversationRepository(tmp_path / "metadata.sqlite")
     repository.create_session("session-1")

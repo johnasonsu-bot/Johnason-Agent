@@ -22,9 +22,9 @@ TASK5_SCAN_ROOT="$(mktemp -d /tmp/hermes-task5-leak.XXXXXX)"
 ## Results
 
 - Offline Engine Host acceptance: 22 passed.
-- Focused Host contract, lifecycle, worker, and exception regression: 101 passed.
-- Related Engine Host, queue, worker, repository, and AG-UI regression: 174 passed.
-- Backend unit, integration, and acceptance suites: 448 passed, 6 skipped.
+- Focused Host contract, lifecycle, worker, and exception regression: 103 passed.
+- Related Engine Host, queue, worker, repository, and AG-UI regression: 179 passed.
+- Backend unit, integration, and acceptance suites: 453 passed, 6 skipped.
 - Python compile check: passed.
 - Isolated artifact leak acceptance: 1 passed; the strict follow-up scan found no matches in the metadata-only NDJSON artifact.
 - Existing upstream warning: one Starlette `httpx` deprecation warning.
@@ -38,6 +38,8 @@ TASK5_SCAN_ROOT="$(mktemp -d /tmp/hermes-task5-leak.XXXXXX)"
 - Failure outcomes: pre-start, accepted-before-tool, read-only-effect, and protocol failures without an unknown write effect are retryable; an unfinished write effect requires reconciliation.
 - A Run terminal cannot erase an unfinished write effect; after the first valid terminal, later Host events only quarantine the Host and cannot create another durable Turn outcome.
 - Retry routing remains pinned to the Engine Host and is released only by a new Host generation; Python fallback is not used.
+- The active Host generation and unfinished write-tool identifiers are persisted while a Turn runs; expired leases and Worker shutdown classify those facts atomically before releasing ownership.
+- Reconciliation clears every stale retry gate, and a shared Host failure is independently classified for each concurrent Run.
 - Protocol capture records metadata only: message names and identifiers, sequence, direction, and byte count.
 
 ## Known limitations

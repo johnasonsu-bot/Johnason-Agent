@@ -166,6 +166,40 @@ async def test_worker_stop_releases_inflight_turn_for_next_start(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_worker_stop_reconciles_inflight_engine_host_write(tmp_path: Path) -> None:
+    repository = ConversationRepository(
+        tmp_path / "host-write-stop.sqlite", host_generation="generation-1"
+    )
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="lmstudio",
+        model="local-agent",
+        prompt="hello",
+        initial_state={
+            "phase": "running",
+            "runner_mode": "engine_host",
+            "active_host_generation": "generation-1",
+            "unfinished_write_tool_ids": ["write-1"],
+        },
+    )
+    blocking_api = BlockingAPI(repository)
+    worker = ConversationTaskWorker(repository, blocking_api, poll_interval=0.001)
+
+    await worker.start()
+    await _wait_for(lambda: blocking_api.started.is_set())
+    await worker.stop()
+
+    recovered = repository.load_turn_status("session-1", "turn-1")
+    assert recovered is not None
+    assert recovered.status == "reconciliation_required"
+    assert recovered.owner_id is None
+    assert recovered.state["host_failure_phase"] == "unknown_write_effect"
+
+
+@pytest.mark.asyncio
 async def test_worker_exception_marks_retryable_with_type_only(tmp_path: Path) -> None:
     repository = ConversationRepository(tmp_path / "worker.sqlite")
     _enqueue(repository)

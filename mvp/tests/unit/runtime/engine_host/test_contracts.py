@@ -2,9 +2,11 @@ import pytest
 from pydantic import ValidationError
 
 from workbench.runtime.engine_host.client import (
+    EngineHostClient,
     HostAdmissionUnknown,
     HostExecutionError,
     HostSequenceError,
+    _RunStream,
 )
 from workbench.runtime.engine_host.contracts import (
     PROTOCOL_V1,
@@ -49,6 +51,28 @@ def test_host_execution_error_rejects_a_conflicting_durable_outcome(
             retryable=retryable,
             reconciliation_required=reconciliation_required,
         )
+
+
+def test_shared_host_failure_is_reclassified_for_each_active_run() -> None:
+    client = EngineHostClient(("unused-host",))
+    write_run = _RunStream(accepted=True, unfinished_write_tools={"write-1"})
+    read_run = _RunStream(accepted=True, read_only_tool_observed=True)
+    client._active_runs = {"write": write_run, "read": read_run}
+    source_failure = HostExecutionError(
+        code="unknown_write_effect",
+        phase="unknown_write_effect",
+        retryable=False,
+        reconciliation_required=True,
+    )
+
+    client._fail_runs(source_failure)
+
+    assert isinstance(write_run.failure, HostExecutionError)
+    assert write_run.failure.phase == "unknown_write_effect"
+    assert isinstance(read_run.failure, HostExecutionError)
+    assert read_run.failure.phase == "read_only_effect"
+    assert read_run.failure.retryable is True
+    assert read_run.failure is not source_failure
 
 
 def test_event_requires_positive_sequence_and_run_id() -> None:

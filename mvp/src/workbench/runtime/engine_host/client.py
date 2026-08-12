@@ -971,7 +971,22 @@ class EngineHostClient:
             stream.consumer_closed = True
             stream.closed.set()
             if stream.terminal_envelope is None:
-                stream_error = classify_failure(stream, error)
+                if isinstance(error, HostTerminalError):
+                    run_error: Exception = HostTerminalError(error.public_summary)
+                elif isinstance(error, HostSequenceError):
+                    run_error = HostSequenceError(error.public_summary)
+                elif isinstance(error, HostProtocolExecutionError):
+                    run_error = HostProtocolExecutionError(
+                        code="protocol_error",
+                        phase="protocol",
+                        retryable=True,
+                        reconciliation_required=False,
+                    )
+                elif isinstance(error, HostExecutionError):
+                    run_error = HostUnavailable(error.public_summary)
+                else:
+                    run_error = error
+                stream_error = classify_failure(stream, run_error)
                 if stream.failure is None:
                     stream.failure = stream_error
                 while not stream.queue.empty():
@@ -1096,6 +1111,11 @@ class EngineHostClient:
             session_id=command.session_id,
             run_id=command.run_id,
             payload=payload,
+            tool_read_only=(
+                bool(envelope.payload["read_only"])
+                if envelope.name == "agent.tool.started"
+                else None
+            ),
         )
 
     @staticmethod
