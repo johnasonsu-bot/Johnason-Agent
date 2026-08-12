@@ -49,6 +49,7 @@ class AppSettings:
     capability_token: str | None = field(default=None, repr=False)
     service_instance_id: str | None = None
     runner_lifecycle: RunnerLifecycle | None = None
+    host_generation: str | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -68,7 +69,9 @@ def create_app(settings: AppSettings) -> FastAPI:
     )
     event_store = EventStore(settings.database)
     conversation_api = ConversationAPI(
-        conversations=ConversationRepository(settings.database),
+        conversations=ConversationRepository(
+            settings.database, host_generation=settings.host_generation
+        ),
         events=event_store,
         runner=settings.runner,
         engine=engine,

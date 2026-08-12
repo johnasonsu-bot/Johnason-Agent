@@ -101,6 +101,7 @@ def build_app(
             capability_token=capability_token,
             service_instance_id=service_instance_id,
             runner_lifecycle=runner_lifecycle,
+            host_generation=getattr(selected_runner, "host_generation", None),
         )
     )
     app.state.agent_runtime = agent_runtime

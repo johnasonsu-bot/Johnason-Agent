@@ -39,6 +39,7 @@ class TurnStatus:
     lease_expires_at: float
     state: dict[str, Any]
     result: list[dict[str, Any]] | None
+    enqueue_sequence: int
     updated_at: float
 
 
@@ -49,8 +50,11 @@ class ToolEffectClaim:
 
 
 class ConversationRepository:
-    def __init__(self, database: Path) -> None:
+    def __init__(
+        self, database: Path, *, host_generation: str | None = None
+    ) -> None:
         self.store = WorkflowStore(database)
+        self.host_generation = host_generation
 
     def create_session(self, session_id: str) -> ConversationSession:
         session = ConversationSession(session_id=session_id)
@@ -216,8 +220,13 @@ class ConversationRepository:
                 INSERT INTO conversation_turns(
                     session_id, command_id, run_id, provider_id, model, prompt,
                     prompt_digest, status, owner_id, lease_expires_at,
-                    state_json, result_json, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, NULL, ?)
+                    state_json, result_json, enqueue_sequence, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, 0, ?, NULL,
+                    (SELECT COALESCE(MAX(enqueue_sequence), 0) + 1
+                     FROM conversation_turns),
+                    ?
+                )
                 """,
                 (
                     session_id,
@@ -251,20 +260,47 @@ class ConversationRepository:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT * FROM conversation_turns
-                WHERE status IN ('queued', 'retryable')
-                  AND (owner_id IS NULL OR lease_expires_at <= ?)
+                SELECT candidate.* FROM conversation_turns AS candidate
+                WHERE candidate.status IN ('queued', 'retryable')
                   AND (
-                    status = 'queued'
-                    OR COALESCE(
-                        CAST(json_extract(state_json, '$.retry_not_before') AS REAL),
-                        0
-                    ) <= ?
+                    candidate.owner_id IS NULL
+                    OR candidate.lease_expires_at <= ?
                   )
-                ORDER BY updated_at, session_id, command_id
+                  AND (
+                    candidate.status = 'queued'
+                    OR (
+                        json_extract(
+                            candidate.state_json, '$.failed_host_generation'
+                        ) IS NOT NULL
+                        AND ? IS NOT NULL
+                        AND json_extract(
+                            candidate.state_json, '$.failed_host_generation'
+                        ) != ?
+                    )
+                    OR (
+                        json_extract(
+                            candidate.state_json, '$.failed_host_generation'
+                        ) IS NULL
+                        AND COALESCE(
+                            CAST(json_extract(
+                                candidate.state_json, '$.retry_not_before'
+                            ) AS REAL),
+                            0
+                        ) <= ?
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM conversation_turns AS earlier
+                    WHERE earlier.session_id = candidate.session_id
+                      AND earlier.enqueue_sequence < candidate.enqueue_sequence
+                      AND earlier.status NOT IN (
+                        'completed', 'failed', 'reconciliation_required'
+                      )
+                  )
+                ORDER BY candidate.enqueue_sequence
                 LIMIT 1
                 """,
-                (now, now),
+                (now, self.host_generation, self.host_generation, now),
             ).fetchone()
             if row is None:
                 connection.commit()
@@ -278,10 +314,27 @@ class ConversationRepository:
                   AND (owner_id IS NULL OR lease_expires_at <= ?)
                   AND (
                     status = 'queued'
-                    OR COALESCE(
-                        CAST(json_extract(state_json, '$.retry_not_before') AS REAL),
-                        0
-                    ) <= ?
+                    OR (
+                        json_extract(state_json, '$.failed_host_generation')
+                            IS NOT NULL
+                        AND ? IS NOT NULL
+                        AND json_extract(state_json, '$.failed_host_generation') != ?
+                    )
+                    OR (
+                        json_extract(state_json, '$.failed_host_generation') IS NULL
+                        AND COALESCE(
+                            CAST(json_extract(state_json, '$.retry_not_before') AS REAL),
+                            0
+                        ) <= ?
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM conversation_turns AS earlier
+                    WHERE earlier.session_id = conversation_turns.session_id
+                      AND earlier.enqueue_sequence < conversation_turns.enqueue_sequence
+                      AND earlier.status NOT IN (
+                        'completed', 'failed', 'reconciliation_required'
+                      )
                   )
                 """,
                 (
@@ -291,6 +344,8 @@ class ConversationRepository:
                     row["session_id"],
                     row["command_id"],
                     now,
+                    self.host_generation,
+                    self.host_generation,
                     now,
                 ),
             )
@@ -454,6 +509,7 @@ class ConversationRepository:
             lease_expires_at=float(row["lease_expires_at"]),
             state=json.loads(row["state_json"]),
             result=json.loads(row["result_json"]) if row["result_json"] else None,
+            enqueue_sequence=int(row["enqueue_sequence"]),
             updated_at=float(row["updated_at"]),
         )
 
@@ -489,8 +545,14 @@ class ConversationRepository:
                 INSERT INTO conversation_turns(
                         session_id, command_id, run_id, provider_id, model, prompt,
                         prompt_digest, status,
-                        owner_id, lease_expires_at, state_json, result_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL, ?)
+                        owner_id, lease_expires_at, state_json, result_json,
+                        enqueue_sequence, updated_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, NULL,
+                        (SELECT COALESCE(MAX(enqueue_sequence), 0) + 1
+                         FROM conversation_turns),
+                        ?
+                    )
                     """,
                     (
                         session_id,

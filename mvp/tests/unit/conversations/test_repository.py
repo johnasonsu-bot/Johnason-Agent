@@ -49,6 +49,48 @@ def test_only_one_worker_claims_a_queued_turn(tmp_path: Path) -> None:
     assert second is None
 
 
+def test_host_retry_waits_for_new_generation_and_preserves_session_fifo(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "host-generation-fifo.sqlite"
+    repository = ConversationRepository(database, host_generation="generation-1")
+    _enqueue(repository, command_id="turn-1")
+    _enqueue(repository, command_id="turn-2")
+    first = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert first is not None and first.command_id == "turn-1"
+    repository.mark_retryable(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        state={
+            "phase": "before_model",
+            "messages": [],
+            "events": [],
+            "failed_host_generation": "generation-1",
+        },
+    )
+
+    assert repository.claim_next_turn(owner_id="same-generation") is None
+    same_generation = ConversationRepository(
+        database, host_generation="generation-1"
+    )
+    assert same_generation.claim_next_turn(owner_id="same-generation") is None
+
+    restarted = ConversationRepository(database, host_generation="generation-2")
+    recovered = restarted.claim_next_turn(owner_id="new-generation")
+    assert recovered is not None and recovered.command_id == "turn-1"
+    restarted.finish_turn(
+        "session-1",
+        "turn-1",
+        owner_id="new-generation",
+        status="completed",
+        state={"phase": "completed"},
+        result=[],
+    )
+    following = restarted.claim_next_turn(owner_id="new-generation")
+    assert following is not None and following.command_id == "turn-2"
+
+
 def test_expired_running_turn_becomes_retryable(tmp_path: Path) -> None:
     repository = ConversationRepository(tmp_path / "queue.sqlite")
     _enqueue(repository)
@@ -409,7 +451,7 @@ def test_v7_migration_removes_v6_unscoped_continuation_once(
         "session-1", {"reasoning_content": "legacy-private"}
     )
     with repository.store.connect() as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 7")
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (6, 0)"
         )

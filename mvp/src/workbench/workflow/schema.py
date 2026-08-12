@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 7
+PHASE1_SCHEMA_VERSION = 8
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -132,6 +132,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             lease_expires_at REAL NOT NULL,
             state_json TEXT NOT NULL,
             result_json TEXT,
+            enqueue_sequence INTEGER,
             updated_at REAL NOT NULL,
             PRIMARY KEY (session_id, command_id),
             FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
@@ -162,17 +163,33 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         connection, "conversation_turns", "prompt_digest", "TEXT"
     )
     _add_column_if_missing(connection, "conversation_turns", "prompt", "TEXT")
+    _add_column_if_missing(
+        connection, "conversation_turns", "enqueue_sequence", "INTEGER"
+    )
+    connection.execute(
+        """
+        UPDATE conversation_turns
+        SET enqueue_sequence = rowid
+        WHERE enqueue_sequence IS NULL
+        """
+    )
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_conversation_turns_queue
-        ON conversation_turns(status, lease_expires_at, updated_at)
+        ON conversation_turns(status, lease_expires_at, enqueue_sequence)
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_turns_enqueue_sequence
+        ON conversation_turns(enqueue_sequence)
         """
     )
     _upgrade_conversation_command_scope(connection)
     current_version = connection.execute(
         "SELECT MAX(version) FROM schema_migrations"
     ).fetchone()[0]
-    if current_version != PHASE1_SCHEMA_VERSION:
+    if current_version is None or current_version < 7:
         connection.execute("DELETE FROM conversation_continuation_states")
     connection.execute(
         "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, unixepoch('subsec'))",

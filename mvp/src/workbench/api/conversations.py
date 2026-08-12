@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import sqlite3
-import time
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
@@ -267,7 +266,7 @@ class ConversationAPI:
                         state["reason"] = projected[-1].get("value", {}).get(
                             "reason", "engine_host_unavailable"
                         )
-                    self._apply_host_retry_backoff(state)
+                    self._apply_host_retry_gate(state)
                     self.conversations.mark_retryable(
                         session_id,
                         command_id,
@@ -281,7 +280,7 @@ class ConversationAPI:
                         state["reason"] = projected[-1].get("value", {}).get(
                             "reason", "engine_host_unavailable"
                         )
-                    self._apply_host_retry_backoff(state)
+                    self._apply_host_retry_gate(state)
                     self.conversations.mark_retryable_unowned(
                         session_id, command_id, state=state
                     )
@@ -457,15 +456,15 @@ class ConversationAPI:
                 )
         return [message.model_dump(mode="json") for message in ordered]
 
-    @staticmethod
-    def _apply_host_retry_backoff(state: dict[str, Any]) -> None:
+    def _apply_host_retry_gate(self, state: dict[str, Any]) -> None:
         if state.get("reason") != "engine_host_unavailable":
             return
-        retry_count = max(0, int(state.get("host_retry_count", 0))) + 1
-        state["host_retry_count"] = retry_count
-        state["retry_not_before"] = time.time() + min(
-            0.05 * (2 ** min(retry_count - 1, 10)), 30.0
-        )
+        generation = getattr(self.runner, "host_generation", None)
+        if not isinstance(generation, str) or not generation:
+            raise TurnSnapshotCorruption("Host generation is unavailable")
+        state["failed_host_generation"] = generation
+        state.pop("retry_not_before", None)
+        state.pop("host_retry_count", None)
 
     async def run_message(
         self,

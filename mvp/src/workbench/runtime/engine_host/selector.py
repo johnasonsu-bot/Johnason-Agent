@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 import hashlib
 from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 
@@ -34,11 +35,13 @@ class RunnerSelector:
         host_runner: _TurnRunner,
         enabled: bool,
         provider_allowlist: tuple[str, ...] = ("lmstudio",),
+        host_generation: str | None = None,
     ) -> None:
         self.python_runner = python_runner
         self.host_runner = host_runner
         self.enabled = enabled
         self.provider_allowlist = provider_allowlist
+        self.host_generation = host_generation or str(uuid4())
 
     def mode_for(
         self, session_id: str, provider_id: str, model: str

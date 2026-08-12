@@ -568,11 +568,11 @@ async def test_queued_host_turn_freezes_context_only_after_prior_turn_finishes(
 
 
 @pytest.mark.asyncio
-async def test_host_retry_reuses_frozen_snapshot_and_obeys_persisted_backoff(
+async def test_host_retry_waits_for_restart_and_preserves_fifo_snapshot(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "host-retry-snapshot.sqlite"
-    repository = ConversationRepository(database)
+    repository = ConversationRepository(database, host_generation="generation-1")
     profile = ProviderProfileRecord(
         id="studio-primary",
         name="Custom LM Studio",
@@ -585,6 +585,7 @@ async def test_host_retry_reuses_frozen_snapshot_and_obeys_persisted_backoff(
         host_runner,
         enabled=True,
         provider_allowlist=("lmstudio",),
+        host_generation="generation-1",
     )
     api = ConversationAPI(repository, EventStore(database), selector)
     api.create_session("session-1")
@@ -595,17 +596,26 @@ async def test_host_retry_reuses_frozen_snapshot_and_obeys_persisted_backoff(
         model="local-agent",
         provider_id="lmstudio",
     )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-2",
+        content="second",
+        model="local-agent",
+        provider_id="lmstudio",
+    )
     claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
-    assert claimed is not None
+    assert claimed is not None and claimed.command_id == "turn-1"
 
     await api.process_queued_turn("session-1", "turn-1")
 
     retryable = repository.load_turn_status("session-1", "turn-1")
     assert retryable is not None and retryable.status == "retryable"
     assert retryable.state["message_snapshot_frozen"] is True
-    assert retryable.state["retry_not_before"] > time.time()
-    reopened = ConversationRepository(database)
-    assert reopened.claim_next_turn(owner_id="worker", lease_seconds=30) is None
+    assert retryable.state["failed_host_generation"] == "generation-1"
+    same_generation = ConversationRepository(
+        database, host_generation="generation-1"
+    )
+    assert same_generation.claim_next_turn(owner_id="worker") is None
     repository.append_message(
         ConversationMessage(
             session_id="session-1",
@@ -614,13 +624,34 @@ async def test_host_retry_reuses_frozen_snapshot_and_obeys_persisted_backoff(
             content="later mutation",
         )
     )
-    await asyncio.sleep(0.12)
-    claimed = repository.claim_next_turn(owner_id="worker", lease_seconds=30)
-    assert claimed is not None
-    await api.process_queued_turn("session-1", "turn-1")
+    restarted = ConversationRepository(database, host_generation="generation-2")
+    restarted_selector = RunnerSelector(
+        RepositoryPythonRunner(profile, restarted),
+        host_runner,
+        enabled=True,
+        provider_allowlist=("lmstudio",),
+        host_generation="generation-2",
+    )
+    restarted_api = ConversationAPI(
+        restarted, EventStore(database), restarted_selector
+    )
+    claimed = restarted.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert claimed is not None and claimed.command_id == "turn-1"
+    await restarted_api.process_queued_turn("session-1", "turn-1")
+    second = restarted.claim_next_turn(owner_id="worker", lease_seconds=30)
+    assert second is not None and second.command_id == "turn-2"
+    await restarted_api.process_queued_turn("session-1", "turn-2")
 
-    assert host_runner.calls == 2
+    assert host_runner.calls == 3
     assert host_runner.commands[1].message_snapshot == host_runner.commands[0].message_snapshot
+    assert [
+        (message.role, message.content)
+        for message in host_runner.commands[2].message_snapshot
+    ] == [
+        ("user", "first"),
+        ("assistant", "host answer"),
+        ("user", "second"),
+    ]
 
 
 @pytest.mark.parametrize(

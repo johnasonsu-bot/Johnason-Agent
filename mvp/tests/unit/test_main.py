@@ -3,6 +3,7 @@ import json
 import socket
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -318,6 +319,42 @@ def test_real_build_app_selector_resolves_default_deepseek_and_context(
     assert [message.content for message in selector.model_messages("session-1")] == [
         "earlier"
     ]
+
+
+def test_each_build_app_host_instance_gets_a_new_comparable_generation(
+    tmp_path: Path,
+) -> None:
+    settings = WorkbenchSettings(
+        runtime_dir=tmp_path,
+        engine_host_enabled=True,
+        engine_host_command=("engine-host", "--stdio"),
+    )
+
+    first = main.build_app(settings, runner=NoopRunner()).state.execution_runner
+    second = main.build_app(settings, runner=NoopRunner()).state.execution_runner
+
+    assert UUID(first.host_generation)
+    assert UUID(second.host_generation)
+    assert first.host_generation != second.host_generation
+
+
+def test_create_app_passes_host_generation_to_worker_repository(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        AppSettings(
+            database=tmp_path / "generation.sqlite",
+            runner=NoopRunner(),
+            owner_id="api",
+            host_generation="generation-1",
+        )
+    )
+
+    with TestClient(app):
+        assert (
+            app.state.conversation_worker.repository.host_generation
+            == "generation-1"
+        )
 
 
 def test_app_starts_host_before_worker_and_closes_after_worker(
