@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator
 from typing import Literal
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import StateSnapshot
 from pydantic import BaseModel, ConfigDict, Field
 
 from workbench.orchestration.checkpointer import graph_config
@@ -79,8 +82,10 @@ class LangGraphRuntimeAdapter:
     state. Every execution decision is read from the LangGraph checkpoint.
     """
 
-    def __init__(self, *, checkpointer: object, node_executor: NodeExecutor) -> None:
-        self._graph = build_gate_graph(checkpointer, node_executor)
+    def __init__(
+        self, *, checkpointer: BaseCheckpointSaver, node_executor: NodeExecutor
+    ) -> None:
+        self._graph: CompiledStateGraph = build_gate_graph(checkpointer, node_executor)
         self._inflight: dict[str, asyncio.Task[object]] = {}
 
     @staticmethod
@@ -94,18 +99,31 @@ class LangGraphRuntimeAdapter:
     def _config(run_ref: GraphRunRef, max_concurrency: int = 4) -> dict[str, object]:
         return graph_config(run_ref.thread_id, max_concurrency)
 
-    async def _get_state(self, run_ref: GraphRunRef):
+    async def _get_state(self, run_ref: GraphRunRef) -> StateSnapshot:
         return await asyncio.to_thread(self._graph.get_state, self._config(run_ref))
+
+    def _clear_inflight(self, thread_id: str, task: asyncio.Task[object]) -> None:
+        if self._inflight.get(thread_id) is task:
+            self._inflight.pop(thread_id, None)
+
+    def _require_not_inflight(self, run_ref: GraphRunRef) -> None:
+        task = self._inflight.get(run_ref.thread_id)
+        if task is None:
+            return
+        if not task.done():
+            raise RunInProgress("graph run is already executing")
+        self._clear_inflight(run_ref.thread_id, task)
 
     async def _invoke(self, run_ref: GraphRunRef, value: object, max_concurrency: int) -> None:
         thread_id = run_ref.thread_id
-        active = self._inflight.get(thread_id)
-        if active is not None and not active.done():
-            raise RunInProgress("graph run is already executing")
+        self._require_not_inflight(run_ref)
         task = asyncio.create_task(
             asyncio.to_thread(self._graph.invoke, value, self._config(run_ref, max_concurrency))
         )
         self._inflight[thread_id] = task
+        task.add_done_callback(
+            lambda completed: self._clear_inflight(thread_id, completed)
+        )
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -116,18 +134,22 @@ class LangGraphRuntimeAdapter:
             raise RuntimeGateError("local graph execution failed") from exc
         finally:
             if task.done():
-                self._inflight.pop(thread_id, None)
+                self._clear_inflight(thread_id, task)
 
     async def start(
         self, plan: ExecutionPlan, run_ref: GraphRunRef, max_concurrency: int
     ) -> PublicRuntimeSnapshot:
         self._validate_pair(plan, run_ref)
+        self._require_not_inflight(run_ref)
         # Validate before inspecting/checkpointing to reject bool and invalid ranges.
         self._config(run_ref, max_concurrency)
         existing = await self._get_state(run_ref)
         if existing.values or existing.next:
             raise StaleResume("graph run already exists")
-        branches = [{"branch_id": node.node_id} for node in sorted(plan.nodes, key=lambda node: node.node_id)]
+        branches = [
+            {"branch_id": node.node_id}
+            for node in sorted(plan.nodes, key=lambda node: node.node_id)
+        ]
         await self._invoke(
             run_ref,
             {
@@ -150,18 +172,26 @@ class LangGraphRuntimeAdapter:
         return await self.snapshot(run_ref)
 
     async def resume(
-        self, run_ref: GraphRunRef, responses: Mapping[str, object]
+        self, run_ref: GraphRunRef, responses: dict[str, object]
     ) -> PublicRuntimeSnapshot:
+        self._require_not_inflight(run_ref)
         state = await self._get_state(run_ref)
         if not state.values and not state.next:
             raise UnknownRun("graph run does not exist")
+        if state.values.get("run_id") != run_ref.graph_run_id:
+            raise UnknownRun("graph run does not exist")
+        if (
+            state.values.get("plan_id") != run_ref.plan_id
+            or state.values.get("plan_version") != run_ref.plan_version
+        ):
+            raise RunPlanMismatch("checkpoint plan does not match run reference")
         status = state.values.get("status")
         if status != "awaiting_approval" or "approval" not in state.next:
             raise StaleResume("graph run is not awaiting an approval resume")
-        if not isinstance(responses, Mapping):
+        if not isinstance(responses, dict) or set(responses) != {"plan_approval"}:
             raise InvalidApprovalResponse("approval response must be a mapping")
         approval = responses.get("plan_approval")
-        if not isinstance(approval, Mapping) or approval.get("decision") != "approved":
+        if approval != {"decision": "approved"}:
             raise InvalidApprovalResponse("only an explicit approved decision may resume")
         # A completed plan approval is the only command that can release fan-out.
         from langgraph.types import Command
@@ -266,7 +296,11 @@ class LangGraphRuntimeAdapter:
             )
             count += 1
         final = values.get("final_result")
-        if count < 16 and isinstance(final, dict) and final.get("decision") in {"approved", "failed"}:
+        if (
+            count < 16
+            and isinstance(final, dict)
+            and final.get("decision") in {"approved", "failed"}
+        ):
             yield PublicRuntimeEvent(
                 event_type="global_verification",
                 graph_run_id=run_ref.graph_run_id,

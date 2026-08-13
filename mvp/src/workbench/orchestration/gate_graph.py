@@ -6,12 +6,18 @@ import asyncio
 import inspect
 from typing import Annotated, Awaitable, Callable, TypedDict
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Send, interrupt
+from pydantic import TypeAdapter, ValidationError
+
+from workbench.orchestration.contracts import OpaqueReference
 
 
 MAX_BRANCH_ATTEMPTS = 2
 NodeExecutor = Callable[..., dict[str, object] | Awaitable[dict[str, object]]]
+_evidence_reference = TypeAdapter(OpaqueReference)
 
 
 def _ordered_records(
@@ -62,12 +68,11 @@ class GateState(TypedDict, total=False):
 
 
 def _safe_evidence_refs(value: object) -> tuple[str, ...]:
-    """Keep only bounded opaque-ish references from executor output."""
-    if not isinstance(value, str) or not value or len(value) > 128:
+    """Apply the same opaque-reference contract as public control records."""
+    try:
+        return (_evidence_reference.validate_python(value),)
+    except ValidationError:
         return ()
-    if not all(character.isalnum() or character in "._:/-" for character in value):
-        return ()
-    return (value,)
 
 
 def _execute(
@@ -81,7 +86,9 @@ def _execute(
     return result
 
 
-def build_gate_graph(checkpointer: object, node_executor: NodeExecutor):
+def build_gate_graph(
+    checkpointer: BaseCheckpointSaver, node_executor: NodeExecutor
+) -> CompiledStateGraph:
     """Build the approval → Send fan-out → merge → global verifier graph.
 
     The executor is deliberately synchronous because Task 1's local ``SqliteSaver``
@@ -90,14 +97,19 @@ def build_gate_graph(checkpointer: object, node_executor: NodeExecutor):
     graph invocation from an asyncio-friendly thread boundary.
     """
 
-    def approval(_: GateState) -> dict[str, object]:
-        response = interrupt({"kind": "plan_approval"})
-        if not isinstance(response, dict):
+    def approval(state: GateState) -> dict[str, object]:
+        response = interrupt(
+            {
+                "kind": "plan_approval",
+                "plan_id": state["plan_id"],
+                "plan_version": state["plan_version"],
+                "graph_run_id": state["run_id"],
+            }
+        )
+        if not isinstance(response, dict) or set(response) != {"plan_approval"}:
             return {"approved": False, "status": "awaiting_approval"}
         approval_value = response.get("plan_approval")
-        if not isinstance(approval_value, dict):
-            return {"approved": False, "status": "awaiting_approval"}
-        if approval_value.get("decision") != "approved":
+        if approval_value != {"decision": "approved"}:
             return {"approved": False, "status": "awaiting_approval"}
         return {"approved": True, "status": "running"}
 

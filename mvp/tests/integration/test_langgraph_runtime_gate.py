@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import time
 from collections import Counter
 from pathlib import Path
 
 import pytest
+from pydantic import TypeAdapter, ValidationError
 
 from workbench.orchestration.checkpointer import open_graph_checkpointer
-from workbench.orchestration.contracts import ExecutionPlan, GraphRunRef, PlanNode
+from workbench.orchestration.contracts import (
+    ExecutionPlan,
+    GraphRunRef,
+    OpaqueReference,
+    PlanNode,
+)
 from workbench.orchestration.runtime import (
     ExecutorFailure,
     InvalidApprovalResponse,
     LangGraphRuntimeAdapter,
     PublicRuntimeSnapshot,
+    RunInProgress,
     RunPlanMismatch,
     StaleResume,
     UnknownRun,
@@ -147,6 +155,138 @@ async def test_approval_gates_real_parallel_selective_rework_and_public_state(
     assert len(events) <= 16
     assert all("raw_tool_result" not in event.model_dump_json() for event in events)
     assert all("must never escape" not in event.model_dump_json() for event in events)
+
+
+@pytest.mark.asyncio
+async def test_approval_interrupt_binds_the_immutable_plan_and_run_reference(
+    runtime: LangGraphRuntimeAdapter,
+) -> None:
+    plan = gate_plan()
+    run = gate_run()
+
+    await runtime.start(plan, run, max_concurrency=4)
+
+    state = await asyncio.to_thread(
+        runtime._graph.get_state, runtime._config(run, max_concurrency=4)
+    )
+    assert len(state.tasks) == 1
+    assert len(state.tasks[0].interrupts) == 1
+    assert state.tasks[0].interrupts[0].value == {
+        "kind": "plan_approval",
+        "plan_id": plan.plan_id,
+        "plan_version": plan.version,
+        "graph_run_id": run.graph_run_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_same_thread_with_mismatched_run_reference_before_work(
+    runtime: LangGraphRuntimeAdapter, executor: DeterministicExecutor
+) -> None:
+    plan = gate_plan()
+    run = gate_run()
+    await runtime.start(plan, run, max_concurrency=4)
+    wrong_run = run.model_copy(update={"graph_run_id": "other-run-1"})
+    wrong_plan = run.model_copy(update={"plan_id": "other-plan-1"})
+    wrong_version = run.model_copy(update={"plan_version": 2})
+
+    with pytest.raises(UnknownRun):
+        await runtime.resume(
+            wrong_run, {"plan_approval": {"decision": "approved"}}
+        )
+    with pytest.raises(RunPlanMismatch):
+        await runtime.resume(
+            wrong_plan, {"plan_approval": {"decision": "approved"}}
+        )
+    with pytest.raises(RunPlanMismatch):
+        await runtime.resume(
+            wrong_version, {"plan_approval": {"decision": "approved"}}
+        )
+    assert executor.calls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "secret_ref",
+    [
+        "github" + "_pat_" + "abcdefghijklmnop",
+        "sk" + "-" + "abcdefghijklmnop",
+        "Bearer abcdefghijklmnop",
+        "password=never-checkpoint",
+        "private_prompt=never-checkpoint",
+    ],
+)
+async def test_evidence_references_reuse_opaque_reference_boundary_everywhere(
+    tmp_path: Path, secret_ref: str
+) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(OpaqueReference).validate_python(secret_ref)
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            return {"evidence_ref": secret_ref}
+        return {"decision": "approved", "evidence_ref": secret_ref}
+
+    database = tmp_path / "graph.sqlite"
+    with open_graph_checkpointer(database) as checkpointer:
+        runtime = LangGraphRuntimeAdapter(
+            checkpointer=checkpointer, node_executor=executor
+        )
+        await runtime.start(gate_plan(), gate_run(), max_concurrency=4)
+        snapshot = await runtime.resume(
+            gate_run(), {"plan_approval": {"decision": "approved"}}
+        )
+        events = [event async for event in runtime.stream(gate_run())]
+        state = await asyncio.to_thread(
+            runtime._graph.get_state, runtime._config(gate_run(), max_concurrency=4)
+        )
+        checkpoint = await asyncio.to_thread(
+            checkpointer.get_tuple, runtime._config(gate_run(), max_concurrency=4)
+        )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT checkpoint, metadata FROM checkpoints"
+        ).fetchall()
+
+    assert secret_ref not in snapshot.model_dump_json()
+    assert all(secret_ref not in event.model_dump_json() for event in events)
+    assert secret_ref not in repr(state.values)
+    assert checkpoint is not None
+    assert secret_ref not in repr(checkpoint.checkpoint)
+    assert secret_ref not in repr(rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"plan_approval": {"decision": "approved", "edited": "new goal"}},
+        {"plan_approval": {"decision": "approved"}, "unrelated": "value"},
+        {"plan_approval": {"decision": "approved"}, "edited_plan": "other"},
+    ],
+)
+async def test_approval_resume_requires_the_exact_approved_shape(
+    tmp_path: Path, response: dict[str, object]
+) -> None:
+    calls = Counter[str]()
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            calls[branch] += 1
+        return {"decision": "approved"}
+
+    runtime = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(tmp_path / "graph.sqlite"),
+        node_executor=executor,
+    )
+    await runtime.start(gate_plan(), gate_run(), max_concurrency=4)
+
+    with pytest.raises(InvalidApprovalResponse):
+        await runtime.resume(gate_run(), response)
+
+    assert calls == {}
+    assert (await runtime.snapshot(gate_run())).status == "awaiting_approval"
 
 
 @pytest.mark.asyncio
@@ -291,8 +431,15 @@ async def test_runtime_surfaces_cancellation_without_second_execution(
     resume.cancel()
     with pytest.raises(asyncio.CancelledError):
         await resume
+    with pytest.raises(RunInProgress):
+        await runtime.resume(gate_run(), {"plan_approval": {"decision": "approved"}})
+    assert gate_run().thread_id in runtime._inflight
     release.set()
-    await asyncio.sleep(0.05)
+    for _ in range(100):
+        if gate_run().thread_id not in runtime._inflight:
+            break
+        await asyncio.sleep(0.01)
+    assert gate_run().thread_id not in runtime._inflight
     with pytest.raises(StaleResume):
         await runtime.resume(gate_run(), {"plan_approval": {"decision": "approved"}})
     assert dict(calls) == {
