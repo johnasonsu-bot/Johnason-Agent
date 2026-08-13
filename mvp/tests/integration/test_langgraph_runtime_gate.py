@@ -536,3 +536,165 @@ async def test_runtime_surfaces_cancellation_without_second_execution(
         "worker-3": 1,
         "worker-4": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_two_adapters_fence_concurrent_approval_resume_without_duplicate_effects(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = Counter[str]()
+    stage_calls = Counter[str]()
+    lock = threading.Lock()
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            with lock:
+                calls[branch] += 1
+            entered.set()
+            release.wait(timeout=2)
+            return {"observed_workers": 1}
+        if stage == "local_verifier" and branch == "worker-2" and attempt == 1:
+            return {"decision": "rejected"}
+        if stage in {"merge", "global_verifier"}:
+            with lock:
+                stage_calls[stage] += 1
+        return {"decision": "approved"}
+
+    database = tmp_path / "graph.sqlite"
+    first = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    second = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    await first.start(gate_plan(), gate_run(), max_concurrency=1)
+
+    go = asyncio.Event()
+
+    async def resume(adapter: LangGraphRuntimeAdapter) -> object:
+        await go.wait()
+        try:
+            return await adapter.resume(
+                gate_run(), {"plan_approval": {"decision": "approved"}}
+            )
+        except RunInProgress as error:
+            return error
+
+    attempts = [asyncio.create_task(resume(first)), asyncio.create_task(resume(second))]
+    go.set()
+    assert await asyncio.to_thread(entered.wait, 1)
+    release.set()
+    outcomes = await asyncio.gather(*attempts)
+
+    assert sum(isinstance(item, RunInProgress) for item in outcomes) == 1
+    assert sum(isinstance(item, PublicRuntimeSnapshot) for item in outcomes) == 1
+    assert calls == {
+        "worker-1": 1,
+        "worker-2": 2,
+        "worker-3": 1,
+        "worker-4": 1,
+    }
+    assert stage_calls == {"merge": 1, "global_verifier": 1}
+
+
+@pytest.mark.asyncio
+async def test_second_adapter_cannot_resume_running_while_first_owns_fence(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            entered.set()
+            release.wait(timeout=2)
+            return {"observed_workers": 1}
+        return {"decision": "approved"}
+
+    database = tmp_path / "graph.sqlite"
+    first = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    second = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    await first.start(gate_plan(), gate_run(), max_concurrency=1)
+    running = asyncio.create_task(
+        first.resume(gate_run(), {"plan_approval": {"decision": "approved"}})
+    )
+    assert await asyncio.to_thread(entered.wait, 1)
+
+    with pytest.raises(RunInProgress):
+        await second.resume_running(gate_run())
+
+    release.set()
+    assert (await running).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_distinct_threads_execute_while_their_independent_fences_are_held(
+    tmp_path: Path,
+) -> None:
+    two_workers_active = threading.Event()
+    release = threading.Event()
+    active_workers = 0
+    maximum_active_workers = 0
+    calls = Counter[str]()
+    lock = threading.Lock()
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        nonlocal active_workers, maximum_active_workers
+        if stage == "worker":
+            with lock:
+                calls[branch] += 1
+                active_workers += 1
+                maximum_active_workers = max(maximum_active_workers, active_workers)
+                if active_workers >= 2:
+                    two_workers_active.set()
+            try:
+                release.wait(timeout=2)
+                return {"observed_workers": 1}
+            finally:
+                with lock:
+                    active_workers -= 1
+        if stage == "local_verifier" and branch == "worker-2" and attempt == 1:
+            return {"decision": "rejected"}
+        return {"decision": "approved"}
+
+    database = tmp_path / "graph.sqlite"
+    first = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    second = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    first_run = gate_run()
+    second_run = gate_run().model_copy(
+        update={"graph_run_id": "gate-run-2", "thread_id": "gate-thread-2"}
+    )
+    await first.start(gate_plan(), first_run, max_concurrency=1)
+    await second.start(gate_plan(), second_run, max_concurrency=1)
+
+    resumes = [
+        asyncio.create_task(
+            first.resume(first_run, {"plan_approval": {"decision": "approved"}})
+        ),
+        asyncio.create_task(
+            second.resume(second_run, {"plan_approval": {"decision": "approved"}})
+        ),
+    ]
+    assert await asyncio.to_thread(two_workers_active.wait, 1)
+    release.set()
+    assert [result.status for result in await asyncio.gather(*resumes)] == [
+        "completed",
+        "completed",
+    ]
+    assert maximum_active_workers >= 2
+    assert calls == {
+        "worker-1": 2,
+        "worker-2": 4,
+        "worker-3": 2,
+        "worker-4": 2,
+    }

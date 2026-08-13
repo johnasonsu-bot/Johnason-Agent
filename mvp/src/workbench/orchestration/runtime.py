@@ -11,7 +11,12 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import StateSnapshot
 from pydantic import BaseModel, ConfigDict, Field
 
-from workbench.orchestration.checkpointer import graph_config
+from workbench.orchestration.checkpointer import (
+    GraphExecutionFence,
+    GraphExecutionFenceBusy,
+    acquire_graph_execution_fence,
+    graph_config,
+)
 from workbench.orchestration.contracts import ExecutionPlan, GraphRunRef
 from workbench.orchestration.gate_graph import NodeExecutor, build_gate_graph
 
@@ -85,6 +90,7 @@ class LangGraphRuntimeAdapter:
     def __init__(
         self, *, checkpointer: BaseCheckpointSaver, node_executor: NodeExecutor
     ) -> None:
+        self._checkpointer = checkpointer
         self._graph: CompiledStateGraph = build_gate_graph(checkpointer, node_executor)
         self._inflight: dict[str, asyncio.Task[object]] = {}
 
@@ -101,6 +107,20 @@ class LangGraphRuntimeAdapter:
 
     async def _get_state(self, run_ref: GraphRunRef) -> StateSnapshot:
         return await asyncio.to_thread(self._graph.get_state, self._config(run_ref))
+
+    async def _acquire_fence(self, run_ref: GraphRunRef) -> GraphExecutionFence:
+        try:
+            return await asyncio.to_thread(
+                acquire_graph_execution_fence, self._checkpointer, run_ref.thread_id
+            )
+        except GraphExecutionFenceBusy as error:
+            # The mutation fence was attempted first. A read-only identity check
+            # preserves the typed wrong-generation boundary without permitting an
+            # unfenced state transition or external effect.
+            state = await self._get_state(run_ref)
+            if state.values:
+                self._validate_checkpoint_identity(state.values, run_ref)
+            raise RunInProgress("graph run is already executing") from error
 
     @staticmethod
     def _validate_checkpoint_identity(
@@ -127,16 +147,29 @@ class LangGraphRuntimeAdapter:
             raise RunInProgress("graph run is already executing")
         self._clear_inflight(run_ref.thread_id, task)
 
-    async def _invoke(self, run_ref: GraphRunRef, value: object, max_concurrency: int) -> None:
+    async def _invoke(
+        self,
+        run_ref: GraphRunRef,
+        value: object,
+        max_concurrency: int,
+        fence: GraphExecutionFence,
+    ) -> None:
         thread_id = run_ref.thread_id
-        self._require_not_inflight(run_ref)
-        task = asyncio.create_task(
-            asyncio.to_thread(self._graph.invoke, value, self._config(run_ref, max_concurrency))
-        )
+        try:
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._graph.invoke, value, self._config(run_ref, max_concurrency)
+                )
+            )
+        except Exception:
+            fence.release()
+            raise
         self._inflight[thread_id] = task
-        task.add_done_callback(
-            lambda completed: self._clear_inflight(thread_id, completed)
-        )
+        def completed(completed_task: asyncio.Task[object]) -> None:
+            self._clear_inflight(thread_id, completed_task)
+            fence.release()
+
+        task.add_done_callback(completed)
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -152,64 +185,80 @@ class LangGraphRuntimeAdapter:
     async def start(
         self, plan: ExecutionPlan, run_ref: GraphRunRef, max_concurrency: int
     ) -> PublicRuntimeSnapshot:
-        self._validate_pair(plan, run_ref)
-        self._require_not_inflight(run_ref)
-        # Validate before inspecting/checkpointing to reject bool and invalid ranges.
-        self._config(run_ref, max_concurrency)
-        existing = await self._get_state(run_ref)
-        if existing.values or existing.next:
-            raise StaleResume("graph run already exists")
-        branches = [
-            {"branch_id": node.node_id}
-            for node in sorted(plan.nodes, key=lambda node: node.node_id)
-        ]
-        await self._invoke(
-            run_ref,
-            {
-                "plan_id": plan.plan_id,
-                "plan_version": plan.version,
-                "run_id": run_ref.graph_run_id,
-                "generation": run_ref.generation,
-                "max_concurrency": max_concurrency,
-                "status": "awaiting_approval",
-                "approved": False,
-                "branch_inputs": branches,
-                "branch_results": [],
-                "verified_results": [],
-                "branch_outcomes": [],
-                "max_observed_workers": 0,
-                "merge_result": None,
-                "final_result": None,
-            },
-            max_concurrency,
-        )
+        fence = await self._acquire_fence(run_ref)
+        submitted = False
+        try:
+            self._validate_pair(plan, run_ref)
+            self._require_not_inflight(run_ref)
+            # Validate before inspecting/checkpointing to reject bool and invalid ranges.
+            self._config(run_ref, max_concurrency)
+            existing = await self._get_state(run_ref)
+            if existing.values or existing.next:
+                raise StaleResume("graph run already exists")
+            branches = [
+                {"branch_id": node.node_id}
+                for node in sorted(plan.nodes, key=lambda node: node.node_id)
+            ]
+            submitted = True
+            await self._invoke(
+                run_ref,
+                {
+                    "plan_id": plan.plan_id,
+                    "plan_version": plan.version,
+                    "run_id": run_ref.graph_run_id,
+                    "generation": run_ref.generation,
+                    "max_concurrency": max_concurrency,
+                    "status": "awaiting_approval",
+                    "approved": False,
+                    "branch_inputs": branches,
+                    "branch_results": [],
+                    "verified_results": [],
+                    "branch_outcomes": [],
+                    "max_observed_workers": 0,
+                    "merge_result": None,
+                    "final_result": None,
+                },
+                max_concurrency,
+                fence,
+            )
+        except Exception:
+            if not submitted:
+                fence.release()
+            raise
         return await self.snapshot(run_ref)
 
     async def resume(
         self, run_ref: GraphRunRef, responses: dict[str, object]
     ) -> PublicRuntimeSnapshot:
-        state = await self._get_state(run_ref)
-        if not state.values and not state.next:
-            raise UnknownRun("graph run does not exist")
-        self._validate_checkpoint_identity(state.values, run_ref)
-        self._require_not_inflight(run_ref)
-        status = state.values.get("status")
-        if status != "awaiting_approval" or "approval" not in state.next:
-            raise StaleResume("graph run is not awaiting an approval resume")
-        if not isinstance(responses, dict) or set(responses) != {"plan_approval"}:
-            raise InvalidApprovalResponse("approval response must be a mapping")
-        approval = responses.get("plan_approval")
-        if approval != {"decision": "approved"}:
-            raise InvalidApprovalResponse("only an explicit approved decision may resume")
-        # A completed plan approval is the only command that can release fan-out.
-        from langgraph.types import Command
+        fence = await self._acquire_fence(run_ref)
+        submitted = False
+        try:
+            state = await self._get_state(run_ref)
+            if not state.values and not state.next:
+                raise UnknownRun("graph run does not exist")
+            self._validate_checkpoint_identity(state.values, run_ref)
+            self._require_not_inflight(run_ref)
+            status = state.values.get("status")
+            if status != "awaiting_approval" or "approval" not in state.next:
+                raise StaleResume("graph run is not awaiting an approval resume")
+            if not isinstance(responses, dict) or set(responses) != {"plan_approval"}:
+                raise InvalidApprovalResponse("approval response must be a mapping")
+            approval = responses.get("plan_approval")
+            if approval != {"decision": "approved"}:
+                raise InvalidApprovalResponse("only an explicit approved decision may resume")
+            from langgraph.types import Command
 
-        max_concurrency = state.values.get("max_concurrency")
-        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
-            raise StaleResume("checkpoint has no valid concurrency bound")
-        await self._invoke(
-            run_ref, Command(resume=dict(responses)), max_concurrency=max_concurrency
-        )
+            max_concurrency = state.values.get("max_concurrency")
+            if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+                raise StaleResume("checkpoint has no valid concurrency bound")
+            submitted = True
+            await self._invoke(
+                run_ref, Command(resume=dict(responses)), max_concurrency, fence
+            )
+        except Exception:
+            if not submitted:
+                fence.release()
+            raise
         snapshot = await self.snapshot(run_ref)
         if snapshot.status == "failed":
             raise ExecutorFailure("graph executor failed")
@@ -223,17 +272,25 @@ class LangGraphRuntimeAdapter:
         and therefore cannot create a second worker effect for an already committed
         branch stage.
         """
-        state = await self._get_state(run_ref)
-        if not state.values and not state.next:
-            raise UnknownRun("graph run does not exist")
-        self._validate_checkpoint_identity(state.values, run_ref)
-        self._require_not_inflight(run_ref)
-        if state.values.get("status") != "running" or not state.next:
-            raise StaleResume("graph run has no recoverable pending execution")
-        max_concurrency = state.values.get("max_concurrency")
-        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
-            raise StaleResume("checkpoint has no valid concurrency bound")
-        await self._invoke(run_ref, None, max_concurrency=max_concurrency)
+        fence = await self._acquire_fence(run_ref)
+        submitted = False
+        try:
+            state = await self._get_state(run_ref)
+            if not state.values and not state.next:
+                raise UnknownRun("graph run does not exist")
+            self._validate_checkpoint_identity(state.values, run_ref)
+            self._require_not_inflight(run_ref)
+            if state.values.get("status") != "running" or not state.next:
+                raise StaleResume("graph run has no recoverable pending execution")
+            max_concurrency = state.values.get("max_concurrency")
+            if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+                raise StaleResume("checkpoint has no valid concurrency bound")
+            submitted = True
+            await self._invoke(run_ref, None, max_concurrency, fence)
+        except Exception:
+            if not submitted:
+                fence.release()
+            raise
         snapshot = await self.snapshot(run_ref)
         if snapshot.status == "failed":
             raise ExecutorFailure("graph executor failed")

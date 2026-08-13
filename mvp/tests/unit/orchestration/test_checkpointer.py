@@ -5,7 +5,12 @@ from typing import Any, ClassVar
 import pytest
 from pydantic import BaseModel
 
-from workbench.orchestration.checkpointer import graph_config, open_graph_checkpointer
+from workbench.orchestration.checkpointer import (
+    GraphExecutionFenceBusy,
+    acquire_graph_execution_fence,
+    graph_config,
+    open_graph_checkpointer,
+)
 
 
 class _UnapprovedCheckpointPayload(BaseModel):
@@ -75,3 +80,20 @@ def test_checkpoint_deserialization_keeps_unapproved_pydantic_payload_primitive(
         assert saver.serde.loads_typed(wire_value) == {"value": "safe"}
         assert import_calls == []
         assert _UnapprovedCheckpointPayload.construction_count == 0
+
+
+def test_execution_fence_is_per_thread_and_releases_after_its_owner(tmp_path):
+    database = tmp_path / "graph.sqlite"
+    first = open_graph_checkpointer(database)
+    second = open_graph_checkpointer(database)
+    held = acquire_graph_execution_fence(first, "thread-1")
+    try:
+        with pytest.raises(GraphExecutionFenceBusy):
+            acquire_graph_execution_fence(second, "thread-1")
+        independent = acquire_graph_execution_fence(second, "thread-2")
+        independent.release()
+    finally:
+        held.release()
+
+    acquired_after_release = acquire_graph_execution_fence(second, "thread-1")
+    acquired_after_release.release()
