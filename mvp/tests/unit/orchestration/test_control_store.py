@@ -274,6 +274,51 @@ def test_plan_rejects_non_public_ids_and_summaries(field: str, value: str):
         ExecutionPlan.model_validate(invalid)
 
 
+@pytest.mark.parametrize("summary_field", ["goal", "title"])
+@pytest.mark.parametrize(
+    "private_label",
+    [
+        "password = sensitive-value",
+        "passwd: sensitive-value",
+        "pwd=sensitive-value",
+        "private history: prior conversation",
+        "private_history=prior conversation",
+        "hidden reasoning: scratch work",
+        "chain-of-thought=scratch work",
+        "raw prompt: do not persist this",
+        "system_prompt=do not persist this",
+    ],
+)
+def test_plan_rejects_private_summary_labels(
+    summary_field: str, private_label: str
+):
+    invalid = valid_plan()
+    if summary_field == "goal":
+        invalid["goal"] = private_label
+    else:
+        invalid["nodes"] = [
+            {**invalid["nodes"][0], "title": private_label},
+            invalid["nodes"][1],
+        ]
+
+    with pytest.raises(ValidationError):
+        ExecutionPlan.model_validate(invalid)
+
+
+@pytest.mark.parametrize("summary_field", ["goal", "title"])
+def test_plan_allows_non_secret_summary_mentions(summary_field: str):
+    allowed = valid_plan()
+    if summary_field == "goal":
+        allowed["goal"] = "Review the password policy"
+    else:
+        allowed["nodes"] = [
+            {**allowed["nodes"][0], "title": "Review the password policy"},
+            allowed["nodes"][1],
+        ]
+
+    assert ExecutionPlan.model_validate(allowed)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -34,6 +34,17 @@ _SECRET_LIKE_IDENTIFIER = re.compile(
     r"private[_-]?prompt|github_pat_|gh[pousr]_|sk-|AKIA)",
     re.IGNORECASE,
 )
+_PRIVATE_SUMMARY_LABEL = re.compile(
+    r"(?:"
+    r"(?:password|passwd|pwd)|"
+    r"private[ _-]?history|"
+    r"hidden[ _-]?reasoning|"
+    r"chain[ _-]?of[ _-]?thought|"
+    r"raw[ _-]?prompt|"
+    r"system[ _-]?prompt"
+    r")\s*[:=]",
+    re.IGNORECASE,
+)
 
 
 def _require_opaque_identifier(value: str) -> str:
@@ -58,6 +69,7 @@ def _require_public_summary(value: str) -> str:
         or len(value) > 280
         or _CONTROL_CHARACTER.search(value)
         or _CREDENTIAL_SIGNATURE.search(value)
+        or _PRIVATE_SUMMARY_LABEL.search(value)
     ):
         raise ValueError("must be a bounded public summary")
     return value
