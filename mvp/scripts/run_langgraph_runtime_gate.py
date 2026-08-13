@@ -55,6 +55,15 @@ def _increment(ledger: Path, stage: str, branch: str) -> None:
         )
 
 
+def _set_metric(ledger: Path, name: str, value: int) -> None:
+    with sqlite3.connect(ledger) as connection:
+        connection.execute(
+            "INSERT INTO metrics(name, value) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            (name, value),
+        )
+
+
 class _ChildExecutor:
     """Fixture executor that blocks only after its rework was durably scheduled."""
 
@@ -114,6 +123,7 @@ async def _child(checkpoint: Path, ledger: Path, boundary: Path, token: str) -> 
         node_executor=_ChildExecutor(ledger, boundary),
     )
     await runtime.start(plan, run, max_concurrency=4)
+    _set_metric(ledger, "approval_interrupt", int(_approval_interrupt_matches(runtime, run)))
     await runtime.resume(run, {"plan_approval": {"decision": "approved"}})
 
 
@@ -136,6 +146,23 @@ def _durable_records(runtime: LangGraphRuntimeAdapter, run: GraphRunRef) -> bool
     }.issubset(seen)
 
 
+def _approval_interrupt_matches(runtime: LangGraphRuntimeAdapter, run: GraphRunRef) -> bool:
+    state = runtime._graph.get_state(runtime._config(run))
+    if len(state.tasks) != 1 or len(state.tasks[0].interrupts) != 1:
+        return False
+    return state.tasks[0].interrupts[0].value == {
+        "kind": "plan_approval",
+        "plan_id": run.plan_id,
+        "plan_version": run.plan_version,
+        "graph_run_id": run.graph_run_id,
+    }
+
+
+def _ledger_is_empty(ledger: Path) -> bool:
+    with sqlite3.connect(ledger) as connection:
+        return connection.execute("SELECT COUNT(*) FROM calls").fetchone() == (0,)
+
+
 async def _run(runtime_dir: Path) -> dict[str, object]:
     token = uuid.uuid4().hex
     checkpoint = runtime_dir / f"langgraph-gate-{token}.sqlite"
@@ -153,8 +180,12 @@ async def _run(runtime_dir: Path) -> dict[str, object]:
     control.approve_plan(plan.plan_id, plan.version, actor_id="gate-runner")
     control.create_run(run)
 
+    ledger_empty_before_child = _ledger_is_empty(ledger)
     child = subprocess.Popen(_child_command(checkpoint, ledger, boundary, token), cwd=Path.cwd())
+    child_process_started = child.pid > 0
     child_started = time.monotonic()
+    durable_observed = False
+    child_killed = False
     try:
         while not boundary.exists() and time.monotonic() - child_started < _CHILD_BOUNDARY_SECONDS:
             await asyncio.sleep(0.02)
@@ -168,6 +199,7 @@ async def _run(runtime_dir: Path) -> dict[str, object]:
         durable_started = time.monotonic()
         while time.monotonic() - durable_started < _DURABLE_BOUNDARY_SECONDS:
             if await asyncio.to_thread(_durable_records, observer, run):
+                durable_observed = True
                 break
             await asyncio.sleep(0.02)
         else:
@@ -175,6 +207,7 @@ async def _run(runtime_dir: Path) -> dict[str, object]:
     finally:
         if child.poll() is None:
             os.kill(child.pid, signal.SIGKILL)
+            child_killed = True
         try:
             child.wait(timeout=_CHILD_EXIT_SECONDS)
         except subprocess.TimeoutExpired as error:
@@ -189,23 +222,42 @@ async def _run(runtime_dir: Path) -> dict[str, object]:
     with sqlite3.connect(ledger) as connection:
         calls = {(stage, branch): count for stage, branch, count in connection.execute("SELECT stage, branch, count FROM calls")}
         observed = connection.execute("SELECT value FROM metrics WHERE name = 'max_workers'").fetchone()
+        approval_interrupt = connection.execute(
+            "SELECT value FROM metrics WHERE name = 'approval_interrupt'"
+        ).fetchone()
     expected_workers = {"worker-1": 1, "worker-2": 2, "worker-3": 1, "worker-4": 1}
     worker_ledger = {branch: calls.get(("worker", branch), 0) for branch in expected_workers}
+    recovered_terminal = completed.status == "completed"
+    approval_observed = approval_interrupt == (1,)
     checks = {
-        "approval_interrupt": True,
-        "durable_mid_rework_restart": True,
+        "approval_interrupt": approval_observed,
+        "durable_mid_rework_restart": (
+            child_process_started
+            and ledger_empty_before_child
+            and durable_observed
+            and child_killed
+            and recovered_terminal
+            and worker_ledger == expected_workers
+        ),
         "parallel_overlap": observed is not None and observed[0] == 4,
         "selective_rework": worker_ledger == expected_workers,
         "merge_once": calls.get(("merge", "merge"), 0) == 1,
         "global_once": calls.get(("global_verifier", "global"), 0) == 1,
         "projection_append_only": projections > 0 and replayed == 0,
-        "terminal": completed.status == "completed",
+        "terminal": recovered_terminal,
     }
     return {
         "decision": "GO_LANGGRAPH_RUNTIME" if all(checks.values()) else "REJECT_LANGGRAPH_RUNTIME",
         "checks": checks,
         "call_ledger": worker_ledger,
         "projection_count": projections,
+        "evidence": {
+            "approval_interrupt_unique_identity": approval_observed,
+            "ledger_empty_before_child": ledger_empty_before_child,
+            "durable_records_observed": durable_observed,
+            "child_killed_at_rework_boundary": child_killed,
+            "fresh_recovery_terminal": recovered_terminal,
+        },
     }
 
 

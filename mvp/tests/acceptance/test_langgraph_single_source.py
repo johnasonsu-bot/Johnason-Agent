@@ -205,7 +205,11 @@ def test_gate_runner_atomically_replaces_stale_go_when_execution_raises(
     monkeypatch.setattr(gate_runner, "_run", fail)
     assert gate_runner.main() == 1
     rendered = target.read_text(encoding="utf-8")
-    assert json.loads(rendered)["decision"] == "REJECT_LANGGRAPH_RUNTIME"
+    assert json.loads(rendered) == {
+        "checks": {"runner_completed": False},
+        "decision": "REJECT_LANGGRAPH_RUNTIME",
+        "reason": "runtime_gate_execution_failed",
+    }
     assert "private failure detail" not in rendered
 
 
@@ -295,7 +299,15 @@ async def test_gate_runner_executes_a_real_durable_mid_rework_restart(
     result = await gate_runner._run(tmp_path)
 
     assert result["decision"] == "GO_LANGGRAPH_RUNTIME"
+    assert result["checks"]["approval_interrupt"] is True
     assert result["checks"]["durable_mid_rework_restart"] is True
+    assert result["evidence"] == {
+        "approval_interrupt_unique_identity": True,
+        "ledger_empty_before_child": True,
+        "durable_records_observed": True,
+        "child_killed_at_rework_boundary": True,
+        "fresh_recovery_terminal": True,
+    }
     assert result["call_ledger"] == {
         "worker-1": 1,
         "worker-2": 2,
