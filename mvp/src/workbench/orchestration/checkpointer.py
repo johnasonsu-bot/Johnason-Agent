@@ -40,8 +40,12 @@ def open_graph_checkpointer(path: Path) -> SqliteSaver:
 
 def graph_config(graph_run_id: str, max_concurrency: int) -> dict[str, object]:
     """Build LangGraph runtime configuration for one graph run."""
+    if not isinstance(graph_run_id, str):
+        raise TypeError("graph_run_id must be a string")
     if not graph_run_id.strip():
         raise ValueError("graph_run_id must not be blank")
+    if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+        raise TypeError("max_concurrency must be an integer")
     if max_concurrency < 1:
         raise ValueError("max_concurrency must be at least one")
     return {
