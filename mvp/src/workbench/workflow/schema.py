@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 8
+PHASE1_SCHEMA_VERSION = 9
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -151,6 +151,72 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (session_id, command_id)
                 REFERENCES conversation_turns(session_id, command_id)
         );
+        CREATE TABLE IF NOT EXISTS graph_execution_plans (
+            plan_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            plan_json TEXT NOT NULL,
+            plan_digest TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (plan_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS graph_plan_approvals (
+            approval_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            actor_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            approval_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (plan_id, version)
+                REFERENCES graph_execution_plans(plan_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS graph_run_refs (
+            graph_run_id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            generation INTEGER NOT NULL,
+            thread_id TEXT NOT NULL UNIQUE,
+            checkpoint_ref TEXT,
+            created_at REAL NOT NULL,
+            UNIQUE (plan_id, version, generation),
+            FOREIGN KEY (plan_id, version)
+                REFERENCES graph_execution_plans(plan_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS graph_external_effect_refs (
+            effect_ref_id TEXT PRIMARY KEY,
+            graph_run_id TEXT NOT NULL,
+            effect_type TEXT NOT NULL,
+            external_ref TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS public_graph_projections (
+            projection_id TEXT PRIMARY KEY,
+            graph_run_id TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
+        BEFORE UPDATE ON graph_plan_approvals
+        BEGIN
+            SELECT RAISE(ABORT, 'graph plan approvals are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_delete
+        BEFORE DELETE ON graph_plan_approvals
+        BEGIN
+            SELECT RAISE(ABORT, 'graph plan approvals are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS public_graph_projections_no_update
+        BEFORE UPDATE ON public_graph_projections
+        BEGIN
+            SELECT RAISE(ABORT, 'public graph projections are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS public_graph_projections_no_delete
+        BEFORE DELETE ON public_graph_projections
+        BEGIN
+            SELECT RAISE(ABORT, 'public graph projections are append-only');
+        END;
         """
     )
     _add_column_if_missing(
