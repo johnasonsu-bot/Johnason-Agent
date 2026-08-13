@@ -2,9 +2,8 @@
 
 ## Formal exit status
 
-Pending a fresh full-backend pytest exit result. The runtime gate runner itself
-currently emits `GO_LANGGRAPH_RUNTIME`; this report does not treat that as the
-formal exit decision until the full backend command completes with exit code 0.
+`GO_LANGGRAPH_RUNTIME`. The runtime gate runner and the fresh complete backend
+regression both finished with exit code 0.
 
 ## Evidence
 
@@ -47,7 +46,7 @@ formal exit decision until the full backend command completes with exit code 0.
 tests/integration/test_langgraph_runtime_gate.py
 tests/integration/test_langgraph_restart.py
 tests/acceptance/test_langgraph_single_source.py
-20 passed in 0.85s
+34 passed in 1.40s
 
 Cumulative orchestration/runtime/restart/acceptance suite
 101 passed in 1.47s
@@ -59,5 +58,6 @@ GO_LANGGRAPH_RUNTIME
 The gate JSON contains the exact decision, metadata-only booleans, a public call
 ledger, and the projection count. No environment configuration is reported.
 
-The requested complete backend command is running. No formal full-suite result
-is claimed until the process returns a fresh terminal exit code.
+Complete backend (`tests/unit tests/integration tests/acceptance -q`):
+`561 passed, 6 skipped, 1 existing Starlette/httpx deprecation warning in
+84.98s`; exit code 0.
