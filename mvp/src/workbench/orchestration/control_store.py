@@ -27,12 +27,12 @@ class GraphControlStore:
     """Durable public references surrounding a LangGraph-owned execution."""
 
     def __init__(self, database: Path) -> None:
-        self.store = WorkflowStore(database)
+        self._store = WorkflowStore(database)
 
     def create_plan(self, plan: ExecutionPlan) -> None:
         plan_json = _canonical_json(plan.model_dump(mode="json"))
         digest = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
-        with self.store.connect() as connection:
+        with self._store.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO graph_execution_plans(
@@ -46,7 +46,7 @@ class GraphControlStore:
         """Replace an unapproved draft only; approvals permanently seal a version."""
         plan_json = _canonical_json(plan.model_dump(mode="json"))
         digest = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
-        with self.store.connect() as connection:
+        with self._store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 exists = connection.execute(
@@ -95,7 +95,7 @@ class GraphControlStore:
 
     def append_approval(self, approval: ApprovalRecord) -> None:
         approval_json = _canonical_json(approval.model_dump(mode="json"))
-        with self.store.connect() as connection:
+        with self._store.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO graph_plan_approvals(
@@ -115,7 +115,7 @@ class GraphControlStore:
             )
 
     def create_run(self, run: GraphRunRef) -> None:
-        with self.store.connect() as connection:
+        with self._store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 approval = connection.execute(
@@ -151,17 +151,39 @@ class GraphControlStore:
 
     def append_projection(self, event: PublicGraphEvent) -> None:
         event_json = _canonical_json(event.model_dump(mode="json"))
-        with self.store.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO public_graph_projections(
-                    projection_id, graph_run_id, event_json, created_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    event.projection_id,
-                    event.graph_run_id,
-                    event_json,
-                    event.created_at,
-                ),
-            )
+        with self._store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT plan.plan_json FROM graph_run_refs AS run
+                    JOIN graph_execution_plans AS plan
+                      ON plan.plan_id = run.plan_id AND plan.version = run.version
+                    WHERE run.graph_run_id = ?
+                    """,
+                    (event.graph_run_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("public projection requires an existing graph run")
+                if event.node_id is not None:
+                    plan = json.loads(row["plan_json"])
+                    node_ids = {node["node_id"] for node in plan["nodes"]}
+                    if event.node_id not in node_ids:
+                        raise ValueError("public projection node is not in the run plan")
+                connection.execute(
+                    """
+                    INSERT INTO public_graph_projections(
+                        projection_id, graph_run_id, event_json, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        event.projection_id,
+                        event.graph_run_id,
+                        event_json,
+                        event.created_at,
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise

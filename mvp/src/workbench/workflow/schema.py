@@ -217,6 +217,28 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'public graph projections are append-only');
         END;
+        CREATE TRIGGER IF NOT EXISTS graph_execution_plans_no_change_when_approved
+        BEFORE UPDATE ON graph_execution_plans
+        WHEN EXISTS (
+            SELECT 1 FROM graph_plan_approvals
+            WHERE plan_id = OLD.plan_id
+              AND version = OLD.version
+              AND decision = 'approved'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'approved graph plans are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS graph_execution_plans_no_delete_when_approved
+        BEFORE DELETE ON graph_execution_plans
+        WHEN EXISTS (
+            SELECT 1 FROM graph_plan_approvals
+            WHERE plan_id = OLD.plan_id
+              AND version = OLD.version
+              AND decision = 'approved'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'approved graph plans are immutable');
+        END;
         """
     )
     _add_column_if_missing(
