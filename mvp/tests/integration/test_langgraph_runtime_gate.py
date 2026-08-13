@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 import threading
 import time
+from collections.abc import Awaitable
 from collections import Counter
 from pathlib import Path
 
@@ -703,8 +704,8 @@ async def test_distinct_threads_execute_while_their_independent_fences_are_held(
 async def _cancel_after_fence_before_preflight_state(
     monkeypatch: pytest.MonkeyPatch,
     adapter: LangGraphRuntimeAdapter,
-    operation: object,
-) -> None:
+    operation: Awaitable[object],
+) -> asyncio.Task[object]:
     entered = asyncio.Event()
     never_release = asyncio.Event()
 
@@ -719,6 +720,9 @@ async def _cancel_after_fence_before_preflight_state(
     retained_operation.cancel()
     with pytest.raises(asyncio.CancelledError):
         await retained_operation
+    assert retained_operation.cancelled()
+    assert retained_operation.done()
+    return retained_operation
 
 
 @pytest.mark.asyncio
@@ -734,11 +738,12 @@ async def test_cancelled_start_preflight_releases_the_execution_fence(
         checkpointer=open_graph_checkpointer(database), node_executor=executor
     )
 
-    await _cancel_after_fence_before_preflight_state(
+    retained = await _cancel_after_fence_before_preflight_state(
         monkeypatch, first, first.start(gate_plan(), gate_run(), max_concurrency=1)
     )
 
     assert (await second.start(gate_plan(), gate_run(), max_concurrency=1)).status == "awaiting_approval"
+    del retained
 
 
 @pytest.mark.asyncio
@@ -760,7 +765,7 @@ async def test_cancelled_approval_preflight_releases_the_execution_fence(
     )
     await first.start(gate_plan(), gate_run(), max_concurrency=1)
 
-    await _cancel_after_fence_before_preflight_state(
+    retained = await _cancel_after_fence_before_preflight_state(
         monkeypatch,
         first,
         first.resume(gate_run(), {"plan_approval": {"decision": "approved"}}),
@@ -769,6 +774,7 @@ async def test_cancelled_approval_preflight_releases_the_execution_fence(
     assert (
         await second.resume(gate_run(), {"plan_approval": {"decision": "approved"}})
     ).status == "completed"
+    del retained
 
 
 @pytest.mark.asyncio
@@ -785,9 +791,10 @@ async def test_cancelled_running_recovery_preflight_releases_the_execution_fence
     )
     await first.start(gate_plan(), gate_run(), max_concurrency=1)
 
-    await _cancel_after_fence_before_preflight_state(
+    retained = await _cancel_after_fence_before_preflight_state(
         monkeypatch, first, first.resume_running(gate_run())
     )
 
     with pytest.raises(StaleResume):
         await second.resume_running(gate_run())
+    del retained
