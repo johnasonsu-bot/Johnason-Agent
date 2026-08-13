@@ -2,9 +2,9 @@
 
 ## Formal exit status
 
-The runtime gate runner is `GO_LANGGRAPH_RUNTIME`; formal Batch 3.0 exit remains
-pending a fresh complete-backend regression after the concurrent-execution fence
-change. The earlier complete-backend result is not represented as current proof.
+`GO_LANGGRAPH_RUNTIME`. The runtime gate runner and the fresh complete-backend
+regression after the concurrent-execution fence change both finished with exit
+code 0.
 
 ## Evidence
 
@@ -52,13 +52,13 @@ change. The earlier complete-backend result is not represented as current proof.
 ## Fresh results
 
 ```text
-tests/unit/orchestration/test_checkpointer.py
 tests/integration/test_langgraph_runtime_gate.py
 tests/integration/test_langgraph_restart.py
-38 passed in 0.92s
+tests/acceptance/test_langgraph_single_source.py
+40 passed in 1.56s
 
 Cumulative orchestration/runtime/restart/acceptance suite
-105 passed in 1.54s
+108 passed in 1.56s
 
 scripts/run_langgraph_runtime_gate.py
 GO_LANGGRAPH_RUNTIME
@@ -71,7 +71,6 @@ The runner emitted `GO_LANGGRAPH_RUNTIME`; its JSON had the exact worker ledger
 `1/2/1/1`, one merge/global verification each, and only metadata-safe evidence.
 The targeted secret-leak scan, compilation, and diff whitespace check all passed.
 
-Complete backend (`tests/unit tests/integration tests/acceptance -q`) remains
-pending a fresh run after this fence/evidence change. A previous `561 passed,
-6 skipped` result predates this change and is retained only as historical context,
-not as exit evidence.
+Complete backend (`tests/unit tests/integration tests/acceptance -q`): `568
+passed, 6 skipped, 1 existing Starlette/httpx deprecation warning in 85.41s`;
+exit code 0.
