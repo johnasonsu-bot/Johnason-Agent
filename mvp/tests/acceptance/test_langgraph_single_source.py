@@ -219,10 +219,29 @@ def _projection_store(tmp_path: Path) -> tuple[GraphControlStore, GraphRunRef]:
     return control, run
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "graph_run_id",
+        "event_type",
+        "node_id",
+        "stage",
+        "decision",
+        "evidence_refs",
+    ],
+)
 def test_projection_replay_rejects_same_id_with_different_semantics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
 ) -> None:
     control, run = _projection_store(tmp_path)
+    alternate_run = run.model_copy(
+        update={
+            "graph_run_id": "projection-run-2",
+            "generation": 2,
+            "thread_id": "projection-thread-2",
+        }
+    )
+    control.create_run(alternate_run)
     stored = PublicGraphEvent(
         projection_id="projection-conflict-1",
         graph_run_id=run.graph_run_id,
@@ -232,7 +251,15 @@ def test_projection_replay_rejects_same_id_with_different_semantics(
         decision="approved",
         evidence_refs=("evidence-worker-1-1",),
     )
-    conflicting = stored.model_copy(update={"decision": "rejected"})
+    replacements: dict[str, object] = {
+        "graph_run_id": alternate_run.graph_run_id,
+        "event_type": "branch_worker",
+        "node_id": "worker-2",
+        "stage": "worker",
+        "decision": "rejected",
+        "evidence_refs": ("evidence-worker-1-2",),
+    }
+    conflicting = stored.model_copy(update={field: replacements[field]})
     control.append_projection(stored)
     monkeypatch.setattr(projector, "project_checkpoint", lambda *_: ((conflicting,), ()))
 

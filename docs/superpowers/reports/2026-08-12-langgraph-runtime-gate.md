@@ -50,7 +50,7 @@ tests/acceptance/test_langgraph_single_source.py
 20 passed in 0.85s
 
 Cumulative orchestration/runtime/restart/acceptance suite
-96 passed in 1.43s
+101 passed in 1.47s
 
 scripts/run_langgraph_runtime_gate.py
 GO_LANGGRAPH_RUNTIME
