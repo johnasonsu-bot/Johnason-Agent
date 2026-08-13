@@ -321,6 +321,50 @@ async def test_runtime_rejects_invalid_pairing_and_stale_or_unknown_resume(
 
 
 @pytest.mark.asyncio
+async def test_generation_is_bound_for_snapshot_approval_and_running_recovery(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = Counter[str]()
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            calls[branch] += 1
+            entered.set()
+            release.wait(timeout=2)
+            return {"observed_workers": 1}
+        return {"decision": "approved"}
+
+    runtime = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(tmp_path / "graph.sqlite"),
+        node_executor=executor,
+    )
+    run = gate_run()
+    wrong_generation = run.model_copy(update={"generation": 2})
+    await runtime.start(gate_plan(), run, max_concurrency=1)
+
+    with pytest.raises(RunPlanMismatch):
+        await runtime.snapshot(wrong_generation)
+    with pytest.raises(RunPlanMismatch):
+        await runtime.resume(
+            wrong_generation, {"plan_approval": {"decision": "approved"}}
+        )
+    assert calls == {}
+
+    running = asyncio.create_task(
+        runtime.resume(run, {"plan_approval": {"decision": "approved"}})
+    )
+    await asyncio.to_thread(entered.wait, 1)
+    before = dict(calls)
+    with pytest.raises(RunPlanMismatch):
+        await runtime.resume_running(wrong_generation)
+    assert dict(calls) == before
+    release.set()
+    await running
+
+
+@pytest.mark.asyncio
 async def test_executor_failure_is_publicly_typed_without_payload_leak(
     tmp_path: Path,
 ) -> None:

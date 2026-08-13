@@ -102,6 +102,19 @@ class LangGraphRuntimeAdapter:
     async def _get_state(self, run_ref: GraphRunRef) -> StateSnapshot:
         return await asyncio.to_thread(self._graph.get_state, self._config(run_ref))
 
+    @staticmethod
+    def _validate_checkpoint_identity(
+        values: dict[str, object], run_ref: GraphRunRef
+    ) -> None:
+        if values.get("run_id") != run_ref.graph_run_id:
+            raise UnknownRun("graph run does not exist")
+        if (
+            values.get("plan_id") != run_ref.plan_id
+            or values.get("plan_version") != run_ref.plan_version
+            or values.get("generation") != run_ref.generation
+        ):
+            raise RunPlanMismatch("checkpoint plan/run generation does not match run reference")
+
     def _clear_inflight(self, thread_id: str, task: asyncio.Task[object]) -> None:
         if self._inflight.get(thread_id) is task:
             self._inflight.pop(thread_id, None)
@@ -156,6 +169,7 @@ class LangGraphRuntimeAdapter:
                 "plan_id": plan.plan_id,
                 "plan_version": plan.version,
                 "run_id": run_ref.graph_run_id,
+                "generation": run_ref.generation,
                 "max_concurrency": max_concurrency,
                 "status": "awaiting_approval",
                 "approved": False,
@@ -174,17 +188,11 @@ class LangGraphRuntimeAdapter:
     async def resume(
         self, run_ref: GraphRunRef, responses: dict[str, object]
     ) -> PublicRuntimeSnapshot:
-        self._require_not_inflight(run_ref)
         state = await self._get_state(run_ref)
         if not state.values and not state.next:
             raise UnknownRun("graph run does not exist")
-        if state.values.get("run_id") != run_ref.graph_run_id:
-            raise UnknownRun("graph run does not exist")
-        if (
-            state.values.get("plan_id") != run_ref.plan_id
-            or state.values.get("plan_version") != run_ref.plan_version
-        ):
-            raise RunPlanMismatch("checkpoint plan does not match run reference")
+        self._validate_checkpoint_identity(state.values, run_ref)
+        self._require_not_inflight(run_ref)
         status = state.values.get("status")
         if status != "awaiting_approval" or "approval" not in state.next:
             raise StaleResume("graph run is not awaiting an approval resume")
@@ -215,17 +223,11 @@ class LangGraphRuntimeAdapter:
         and therefore cannot create a second worker effect for an already committed
         branch stage.
         """
-        self._require_not_inflight(run_ref)
         state = await self._get_state(run_ref)
         if not state.values and not state.next:
             raise UnknownRun("graph run does not exist")
-        if state.values.get("run_id") != run_ref.graph_run_id:
-            raise UnknownRun("graph run does not exist")
-        if (
-            state.values.get("plan_id") != run_ref.plan_id
-            or state.values.get("plan_version") != run_ref.plan_version
-        ):
-            raise RunPlanMismatch("checkpoint plan does not match run reference")
+        self._validate_checkpoint_identity(state.values, run_ref)
+        self._require_not_inflight(run_ref)
         if state.values.get("status") != "running" or not state.next:
             raise StaleResume("graph run has no recoverable pending execution")
         max_concurrency = state.values.get("max_concurrency")
@@ -247,13 +249,9 @@ class LangGraphRuntimeAdapter:
     async def snapshot(self, run_ref: GraphRunRef) -> PublicRuntimeSnapshot:
         state = await self._get_state(run_ref)
         values = state.values
-        if not values or values.get("run_id") != run_ref.graph_run_id:
+        if not values:
             raise UnknownRun("graph run does not exist")
-        if (
-            values.get("plan_id") != run_ref.plan_id
-            or values.get("plan_version") != run_ref.plan_version
-        ):
-            raise RunPlanMismatch("checkpoint plan does not match run reference")
+        self._validate_checkpoint_identity(values, run_ref)
         verifier_records = values.get("verified_results", [])
         decisions: dict[str, list[str]] = {}
         for record in verifier_records:

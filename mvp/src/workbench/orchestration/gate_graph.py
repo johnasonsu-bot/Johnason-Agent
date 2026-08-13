@@ -54,6 +54,7 @@ class GateState(TypedDict, total=False):
     plan_id: str
     plan_version: int
     run_id: str
+    generation: int
     max_concurrency: int
     approved: bool
     status: str
