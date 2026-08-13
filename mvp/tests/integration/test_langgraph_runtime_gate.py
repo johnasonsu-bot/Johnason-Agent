@@ -56,6 +56,8 @@ class DeterministicExecutor:
 
     def __init__(self) -> None:
         self.calls: Counter[str] = Counter()
+        self.merge_calls = 0
+        self.global_calls = 0
         self.local_decisions: dict[str, list[str]] = {
             f"worker-{number}": [] for number in range(1, 5)
         }
@@ -89,7 +91,12 @@ class DeterministicExecutor:
             self.local_decisions[branch].append(decision)
             return {"decision": decision, "evidence_ref": f"verify-{branch}-{attempt}"}
 
+        if stage == "merge":
+            self.merge_calls += 1
+            return {"decision": "approved", "evidence_ref": "merge-1"}
+
         assert stage == "global_verifier"
+        self.global_calls += 1
         return {"decision": "approved", "evidence_ref": "global-verification-1"}
 
 
@@ -136,6 +143,8 @@ async def test_approval_gates_real_parallel_selective_rework_and_public_state(
         "worker-3": 1,
         "worker-4": 1,
     }
+    assert executor.merge_calls == 1
+    assert executor.global_calls == 1
     assert result.local_decisions == {
         "worker-1": ("approved",),
         "worker-2": ("rejected", "approved"),

@@ -207,6 +207,36 @@ class LangGraphRuntimeAdapter:
             raise ExecutorFailure("graph executor failed")
         return snapshot
 
+    async def resume_running(self, run_ref: GraphRunRef) -> PublicRuntimeSnapshot:
+        """Continue only a checkpointed, non-terminal graph after a process restart.
+
+        The graph checkpointer, rather than this adapter, decides which nested
+        branch task remains pending.  This method has no in-memory recovery state
+        and therefore cannot create a second worker effect for an already committed
+        branch stage.
+        """
+        self._require_not_inflight(run_ref)
+        state = await self._get_state(run_ref)
+        if not state.values and not state.next:
+            raise UnknownRun("graph run does not exist")
+        if state.values.get("run_id") != run_ref.graph_run_id:
+            raise UnknownRun("graph run does not exist")
+        if (
+            state.values.get("plan_id") != run_ref.plan_id
+            or state.values.get("plan_version") != run_ref.plan_version
+        ):
+            raise RunPlanMismatch("checkpoint plan does not match run reference")
+        if state.values.get("status") != "running" or not state.next:
+            raise StaleResume("graph run has no recoverable pending execution")
+        max_concurrency = state.values.get("max_concurrency")
+        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+            raise StaleResume("checkpoint has no valid concurrency bound")
+        await self._invoke(run_ref, None, max_concurrency=max_concurrency)
+        snapshot = await self.snapshot(run_ref)
+        if snapshot.status == "failed":
+            raise ExecutorFailure("graph executor failed")
+        return snapshot
+
     async def run_to_terminal(self, run_ref: GraphRunRef) -> PublicRuntimeSnapshot:
         """Return the checkpointed terminal state without causing new execution."""
         snapshot = await self.snapshot(run_ref)
