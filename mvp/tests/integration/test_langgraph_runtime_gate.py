@@ -698,3 +698,96 @@ async def test_distinct_threads_execute_while_their_independent_fences_are_held(
         "worker-3": 2,
         "worker-4": 2,
     }
+
+
+async def _cancel_after_fence_before_preflight_state(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter: LangGraphRuntimeAdapter,
+    operation: object,
+) -> None:
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_state(_: GraphRunRef) -> object:
+        entered.set()
+        await never_release.wait()
+        raise AssertionError("cancelled preflight state read must not continue")
+
+    monkeypatch.setattr(adapter, "_get_state", blocked_state)
+    retained_operation = asyncio.create_task(operation)  # type: ignore[arg-type]
+    assert await asyncio.wait_for(entered.wait(), timeout=1)
+    retained_operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await retained_operation
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_preflight_releases_the_execution_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "graph.sqlite"
+    executor = lambda **_: {"decision": "approved"}
+    first = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    second = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+
+    await _cancel_after_fence_before_preflight_state(
+        monkeypatch, first, first.start(gate_plan(), gate_run(), max_concurrency=1)
+    )
+
+    assert (await second.start(gate_plan(), gate_run(), max_concurrency=1)).status == "awaiting_approval"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_approval_preflight_releases_the_execution_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "graph.sqlite"
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            return {"observed_workers": 1}
+        return {"decision": "approved"}
+
+    first = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    second = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    await first.start(gate_plan(), gate_run(), max_concurrency=1)
+
+    await _cancel_after_fence_before_preflight_state(
+        monkeypatch,
+        first,
+        first.resume(gate_run(), {"plan_approval": {"decision": "approved"}}),
+    )
+
+    assert (
+        await second.resume(gate_run(), {"plan_approval": {"decision": "approved"}})
+    ).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_running_recovery_preflight_releases_the_execution_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "graph.sqlite"
+    executor = lambda **_: {"decision": "approved"}
+    first = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    second = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(database), node_executor=executor
+    )
+    await first.start(gate_plan(), gate_run(), max_concurrency=1)
+
+    await _cancel_after_fence_before_preflight_state(
+        monkeypatch, first, first.resume_running(gate_run())
+    )
+
+    with pytest.raises(StaleResume):
+        await second.resume_running(gate_run())

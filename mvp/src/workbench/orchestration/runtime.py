@@ -147,29 +147,34 @@ class LangGraphRuntimeAdapter:
             raise RunInProgress("graph run is already executing")
         self._clear_inflight(run_ref.thread_id, task)
 
-    async def _invoke(
+    def _invoke(
         self,
         run_ref: GraphRunRef,
         value: object,
         max_concurrency: int,
         fence: GraphExecutionFence,
-    ) -> None:
+    ) -> asyncio.Task[object]:
+        """Install the invoke task and its fence-release callback atomically."""
         thread_id = run_ref.thread_id
-        try:
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    self._graph.invoke, value, self._config(run_ref, max_concurrency)
-                )
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._graph.invoke, value, self._config(run_ref, max_concurrency)
             )
-        except Exception:
-            fence.release()
-            raise
+        )
         self._inflight[thread_id] = task
+
         def completed(completed_task: asyncio.Task[object]) -> None:
             self._clear_inflight(thread_id, completed_task)
             fence.release()
 
         task.add_done_callback(completed)
+        return task
+
+    async def _await_invoke(
+        self, run_ref: GraphRunRef, task: asyncio.Task[object]
+    ) -> None:
+        """Await a task after its done callback owns the execution fence."""
+        thread_id = run_ref.thread_id
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -186,7 +191,7 @@ class LangGraphRuntimeAdapter:
         self, plan: ExecutionPlan, run_ref: GraphRunRef, max_concurrency: int
     ) -> PublicRuntimeSnapshot:
         fence = await self._acquire_fence(run_ref)
-        submitted = False
+        fence_owned = True
         try:
             self._validate_pair(plan, run_ref)
             self._require_not_inflight(run_ref)
@@ -199,8 +204,7 @@ class LangGraphRuntimeAdapter:
                 {"branch_id": node.node_id}
                 for node in sorted(plan.nodes, key=lambda node: node.node_id)
             ]
-            submitted = True
-            await self._invoke(
+            task = self._invoke(
                 run_ref,
                 {
                     "plan_id": plan.plan_id,
@@ -221,17 +225,18 @@ class LangGraphRuntimeAdapter:
                 max_concurrency,
                 fence,
             )
-        except Exception:
-            if not submitted:
+            fence_owned = False
+            await self._await_invoke(run_ref, task)
+        finally:
+            if fence_owned:
                 fence.release()
-            raise
         return await self.snapshot(run_ref)
 
     async def resume(
         self, run_ref: GraphRunRef, responses: dict[str, object]
     ) -> PublicRuntimeSnapshot:
         fence = await self._acquire_fence(run_ref)
-        submitted = False
+        fence_owned = True
         try:
             state = await self._get_state(run_ref)
             if not state.values and not state.next:
@@ -251,14 +256,14 @@ class LangGraphRuntimeAdapter:
             max_concurrency = state.values.get("max_concurrency")
             if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
                 raise StaleResume("checkpoint has no valid concurrency bound")
-            submitted = True
-            await self._invoke(
+            task = self._invoke(
                 run_ref, Command(resume=dict(responses)), max_concurrency, fence
             )
-        except Exception:
-            if not submitted:
+            fence_owned = False
+            await self._await_invoke(run_ref, task)
+        finally:
+            if fence_owned:
                 fence.release()
-            raise
         snapshot = await self.snapshot(run_ref)
         if snapshot.status == "failed":
             raise ExecutorFailure("graph executor failed")
@@ -273,7 +278,7 @@ class LangGraphRuntimeAdapter:
         branch stage.
         """
         fence = await self._acquire_fence(run_ref)
-        submitted = False
+        fence_owned = True
         try:
             state = await self._get_state(run_ref)
             if not state.values and not state.next:
@@ -285,12 +290,12 @@ class LangGraphRuntimeAdapter:
             max_concurrency = state.values.get("max_concurrency")
             if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
                 raise StaleResume("checkpoint has no valid concurrency bound")
-            submitted = True
-            await self._invoke(run_ref, None, max_concurrency, fence)
-        except Exception:
-            if not submitted:
+            task = self._invoke(run_ref, None, max_concurrency, fence)
+            fence_owned = False
+            await self._await_invoke(run_ref, task)
+        finally:
+            if fence_owned:
                 fence.release()
-            raise
         snapshot = await self.snapshot(run_ref)
         if snapshot.status == "failed":
             raise ExecutorFailure("graph executor failed")
