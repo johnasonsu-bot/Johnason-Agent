@@ -1,8 +1,10 @@
 # LangGraph Runtime Gate Report
 
-## Decision
+## Formal exit status
 
-`GO_LANGGRAPH_RUNTIME`
+Pending a fresh full-backend pytest exit result. The runtime gate runner itself
+currently emits `GO_LANGGRAPH_RUNTIME`; this report does not treat that as the
+formal exit decision until the full backend command completes with exit code 0.
 
 ## Evidence
 
@@ -17,6 +19,19 @@
   Its external SQLite fixture ledger reports Worker 1/3/4 = 1 and Worker 2 = 2.
 - Checkpoint projections use deterministic semantic IDs, are append-only through
   `GraphControlStore.append_projection`, and replay without duplicate rows.
+- The runner itself launches a child process, waits for an externally observed
+  durable rejection boundary, kills and waits for that child, then constructs a
+  fresh adapter and calls `resume_running`. It does not use a terminal snapshot
+  as a substitute for restart recovery.
+- Failed worker and merge paths project exactly one `graph_terminal` /
+  `RUN_FINISHED` event with `terminal_state=failed`; the public decision contract
+  remains closed and does not add a failed decision value.
+- A checkpoint includes graph-run generation. Snapshot, approval resume, and
+  running recovery all reject a wrong generation before executing a worker.
+- Projection IDs use a fixed `p.` prefix plus SHA-256 digest, so maximum-length
+  identifiers remain deterministic and safely below the public ID limit.
+- Any runner exception atomically replaces a stale decision file with a fixed,
+  metadata-only `REJECT_LANGGRAPH_RUNTIME` result.
 - Projected records include only graph/run, branch/node, attempt, stage,
   decision, opaque evidence references, approval interrupt, and terminal state.
   Prompts, state blobs, tool results, exceptions, credentials, histories,
@@ -31,7 +46,7 @@ tests/acceptance/test_langgraph_single_source.py
 20 passed in 0.85s
 
 Cumulative orchestration/runtime/restart/acceptance suite
-88 passed in 0.95s
+94 passed in 1.37s
 
 scripts/run_langgraph_runtime_gate.py
 GO_LANGGRAPH_RUNTIME
@@ -40,7 +55,5 @@ GO_LANGGRAPH_RUNTIME
 The gate JSON contains the exact decision, metadata-only booleans, a public call
 ledger, and the projection count. No environment configuration is reported.
 
-The requested complete backend command was started and emitted clean progress
-through 25%, but the host wrapper detached before returning its terminal pytest
-summary. Its process later exited; this report does not represent that truncated
-capture as a full-suite pass.
+The requested complete backend command is running. No formal full-suite result
+is claimed until the process returns a fresh terminal exit code.

@@ -8,6 +8,7 @@ exception, or tool output.
 from __future__ import annotations
 
 import sqlite3
+from hashlib import sha256
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -51,12 +52,17 @@ def _projection_id(
     decision: ProjectionDecision,
 ) -> str:
     """Create a stable semantic identity for replay-safe append-only storage."""
-    parts = [run.graph_run_id, event_type, node_id or "graph", stage or "none"]
-    if attempt is not None:
-        parts.append(str(attempt))
-    if decision is not None:
-        parts.append(decision)
-    return ".".join(parts)
+    material = "\x1f".join(
+        (
+            run.graph_run_id,
+            event_type,
+            node_id or "graph",
+            stage or "none",
+            str(attempt) if attempt is not None else "none",
+            decision or "none",
+        )
+    )
+    return f"p.{sha256(material.encode('utf-8')).hexdigest()}"
 
 
 def _safe_evidence_refs(record: Mapping[str, object]) -> tuple[str, ...]:
@@ -129,12 +135,7 @@ def project_checkpoint(
     """Read only the current local checkpoint and return bounded public events."""
     state = runtime._graph.get_state(runtime._config(run))
     values = state.values
-    if (
-        values.get("run_id") != run.graph_run_id
-        or values.get("plan_id") != run.plan_id
-        or values.get("plan_version") != run.plan_version
-    ):
-        raise ValueError("checkpoint identity does not match graph run")
+    runtime._validate_checkpoint_identity(values, run)
 
     pairs: list[tuple[PublicGraphEvent, SafeAGUIProjection]] = []
     status = values.get("status")
@@ -203,9 +204,15 @@ def project_checkpoint(
                 evidence_refs=_safe_evidence_refs(merge),
             )
         )
-    final = values.get("final_result")
-    if isinstance(final, Mapping):
-        decision = "approved" if final.get("decision") == "approved" else None
+    if status in {"completed", "failed"}:
+        final = values.get("final_result")
+        decision = (
+            "approved"
+            if status == "completed"
+            and isinstance(final, Mapping)
+            and final.get("decision") == "approved"
+            else None
+        )
         pairs.append(
             _event(
                 run,
@@ -214,7 +221,9 @@ def project_checkpoint(
                 stage="global_verifier",
                 attempt=1,
                 decision=decision,
-                evidence_refs=_safe_evidence_refs(final),
+                evidence_refs=_safe_evidence_refs(final)
+                if isinstance(final, Mapping)
+                else (),
             )
         )
     events, agui = zip(*pairs) if pairs else ((), ())
@@ -238,6 +247,13 @@ def append_checkpoint_projections(
             # Do not turn foreign-key, trigger, or other audit failures into a
             # misleading idempotency success.
             if "public_graph_projections.projection_id" not in str(error):
+                raise
+            with control_store._store.connect() as connection:
+                exists = connection.execute(
+                    "SELECT 1 FROM public_graph_projections WHERE projection_id = ?",
+                    (event.projection_id,),
+                ).fetchone()
+            if exists is None:
                 raise
             continue
     return appended

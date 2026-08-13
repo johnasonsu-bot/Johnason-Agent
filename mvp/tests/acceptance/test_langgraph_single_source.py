@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
+import sys
 from collections import Counter
 from pathlib import Path
 
 import pytest
+from scripts import run_langgraph_runtime_gate as gate_runner
 
 from workbench.orchestration.checkpointer import open_graph_checkpointer
 from workbench.orchestration.contracts import (
@@ -17,6 +20,7 @@ from workbench.orchestration.contracts import (
 from workbench.orchestration.control_store import GraphControlStore
 from workbench.orchestration import projector
 from workbench.orchestration.projector import append_checkpoint_projections
+from workbench.orchestration.projector import project_checkpoint
 from workbench.orchestration.runtime import LangGraphRuntimeAdapter
 
 
@@ -146,3 +150,78 @@ def test_failed_terminal_uses_a_finished_agui_event_with_explicit_status() -> No
     assert agui.type == "RUN_FINISHED"
     assert agui.metadata["terminal_state"] == "failed"
     assert agui.metadata["decision_summary"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["worker", "merge"])
+async def test_failed_runtime_projects_exactly_one_terminal_finished_event(
+    tmp_path: Path, failure_stage: str
+) -> None:
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == failure_stage and (stage != "worker" or branch == "worker-3"):
+            raise RuntimeError("private failure detail")
+        if stage == "local_verifier":
+            return {"decision": "approved"}
+        return {"decision": "approved"}
+
+    runtime = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(tmp_path / "graph.sqlite"),
+        node_executor=executor,
+    )
+    await runtime.start(_plan(), _run(), max_concurrency=4)
+    with pytest.raises(Exception):
+        await runtime.resume(_run(), {"plan_approval": {"decision": "approved"}})
+
+    events, agui = project_checkpoint(runtime, _run())
+    terminal_events = [event for event in events if event.event_type == "graph_terminal"]
+    terminal_agui = [event for event in agui if event.type == "RUN_FINISHED"]
+    assert len(terminal_events) == 1
+    assert len(terminal_agui) == 1
+    assert terminal_agui[0].metadata["terminal_state"] == "failed"
+
+
+def test_projection_id_is_hashed_and_bounded_for_maximum_opaque_identifiers() -> None:
+    run = _run().model_copy(update={"graph_run_id": "r" * 128})
+    projection_id = projector._projection_id(
+        run, "local_verification", "n" * 128, "local_verifier", 2, "approved"
+    )
+
+    assert projection_id.startswith("p.")
+    assert len(projection_id) <= 128
+
+
+def test_gate_runner_atomically_replaces_stale_go_when_execution_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_dir = tmp_path / ".runtime"
+    runtime_dir.mkdir()
+    target = runtime_dir / "langgraph-runtime-gate.json"
+    target.write_text('{"decision":"GO_LANGGRAPH_RUNTIME"}', encoding="utf-8")
+
+    async def fail(_: Path) -> dict[str, object]:
+        raise RuntimeError("private failure detail must never be written")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gate_runner, "_run", fail)
+    assert gate_runner.main() == 1
+    rendered = target.read_text(encoding="utf-8")
+    assert json.loads(rendered)["decision"] == "REJECT_LANGGRAPH_RUNTIME"
+    assert "private failure detail" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_gate_runner_executes_a_real_durable_mid_rework_restart(
+    tmp_path: Path,
+) -> None:
+    result = await gate_runner._run(tmp_path)
+
+    assert result["decision"] == "GO_LANGGRAPH_RUNTIME"
+    assert result["checks"]["durable_mid_rework_restart"] is True
+    assert result["call_ledger"] == {
+        "worker-1": 1,
+        "worker-2": 2,
+        "worker-3": 1,
+        "worker-4": 1,
+    }
+    assert result["checks"]["merge_once"] is True
+    assert result["checks"]["global_once"] is True
