@@ -9,7 +9,7 @@ from typing import Annotated, Awaitable, Callable, TypedDict
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.types import Send, interrupt
+from langgraph.types import Command, Send, interrupt
 from pydantic import TypeAdapter, ValidationError
 
 from workbench.orchestration.contracts import OpaqueReference
@@ -66,19 +66,6 @@ class GateState(TypedDict, total=False):
     final_result: dict[str, object] | None
 
 
-class BranchState(TypedDict, total=False):
-    """State for one dynamic branch subgraph, checkpointed after every stage."""
-
-    branch_id: str
-    attempt: int
-    verified_attempt: int
-    local_decision: str
-    branch_results: Annotated[list[dict[str, object]], _ordered_records]
-    verified_results: Annotated[list[dict[str, object]], _ordered_records]
-    branch_outcomes: Annotated[list[dict[str, object]], _ordered_outcomes]
-    max_observed_workers: Annotated[int, _max_observed]
-
-
 def _safe_evidence_refs(value: object) -> tuple[str, ...]:
     """Apply the same opaque-reference contract as public control records."""
     try:
@@ -96,137 +83,6 @@ def _execute(
     if not isinstance(result, dict):
         raise TypeError("node executor must return a mapping")
     return result
-
-
-def _build_branch_graph(node_executor: NodeExecutor) -> CompiledStateGraph:
-    """Build one checkpointed ``worker → verifier → rework`` branch graph.
-
-    This compiled subgraph inherits the parent checkpointer.  Consequently the
-    rejection record is committed before its conditional edge schedules a second
-    worker attempt, including when four parent ``Send`` tasks run concurrently.
-    """
-
-    def worker(state: BranchState) -> dict[str, object]:
-        branch = state["branch_id"]
-        attempt = state["attempt"]
-        record = {
-            "branch_id": branch,
-            "node_id": branch,
-            "stage": "worker",
-            "attempt": attempt,
-            "evidence_refs": (),
-        }
-        try:
-            value = _execute(
-                node_executor, stage="worker", branch=branch, attempt=attempt
-            )
-            record["evidence_refs"] = _safe_evidence_refs(value.get("evidence_ref"))
-            measured = value.get("observed_workers", 0)
-            observed = (
-                max(0, measured)
-                if isinstance(measured, int) and not isinstance(measured, bool)
-                else 0
-            )
-            return {
-                "branch_results": [record],
-                "max_observed_workers": observed,
-                "local_decision": "pending",
-            }
-        except Exception:
-            return {
-                "branch_results": [record],
-                "verified_results": [
-                    {
-                        "branch_id": branch,
-                        "node_id": f"{branch}.verifier",
-                        "stage": "local_verifier",
-                        "attempt": attempt,
-                        "decision": "failed",
-                        "evidence_refs": (),
-                    }
-                ],
-                "verified_attempt": attempt,
-                "local_decision": "failed",
-            }
-
-    def after_worker(state: BranchState) -> str:
-        return "local_verifier" if state.get("local_decision") == "pending" else "branch_complete"
-
-    def local_verifier(state: BranchState) -> dict[str, object]:
-        branch = state["branch_id"]
-        attempt = state["attempt"]
-        decision = "failed"
-        evidence_refs: tuple[str, ...] = ()
-        try:
-            value = _execute(
-                node_executor,
-                stage="local_verifier",
-                branch=branch,
-                attempt=attempt,
-            )
-            decision = value.get("decision")
-            if decision not in {"approved", "rejected"}:
-                decision = "rejected"
-            evidence_refs = _safe_evidence_refs(value.get("evidence_ref"))
-        except Exception:
-            decision = "failed"
-        update: dict[str, object] = {
-            "verified_results": [
-                {
-                    "branch_id": branch,
-                    "node_id": f"{branch}.verifier",
-                    "stage": "local_verifier",
-                    "attempt": attempt,
-                    "decision": decision,
-                    "evidence_refs": evidence_refs,
-                }
-            ],
-            "verified_attempt": attempt,
-            "local_decision": decision,
-        }
-        if decision == "rejected" and attempt < MAX_BRANCH_ATTEMPTS:
-            # This next attempt is itself checkpointed before ``worker`` runs.
-            update["attempt"] = attempt + 1
-        return update
-
-    def after_local_verifier(state: BranchState) -> str:
-        if (
-            state.get("local_decision") == "rejected"
-            and state.get("verified_attempt", 0) < MAX_BRANCH_ATTEMPTS
-        ):
-            return "worker"
-        return "branch_complete"
-
-    def branch_complete(state: BranchState) -> dict[str, object]:
-        branch = state["branch_id"]
-        decision = state.get("local_decision")
-        if decision not in {"approved", "rejected", "failed"}:
-            decision = "failed"
-        return {
-            "branch_outcomes": [
-                {
-                    "branch_id": branch,
-                    "node_id": branch,
-                    "stage": "local_verifier",
-                    "attempt": state.get("verified_attempt", state.get("attempt", 1)),
-                    "decision": decision,
-                }
-            ]
-        }
-
-    graph = StateGraph(BranchState)
-    graph.add_node("worker", worker)
-    graph.add_node("local_verifier", local_verifier)
-    graph.add_node("branch_complete", branch_complete)
-    graph.add_edge(START, "worker")
-    graph.add_conditional_edges(
-        "worker", after_worker, ["local_verifier", "branch_complete"]
-    )
-    graph.add_conditional_edges(
-        "local_verifier", after_local_verifier, ["worker", "branch_complete"]
-    )
-    graph.add_edge("branch_complete", END)
-    return graph.compile()
 
 
 def build_gate_graph(
@@ -261,8 +117,77 @@ def build_gate_graph(
             for item in state["branch_inputs"]
         ]
 
+    def worker_branch(state: GateState) -> Command:
+        """Execute exactly one worker attempt then checkpoint before verification."""
+        branch = state["branch_id"]
+        attempt = state["attempt"]
+        record = {
+            "branch_id": branch,
+            "node_id": branch,
+            "stage": "worker",
+            "attempt": attempt,
+            "evidence_refs": (),
+        }
+        try:
+            value = _execute(node_executor, stage="worker", branch=branch, attempt=attempt)
+            record["evidence_refs"] = _safe_evidence_refs(value.get("evidence_ref"))
+            measured = value.get("observed_workers", 0)
+            observed = max(0, measured) if isinstance(measured, int) and not isinstance(measured, bool) else 0
+            return Command(
+                update={"branch_results": [record], "max_observed_workers": observed},
+                goto=Send("local_verifier", {"branch_id": branch, "attempt": attempt}),
+            )
+        except Exception:
+            return Command(
+                update={
+                    "branch_results": [record],
+                    "verified_results": [{"branch_id": branch, "node_id": f"{branch}.verifier", "stage": "local_verifier", "attempt": attempt, "decision": "failed", "evidence_refs": ()}],
+                    "branch_outcomes": [{"branch_id": branch, "node_id": branch, "stage": "local_verifier", "attempt": attempt, "decision": "failed"}],
+                },
+                goto="merge",
+            )
+
+    def local_verifier(state: GateState) -> Command:
+        """Persist the local decision before its conditional rework Send is runnable."""
+        branch = state["branch_id"]
+        attempt = state["attempt"]
+        decision = "failed"
+        evidence_refs: tuple[str, ...] = ()
+        try:
+            value = _execute(node_executor, stage="local_verifier", branch=branch, attempt=attempt)
+            decision = value.get("decision")
+            if decision not in {"approved", "rejected"}:
+                decision = "rejected"
+            evidence_refs = _safe_evidence_refs(value.get("evidence_ref"))
+        except Exception:
+            decision = "failed"
+        record = {"branch_id": branch, "node_id": f"{branch}.verifier", "stage": "local_verifier", "attempt": attempt, "decision": decision, "evidence_refs": evidence_refs}
+        if decision == "rejected" and attempt < MAX_BRANCH_ATTEMPTS:
+            return Command(
+                update={"verified_results": [record]},
+                goto=Send("worker_branch", {"branch_id": branch, "attempt": attempt + 1}),
+            )
+        return Command(
+            update={"verified_results": [record]},
+            goto=Send("branch_complete", {"branch_id": branch, "attempt": attempt, "decision": decision}),
+        )
+
+    def branch_complete(state: GateState) -> Command:
+        branch = state["branch_id"]
+        decision = state["decision"]
+        if decision not in {"approved", "rejected", "failed"}:
+            decision = "failed"
+        return Command(
+            update={"branch_outcomes": [{"branch_id": branch, "node_id": branch, "stage": "local_verifier", "attempt": state["attempt"], "decision": decision}]},
+            goto="merge",
+        )
+
     def merge(state: GateState) -> dict[str, object]:
         outcomes = state.get("branch_outcomes", [])
+        if len(outcomes) < 4:
+            # The node may be scheduled by an earlier branch completion; only the
+            # fourth durable outcome is permitted to trigger the merge effect.
+            return {}
         all_approved = len(outcomes) == 4 and all(
             item.get("decision") == "approved" for item in outcomes
         )
@@ -289,7 +214,12 @@ def build_gate_graph(
         return {"status": "failed", "merge_result": {"status": "failed", "branch_count": 4}}
 
     def after_merge(state: GateState) -> str:
-        return "global_verifier" if state.get("status") == "running" else END
+        merge_result = state.get("merge_result")
+        return (
+            "global_verifier"
+            if isinstance(merge_result, dict) and merge_result.get("status") == "approved"
+            else END
+        )
 
     def global_verifier(_: GateState) -> dict[str, object]:
         try:
@@ -311,7 +241,9 @@ def build_gate_graph(
 
     graph = StateGraph(GateState)
     graph.add_node("approval", approval)
-    graph.add_node("worker_branch", _build_branch_graph(node_executor))
+    graph.add_node("worker_branch", worker_branch)
+    graph.add_node("local_verifier", local_verifier)
+    graph.add_node("branch_complete", branch_complete)
     graph.add_node("merge", merge)
     graph.add_node("global_verifier", global_verifier)
     graph.add_edge(START, "approval")
