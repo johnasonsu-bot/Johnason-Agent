@@ -287,7 +287,10 @@ async def test_concurrent_duplicate_turn_has_one_gateway_and_tool_owner(
         profile=profile(),
         conversations=ConversationRepository(tmp_path / "runtime.sqlite"),
         tools=[BlockingTool(operations, release)],
-        turn_lease_seconds=0.01,
+        # Keep the test above the host/SQLite scheduling quantum while still
+        # holding the tool for three complete lease periods. A 10 ms lease made
+        # this heartbeat assertion dependent on unrelated full-suite load.
+        turn_lease_seconds=0.1,
     )
     command = RunAgentTurn(
         session_id="session-1",
@@ -300,7 +303,7 @@ async def test_concurrent_duplicate_turn_has_one_gateway_and_tool_owner(
     while operations != ["tool"]:
         await asyncio.sleep(0)
     second = asyncio.create_task(_collect(runtime, command))
-    await asyncio.sleep(0.03)
+    await asyncio.sleep(0.3)
     release.set()
 
     assert await second == await first
