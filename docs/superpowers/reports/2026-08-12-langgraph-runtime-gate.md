@@ -30,6 +30,10 @@ formal exit decision until the full backend command completes with exit code 0.
   running recovery all reject a wrong generation before executing a worker.
 - Projection IDs use a fixed `p.` prefix plus SHA-256 digest, so maximum-length
   identifiers remain deterministic and safely below the public ID limit.
+- A duplicate projection is replay-idempotent only when the stored event has the
+  same graph run, event type, node, stage, decision, and evidence references.
+  A conflicting semantic event with the same ID re-raises its original SQLite
+  integrity error. `created_at` is intentionally not part of that semantic key.
 - Any runner exception atomically replaces a stale decision file with a fixed,
   metadata-only `REJECT_LANGGRAPH_RUNTIME` result.
 - Projected records include only graph/run, branch/node, attempt, stage,
@@ -46,7 +50,7 @@ tests/acceptance/test_langgraph_single_source.py
 20 passed in 0.85s
 
 Cumulative orchestration/runtime/restart/acceptance suite
-94 passed in 1.37s
+96 passed in 1.43s
 
 scripts/run_langgraph_runtime_gate.py
 GO_LANGGRAPH_RUNTIME

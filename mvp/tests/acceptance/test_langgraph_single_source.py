@@ -209,6 +209,58 @@ def test_gate_runner_atomically_replaces_stale_go_when_execution_raises(
     assert "private failure detail" not in rendered
 
 
+def _projection_store(tmp_path: Path) -> tuple[GraphControlStore, GraphRunRef]:
+    control = GraphControlStore(tmp_path / "control.sqlite")
+    plan = _plan()
+    run = _run()
+    control.create_plan(plan)
+    control.approve_plan(plan.plan_id, plan.version, actor_id="user")
+    control.create_run(run)
+    return control, run
+
+
+def test_projection_replay_rejects_same_id_with_different_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, run = _projection_store(tmp_path)
+    stored = PublicGraphEvent(
+        projection_id="projection-conflict-1",
+        graph_run_id=run.graph_run_id,
+        event_type="local_verification",
+        node_id="worker-1",
+        stage="local_verifier",
+        decision="approved",
+        evidence_refs=("evidence-worker-1-1",),
+    )
+    conflicting = stored.model_copy(update={"decision": "rejected"})
+    control.append_projection(stored)
+    monkeypatch.setattr(projector, "project_checkpoint", lambda *_: ((conflicting,), ()))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        projector.append_checkpoint_projections(control, object(), run)
+
+
+def test_projection_replay_accepts_same_stable_semantics_despite_created_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control, run = _projection_store(tmp_path)
+    stored = PublicGraphEvent(
+        projection_id="projection-replay-2",
+        graph_run_id=run.graph_run_id,
+        event_type="local_verification",
+        node_id="worker-1",
+        stage="local_verifier",
+        decision="approved",
+        evidence_refs=("evidence-worker-1-1",),
+        created_at=1.0,
+    )
+    replay = stored.model_copy(update={"created_at": 2.0})
+    control.append_projection(stored)
+    monkeypatch.setattr(projector, "project_checkpoint", lambda *_: ((replay,), ()))
+
+    assert projector.append_checkpoint_projections(control, object(), run) == 0
+
+
 @pytest.mark.asyncio
 async def test_gate_runner_executes_a_real_durable_mid_rework_restart(
     tmp_path: Path,

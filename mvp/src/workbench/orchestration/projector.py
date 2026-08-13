@@ -8,6 +8,7 @@ exception, or tool output.
 from __future__ import annotations
 
 import sqlite3
+import json
 from hashlib import sha256
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -28,6 +29,14 @@ if TYPE_CHECKING:
 
 ProjectionDecision = Literal["approved", "rejected", "needs_human"] | None
 _opaque_reference = TypeAdapter(OpaqueReference)
+_SEMANTIC_EVENT_FIELDS = (
+    "graph_run_id",
+    "event_type",
+    "node_id",
+    "stage",
+    "decision",
+    "evidence_refs",
+)
 
 
 @dataclass(frozen=True)
@@ -249,11 +258,18 @@ def append_checkpoint_projections(
             if "public_graph_projections.projection_id" not in str(error):
                 raise
             with control_store._store.connect() as connection:
-                exists = connection.execute(
-                    "SELECT 1 FROM public_graph_projections WHERE projection_id = ?",
+                row = connection.execute(
+                    "SELECT event_json FROM public_graph_projections WHERE projection_id = ?",
                     (event.projection_id,),
                 ).fetchone()
-            if exists is None:
+            if row is None:
+                raise
+            try:
+                stored = json.loads(row["event_json"])
+            except (TypeError, ValueError):
+                raise
+            incoming = event.model_dump(mode="json")
+            if any(stored.get(name) != incoming.get(name) for name in _SEMANTIC_EVENT_FIELDS):
                 raise
             continue
     return appended
