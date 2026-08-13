@@ -413,6 +413,41 @@ async def test_runtime_accepts_an_async_local_executor(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_two_local_rejections_stop_after_the_bounded_second_attempt(
+    tmp_path: Path,
+) -> None:
+    calls = Counter[str]()
+
+    def executor(*, stage: str, branch: str, attempt: int) -> dict[str, object]:
+        if stage == "worker":
+            calls[branch] += 1
+            return {"observed_workers": 1}
+        if stage == "local_verifier":
+            return {
+                "decision": "rejected" if branch == "worker-2" else "approved"
+            }
+        return {"decision": "approved"}
+
+    runtime = LangGraphRuntimeAdapter(
+        checkpointer=open_graph_checkpointer(tmp_path / "graph.sqlite"),
+        node_executor=executor,
+    )
+    await runtime.start(gate_plan(), gate_run(), max_concurrency=4)
+
+    with pytest.raises(ExecutorFailure):
+        await runtime.resume(gate_run(), {"plan_approval": {"decision": "approved"}})
+
+    snapshot = await runtime.snapshot(gate_run())
+    assert snapshot.status == "failed"
+    assert calls == {
+        "worker-1": 1,
+        "worker-2": 2,
+        "worker-3": 1,
+        "worker-4": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_runtime_surfaces_cancellation_without_second_execution(
     tmp_path: Path,
 ) -> None:

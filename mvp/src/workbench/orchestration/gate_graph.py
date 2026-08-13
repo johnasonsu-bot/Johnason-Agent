@@ -192,7 +192,7 @@ def _build_branch_graph(node_executor: NodeExecutor) -> CompiledStateGraph:
     def after_local_verifier(state: BranchState) -> str:
         if (
             state.get("local_decision") == "rejected"
-            and state.get("attempt", 0) <= MAX_BRANCH_ATTEMPTS
+            and state.get("verified_attempt", 0) < MAX_BRANCH_ATTEMPTS
         ):
             return "worker"
         return "branch_complete"
