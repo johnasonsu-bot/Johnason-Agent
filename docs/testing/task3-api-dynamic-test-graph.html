@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task 3 API 测试场景因子与分支动态图谱</title>
+<style>
+:root{
+  --ink:#0E1422; --line:#25304A;
+  --serif:"Songti SC",Georgia,"Times New Roman",serif;
+  --sans:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:#C6CFE2;font-family:var(--sans);-webkit-font-smoothing:antialiased}
+header{padding:20px 22px 4px;max-width:1100px;margin:0 auto}
+header h1{font-size:18px;margin:0 0 4px;font-weight:700;color:#EAEEF7}
+header p{margin:0;color:#8B96AE;font-size:13px;line-height:1.6}
+.stage{margin:16px auto;max-width:1100px;background:radial-gradient(120% 130% at 50% 0%,#161D2E 0%,#0C111C 80%);
+  border:1px solid var(--line);border-radius:16px;overflow:hidden;position:relative}
+#graph-box{position:relative;height:900px;overflow:hidden}
+@media(max-width:680px){#graph-box{height:620px}}
+#graph-svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+
+/* ----- 五层横带（仅 layered 模式） ----- */
+.gband-line{stroke:#22304C;stroke-width:1;stroke-dasharray:4 7;stroke-opacity:.7}
+.gband-cap{fill:#5E6E92;font-family:var(--mono);font-size:11px;letter-spacing:.06em}
+.gband-sub{fill:#9AA7C4;font-family:var(--sans);font-size:13px;font-weight:600}
+.gband-band:nth-child(odd){fill:#121A2B} .gband-band{fill:#0E1626;opacity:.5}
+
+/* ----- 节点 / 连线 / 标签 ----- */
+.gnode{cursor:grab}.gnode.dragging{cursor:grabbing}
+.gnode,.glink,.gelabel{transition:opacity .22s ease}
+.gnode.dim{opacity:.12}.glink.dim{opacity:.04}.gelabel.dim{opacity:0}
+.gn-core{transition:transform .2s cubic-bezier(.34,1.56,.64,1);transform-box:fill-box;transform-origin:center}
+.gnode.pop .gn-core{transform:scale(1.28)}
+.glabel{fill:#C6CFE2;paint-order:stroke;stroke:#0B1018;stroke-width:3px;stroke-linejoin:round;
+  font-size:10px;font-family:var(--sans)}
+.gnode.pop .glabel{fill:#fff;font-weight:700;font-size:11.5px}
+.gelabel{fill:#8B96AE;font-size:8.5px;font-family:var(--mono);opacity:0}
+
+/* ----- 工具条 / 图例 / 详情 ----- */
+.toolbar{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:6}
+.tb-btn{font-size:12px;font-family:var(--mono);color:#C6CFE2;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:6px 11px;cursor:pointer}
+.tb-btn:hover{background:#1E2A44;color:#fff}
+#g-search{flex:1 1 130px;min-width:120px;font-size:12.5px;color:#E6EBF5;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:7px 11px;font-family:var(--sans)}
+#g-search::placeholder{color:#7782A0}
+.legend{display:flex;flex-wrap:wrap;gap:7px;padding:14px;border-top:1px solid #25304A;background:#0E1421}
+.lg{display:flex;align-items:center;gap:6px;font-size:11.5px;color:#AEB8CE;cursor:pointer;
+  padding:4px 9px;border-radius:18px;border:1px solid transparent}
+.lg:hover{border-color:#2A3650}
+.lg.active{background:#1A2336;border-color:#3A4E6E;color:#fff}
+.lg .sw{width:11px;height:11px;border-radius:50%}
+.g-pop{position:absolute;z-index:8;background:#161D2E;border:1px solid #2C3A58;border-radius:11px;
+  box-shadow:0 10px 34px rgba(0,0,0,.5);padding:11px 13px;font-size:12.5px;color:#D4DAE8;
+  pointer-events:none;max-width:250px;line-height:1.55}
+.g-pop b{color:#fff}
+#g-detail{padding:16px 18px;border-top:1px solid #25304A;background:#0E1421;min-height:64px;font-size:13.5px}
+#g-detail .ph{color:#7E8AA6;font-family:var(--mono);font-size:11.5px}
+#g-detail .nm{font-family:var(--serif);font-size:18px;color:#fff;margin:2px 0 6px}
+#g-detail .gp{font-size:11px;font-family:var(--mono);padding:2px 8px;border-radius:12px;margin-left:8px;vertical-align:middle}
+#g-detail .ds{color:#B6C0D6;margin:6px 0 4px}
+#g-detail .pr{display:flex;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:1px solid #1E2840;font-size:12.5px}
+#g-detail .pr span{color:#828FAB} #g-detail .pr b{color:#DCE2EF}
+#g-detail .nbtit{margin-top:12px;color:#7E8AA6;font-size:11.5px;font-family:var(--mono)}
+#g-detail .nb{display:inline-block;margin:4px 4px 0 0;padding:3px 9px;border-radius:8px;font-size:12px;cursor:pointer}
+@media (prefers-reduced-motion: reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Task 3 API 测试场景因子与分支动态图谱</h1>
+  <p>测试依据：从 API 入口与协议，经场景因子、异常/并发分支、持久化证据，落到验收断言。支持分层横带与自由力导向布局；点击节点查看前置条件、预期结果及相邻测试路径。</p>
+</header>
+
+<div class="stage">
+  <div id="graph-box">
+    <div class="toolbar">
+      <input id="g-search" type="text" placeholder="搜索节点…" autocomplete="off">
+      <button class="tb-btn" id="g-mode">切换布局</button>
+      <button class="tb-btn" id="g-reset">重置视图</button>
+      <button class="tb-btn" id="g-relayout">重新布局</button>
+    </div>
+    <svg id="graph-svg"></svg>
+  </div>
+  <div class="legend" id="g-legend"></div>
+  <div id="g-detail"></div>
+</div>
+
+<script>
+/* ============================================================
+   1) 布局模式： "layered"（纵向分层横带） | "force"（自由力导向）
+   ============================================================ */
+let LAYOUT="layered";
+
+/* ============================================================
+   2) 数据 —— 换成你自己的领域数据
+   - GROUPS：颜色分组（决定节点颜色 + 图例 + 高亮筛选维度）
+   - LAYERS：纵向层带（仅 layered 模式生效）。每层声明它包含哪些 group。
+             颜色仍按 GROUPS，层带只决定纵向位置 → 颜色与结构是两个独立维度。
+   - NODES ：id 唯一；group 必须是 GROUPS 里的 id；desc/props 用于详情面板。
+   - EDGES ：[source, target, relation] 三元组；source/target 必须是节点 id。
+   下面是一份与具体业务无关的「系统架构」示例数据，仅作占位演示。
+   ============================================================ */
+const GROUPS=[
+  {id:"endpoint",   label:"API 入口",color:"#5B8FF0"},
+  {id:"protocol",   label:"协议约束",color:"#34B3C7"},
+  {id:"control",    label:"会话控制",color:"#E8B84B"},
+  {id:"concurrency",label:"并发语义",color:"#A47BE0"},
+  {id:"failure",    label:"异常分支",color:"#E0574F"},
+  {id:"storage",    label:"持久化证据",color:"#5FB87A"},
+  {id:"projection", label:"AG-UI 投影",color:"#E8924B"},
+  {id:"assertion",  label:"验收断言",color:"#C96C8A"}
+];
+
+const LAYERS=[
+  {key:1,label:"入口与协议",en:"Entry & Protocol",groups:["endpoint","protocol"]},
+  {key:2,label:"场景因子",en:"Scenario Factors",groups:["control","concurrency"]},
+  {key:3,label:"异常与分支",en:"Fault Branches",groups:["failure"]},
+  {key:4,label:"证据与投影",en:"Evidence & Projection",groups:["storage","projection"]},
+  {key:5,label:"验收门禁",en:"Assertions & Gates",groups:["assertion"]}
+];
+
+const NODES=[
+  {id:"E1",label:"创建会话",group:"endpoint",desc:"POST /api/sessions 创建或取得一个持久化会话。",props:[["输入","session_id"],["成功","HTTP 200"]]},
+  {id:"E2",label:"发送消息",group:"endpoint",desc:"POST /api/sessions/{id}/messages 执行一次真实 Agent turn。",props:[["必需头","Idempotency-Key"],["输出","status + public events"]]},
+  {id:"E3",label:"事件流",group:"endpoint",desc:"GET /api/sessions/{id}/events 返回可断线重放的 SSE 帧。",props:[["媒体类型","text/event-stream"],["游标","Last-Event-ID"]]},
+  {id:"E4",label:"人工介入",group:"endpoint",desc:"POST scoped intervention，仅写入目标会话。",props:[["类型","supplement / correct / replan …"],["隔离","session scoped"]]},
+  {id:"E5",label:"暂停会话",group:"endpoint",desc:"POST pause 记录 paused 状态并阻止新消息执行。",props:[["成功","HTTP 200"],["后续消息","HTTP 409"]]},
+  {id:"E6",label:"恢复会话",group:"endpoint",desc:"POST resume 记录 running 状态并恢复消息执行。",props:[["成功","HTTP 200"],["状态","running"]]},
+  {id:"P1",label:"能力令牌",group:"protocol",desc:"所有会话路由复用现有 capability middleware。",props:[["请求头","X-Workbench-Capability"],["缺失","HTTP 401"]]},
+  {id:"P2",label:"幂等键",group:"protocol",desc:"写命令必须携带 Idempotency-Key，并按会话作用域去重。",props:[["缺失","HTTP 400"],["作用域","session + command"]]},
+  {id:"P3",label:"重放游标",group:"protocol",desc:"Last-Event-ID 只允许非负整数，表示已消费 sequence。",props:[["非整数","HTTP 400"],["负数","HTTP 400"]]},
+  {id:"P4",label:"SSE 帧格式",group:"protocol",desc:"每帧包含单调 id 与 JSON data，帧间空行分隔。",props:[["格式","id: N / data: JSON"],["编码","UTF-8"]]},
+
+  {id:"C1",label:"会话存在",group:"control",desc:"所有消息、事件和控制操作先验证目标 session。",props:[["不存在","HTTP 404"],["存在","进入命令路径"]]},
+  {id:"C2",label:"运行状态",group:"control",desc:"running、paused、completed、failed 状态由持久化事件推导。",props:[["暂停","拒绝消息"],["恢复","允许执行"]]},
+  {id:"C3",label:"介入类型",group:"control",desc:"补充、纠正、约束、重规划、暂停、跳过、重试、取消均显式建模。",props:[["上下文","context_version ≥ 0"],["内容","public content"]]},
+  {id:"C4",label:"事件表面",group:"control",desc:"覆盖消息、决策、工具、Artifact、状态、介入与失败终态。",props:[["用途","AG-UI UI 消费"],["原则","公开字段白名单"]]},
+  {id:"Q1",label:"同会话双命令",group:"concurrency",desc:"同一 session 的不同 command 同时到达时必须串行执行。",props:[["断言","maximum_active = 1"],["结果","两次 HTTP 200"]]},
+  {id:"Q2",label:"跨会话隔离",group:"concurrency",desc:"session A 的介入与暂停不得污染 session B 的事件或状态。",props:[["A","paused + intervention"],["B","继续 completed"]]},
+  {id:"Q3",label:"重复命令",group:"concurrency",desc:"同一会话重复 Idempotency-Key 应复用已持久化结果。",props:[["目标","无重复副作用"],["依据","command identity"]]},
+  {id:"Q4",label:"独立会话并行",group:"concurrency",desc:"不同 session 保持独立锁与事件流，为后续多 Agent 并行留出能力。",props:[["锁粒度","session_id"],["事件流","run:{session_id}"]]},
+
+  {id:"X1",label:"缺少幂等键",group:"failure",desc:"消息、介入、暂停或恢复缺少 Idempotency-Key 时拒绝请求。",props:[["预期","HTTP 400"],["副作用","无写入"]]},
+  {id:"X2",label:"会话不存在",group:"failure",desc:"访问未知 session 时返回 404，而不是创建隐式会话。",props:[["预期","HTTP 404"],["边界","全部 scoped routes"]]},
+  {id:"X3",label:"暂停时发消息",group:"failure",desc:"目标 session 为 paused 时消息命令返回冲突。",props:[["预期","HTTP 409"],["runner","不调用"]]},
+  {id:"X4",label:"非法游标",group:"failure",desc:"Last-Event-ID 为文本或负数时显式返回输入错误。",props:[["预期","HTTP 400"],["重放","不开始"]]},
+  {id:"X5",label:"Runner 不可用",group:"failure",desc:"composition 未提供 turn runner 时返回服务不可用。",props:[["预期","HTTP 503"],["错误","公开、可诊断"]]},
+  {id:"X6",label:"Agent 异常",group:"failure",desc:"runner 抛错时持久化公开 turn_failed 事件。",props:[["公开 reason","agent_error"],["私有异常","不输出"]]},
+  {id:"X7",label:"工具失败",group:"failure",desc:"tool_failed 投影 tool_call_id、name、reason，隐藏内部 detail。",props:[["事件","CUSTOM agent.tool.failed"],["可重放","是"]]},
+  {id:"X8",label:"私有字段注入",group:"failure",desc:"reasoning_content、detail 或未知 runtime payload 不得越过 HTTP/SSE 边界。",props:[["攻击面","事件 payload"],["预期","白名单丢弃"]]},
+
+  {id:"D1",label:"SQLite 会话",group:"storage",desc:"ConversationRepository 持久化 session，并在每个路由前验证存在性。",props:[["表","conversation_sessions"],["重启","可恢复"]]},
+  {id:"D2",label:"事件流存储",group:"storage",desc:"EventStore 按 run:{session_id} 追加不可变领域事件。",props:[["顺序","monotonic sequence"],["重放","after_sequence"]]},
+  {id:"D3",label:"命令去重",group:"storage",desc:"持久化 command id 由 session、command 与 ordinal 构成。",props:[["键","conversation:{session}:{command}:{ordinal}"],["目标","幂等 append"]]},
+  {id:"D4",label:"会话锁",group:"storage",desc:"每 session 一把重入锁，串行消息与控制写入。",props:[["粒度","session_id"],["跨会话","互不阻塞"]]},
+  {id:"D5",label:"状态折叠",group:"storage",desc:"从 status 与 turn terminal 事件折叠当前会话状态。",props:[["完成","conversation.turn.finished"],["失败","conversation.turn.failed"]]},
+  {id:"D6",label:"游标重放",group:"storage",desc:"只读取 sequence 大于 Last-Event-ID 的事件。",props:[["示例","after 2 → id 3"],["断线恢复","无重复旧帧"]]},
+  {id:"G1",label:"消息 Delta",group:"projection",desc:"agent.message.delta 映射 TEXT_MESSAGE_CONTENT。",props:[["公开字段","delta"],["标识","messageId"]]},
+  {id:"G2",label:"工具生命周期",group:"projection",desc:"tool start/completed/failed 映射工具卡片需要的公开字段。",props:[["开始","TOOL_CALL_START"],["完成","TOOL_CALL_END"]]},
+  {id:"G3",label:"决策摘要",group:"projection",desc:"只投影 agent.decision.summary 的 summary。",props:[["类型","CUSTOM"],["排除","detail / reasoning"]]},
+  {id:"G4",label:"Artifact 链接",group:"projection",desc:"投影 artifact_id、name、url 与 media_type。",props:[["类型","CUSTOM"],["用途","右侧画布打开"]]},
+  {id:"G5",label:"状态与介入",group:"projection",desc:"投影 conversation.status 与 intervention queued/applied。",props:[["类型","CUSTOM"],["作用域","runId = session"]]},
+  {id:"G6",label:"公开终态",group:"projection",desc:"turn_finished 与 turn_failed 形成可重放的完成/失败 UI 事件。",props:[["名称","turn_finished / turn_failed"],["顺序","持久化 sequence"]]},
+  {id:"G7",label:"字段白名单",group:"projection",desc:"自定义事件逐类型选择公开字段，默认未知事件不输出。",props:[["策略","allowlist"],["未知类型","[]"]]},
+
+  {id:"A1",label:"HTTP 可达",group:"assertion",desc:"所有路由通过 FastAPI TestClient 真实请求可达。",props:[["禁止","仅挂 app.state"],["范围","REST + SSE"]]},
+  {id:"A2",label:"严格状态码",group:"assertion",desc:"成功、输入错误、鉴权、未找到、冲突、不可用均有稳定状态码。",props:[["集合","200/400/401/404/409/503"],["断言","无模糊 500"]]},
+  {id:"A3",label:"单调事件 ID",group:"assertion",desc:"新会话事件 ID 从 1 连续增长，重放不回送已确认帧。",props:[["基线","1..N"],["游标示例","2 → 3"]]},
+  {id:"A4",label:"串行化成立",group:"assertion",desc:"并发发送两个同会话命令时 runner 最大活跃数等于 1。",props:[["并发客户端","2"],["maximum_active","1"]]},
+  {id:"A5",label:"会话零串扰",group:"assertion",desc:"A 的介入文本与 paused 状态不出现在 B 的 SSE。",props:[["检查","内容 + 状态"],["结果","隔离"]]},
+  {id:"A6",label:"隐私零泄漏",group:"assertion",desc:"响应与 SSE 不包含 private、reasoning、detail 或 continuation。",props:[["扫描","响应全文 + JSON"],["策略","投影白名单"]]},
+  {id:"A7",label:"事件面覆盖",group:"assertion",desc:"参数化验证决策、Artifact、状态、介入、工具失败与 turn 终态。",props:[["当前用例","7 mapper branches"],["结果","待最终回归"]]},
+  {id:"A8",label:"断线重放",group:"assertion",desc:"Last-Event-ID=2 时不含 id 1，只返回剩余 turn_finished 帧。",props:[["预期 ID","3"],["name","turn_finished"]]},
+  {id:"A9",label:"Focused Gate",group:"assertion",desc:"API 单元与会话重放集成测试全部通过。",props:[["当前结果","30 passed"],["扩展回归","78 passed"]]},
+  {id:"A10",label:"Full Python Gate",group:"assertion",desc:"Task 3 进入 UX 前必须通过全量 Python 回归与独立复审。",props:[["当前结果","257 passed / 4 skipped"],["状态","Task 3 复审通过"]]}
+];
+
+const EDGES=[
+  ["E1","C1","建立"],["E1","D1","持久化"],["E1","P1","鉴权"],
+  ["E2","P2","要求"],["E2","C1","验证"],["E2","C2","检查"],["E2","Q1","并发输入"],["E2","D4","串行"],
+  ["E3","P3","读取"],["E3","P4","输出"],["E3","D6","重放"],["E3","G7","投影"],
+  ["E4","P2","要求"],["E4","C3","承载"],["E4","Q2","隔离"],["E4","G5","投影"],
+  ["E5","C2","写 paused"],["E5","P2","要求"],["E6","C2","写 running"],["E6","P2","要求"],
+  ["P1","A2","401 门禁"],["P2","X1","缺失分支"],["P3","X4","非法分支"],["P4","A3","格式证据"],
+  ["C1","X2","不存在"],["C2","X3","paused 分支"],["C3","D2","追加事件"],["C4","G1","消息"],["C4","G2","工具"],["C4","G3","决策"],["C4","G4","产物"],["C4","G5","控制"],["C4","G6","终态"],
+  ["Q1","D4","同 session 锁"],["Q1","A4","验证"],["Q2","A5","验证"],["Q3","D3","持久化去重"],["Q4","D4","独立锁"],
+  ["X1","A2","400"],["X2","A2","404"],["X3","A2","409"],["X4","A2","400"],["X5","A2","503"],
+  ["X6","G6","公开失败"],["X7","G2","失败投影"],["X8","G7","白名单过滤"],["X8","A6","验证"],
+  ["D1","A1","真实 composition"],["D2","D5","折叠"],["D2","D6","按 sequence"],["D2","A3","单调证据"],["D3","A3","稳定序号"],["D4","A4","活跃数"],["D5","C2","当前状态"],["D6","A8","游标断言"],
+  ["G1","A6","无 reasoning"],["G2","A7","mapper 分支"],["G3","A7","mapper 分支"],["G4","A7","mapper 分支"],["G5","A5","作用域"],["G5","A7","mapper 分支"],["G6","A7","mapper 分支"],["G7","A6","字段扫描"],
+  ["A1","A9","focused"],["A2","A9","focused"],["A3","A9","focused"],["A4","A9","focused"],["A5","A9","focused"],["A6","A9","focused"],["A7","A9","focused"],["A8","A9","focused"],["A9","A10","扩展回归"]
+];
+
+/* ============================================================
+   3) 引擎 —— 一般无需改动
+   ============================================================ */
+const NS="http://www.w3.org/2000/svg";
+const COLOR=Object.fromEntries(GROUPS.map(g=>[g.id,g.color]));
+const GLABEL=Object.fromEntries(GROUPS.map(g=>[g.id,g.label]));
+const G2L={};LAYERS.forEach(L=>L.groups.forEach(g=>G2L[g]=L.key));
+const CN=["一","二","三","四","五","六","七","八","九","十"];
+let _seed=20240101; function rnd(){_seed=(_seed*1103515245+12345)&0x7fffffff;return _seed/0x7fffffff;}
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+const $=s=>document.querySelector(s);
+
+const G={nodes:[],links:[],idx:{},nbr:{},alpha:0,view:{x:0,y:0,k:1},drag:null,pan:null,hover:null,
+  raf:0,W:1000,H:780,root:null,bound:false,sel:null,litGroup:null};
+
+function degree(){const d={};EDGES.forEach(e=>{d[e[0]]=(d[e[0]]||0)+1;d[e[1]]=(d[e[1]]||0)+1;});return d;}
+function nodeR(deg,n){return Math.max(8,Math.min(22,7+(deg[n.id]||1)*1.3));}
+function mkNode(n,L,by,li,r,x,y){return {...n,layer:L,by,li,color:COLOR[n.group],r,x,y,vx:0,vy:0,
+  lw:Math.min(String(n.label).length,11)*11+10};}
+
+function geom(){
+  G.LBL=G.W<560?86:150;            // 左侧层标签留白
+  G.padT=44;G.padB=28;
+  G.bandH=(G.H-G.padT-G.padB)/LAYERS.length;
+  G.x0=G.LBL+34;G.x1=G.W-66;
+}
+function bandY(L){return G.padT+G.bandH*(L-0.5);}
+
+function build(){
+  geom();
+  const deg=degree();
+  G.nodes=[];
+  if(LAYOUT==="layered"){
+    const byLayer={};for(let L=1;L<=LAYERS.length;L++)byLayer[L]=[];
+    NODES.forEach(n=>{const L=G2L[n.group]||1;(byLayer[L]||byLayer[1]).push(n);});
+    for(let L=1;L<=LAYERS.length;L++){
+      const arr=byLayer[L];
+      arr.sort((p,q)=>p.group<q.group?-1:p.group>q.group?1:(deg[q.id]||0)-(deg[p.id]||0));
+      const cy=bandY(L),n_=arr.length;
+      arr.forEach((n,i)=>{
+        const r=nodeR(deg,n),t=n_>1?i/(n_-1):.5,x=G.x0+t*(G.x1-G.x0);
+        const jit=((i%3)-1)*Math.min(34,G.bandH*0.30)*(0.45+0.55*rnd());
+        G.nodes.push(mkNode(n,L,cy,i,r,x,cy+jit));
+      });
+    }
+  }else{
+    NODES.forEach((n,i)=>{
+      const r=nodeR(deg,n),a=i*2.39996,rr=70+Math.sqrt(i+1)*34;
+      G.nodes.push(mkNode(n,G2L[n.group]||1,0,i,r,G.W/2+Math.cos(a)*rr,G.H/2+Math.sin(a)*rr*.82));
+    });
+  }
+  G.links=EDGES.map(e=>({s:e[0],t:e[1],label:e[2]}));
+  G.idx=Object.fromEntries(G.nodes.map(n=>[n.id,n]));
+  G.nbr={};G.links.forEach(l=>{(G.nbr[l.s]||(G.nbr[l.s]=new Set())).add(l.t);(G.nbr[l.t]||(G.nbr[l.t]=new Set())).add(l.s);});
+}
+
+function dom(svg){
+  svg.innerHTML="";const root=el("g",{});G.root=root;
+  const gb=el("g",{}),gl=el("g",{}),gn=el("g",{});
+  if(LAYOUT==="layered"){
+    for(let L=1;L<=LAYERS.length;L++){
+      const top=G.padT+G.bandH*(L-1),cy=bandY(L);
+      gb.appendChild(el("rect",{class:"gband-band",x:0,y:top,width:G.W,height:G.bandH}));
+      gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:top,x2:G.W-10,y2:top}));
+      const cap=el("text",{class:"gband-cap",x:22,y:cy-7});cap.textContent="第"+(CN[L-1]||L)+"层";gb.appendChild(cap);
+      const sub=el("text",{class:"gband-sub",x:22,y:cy+13});sub.textContent=LAYERS[L-1].label;gb.appendChild(sub);
+      if(LAYERS[L-1].en){const en=el("text",{class:"gband-cap",x:22,y:cy+30});en.textContent=LAYERS[L-1].en;gb.appendChild(en);}
+    }
+    gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:G.padT+G.bandH*LAYERS.length,x2:G.W-10,y2:G.padT+G.bandH*LAYERS.length}));
+  }
+  G.links.forEach(l=>{
+    l.el=el("line",{class:"glink",stroke:"#5A6B8C","stroke-width":1.1,"stroke-opacity":.30});gl.appendChild(l.el);
+    l.elt=el("text",{class:"gelabel","text-anchor":"middle"});l.elt.textContent=l.label;gl.appendChild(l.elt);
+  });
+  G.nodes.forEach(n=>{
+    const g=el("g",{class:"gnode","data-id":n.id});
+    const core=el("g",{class:"gn-core"});
+    core.appendChild(el("circle",{r:n.r+5,fill:n.color,"fill-opacity":.16}));      // 光晕
+    const c=el("circle",{r:n.r,fill:n.color,"fill-opacity":.92,stroke:"#0B1018","stroke-width":1.5});
+    core.appendChild(c);n.elc=c;g.appendChild(core);
+    const below=(n.li%2===0);                                                      // 交错上下，缓解标签拥挤
+    const lb=el("text",{class:"glabel","text-anchor":"middle",y:below?n.r+14:-(n.r+7)});lb.textContent=n.label;g.appendChild(lb);
+    n.el=g;gn.appendChild(g);
+  });
+  root.appendChild(gb);root.appendChild(gl);root.appendChild(gn);svg.appendChild(root);applyView();markSel();
+}
+function applyView(){if(G.root)G.root.setAttribute("transform",`translate(${G.view.x},${G.view.y}) scale(${G.view.k})`);}
+function kick(a){G.alpha=Math.max(G.alpha,a);if(!G.raf)G.raf=requestAnimationFrame(loop);}
+function loop(){G.raf=0;step();draw();if(G.alpha>0.012||G.drag)G.raf=requestAnimationFrame(loop);}
+function step(){LAYOUT==="layered"?stepLayered():stepForce();}
+
+function stepForce(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const dx=t.x-s.x,dy=t.y-s.y,d=Math.hypot(dx,dy)||1,f=(d-112)*0.015*a,fx=dx/d*f,fy=dy/d*f;
+    s.vx+=fx;s.vy+=fy;t.vx-=fx;t.vy-=fy;}
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<30000){const f=1250*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    let minD=p.r+q.r+16;if(Math.abs(dy)<32)minD=Math.max(minD,(p.lw+q.lw)*0.40);
+    if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+      if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+      if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}
+  }
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vx+=(G.W/2-n.x)*0.006*a;n.vy+=(G.H/2-n.y)*0.006*a;
+    n.x+=n.vx*=.86;n.y+=n.vy*=.86;}
+  G.alpha*=G.drag?1:.965;
+}
+
+function stepLayered(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const fx=(t.x-s.x)*0.0006*a;s.vx+=fx;t.vx-=fx;}                 // 仅横向对齐
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<42000){const f=1500*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    if(p.layer===q.layer){let minD=p.r+q.r+16;if(Math.abs(dy)<34)minD=Math.max(minD,(p.lw+q.lw)*0.44);
+      if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+        if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+        if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}}
+  }
+  const yIn=Math.min(40,G.bandH*0.34);
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vy+=(n.by-n.y)*0.085*a;                                       // 回吸到本层中线
+    n.x+=n.vx*=.85;n.y+=n.vy*=.85;
+    if(n.x<G.x0)n.x=G.x0;if(n.x>G.x1)n.x=G.x1;                      // 横向夹在画布内
+    if(n.y<n.by-yIn)n.y=n.by-yIn;if(n.y>n.by+yIn)n.y=n.by+yIn;       // 纵向夹在本层带内
+  }
+  G.alpha*=G.drag?1:.965;
+}
+
+function draw(){
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t||!l.el)continue;
+    l.el.setAttribute("x1",s.x.toFixed(1));l.el.setAttribute("y1",s.y.toFixed(1));
+    l.el.setAttribute("x2",t.x.toFixed(1));l.el.setAttribute("y2",t.y.toFixed(1));
+    if(l.elt){l.elt.setAttribute("x",((s.x+t.x)/2).toFixed(1));l.elt.setAttribute("y",((s.y+t.y)/2-3).toFixed(1));}}
+  for(const n of G.nodes)n.el.setAttribute("transform",`translate(${n.x.toFixed(1)},${n.y.toFixed(1)})`);
+}
+function pt(box,ev){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+  const px=(ev.clientX-r.left)*sx,py=(ev.clientY-r.top)*sx;
+  return {x:(px-G.view.x)/G.view.k,y:(py-G.view.y)/G.view.k,px,py};}
+function bind(svg,box){
+  svg.addEventListener("pointerdown",ev=>{
+    const g=ev.target.closest?ev.target.closest(".gnode"):null;
+    if(g){const n=G.idx[g.dataset.id];if(!n)return;G.drag={node:n,moved:0};
+      try{svg.setPointerCapture(ev.pointerId)}catch(e){}n.el.classList.add("dragging");kick(.7);hidePop();}
+    else{G.pan={x:ev.clientX,y:ev.clientY,vx:G.view.x,vy:G.view.y};try{svg.setPointerCapture(ev.pointerId)}catch(e){}}
+  });
+  svg.addEventListener("pointermove",ev=>{
+    if(G.drag){const p=pt(box,ev),n=G.drag.node;G.drag.moved+=Math.abs(p.x-n.x)+Math.abs(p.y-n.y);
+      n.x=p.x;n.y=p.y;n.vx=0;n.vy=0;kick(.5);}
+    else if(G.pan){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+      G.view.x=G.pan.vx+(ev.clientX-G.pan.x)*sx;G.view.y=G.pan.vy+(ev.clientY-G.pan.y)*sx;applyView();}
+    else{const g=ev.target.closest?ev.target.closest(".gnode"):null;hov(g?g.dataset.id:null,box,ev);}
+  });
+  const end=()=>{if(G.drag){G.drag.node.el.classList.remove("dragging");
+    if(G.drag.moved<5){G.sel=G.drag.node.id;markSel();detail(G.drag.node.id);}G.drag=null;kick(.3);}G.pan=null;};
+  svg.addEventListener("pointerup",end);svg.addEventListener("pointercancel",end);
+  svg.addEventListener("pointerleave",()=>{hov(null);G.pan=null;});
+  svg.addEventListener("wheel",ev=>{ev.preventDefault();const p=pt(box,ev);
+    const k2=Math.max(.4,Math.min(3,G.view.k*Math.exp(-ev.deltaY*0.0016)));
+    G.view.x=p.px-p.x*k2;G.view.y=p.py-p.y*k2;G.view.k=k2;applyView();},{passive:false});
+}
+function markSel(){for(const n of G.nodes){const on=G.sel===n.id;
+  n.elc.setAttribute("stroke",on?"#fff":"#0B1018");n.elc.setAttribute("stroke-width",on?2.5:1.5);}}
+function applyGroupLit(){
+  if(!G.litGroup){for(const n of G.nodes)n.el.classList.remove("dim");
+    for(const l of G.links)l.el.classList.remove("dim");return;}
+  for(const n of G.nodes)n.el.classList.toggle("dim",n.group!==G.litGroup);
+  for(const l of G.links){const a=G.idx[l.s].group===G.litGroup||G.idx[l.t].group===G.litGroup;
+    l.el.classList.toggle("dim",!a);}
+}
+function hov(id,box,ev){
+  if(G.litGroup)return;
+  if(G.hover===id){if(id&&ev)posPop(box,ev);return;}G.hover=id;
+  if(!id){for(const n of G.nodes)n.el.classList.remove("dim","pop");
+    for(const l of G.links){l.el.classList.remove("dim");if(l.elt)l.elt.classList.remove("dim");l.elt.style.opacity=0;}
+    hidePop();return;}
+  const nb=G.nbr[id]||new Set();
+  for(const n of G.nodes){const on=n.id===id||nb.has(n.id);n.el.classList.toggle("dim",!on);n.el.classList.toggle("pop",n.id===id);}
+  for(const l of G.links){const a=l.s===id||l.t===id;l.el.classList.toggle("dim",!a);
+    if(l.elt){l.elt.classList.toggle("dim",!a);l.elt.style.opacity=a?1:0;}}
+  showPop(G.idx[id],box,ev);
+}
+let popEl=null;
+function showPop(n,box,ev){hidePop();if(!n)return;popEl=document.createElement("div");popEl.className="g-pop";
+  popEl.innerHTML=`<b>${esc(n.label)}</b> <span style="color:${n.color}">· ${esc(GLABEL[n.group])}</span>
+    <div style="color:#9AA6BE;margin-top:5px">${esc(n.desc||"")}</div>
+    <div style="color:#6E7A96;margin-top:6px;font-size:11px">点击查看详情</div>`;
+  box.appendChild(popEl);if(ev)posPop(box,ev);}
+function posPop(box,ev){if(!popEl)return;const r=box.getBoundingClientRect();
+  let x=ev.clientX-r.left+14,y=ev.clientY-r.top+12;
+  if(x+popEl.offsetWidth>r.width-8)x=ev.clientX-r.left-popEl.offsetWidth-12;
+  if(y+popEl.offsetHeight>r.height-8)y=ev.clientY-r.top-popEl.offsetHeight-12;
+  popEl.style.left=Math.max(4,x)+"px";popEl.style.top=Math.max(4,y)+"px";}
+function hidePop(){if(popEl){popEl.remove();popEl=null;}}
+function detail(id){
+  const n=G.idx[id],box=$("#g-detail");
+  const nb=[...(G.nbr[id]||[])].map(x=>G.idx[x]).filter(Boolean);
+  box.innerHTML=`<span class="ph">${esc(GLABEL[n.group])}</span>
+    <div class="nm">${esc(n.label)}<span class="gp" style="background:${n.color}22;color:${n.color}">${esc(GLABEL[n.group])}</span></div>
+    <div class="ds">${esc(n.desc||"")}</div>
+    ${(n.props||[]).map(p=>`<div class="pr"><span>${esc(p[0])}</span><b>${esc(p[1])}</b></div>`).join("")}
+    <div class="nbtit">关联节点（${nb.length}）— 点击跳转</div>
+    <div>${nb.map(x=>`<span class="nb" data-go="${x.id}" style="background:${x.color}22;color:${x.color}">${esc(x.label)}</span>`).join("")}</div>`;
+  box.querySelectorAll(".nb").forEach(b=>b.addEventListener("click",()=>{
+    G.sel=b.dataset.go;markSel();detail(b.dataset.go);focusNode(b.dataset.go);}));
+}
+function focusNode(id){const n=G.idx[id];if(!n)return;
+  G.view.k=Math.max(G.view.k,1.1);G.view.x=G.W/2-n.x*G.view.k;G.view.y=G.H/2-n.y*G.view.k;applyView();kick(.2);}
+function legend(){
+  const box=$("#g-legend");box.innerHTML="";
+  GROUPS.forEach(g=>{const d=document.createElement("div");d.className="lg";d.dataset.g=g.id;
+    d.innerHTML=`<span class="sw" style="background:${g.color}"></span>${g.label}`;
+    d.addEventListener("click",()=>{
+      const on=G.litGroup===g.id;G.litGroup=on?null:g.id;
+      box.querySelectorAll(".lg").forEach(x=>x.classList.toggle("active",!on&&x.dataset.g===g.id));
+      if(G.litGroup){hov(null);}applyGroupLit();});
+    box.appendChild(d);});
+}
+function init(){
+  const svg=$("#graph-svg"),box=$("#graph-box");
+  G.W=Math.max(box.clientWidth||0,640);G.H=Math.max(box.clientHeight||0,560);
+  svg.setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+  build();dom(svg);legend();if(!G.bound){bind(svg,box);G.bound=true;}kick(1);
+  $("#g-mode").addEventListener("click",()=>{LAYOUT=LAYOUT==="layered"?"force":"layered";
+    _seed=20240101;G.view={x:0,y:0,k:1};applyView();build();dom(svg);kick(1);});
+  $("#g-reset").addEventListener("click",()=>{G.view={x:0,y:0,k:1};applyView();G.sel=null;markSel();
+    G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));applyGroupLit();
+    $("#g-detail").innerHTML="";$("#g-search").value="";});
+  $("#g-relayout").addEventListener("click",()=>{_seed=(Date.now()&0x7fffffff);build();dom(svg);kick(1);});
+  $("#g-search").addEventListener("input",e=>{
+    const q=e.target.value.trim();if(!q){hov(null);return;}
+    const hit=G.nodes.find(n=>n.label.includes(q)||n.id.toLowerCase()===q.toLowerCase());
+    if(hit){G.sel=hit.id;markSel();detail(hit.id);focusNode(hit.id);
+      G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));
+      hov(hit.id,box,null);}});
+}
+if("requestIdleCallback"in window)requestIdleCallback(init);else setTimeout(init,80);
+window.addEventListener("resize",()=>{const box=$("#graph-box");if(!box)return;
+  const w=Math.max(box.clientWidth||0,640),h=Math.max(box.clientHeight||0,560);
+  if(Math.abs(w-G.W)>40){G.W=w;G.H=h;$("#graph-svg").setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+    build();dom($("#graph-svg"));kick(.8);}});
+</script>
+</body>
+</html>

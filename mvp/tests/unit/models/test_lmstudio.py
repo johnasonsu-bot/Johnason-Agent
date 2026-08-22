@@ -5,6 +5,7 @@ import pytest
 
 from workbench.models.contracts import ModelRequest, ToolDefinition
 from workbench.models.lmstudio import LMStudioProvider, ProviderUnavailable
+from workbench.models.profiles import ProviderProfileRecord
 
 
 def _provider(handler) -> LMStudioProvider:
@@ -140,4 +141,70 @@ async def test_maps_connection_failure_to_provider_unavailable() -> None:
     provider = _provider(handler)
     with pytest.raises(ProviderUnavailable):
         await provider.list_models()
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completion_resolves_saved_model_aliases() -> None:
+    """A saved default alias must resolve before the LM Studio request is sent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == "loaded-model"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ready"}}]}
+        )
+
+    provider = _provider(handler)
+    profile = ProviderProfileRecord(
+        id="lmstudio",
+        name="LM Studio",
+        protocol="lmstudio",
+        base_url="http://lmstudio.test",
+        model_aliases={"default": "loaded-model"},
+    )
+
+    response = await provider.complete(
+        ModelRequest(model="default", messages=[]), profile
+    )
+
+    assert response.text == "ready"
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_completion_resolves_local_agent_placeholder_to_first_loaded_model() -> None:
+    """The UI placeholder must not be sent as a literal LM Studio model id."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "gemma-4-31b-it"}]})
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content)["model"] == "gemma-4-31b-it"
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ready"}}]}
+        )
+
+    provider = _provider(handler)
+    profile = ProviderProfileRecord(
+        id="lmstudio",
+        name="LM Studio",
+        protocol="lmstudio",
+        base_url="http://lmstudio.test",
+        model_aliases={},
+    )
+
+    response = await provider.complete(
+        ModelRequest(model="local-agent", messages=[]), profile
+    )
+
+    assert response.text == "ready"
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_timeout_allows_slow_local_generation() -> None:
+    provider = LMStudioProvider()
+
+    assert provider._client.timeout.read >= 300
+
     await provider.aclose()

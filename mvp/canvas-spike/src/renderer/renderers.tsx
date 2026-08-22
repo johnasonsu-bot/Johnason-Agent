@@ -1,4 +1,8 @@
 import type { ComponentType } from "react";
+import { JsonRenderer } from "./JsonRenderer";
+import { MarkdownRenderer } from "./MarkdownRenderer";
+import { RunGraphRenderer } from "./RunGraphRenderer";
+import { TableRenderer } from "./TableRenderer";
 
 export interface ArtifactDescriptor {
   id: string;
@@ -6,6 +10,7 @@ export interface ArtifactDescriptor {
   mimeType: string;
   title: string;
   content?: string;
+  data?: unknown;
 }
 
 export interface RendererProps {
@@ -23,10 +28,6 @@ export class RendererRegistry {
     return this.renderers.get(kind) ?? UnknownRenderer;
   }
 }
-
-const MarkdownRenderer = ({ artifact }: RendererProps) => (
-  <article data-testid={`artifact-${artifact.id}`}><h2>{artifact.title}</h2><p>{artifact.content}</p></article>
-);
 
 const ChartRenderer = ({ artifact }: RendererProps) => (
   <svg data-testid={`artifact-${artifact.id}`} role="img" aria-label={artifact.title} width="240" height="120">
@@ -63,7 +64,9 @@ const UnknownRenderer = ({ artifact }: RendererProps) => (
 
 export const registry = new RendererRegistry();
 registry.register("markdown", MarkdownRenderer);
+registry.register("json", JsonRenderer);
+registry.register("table", TableRenderer);
+registry.register("run-graph", RunGraphRenderer);
 registry.register("chart", ChartRenderer);
 registry.register("html", HtmlRenderer);
 registry.register("audio", AudioRenderer);
-

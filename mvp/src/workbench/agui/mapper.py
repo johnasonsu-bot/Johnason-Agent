@@ -23,6 +23,14 @@ _CUSTOM_TYPES = {
     "approval.requested",
     "connector.progress",
     "supervisor.finding.created",
+    "agent.decision.summary",
+    "artifact.linked",
+    "conversation.status",
+    "conversation.turn.queued",
+    "conversation.turn.finished",
+    "conversation.turn.failed",
+    "conversation.turn.retryable",
+    "agent.tool.failed",
 }
 
 
@@ -52,12 +60,63 @@ def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
         result["delta"] = payload.get("delta", "")
     elif event.event_type == "agent.tool.completed":
         result["toolCallId"] = payload.get("tool_call_id") or event.correlation_id
+        public_result = payload.get("public_result")
+        if isinstance(public_result, str):
+            result["result"] = public_result[:4096]
     elif event.event_type == "run.state.snapshot":
         result["snapshot"] = payload.get("snapshot", {})
     elif event.event_type == "run.state.delta":
         result["delta"] = payload.get("delta", [])
     elif event.event_type in _CUSTOM_TYPES:
-        result["name"] = event.event_type
-        result["value"] = payload
+        result["name"] = {
+            "conversation.turn.queued": "turn_queued",
+            "conversation.turn.finished": "turn_finished",
+            "conversation.turn.failed": "turn_failed",
+            "conversation.turn.retryable": "turn_retryable",
+        }.get(event.event_type, event.event_type)
+        result["value"] = _public_custom_payload(event.event_type, payload)
     return [result]
 
+
+def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Project only fields explicitly safe for the browser event stream."""
+    fields = {
+        "intervention.queued": (
+            "id",
+            "intervention_id",
+            "kind",
+            "content",
+            "context_version",
+            "state",
+        ),
+        "intervention.applied": (
+            "id",
+            "intervention_id",
+            "kind",
+            "content",
+            "context_version",
+            "state",
+        ),
+        "approval.requested": ("approval_id", "message", "status"),
+        "connector.progress": ("connector_id", "status", "progress", "message"),
+        "supervisor.finding.created": ("finding_id", "summary", "severity"),
+        "agent.decision.summary": ("summary",),
+        "artifact.linked": ("artifact_id", "name", "url", "media_type"),
+        "conversation.status": ("status", "command_id"),
+        "conversation.turn.queued": (
+            "command_id",
+            "status",
+            "model",
+            "provider_id",
+        ),
+        "conversation.turn.finished": ("status", "command_id"),
+        "conversation.turn.failed": ("reason", "failure_phase", "command_id"),
+        "conversation.turn.retryable": (
+            "reason",
+            "detail",
+            "failure_phase",
+            "command_id",
+        ),
+        "agent.tool.failed": ("tool_call_id", "name", "reason"),
+    }.get(event_type)
+    return {key: payload[key] for key in fields or () if key in payload}

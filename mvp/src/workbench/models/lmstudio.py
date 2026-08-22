@@ -1,6 +1,7 @@
 """LM Studio adapter using its OpenAI-compatible local API."""
 
 import json
+import math
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -8,11 +9,14 @@ import httpx
 
 from workbench.models.contracts import (
     ModelDelta,
+    ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelUsage,
     ToolCall,
 )
+from workbench.models.profiles import ProviderProfileRecord
+from workbench.models.gateway import ModelEvent, ModelEventKind
 
 
 class ProviderUnavailable(RuntimeError):
@@ -23,16 +27,29 @@ class ProviderResponseError(RuntimeError):
     """Raised when LM Studio returns an invalid response."""
 
 
+DEFAULT_TIMEOUT_SECONDS = 300.0
+
+
 class LMStudioProvider:
     def __init__(
         self,
         base_url: str = "http://127.0.0.1:1234",
         *,
         client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("LM Studio timeout must be finite and positive")
         self.base_url = base_url.rstrip("/")
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(timeout=60)
+        timeout = httpx.Timeout(
+            timeout_seconds,
+            connect=min(10.0, timeout_seconds),
+            write=min(30.0, timeout_seconds),
+            pool=min(30.0, timeout_seconds),
+        )
+        self._client = client or httpx.AsyncClient(timeout=timeout)
+        self._auto_model_cache: dict[str, str] = {}
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -43,28 +60,26 @@ class LMStudioProvider:
     async def health(self) -> bool:
         return bool(await self.list_models())
 
-    async def list_models(self) -> list[str]:
+    async def list_models(self, profile: ProviderProfileRecord | None = None) -> list[str]:
         try:
-            response = await self._client.get(f"{self.base_url}/v1/models")
+            response = await self._client.get(f"{_base_url(self, profile)}/v1/models")
             response.raise_for_status()
         except httpx.RequestError as exc:
             raise ProviderUnavailable(str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            raise ProviderResponseError(str(exc)) from exc
         data = response.json()
         return [item["id"] for item in data.get("data", []) if item.get("id")]
 
-    async def complete_with_tools(self, request: ModelRequest) -> ModelResponse:
+    async def complete_with_tools(
+        self, request: ModelRequest, profile: ProviderProfileRecord | None = None
+    ) -> ModelResponse:
         try:
             response = await self._client.post(
-                f"{self.base_url}/v1/chat/completions",
-                json=_request_body(request, stream=False),
+                f"{_base_url(self, profile)}/v1/chat/completions",
+                json=_request_body(request, profile, stream=False),
             )
             response.raise_for_status()
         except httpx.RequestError as exc:
             raise ProviderUnavailable(str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            raise ProviderResponseError(str(exc)) from exc
 
         raw = response.json()
         try:
@@ -83,15 +98,41 @@ class LMStudioProvider:
             raw=raw,
         )
 
+    async def complete(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> ModelResponse:
+        """Adapt the legacy LM Studio probe to the provider-neutral gateway."""
+        resolved_profile = await self._resolve_placeholder_model(request, profile)
+        return await self.complete_with_tools(request, resolved_profile)
+
+    async def _resolve_placeholder_model(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> ProviderProfileRecord:
+        if request.model not in {"default", "local-agent"}:
+            return profile
+        if profile.model_aliases.get(request.model) or profile.model_aliases.get("default"):
+            return profile
+        cache_key = _base_url(self, profile)
+        model = self._auto_model_cache.get(cache_key)
+        if model is None:
+            models = await self.list_models(profile)
+            if not models:
+                raise ProviderUnavailable("LM Studio has no loaded model")
+            model = models[0]
+            self._auto_model_cache[cache_key] = model
+        return profile.model_copy(
+            update={"model_aliases": {**profile.model_aliases, "default": model, request.model: model}}
+        )
+
     async def stream_with_tools(
-        self, request: ModelRequest
+        self, request: ModelRequest, profile: ProviderProfileRecord | None = None
     ) -> AsyncIterator[ModelDelta]:
         tool_parts: dict[int, dict[str, str]] = {}
         try:
             async with self._client.stream(
                 "POST",
-                f"{self.base_url}/v1/chat/completions",
-                json=_request_body(request, stream=True),
+                f"{_base_url(self, profile)}/v1/chat/completions",
+                json=_request_body(request, profile, stream=True),
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -115,9 +156,6 @@ class LMStudioProvider:
                         current["arguments"] += function.get("arguments") or ""
         except httpx.RequestError as exc:
             raise ProviderUnavailable(str(exc)) from exc
-        except httpx.HTTPStatusError as exc:
-            raise ProviderResponseError(str(exc)) from exc
-
         for part in tool_parts.values():
             try:
                 arguments = json.loads(part["arguments"] or "{}")
@@ -129,11 +167,34 @@ class LMStudioProvider:
                 )
             )
 
+    async def stream(
+        self, request: ModelRequest, profile: ProviderProfileRecord
+    ) -> AsyncIterator[ModelEvent]:
+        """Expose legacy LM Studio deltas through the gateway event contract."""
+        async for delta in self.stream_with_tools(request, profile):
+            if delta.text:
+                yield ModelEvent(kind=ModelEventKind.TEXT_DELTA, text=delta.text)
+            elif delta.tool_call:
+                yield ModelEvent(kind=ModelEventKind.TOOL_CALL, tool_call=delta.tool_call)
 
-def _request_body(request: ModelRequest, *, stream: bool) -> dict[str, Any]:
+
+def _request_body(
+    request: ModelRequest,
+    profile: ProviderProfileRecord | None,
+    *,
+    stream: bool,
+) -> dict[str, Any]:
+    model = request.model
+    if profile is not None:
+        model = profile.model_aliases.get(
+            request.model,
+            profile.model_aliases.get("default", request.model)
+            if request.model in {"default", "local-agent"}
+            else request.model,
+        )
     return {
-        "model": request.model,
-        "messages": request.messages,
+        "model": model,
+        "messages": [_message_body(message) for message in request.messages],
         "tools": [
             {
                 "type": "function",
@@ -148,6 +209,35 @@ def _request_body(request: ModelRequest, *, stream: bool) -> dict[str, Any]:
         "temperature": request.temperature,
         "stream": stream,
     }
+
+
+def _message_body(message: ModelMessage) -> dict[str, Any]:
+    body: dict[str, Any] = {"role": message.role}
+    if message.content is not None or message.role == "assistant":
+        body["content"] = message.content
+    if message.name is not None:
+        body["name"] = message.name
+    if message.tool_call_id is not None:
+        body["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        body["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, separators=(",", ":")),
+                },
+            }
+            for call in message.tool_calls
+        ]
+    return body
+
+
+def _base_url(
+    provider: LMStudioProvider, profile: ProviderProfileRecord | None
+) -> str:
+    return profile.base_url.rstrip("/") if profile is not None else provider.base_url
 
 
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall:

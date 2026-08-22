@@ -3,6 +3,8 @@
 import sqlite3
 from pathlib import Path
 
+from workbench.workflow.schema import migrate_phase1
+
 
 class WorkflowStore:
     def __init__(self, path: Path) -> None:
@@ -75,3 +77,4 @@ class WorkflowStore:
                 );
                 """
             )
+            migrate_phase1(connection)

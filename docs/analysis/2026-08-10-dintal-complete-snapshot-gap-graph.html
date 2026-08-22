@@ -1,0 +1,475 @@
+Your user’s .npmrc file (${HOME}/.npmrc)
+has a `globalconfig` and/or a `prefix` setting, which are incompatible with nvm.
+Run `nvm use --delete-prefix v22.20.0 --silent` to unset it.
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Generic Agent × DinTal · 完整差异与 Go Engine 替换动态图谱</title>
+<style>
+:root{
+  --ink:#0E1422; --line:#25304A;
+  --serif:"Songti SC",Georgia,"Times New Roman",serif;
+  --sans:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:#C6CFE2;font-family:var(--sans);-webkit-font-smoothing:antialiased}
+header{padding:20px 22px 4px;max-width:1320px;margin:0 auto}
+header h1{font-size:18px;margin:0 0 4px;font-weight:700;color:#EAEEF7}
+header p{margin:0;color:#8B96AE;font-size:13px;line-height:1.6}
+.stage{margin:16px auto;max-width:1320px;background:radial-gradient(120% 130% at 50% 0%,#161D2E 0%,#0C111C 80%);
+  border:1px solid var(--line);border-radius:16px;overflow:hidden;position:relative}
+#graph-box{position:relative;height:920px;overflow:hidden}
+@media(max-width:680px){#graph-box{height:760px}}
+#graph-svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+
+/* ----- 五层横带（仅 layered 模式） ----- */
+.gband-line{stroke:#22304C;stroke-width:1;stroke-dasharray:4 7;stroke-opacity:.7}
+.gband-cap{fill:#5E6E92;font-family:var(--mono);font-size:11px;letter-spacing:.06em}
+.gband-sub{fill:#9AA7C4;font-family:var(--sans);font-size:13px;font-weight:600}
+.gband-band:nth-child(odd){fill:#121A2B} .gband-band{fill:#0E1626;opacity:.5}
+
+/* ----- 节点 / 连线 / 标签 ----- */
+.gnode{cursor:grab}.gnode.dragging{cursor:grabbing}
+.gnode,.glink,.gelabel{transition:opacity .22s ease}
+.gnode.dim{opacity:.12}.glink.dim{opacity:.04}.gelabel.dim{opacity:0}
+.gn-core{transition:transform .2s cubic-bezier(.34,1.56,.64,1);transform-box:fill-box;transform-origin:center}
+.gnode.pop .gn-core{transform:scale(1.28)}
+.glabel{fill:#C6CFE2;paint-order:stroke;stroke:#0B1018;stroke-width:3px;stroke-linejoin:round;
+  font-size:10px;font-family:var(--sans)}
+.gnode.pop .glabel{fill:#fff;font-weight:700;font-size:11.5px}
+.gelabel{fill:#8B96AE;font-size:8.5px;font-family:var(--mono);opacity:0}
+
+/* ----- 工具条 / 图例 / 详情 ----- */
+.toolbar{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:6}
+.tb-btn{font-size:12px;font-family:var(--mono);color:#C6CFE2;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:6px 11px;cursor:pointer}
+.tb-btn:hover{background:#1E2A44;color:#fff}
+#g-search{flex:1 1 130px;min-width:120px;font-size:12.5px;color:#E6EBF5;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:7px 11px;font-family:var(--sans)}
+#g-search::placeholder{color:#7782A0}
+.legend{display:flex;flex-wrap:wrap;gap:7px;padding:14px;border-top:1px solid #25304A;background:#0E1421}
+.lg{display:flex;align-items:center;gap:6px;font-size:11.5px;color:#AEB8CE;cursor:pointer;
+  padding:4px 9px;border-radius:18px;border:1px solid transparent}
+.lg:hover{border-color:#2A3650}
+.lg.active{background:#1A2336;border-color:#3A4E6E;color:#fff}
+.lg .sw{width:11px;height:11px;border-radius:50%}
+.g-pop{position:absolute;z-index:8;background:#161D2E;border:1px solid #2C3A58;border-radius:11px;
+  box-shadow:0 10px 34px rgba(0,0,0,.5);padding:11px 13px;font-size:12.5px;color:#D4DAE8;
+  pointer-events:none;max-width:250px;line-height:1.55}
+.g-pop b{color:#fff}
+#g-detail{padding:16px 18px;border-top:1px solid #25304A;background:#0E1421;min-height:64px;font-size:13.5px}
+#g-detail .ph{color:#7E8AA6;font-family:var(--mono);font-size:11.5px}
+#g-detail .nm{font-family:var(--serif);font-size:18px;color:#fff;margin:2px 0 6px}
+#g-detail .gp{font-size:11px;font-family:var(--mono);padding:2px 8px;border-radius:12px;margin-left:8px;vertical-align:middle}
+#g-detail .ds{color:#B6C0D6;margin:6px 0 4px}
+#g-detail .pr{display:flex;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:1px solid #1E2840;font-size:12.5px}
+#g-detail .pr span{color:#828FAB} #g-detail .pr b{color:#DCE2EF}
+#g-detail .nbtit{margin-top:12px;color:#7E8AA6;font-size:11.5px;font-family:var(--mono)}
+#g-detail .nb{display:inline-block;margin:4px 4px 0 0;padding:3px 9px;border-radius:8px;font-size:12px;cursor:pointer}
+@media (prefers-reduced-motion: reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Generic Agent × DinTal · 完整差异与 Go Engine 替换动态图谱</h1>
+  <p>新增 Go Engine 专项：附件证据 → Engine 能力 → 当前 Python 控制面 → 替换边界与阻塞项 → 分阶段决策。点击节点查看落地度、保留/替换归属、前置门槛与回滚策略。</p>
+</header>
+
+<div class="stage">
+  <div id="graph-box">
+    <div class="toolbar">
+      <input id="g-search" type="text" placeholder="搜索节点…" autocomplete="off">
+      <button class="tb-btn" id="g-mode">切换布局</button>
+      <button class="tb-btn" id="g-reset">重置视图</button>
+      <button class="tb-btn" id="g-relayout">重新布局</button>
+    </div>
+    <svg id="graph-svg"></svg>
+  </div>
+  <div class="legend" id="g-legend"></div>
+  <div id="g-detail"></div>
+</div>
+
+<script>
+/* ============================================================
+   1) 布局模式： "layered"（纵向分层横带） | "force"（自由力导向）
+   ============================================================ */
+let LAYOUT="layered";
+
+/* ============================================================
+   2) 数据 —— 换成你自己的领域数据
+   - GROUPS：颜色分组（决定节点颜色 + 图例 + 高亮筛选维度）
+   - LAYERS：纵向层带（仅 layered 模式生效）。每层声明它包含哪些 group。
+             颜色仍按 GROUPS，层带只决定纵向位置 → 颜色与结构是两个独立维度。
+   - NODES ：id 唯一；group 必须是 GROUPS 里的 id；desc/props 用于详情面板。
+   - EDGES ：[source, target, relation] 三元组；source/target 必须是节点 id。
+   下面是一份与具体业务无关的「系统架构」示例数据，仅作占位演示。
+   ============================================================ */
+const GROUPS=[
+  {id:"evidence",label:"完整附件证据",color:"#E8B84B"},
+  {id:"benchmark",label:"DinTal / FDE 能力",color:"#A47BE0"},
+  {id:"goengine",label:"Go Engine 替换能力",color:"#E8924B"},
+  {id:"current",label:"当前已实现",color:"#5FB87A"},
+  {id:"gap",label:"真实差距",color:"#E0574F"},
+  {id:"boundary",label:"替换与保留边界",color:"#C96C8A"},
+  {id:"decision",label:"组件与实施决策",color:"#34B3C7"}
+];
+
+const LAYERS=[
+  {key:1,label:"完整证据基线",en:"Verified snapshot evidence",groups:["evidence"]},
+  {key:2,label:"DinTal/FDE/Go 能力",en:"Benchmark and Go engine",groups:["benchmark","goengine"]},
+  {key:3,label:"当前已实现",en:"Implemented Workbench",groups:["current"]},
+  {key:4,label:"替换边界与差距",en:"Boundaries and blockers",groups:["gap","boundary"]},
+  {key:5,label:"引入与路线",en:"Adoption decisions",groups:["decision"]}
+];
+
+const NODES=[
+  {id:"E_ALL",label:"三仓总快照",group:"evidence",desc:"dev 分支三个代码仓合计 413 节点、488 条依赖边、23 个重构候选。",props:[["生成时间","2026-08-06 19:21"],["工具","codegraph-analyzer"],["限制","不能证明运行成熟度"]]},
+  {id:"E_MASTER",label:"dintal-master",group:"evidence",desc:"Commit 7f6ac81，338 节点、364 边、8 个重构候选，包含 legacy/scripts/src。",props:[["规模","200KB graph"],["风险","legacy 边界复杂"]]},
+  {id:"E_ENGINE",label:"engine-core-dev",group:"evidence",desc:"Commit 6531f5e，57 节点、110 边、8 个重构候选，顶层 examples/internal/pkg。",props:[["边密度","约 1.9"],["重点","agent/tools/llm"]]},
+  {id:"E_FDE",label:"fde-workbench",group:"evidence",desc:"Commit ef05d95，18 节点、14 边、7 个重构候选，packages/bridge 有 44 个文件。",props:[["规模","16KB graph"],["重点","Bridge 适配层"]]},
+  {id:"E_TIP",label:"TipTap Skill 快照",group:"evidence",desc:"Commit d70b465，仅一份 287 行 SKILL.md，0 代码节点、0 依赖边。",props:[["性质","API 规范包"],["不是","协作后端源码"]]},
+  {id:"E_PROTOCOL",label:"TipTap 流式协议",group:"evidence",desc:"REST CRUD/export 与 start→append*→end 流式写入；content 必须是序列化 TipTap JSON 字符串。",props:[["一致性","Hocuspocus→MySQL 异步"],["限制","创建后读取约有延迟"]]},
+  {id:"E_SPEC",label:"Engine 大师规范",group:"evidence",desc:"600 行规范覆盖 AG-UI、A2UI、MCP、Tools、Skills、路径、子 Agent 与 Go Runtime，并明确当前成熟度和 P0/P1/P2。",props:[["基线","dev@6531f5e"],["性质","目标规范 + 静态证据"]]},
+  {id:"E_MATRIX",label:"97 项落地矩阵",group:"evidence",desc:"综合落地度 49.5%；AG-UI 83.3%、Tools 79.2%，但子 Agent 15.0%、Go Runtime 29.2%。",props:[["工作表","概览 / 落地矩阵"],["口径","已应用/部分/样例/未应用"]]},
+  {id:"E_RELEASE",label:"Go Release Contract",group:"evidence",desc:"Host 只依赖 pkg/*，精确 pin semver tag，不 vendor；破坏性公共 API 变更走 Go module /v2。",props:[["来源","RELEASING.md"],["边界","internal/* 禁止宿主引用"]]},
+  {id:"E_SYNC",label:"dev/upstream 同构",group:"evidence",desc:"两仓依赖图同构；dev 无 Git 元数据且少二进制写入防护源码与测试，正式迁移应以 upstream/tag 为准。",props:[["upstream","dev@6531f5e"],["风险","本地 manifest commit 为空"]]},
+
+  {id:"B_MASTER",label:"Master 业务生态",group:"benchmark",desc:"大规模主仓与 legacy 业务模块，体现业务覆盖广度，也带来迁移和耦合风险。",props:[["来源","dintal-master snapshot"],["复用方式","黑盒协议，不整仓复制"]]},
+  {id:"B_AGENT",label:"Engine Agent",group:"benchmark",desc:"internal/agent 为 13,303 行/43 文件，是 Engine 核心域。",props:[["来源","engine snapshot"],["能力证据","模块规模，不等于运行质量"]]},
+  {id:"B_TOOLS",label:"Engine Tools",group:"benchmark",desc:"internal/tools 为 14,652 行/47 文件，说明工具生态覆盖较广。",props:[["来源","engine snapshot"],["比较","当前工具面较窄"]]},
+  {id:"B_LLM",label:"Engine LLM",group:"benchmark",desc:"internal/llm 为 5,974 行/21 文件，独立承担模型适配。",props:[["来源","engine snapshot"],["比较","双方均有模型抽象"]]},
+  {id:"B_BRIDGE",label:"FDE Bridge",group:"benchmark",desc:"packages/bridge 44 文件，是工作台对外适配的核心边界。",props:[["来源","fde-workbench snapshot"],["价值","Adapter 边界"]]},
+  {id:"B_DOC",label:"TipTap 文档协议",group:"benchmark",desc:"Skill 定义结构化文档、导出、stream-chunk、taskCard 与常见错误。",props:[["来源","TipTap Skill"],["复用方式","协议与 schema"]]},
+  {id:"B_COLLAB",label:"外部协作后端",group:"benchmark",desc:"Skill 声明依赖 Hocuspocus、Yjs CRDT、MySQL 和 REST Server，但没有提供其源码。",props:[["证据状态","外部依赖声明"],["不能认定","已验证实现"]]},
+  {id:"B_GRAPH",label:"架构快照治理",group:"benchmark",desc:"每仓保存 manifest.json 与 dependency-graph.json，可用于跨版本耦合与重构趋势。",props:[["来源","snapshot-codes"],["价值","架构回归基线"]]},
+  {id:"GO_AGUI",label:"Go AG-UI 83.3%",group:"goengine",desc:"事件联合、顺序桥、背压、interrupt/resume 和真实客户端回放较成熟；缺 durable cursor、完整错误元数据和重连策略。",props:[["可替换","条件可用"],["归属","单 Run 事件生成"]]},
+  {id:"GO_TOOLS",label:"Go Tools 79.2%",group:"goengine",desc:"注册、审批、审计、并行、资源锁和输出治理较强；Tool 默认信任和统一参数校验需先修复。",props:[["可替换","条件可用"],["热点","internal/tools 14514 行"]]},
+  {id:"GO_MCP",label:"Go MCP 36.7%",group:"goengine",desc:"基础 Tools 可用，但协议固定 2024-11-05；分页、list_changed、rich content、Resources/Prompts、现代 Streamable HTTP/OAuth 不完整。",props:[["可替换","仅基础 Tools"],["前置","P0 正确性升级"]]},
+  {id:"GO_SUB",label:"Go 子 Agent 15%",group:"goengine",desc:"当前 subagent runner 为 no-op，没有 Registry、Handoff、ContextFilter、预算和循环检测。",props:[["可替换","否"],["结论","Python 保留编排"]]},
+  {id:"GO_LIFE",label:"Go Runtime 29.2%",group:"goengine",desc:"局部并发和进程回收已有；统一取消树、RuntimeSupervisor、graceful shutdown、metrics 与 CI 门禁不足。",props:[["可替换","不能独立承载长期服务"],["前置","生命周期 P0"]]},
+  {id:"GO_DUR",label:"Runtrace 非 Durable",group:"goengine",desc:"session/runtrace/文件持久化可用于诊断回放，但不是跨进程、外部副作用安全的 durable workflow。",props:[["可替换","否"],["结论","Python Event Store 保留"]]},
+  {id:"GO_FACADE",label:"pkg/* 稳定门面",group:"goengine",desc:"25 个 pkg facade 是唯一允许的宿主边界；Python 不能直接 import Go module，需要独立 engine-host。",props:[["发布","精确 semver tag"],["禁止","依赖 internal/*"]]},
+
+  {id:"C_RUNTIME",label:"AgentRuntime",group:"current",desc:"实现单 Agent 模型→工具→模型循环、检查点、安全介入和单 turn 步数边界。",props:[["状态","已实现"],["限制","非真实多 Agent 图"]]},
+  {id:"C_WORKER",label:"持久化 Worker",group:"current",desc:"Conversation Worker 支持 lease、retryable、idempotency 和重启恢复。",props:[["状态","已验证"],["规模","单 asyncio worker"]]},
+  {id:"C_EVENT",label:"Event Store / AG-UI",group:"current",desc:"业务事件持久化并映射 AG-UI，通过 SSE cursor 恢复与重放。",props:[["状态","已实现"],["优势","任务状态可追溯"]]},
+  {id:"C_MODEL",label:"Model Gateway / Vault",group:"current",desc:"支持 LM Studio、DeepSeek、OpenAI-compatible、模型发现和加密凭据。",props:[["状态","已实现"],["限制","节点级模型绑定未运行"]]},
+  {id:"C_ART",label:"Artifact Store",group:"current",desc:"支持内容寻址和原子文件替换，但没有逻辑版本、冲突和协作编辑。",props:[["状态","部分实现"],["优势","内容可靠写入"]]},
+  {id:"C_DP",label:"Data Platform Connector",group:"current",desc:"已有 API/CDP 特例，可调用本地平台，但不是通用 Connector Runtime。",props:[["状态","已实现特例"],["下一步","迁移 Manifest"]]},
+  {id:"C_SKILL",label:"Skill Pin Registry",group:"current",desc:"可发现 Skill 并固定摘要版本，不负责安装、运行和权限交集。",props:[["状态","只读发现"],["限制","无执行生命周期"]]},
+  {id:"C_UI",label:"React / Electron UX",group:"current",desc:"已有会话、Agent、Provider、Workspace 和 Artifacts 入口，部分界面能力领先后端。",props:[["状态","初版可用"],["风险","假功能入口"]]},
+
+  {id:"G_MULTI",label:"真实多 Agent 缺失",group:"gap",desc:"尚无 ExecutionGraph、独立 Agent Session、Handoff、Supervisor/Verifier 与返工运行时。",props:[["优先级","P0"],["阻塞","核心验收"]]},
+  {id:"G_CONNECT",label:"Connector Runtime 缺失",group:"gap",desc:"缺统一 capability、health、invoke、progress、cancel 和 manifest 契约。",props:[["优先级","P0"],["现状","Data Platform 特例"]]},
+  {id:"G_MCP",label:"MCP 缺失",group:"gap",desc:"依赖与实现均不存在，无法接入标准工具/资源/提示生态。",props:[["优先级","P0"],["范围","stdio + Streamable HTTP"]]},
+  {id:"G_WS",label:"Workspace 运行面缺失",group:"gap",desc:"后端没有受控文件、终端、Git、进程和资源限制能力。",props:[["优先级","P1"],["风险","UI 有选择但无能力"]]},
+  {id:"G_TOOL",label:"Tool Sandbox 缺失",group:"gap",desc:"无统一 timeout、cancel、权限、资源限额、审计和隔离。",props:[["优先级","P1"],["影响","工具执行可靠性"]]},
+  {id:"G_TIP",label:"TipTap Adapter 缺失",group:"gap",desc:"未实现 CRUD/export、stream session、TipTap JSON schema 和 taskCard renderer。",props:[["优先级","P1"],["注意","Skill 不是后端代码"]]},
+  {id:"G_COLLAB",label:"CRDT 协作缺失",group:"gap",desc:"当前 Artifact 不支持多人光标、离线合并、协作权限和 CRDT。",props:[["优先级","P2"],["触发","真实多人编辑需求"]]},
+  {id:"G_OBS",label:"端到端观测缺失",group:"gap",desc:"业务事件存在，但缺 Graph→Node→Model→Tool/Connector→Artifact 标准 trace/metrics。",props:[["优先级","P0"],["影响","定位跨模型失败"]]},
+  {id:"G_ARCH",label:"架构回归基线缺失",group:"gap",desc:"当前没有同口径 dependency graph snapshot 和跨版本差异门禁。",props:[["优先级","P1"],["影响","耦合劣化不可量化"]]},
+  {id:"G_DEPS",label:"前端依赖未固定",group:"gap",desc:"React/Vite/Electron/Playwright 等使用 latest，构建可复现性不足。",props:[["优先级","P1"],["建议","明确版本 + lockfile"]]},
+  {id:"X_EXEC",label:"Go 接管执行平面",group:"boundary",desc:"Go Engine Host 接管单次 Agent 的 LLM、Tool、Skill、Workspace、Sandbox 执行。",props:[["替换","Python AgentRuntime"],["粒度","一个可取消 Run"]]},
+  {id:"X_DUR",label:"Python 保留持久化",group:"boundary",desc:"Conversation Worker、Lease、Retry、WorkflowRuntime 和 Event Store 继续作为任务恢复事实源。",props:[["保留","Control Plane"],["禁止","Go runtrace 双写 durable state"]]},
+  {id:"X_ORCH",label:"Python 保留编排",group:"boundary",desc:"ExecutionGraph、Supervisor/Verifier、Handoff 和返工仍由 Python 调度，每个节点调用一个 Go Run。",props:[["原因","Go 子 Agent no-op"],["边界","Agent 私有上下文由控制面持久化"]]},
+  {id:"X_SECRET",label:"Vault 凭据 Broker",group:"boundary",desc:"Provider Repository/Vault 保留，Go 只接收短期 credential handle；secret 不进入 IPC JSON、事件、runtrace 或日志。",props:[["保留","Python Vault"],["安全","不复制密钥"]]},
+  {id:"X_EVENT",label:"AG-UI 单一生成者",group:"boundary",desc:"Go 生成 canonical AG-UI；Python只校验、持久化和投影，避免维护两套事件状态机。",props:[["事实源","Python DomainEvent"],["生成者","Go AG-UI bridge"]]},
+  {id:"X_HOST",label:"engine-host Sidecar",group:"boundary",desc:"新增只依赖 pkg/* 的 Go 可执行文件，通过本地版本化 IPC 提供 health/capabilities/run/cancel/resume/drain/shutdown。",props:[["推荐","Unix socket / loopback / stdio"],["不推荐","c-shared / FFI"]]},
+
+  {id:"D_ORCH",label:"Orchestration 决策 Spike",group:"decision",desc:"用四节点审核返工场景比较 LangGraph 与自研方案，只允许一个执行事实源。",props:[["时机","立即"],["验收","拒绝/返工/重启/幂等"]]},
+  {id:"D_MCP",label:"升级 Go 内置 MCP",group:"decision",desc:"Go 替换路线不再向 Python 核心增加第二套 MCP；优先升级 Go 版本协商、SSE/session、分页、动态刷新和结构化结果。",props:[["决策","Go 单协议栈"],["优先级","P0"]]},
+  {id:"D_OTEL",label:"引入 OpenTelemetry",group:"decision",desc:"补齐 trace/metrics；Event Store 继续保存业务状态和公共事件。",props:[["决策","立即引入"],["优先级","P0"]]},
+  {id:"D_BRIDGE",label:"统一 Connector 契约",group:"decision",desc:"吸收 FDE Bridge 的边界思想，把 Data Platform、DinTal Engine 和 TipTap 都放在适配层。",props:[["决策","实现"],["优先级","P0"]]},
+  {id:"D_TIP",label:"先接 TipTap 协议",group:"decision",desc:"实现 REST/stream Adapter、schema validation、异步确认和 taskCard；不把 Skill 当后端。",props:[["决策","P1"],["一致性","轮询/回执，不固定 sleep"]]},
+  {id:"D_HOCUS",label:"Hocuspocus 条件引入",group:"decision",desc:"出现真实多人/离线编辑需求后，以 sidecar 引入 Tiptap/Yjs/Hocuspocus。",props:[["决策","暂缓至 P2"],["起步","可先 SQLite"]]},
+  {id:"D_GRAPH",label:"架构快照门禁",group:"decision",desc:"每个 Batch 保存 manifest/dependency graph，报告新增循环依赖和重构候选变化。",props:[["决策","P1"],["注意","节点数不是质量 KPI"]]},
+  {id:"D_WS",label:"受控 Workspace",group:"decision",desc:"实现授权根目录、文件、终端、Git、进程、timeout/cancel 和审计。",props:[["决策","P1"],["边界","不扩大用户授权"]]},
+  {id:"D_DEFER",label:"分布式组件暂缓",group:"decision",desc:"Temporal、消息总线、APISIX、Keycloak 等等待单机瓶颈或多租户需求。",props:[["决策","暂缓"],["原则","不复制微服务外形"]]},
+  {id:"D_BASE",label:"G0 基线冻结",group:"decision",desc:"同步 upstream 二进制写入防护，纳入 Git，以精确 semver tag 发布，记录 SBOM/build info/校验和。",props:[["出口","空缓存可复现构建"],["回滚","继续 Python Runtime"]]},
+  {id:"D_CONTRACT",label:"G1 Host Contract",group:"decision",desc:"实现 health/capabilities/run/cancel/resume/drain/shutdown 与 AG-UI conformance。",props:[["出口","LM Studio 单轮 + 取消 + 唯一终态"],["开关","Go Runner feature flag"]]},
+  {id:"D_SHADOW",label:"G2 只读 Shadow",group:"decision",desc:"只对无副作用模型和 read-only Tool 影子执行，比较事件不变量；禁止双跑写操作。",props:[["出口","无协议偏差"],["原则","不比较非确定性文本逐字"]]},
+  {id:"D_CUTOVER",label:"G3/G4 分层切换",group:"decision",desc:"先切单 Agent 执行，再由 Python 多 Agent 图逐节点调用 Go；按 provider/agent/session 可回退。",props:[["出口","返工循环跨重启"],["保留","Python durable control"]]},
+  {id:"D_ROLLBACK",label:"G5 回滚与长稳",group:"decision",desc:"24h/72h soak、race/leak/fuzz/vuln 与资源预算通过后设为默认；Python Runner 至少保留一个发布周期。",props:[["回滚","尚未开始节点可切回"],["禁止","未知副作用自动重跑"]]}
+];
+
+const EDGES=[
+  ["E_ALL","E_MASTER","包含"],["E_ALL","E_ENGINE","包含"],["E_ALL","E_FDE","包含"],
+  ["E_TIP","E_PROTOCOL","定义"],["E_MASTER","B_MASTER","证明结构"],
+  ["E_SPEC","GO_AGUI","成熟度证据"],["E_SPEC","GO_TOOLS","成熟度证据"],["E_MATRIX","GO_MCP","落地度证据"],
+  ["E_MATRIX","GO_SUB","落地度证据"],["E_MATRIX","GO_LIFE","落地度证据"],["E_RELEASE","GO_FACADE","发布边界"],
+  ["E_SYNC","D_BASE","基线风险"],["E_ENGINE","E_SPEC","同一基线"],
+  ["E_ENGINE","B_AGENT","模块证据"],["E_ENGINE","B_TOOLS","模块证据"],["E_ENGINE","B_LLM","模块证据"],
+  ["E_FDE","B_BRIDGE","模块证据"],["E_TIP","B_DOC","协议证据"],["E_PROTOCOL","B_COLLAB","依赖声明"],["E_ALL","B_GRAPH","生成基线"],
+  ["B_AGENT","C_RUNTIME","运行时对照"],["B_TOOLS","C_DP","工具对照"],["B_LLM","C_MODEL","模型对照"],
+  ["B_BRIDGE","C_DP","适配层对照"],["B_DOC","C_ART","文档对照"],["B_GRAPH","G_ARCH","当前缺失"],
+  ["C_RUNTIME","G_MULTI","尚未扩展"],["C_WORKER","G_MULTI","需节点化"],["C_EVENT","G_OBS","不能替代 telemetry"],
+  ["C_MODEL","G_MULTI","缺节点绑定"],["C_ART","G_TIP","缺协议 Adapter"],["C_ART","G_COLLAB","缺 CRDT"],
+  ["C_DP","G_CONNECT","专用特例"],["C_SKILL","G_MCP","无运行协议"],["C_UI","G_WS","前端先于后端"],
+  ["B_TOOLS","G_MCP","生态差距"],["B_BRIDGE","G_CONNECT","边界差距"],["B_COLLAB","G_COLLAB","协作差距"],
+  ["GO_AGUI","X_EVENT","条件接管"],["GO_TOOLS","X_EXEC","条件接管"],["GO_FACADE","X_HOST","要求 Host"],
+  ["GO_MCP","D_MCP","升级"],["GO_SUB","X_ORCH","不能接管"],["GO_DUR","X_DUR","不能接管"],["GO_LIFE","X_HOST","阻塞生产化"],
+  ["C_RUNTIME","X_EXEC","被替换"],["C_WORKER","X_DUR","继续保留"],["C_EVENT","X_EVENT","继续持久化"],
+  ["C_MODEL","X_SECRET","保留配置凭据"],["G_MULTI","X_ORCH","由 Python 落地"],
+  ["G_MULTI","D_ORCH","决策与实现"],["G_MCP","D_MCP","补齐"],["G_CONNECT","D_BRIDGE","补齐"],
+  ["G_OBS","D_OTEL","补齐"],["G_WS","D_WS","补齐"],["G_TOOL","D_WS","统一执行边界"],
+  ["G_TIP","D_TIP","采用协议"],["G_COLLAB","D_HOCUS","需求触发"],["G_ARCH","D_GRAPH","建立门禁"],
+  ["G_DEPS","D_GRAPH","纳入构建基线"],["D_BRIDGE","D_MCP","协议实现"],["D_BRIDGE","D_TIP","文档连接器"],
+  ["X_HOST","D_CONTRACT","先建契约"],["D_BASE","D_CONTRACT","完成后"],["D_CONTRACT","D_SHADOW","完成后"],
+  ["D_SHADOW","D_CUTOVER","完成后"],["D_CUTOVER","D_ROLLBACK","完成后"],["X_DUR","D_CUTOVER","控制面不迁移"],
+  ["X_ORCH","D_CUTOVER","逐节点调用"],["X_SECRET","D_CONTRACT","凭据句柄"],["X_EVENT","D_CONTRACT","事件契约"],
+  ["D_ORCH","D_OTEL","需可观测"],["D_MCP","D_OTEL","需可观测"],["B_MASTER","D_DEFER","不整仓复制"]
+];
+
+/* ============================================================
+   3) 引擎 —— 一般无需改动
+   ============================================================ */
+const NS="http://www.w3.org/2000/svg";
+const COLOR=Object.fromEntries(GROUPS.map(g=>[g.id,g.color]));
+const GLABEL=Object.fromEntries(GROUPS.map(g=>[g.id,g.label]));
+const G2L={};LAYERS.forEach(L=>L.groups.forEach(g=>G2L[g]=L.key));
+const CN=["一","二","三","四","五","六","七","八","九","十"];
+let _seed=20240101; function rnd(){_seed=(_seed*1103515245+12345)&0x7fffffff;return _seed/0x7fffffff;}
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+const $=s=>document.querySelector(s);
+
+const G={nodes:[],links:[],idx:{},nbr:{},alpha:0,view:{x:0,y:0,k:1},drag:null,pan:null,hover:null,
+  raf:0,W:1000,H:780,root:null,bound:false,sel:null,litGroup:null};
+
+function degree(){const d={};EDGES.forEach(e=>{d[e[0]]=(d[e[0]]||0)+1;d[e[1]]=(d[e[1]]||0)+1;});return d;}
+function nodeR(deg,n){return Math.max(8,Math.min(22,7+(deg[n.id]||1)*1.3));}
+function mkNode(n,L,by,li,r,x,y){return {...n,layer:L,by,li,color:COLOR[n.group],r,x,y,vx:0,vy:0,
+  lw:Math.min(String(n.label).length,11)*11+10};}
+
+function geom(){
+  G.LBL=G.W<560?86:150;            // 左侧层标签留白
+  G.padT=44;G.padB=28;
+  G.bandH=(G.H-G.padT-G.padB)/LAYERS.length;
+  G.x0=G.LBL+34;G.x1=G.W-66;
+}
+function bandY(L){return G.padT+G.bandH*(L-0.5);}
+
+function build(){
+  geom();
+  const deg=degree();
+  G.nodes=[];
+  if(LAYOUT==="layered"){
+    const byLayer={};for(let L=1;L<=LAYERS.length;L++)byLayer[L]=[];
+    NODES.forEach(n=>{const L=G2L[n.group]||1;(byLayer[L]||byLayer[1]).push(n);});
+    for(let L=1;L<=LAYERS.length;L++){
+      const arr=byLayer[L];
+      arr.sort((p,q)=>p.group<q.group?-1:p.group>q.group?1:(deg[q.id]||0)-(deg[p.id]||0));
+      const cy=bandY(L),n_=arr.length;
+      arr.forEach((n,i)=>{
+        const r=nodeR(deg,n),t=n_>1?i/(n_-1):.5,x=G.x0+t*(G.x1-G.x0);
+        const jit=((i%3)-1)*Math.min(34,G.bandH*0.30)*(0.45+0.55*rnd());
+        G.nodes.push(mkNode(n,L,cy,i,r,x,cy+jit));
+      });
+    }
+  }else{
+    NODES.forEach((n,i)=>{
+      const r=nodeR(deg,n),a=i*2.39996,rr=70+Math.sqrt(i+1)*34;
+      G.nodes.push(mkNode(n,G2L[n.group]||1,0,i,r,G.W/2+Math.cos(a)*rr,G.H/2+Math.sin(a)*rr*.82));
+    });
+  }
+  G.links=EDGES.map(e=>({s:e[0],t:e[1],label:e[2]}));
+  G.idx=Object.fromEntries(G.nodes.map(n=>[n.id,n]));
+  G.nbr={};G.links.forEach(l=>{(G.nbr[l.s]||(G.nbr[l.s]=new Set())).add(l.t);(G.nbr[l.t]||(G.nbr[l.t]=new Set())).add(l.s);});
+}
+
+function dom(svg){
+  svg.innerHTML="";const root=el("g",{});G.root=root;
+  const gb=el("g",{}),gl=el("g",{}),gn=el("g",{});
+  if(LAYOUT==="layered"){
+    for(let L=1;L<=LAYERS.length;L++){
+      const top=G.padT+G.bandH*(L-1),cy=bandY(L);
+      gb.appendChild(el("rect",{class:"gband-band",x:0,y:top,width:G.W,height:G.bandH}));
+      gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:top,x2:G.W-10,y2:top}));
+      const cap=el("text",{class:"gband-cap",x:22,y:cy-7});cap.textContent="第"+(CN[L-1]||L)+"层";gb.appendChild(cap);
+      const sub=el("text",{class:"gband-sub",x:22,y:cy+13});sub.textContent=LAYERS[L-1].label;gb.appendChild(sub);
+      if(LAYERS[L-1].en){const en=el("text",{class:"gband-cap",x:22,y:cy+30});en.textContent=LAYERS[L-1].en;gb.appendChild(en);}
+    }
+    gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:G.padT+G.bandH*LAYERS.length,x2:G.W-10,y2:G.padT+G.bandH*LAYERS.length}));
+  }
+  G.links.forEach(l=>{
+    l.el=el("line",{class:"glink",stroke:"#5A6B8C","stroke-width":1.1,"stroke-opacity":.30});gl.appendChild(l.el);
+    l.elt=el("text",{class:"gelabel","text-anchor":"middle"});l.elt.textContent=l.label;gl.appendChild(l.elt);
+  });
+  G.nodes.forEach(n=>{
+    const g=el("g",{class:"gnode","data-id":n.id});
+    const core=el("g",{class:"gn-core"});
+    core.appendChild(el("circle",{r:n.r+5,fill:n.color,"fill-opacity":.16}));      // 光晕
+    const c=el("circle",{r:n.r,fill:n.color,"fill-opacity":.92,stroke:"#0B1018","stroke-width":1.5});
+    core.appendChild(c);n.elc=c;g.appendChild(core);
+    const below=(n.li%2===0);                                                      // 交错上下，缓解标签拥挤
+    const lb=el("text",{class:"glabel","text-anchor":"middle",y:below?n.r+14:-(n.r+7)});lb.textContent=n.label;g.appendChild(lb);
+    n.el=g;gn.appendChild(g);
+  });
+  root.appendChild(gb);root.appendChild(gl);root.appendChild(gn);svg.appendChild(root);applyView();markSel();
+}
+function applyView(){if(G.root)G.root.setAttribute("transform",`translate(${G.view.x},${G.view.y}) scale(${G.view.k})`);}
+function kick(a){G.alpha=Math.max(G.alpha,a);if(!G.raf)G.raf=requestAnimationFrame(loop);}
+function loop(){G.raf=0;step();draw();if(G.alpha>0.012||G.drag)G.raf=requestAnimationFrame(loop);}
+function step(){LAYOUT==="layered"?stepLayered():stepForce();}
+
+function stepForce(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const dx=t.x-s.x,dy=t.y-s.y,d=Math.hypot(dx,dy)||1,f=(d-112)*0.015*a,fx=dx/d*f,fy=dy/d*f;
+    s.vx+=fx;s.vy+=fy;t.vx-=fx;t.vy-=fy;}
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<30000){const f=1250*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    let minD=p.r+q.r+16;if(Math.abs(dy)<32)minD=Math.max(minD,(p.lw+q.lw)*0.40);
+    if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+      if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+      if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}
+  }
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vx+=(G.W/2-n.x)*0.006*a;n.vy+=(G.H/2-n.y)*0.006*a;
+    n.x+=n.vx*=.86;n.y+=n.vy*=.86;}
+  G.alpha*=G.drag?1:.965;
+}
+
+function stepLayered(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const fx=(t.x-s.x)*0.0011*a;s.vx+=fx;t.vx-=fx;}                 // 仅横向对齐
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<32000){const f=1080*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    if(p.layer===q.layer){let minD=p.r+q.r+16;if(Math.abs(dy)<34)minD=Math.max(minD,(p.lw+q.lw)*0.44);
+      if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+        if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+        if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}}
+  }
+  const yIn=Math.min(40,G.bandH*0.34);
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vy+=(n.by-n.y)*0.085*a;                                       // 回吸到本层中线
+    n.x+=n.vx*=.85;n.y+=n.vy*=.85;
+    if(n.x<G.x0)n.x=G.x0;if(n.x>G.x1)n.x=G.x1;                      // 横向夹在画布内
+    if(n.y<n.by-yIn)n.y=n.by-yIn;if(n.y>n.by+yIn)n.y=n.by+yIn;       // 纵向夹在本层带内
+  }
+  G.alpha*=G.drag?1:.965;
+}
+
+function draw(){
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t||!l.el)continue;
+    l.el.setAttribute("x1",s.x.toFixed(1));l.el.setAttribute("y1",s.y.toFixed(1));
+    l.el.setAttribute("x2",t.x.toFixed(1));l.el.setAttribute("y2",t.y.toFixed(1));
+    if(l.elt){l.elt.setAttribute("x",((s.x+t.x)/2).toFixed(1));l.elt.setAttribute("y",((s.y+t.y)/2-3).toFixed(1));}}
+  for(const n of G.nodes)n.el.setAttribute("transform",`translate(${n.x.toFixed(1)},${n.y.toFixed(1)})`);
+}
+function pt(box,ev){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+  const px=(ev.clientX-r.left)*sx,py=(ev.clientY-r.top)*sx;
+  return {x:(px-G.view.x)/G.view.k,y:(py-G.view.y)/G.view.k,px,py};}
+function bind(svg,box){
+  svg.addEventListener("pointerdown",ev=>{
+    const g=ev.target.closest?ev.target.closest(".gnode"):null;
+    if(g){const n=G.idx[g.dataset.id];if(!n)return;G.drag={node:n,moved:0};
+      try{svg.setPointerCapture(ev.pointerId)}catch(e){}n.el.classList.add("dragging");kick(.7);hidePop();}
+    else{G.pan={x:ev.clientX,y:ev.clientY,vx:G.view.x,vy:G.view.y};try{svg.setPointerCapture(ev.pointerId)}catch(e){}}
+  });
+  svg.addEventListener("pointermove",ev=>{
+    if(G.drag){const p=pt(box,ev),n=G.drag.node;G.drag.moved+=Math.abs(p.x-n.x)+Math.abs(p.y-n.y);
+      n.x=p.x;n.y=p.y;n.vx=0;n.vy=0;kick(.5);}
+    else if(G.pan){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+      G.view.x=G.pan.vx+(ev.clientX-G.pan.x)*sx;G.view.y=G.pan.vy+(ev.clientY-G.pan.y)*sx;applyView();}
+    else{const g=ev.target.closest?ev.target.closest(".gnode"):null;hov(g?g.dataset.id:null,box,ev);}
+  });
+  const end=()=>{if(G.drag){G.drag.node.el.classList.remove("dragging");
+    if(G.drag.moved<5){G.sel=G.drag.node.id;markSel();detail(G.drag.node.id);}G.drag=null;kick(.3);}G.pan=null;};
+  svg.addEventListener("pointerup",end);svg.addEventListener("pointercancel",end);
+  svg.addEventListener("pointerleave",()=>{hov(null);G.pan=null;});
+  svg.addEventListener("wheel",ev=>{ev.preventDefault();const p=pt(box,ev);
+    const k2=Math.max(.4,Math.min(3,G.view.k*Math.exp(-ev.deltaY*0.0016)));
+    G.view.x=p.px-p.x*k2;G.view.y=p.py-p.y*k2;G.view.k=k2;applyView();},{passive:false});
+}
+function markSel(){for(const n of G.nodes){const on=G.sel===n.id;
+  n.elc.setAttribute("stroke",on?"#fff":"#0B1018");n.elc.setAttribute("stroke-width",on?2.5:1.5);}}
+function applyGroupLit(){
+  if(!G.litGroup){for(const n of G.nodes)n.el.classList.remove("dim");
+    for(const l of G.links)l.el.classList.remove("dim");return;}
+  for(const n of G.nodes)n.el.classList.toggle("dim",n.group!==G.litGroup);
+  for(const l of G.links){const a=G.idx[l.s].group===G.litGroup||G.idx[l.t].group===G.litGroup;
+    l.el.classList.toggle("dim",!a);}
+}
+function hov(id,box,ev){
+  if(G.litGroup)return;
+  if(G.hover===id){if(id&&ev)posPop(box,ev);return;}G.hover=id;
+  if(!id){for(const n of G.nodes)n.el.classList.remove("dim","pop");
+    for(const l of G.links){l.el.classList.remove("dim");if(l.elt)l.elt.classList.remove("dim");l.elt.style.opacity=0;}
+    hidePop();return;}
+  const nb=G.nbr[id]||new Set();
+  for(const n of G.nodes){const on=n.id===id||nb.has(n.id);n.el.classList.toggle("dim",!on);n.el.classList.toggle("pop",n.id===id);}
+  for(const l of G.links){const a=l.s===id||l.t===id;l.el.classList.toggle("dim",!a);
+    if(l.elt){l.elt.classList.toggle("dim",!a);l.elt.style.opacity=a?1:0;}}
+  showPop(G.idx[id],box,ev);
+}
+let popEl=null;
+function showPop(n,box,ev){hidePop();if(!n)return;popEl=document.createElement("div");popEl.className="g-pop";
+  popEl.innerHTML=`<b>${esc(n.label)}</b> <span style="color:${n.color}">· ${esc(GLABEL[n.group])}</span>
+    <div style="color:#9AA6BE;margin-top:5px">${esc(n.desc||"")}</div>
+    <div style="color:#6E7A96;margin-top:6px;font-size:11px">点击查看详情</div>`;
+  box.appendChild(popEl);if(ev)posPop(box,ev);}
+function posPop(box,ev){if(!popEl)return;const r=box.getBoundingClientRect();
+  let x=ev.clientX-r.left+14,y=ev.clientY-r.top+12;
+  if(x+popEl.offsetWidth>r.width-8)x=ev.clientX-r.left-popEl.offsetWidth-12;
+  if(y+popEl.offsetHeight>r.height-8)y=ev.clientY-r.top-popEl.offsetHeight-12;
+  popEl.style.left=Math.max(4,x)+"px";popEl.style.top=Math.max(4,y)+"px";}
+function hidePop(){if(popEl){popEl.remove();popEl=null;}}
+function detail(id){
+  const n=G.idx[id],box=$("#g-detail");
+  const nb=[...(G.nbr[id]||[])].map(x=>G.idx[x]).filter(Boolean);
+  box.innerHTML=`<span class="ph">${esc(GLABEL[n.group])}</span>
+    <div class="nm">${esc(n.label)}<span class="gp" style="background:${n.color}22;color:${n.color}">${esc(GLABEL[n.group])}</span></div>
+    <div class="ds">${esc(n.desc||"")}</div>
+    ${(n.props||[]).map(p=>`<div class="pr"><span>${esc(p[0])}</span><b>${esc(p[1])}</b></div>`).join("")}
+    <div class="nbtit">关联节点（${nb.length}）— 点击跳转</div>
+    <div>${nb.map(x=>`<span class="nb" data-go="${x.id}" style="background:${x.color}22;color:${x.color}">${esc(x.label)}</span>`).join("")}</div>`;
+  box.querySelectorAll(".nb").forEach(b=>b.addEventListener("click",()=>{
+    G.sel=b.dataset.go;markSel();detail(b.dataset.go);focusNode(b.dataset.go);}));
+}
+function focusNode(id){const n=G.idx[id];if(!n)return;
+  G.view.k=Math.max(G.view.k,1.1);G.view.x=G.W/2-n.x*G.view.k;G.view.y=G.H/2-n.y*G.view.k;applyView();kick(.2);}
+function legend(){
+  const box=$("#g-legend");box.innerHTML="";
+  GROUPS.forEach(g=>{const d=document.createElement("div");d.className="lg";d.dataset.g=g.id;
+    d.innerHTML=`<span class="sw" style="background:${g.color}"></span>${g.label}`;
+    d.addEventListener("click",()=>{
+      const on=G.litGroup===g.id;G.litGroup=on?null:g.id;
+      box.querySelectorAll(".lg").forEach(x=>x.classList.toggle("active",!on&&x.dataset.g===g.id));
+      if(G.litGroup){hov(null);}applyGroupLit();});
+    box.appendChild(d);});
+}
+function init(){
+  const svg=$("#graph-svg"),box=$("#graph-box");
+  G.W=Math.max(box.clientWidth||0,640);G.H=Math.max(box.clientHeight||0,560);
+  svg.setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+  build();dom(svg);legend();if(!G.bound){bind(svg,box);G.bound=true;}kick(1);
+  $("#g-mode").addEventListener("click",()=>{LAYOUT=LAYOUT==="layered"?"force":"layered";
+    _seed=20240101;G.view={x:0,y:0,k:1};applyView();build();dom(svg);kick(1);});
+  $("#g-reset").addEventListener("click",()=>{G.view={x:0,y:0,k:1};applyView();G.sel=null;markSel();
+    G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));applyGroupLit();
+    $("#g-detail").innerHTML="";$("#g-search").value="";});
+  $("#g-relayout").addEventListener("click",()=>{_seed=(Date.now()&0x7fffffff);build();dom(svg);kick(1);});
+  $("#g-search").addEventListener("input",e=>{
+    const q=e.target.value.trim();if(!q){hov(null);return;}
+    const hit=G.nodes.find(n=>n.label.includes(q)||n.id.toLowerCase()===q.toLowerCase());
+    if(hit){G.sel=hit.id;markSel();detail(hit.id);focusNode(hit.id);
+      G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));
+      hov(hit.id,box,null);}});
+}
+if("requestIdleCallback"in window)requestIdleCallback(init);else setTimeout(init,80);
+window.addEventListener("resize",()=>{const box=$("#graph-box");if(!box)return;
+  const w=Math.max(box.clientWidth||0,640),h=Math.max(box.clientHeight||0,560);
+  if(Math.abs(w-G.W)>40){G.W=w;G.H=h;$("#graph-svg").setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+    build();dom($("#graph-svg"));kick(.8);}});
+</script>
+</body>
+</html>

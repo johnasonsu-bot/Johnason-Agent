@@ -1,16 +1,16 @@
 # Phase 0 Validation Report
 
-- Commit: `b2d8737690a12809706313b20ea94d5e68a9697d`
-- Decision: **GO_PHASE_1**
+- Commit: `731edf25890e43a167f5a343ee5a10654bf9d597`
+- Decision: **BLOCKED**
 - Recovery guarantee: Step-boundary; token-generation recovery is not claimed.
 
 | Check | Status | Evidence |
 |---|---|---|
 | `hermes.event_compatibility` | **pass** | Required Hermes event families are present; revision=01a1037d1e6d7b6eb96a786ef282c3aea4818194 |
-| `lmstudio.tool_calling` | **pass** | LM Studio produced the required tool call; base_url=http://127.0.0.1:1234; model=gemma-4-31b-it |
+| `lmstudio.tool_calling` | **blocked** | LMSTUDIO_MODEL is not configured; base_url=http://127.0.0.1:1234; loaded_models=gemma-4-31b-it,text-embedding-nomic-embed-text-v1.5 |
 | `workflow.step_recovery` | **pass** | Committed effect survived restart without replay; guarantee=step-boundary; external_id=job-42 |
 | `agui.projection` | **pass** | Domain event projected to AG-UI without state mutation |
-| `data_platform.dual_channel` | **pass** | API job and existing browser page share a stable object ID; job_id=73; status=active; browser_url=http://127.0.0.1:46120/dashboard/data-development/processing/73 |
+| `data_platform.dual_channel` | **blocked** | Data Platform API, job ID, and CDP URL are required |
 | `canvas.sandbox` | **pass** | Electron Canvas sandbox and renderers passed |
 
 ## Decision Rule

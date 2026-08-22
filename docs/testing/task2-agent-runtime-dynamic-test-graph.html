@@ -1,0 +1,1562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task 2 测试场景因子与分支动态图谱</title>
+<style>
+:root{
+  --ink:#0E1422; --line:#25304A;
+  --serif:"Songti SC",Georgia,"Times New Roman",serif;
+  --sans:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:#C6CFE2;font-family:var(--sans);-webkit-font-smoothing:antialiased}
+header{padding:20px 22px 4px;max-width:1380px;margin:0 auto}
+header h1{font-size:18px;margin:0 0 4px;font-weight:700;color:#EAEEF7}
+header p{margin:0;color:#8B96AE;font-size:13px;line-height:1.6}
+.stage{margin:16px auto;max-width:1380px;background:radial-gradient(120% 130% at 50% 0%,#161D2E 0%,#0C111C 80%);
+  border:1px solid var(--line);border-radius:16px;overflow:hidden;position:relative}
+#graph-box{position:relative;height:900px;overflow:hidden}
+@media(max-width:680px){#graph-box{height:720px}}
+#graph-svg{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+
+/* ----- 五层横带（仅 layered 模式） ----- */
+.gband-line{stroke:#22304C;stroke-width:1;stroke-dasharray:4 7;stroke-opacity:.7}
+.gband-cap{fill:#5E6E92;font-family:var(--mono);font-size:11px;letter-spacing:.06em}
+.gband-sub{fill:#9AA7C4;font-family:var(--sans);font-size:13px;font-weight:600}
+.gband-band:nth-child(odd){fill:#121A2B} .gband-band{fill:#0E1626;opacity:.5}
+
+/* ----- 节点 / 连线 / 标签 ----- */
+.gnode{cursor:grab}.gnode.dragging{cursor:grabbing}
+.gnode,.glink,.gelabel{transition:opacity .22s ease}
+.gnode.dim{opacity:.12}.glink.dim{opacity:.04}.gelabel.dim{opacity:0}
+.gn-core{transition:transform .2s cubic-bezier(.34,1.56,.64,1);transform-box:fill-box;transform-origin:center}
+.gnode.pop .gn-core{transform:scale(1.28)}
+.glabel{fill:#C6CFE2;paint-order:stroke;stroke:#0B1018;stroke-width:3px;stroke-linejoin:round;
+  font-size:10px;font-family:var(--sans)}
+.gnode.pop .glabel{fill:#fff;font-weight:700;font-size:11.5px}
+.gelabel{fill:#8B96AE;font-size:8.5px;font-family:var(--mono);opacity:0}
+
+/* ----- 工具条 / 图例 / 详情 ----- */
+.toolbar{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;z-index:6}
+.tb-btn{font-size:12px;font-family:var(--mono);color:#C6CFE2;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:6px 11px;cursor:pointer}
+.tb-btn:hover{background:#1E2A44;color:#fff}
+#g-search{flex:1 1 130px;min-width:120px;font-size:12.5px;color:#E6EBF5;background:rgba(20,26,40,.7);
+  border:1px solid #2A3650;border-radius:8px;padding:7px 11px;font-family:var(--sans)}
+#g-search::placeholder{color:#7782A0}
+.legend{display:flex;flex-wrap:wrap;gap:7px;padding:14px;border-top:1px solid #25304A;background:#0E1421}
+.lg{display:flex;align-items:center;gap:6px;font-size:11.5px;color:#AEB8CE;cursor:pointer;
+  padding:4px 9px;border-radius:18px;border:1px solid transparent}
+.lg:hover{border-color:#2A3650}
+.lg.active{background:#1A2336;border-color:#3A4E6E;color:#fff}
+.lg .sw{width:11px;height:11px;border-radius:50%}
+.g-pop{position:absolute;z-index:8;background:#161D2E;border:1px solid #2C3A58;border-radius:11px;
+  box-shadow:0 10px 34px rgba(0,0,0,.5);padding:11px 13px;font-size:12.5px;color:#D4DAE8;
+  pointer-events:none;max-width:250px;line-height:1.55}
+.g-pop b{color:#fff}
+#g-detail{padding:16px 18px;border-top:1px solid #25304A;background:#0E1421;min-height:64px;font-size:13.5px}
+#g-detail .ph{color:#7E8AA6;font-family:var(--mono);font-size:11.5px}
+#g-detail .nm{font-family:var(--serif);font-size:18px;color:#fff;margin:2px 0 6px}
+#g-detail .gp{font-size:11px;font-family:var(--mono);padding:2px 8px;border-radius:12px;margin-left:8px;vertical-align:middle}
+#g-detail .ds{color:#B6C0D6;margin:6px 0 4px}
+#g-detail .pr{display:flex;justify-content:space-between;gap:14px;padding:5px 0;border-bottom:1px solid #1E2840;font-size:12.5px}
+#g-detail .pr span{color:#828FAB} #g-detail .pr b{color:#DCE2EF}
+#g-detail .nbtit{margin-top:12px;color:#7E8AA6;font-size:11.5px;font-family:var(--mono)}
+#g-detail .nb{display:inline-block;margin:4px 4px 0 0;padding:3px 9px;border-radius:8px;font-size:12px;cursor:pointer}
+@media (prefers-reduced-motion: reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Task 2 测试场景因子与分支动态图谱</h1>
+  <p>Hermes Agent Runtime · 分层测试依据 · 输入因子 → 运行分支 → 持久化机制 → 故障恢复 → 验收断言。可切换力导向布局、搜索节点、按分类筛选并点击查看测试说明。</p>
+</header>
+
+<div class="stage">
+  <div id="graph-box">
+    <div class="toolbar">
+      <input id="g-search" type="text" placeholder="搜索节点…" autocomplete="off">
+      <button class="tb-btn" id="g-mode">切换布局</button>
+      <button class="tb-btn" id="g-reset">重置视图</button>
+      <button class="tb-btn" id="g-relayout">重新布局</button>
+    </div>
+    <svg id="graph-svg"></svg>
+  </div>
+  <div class="legend" id="g-legend"></div>
+  <div id="g-detail"></div>
+</div>
+
+<script>
+/* ============================================================
+   1) 布局模式： "layered"（纵向分层横带） | "force"（自由力导向）
+   ============================================================ */
+let LAYOUT="layered";
+
+/* ============================================================
+   2) 数据 —— 换成你自己的领域数据
+   - GROUPS：颜色分组（决定节点颜色 + 图例 + 高亮筛选维度）
+   - LAYERS：纵向层带（仅 layered 模式生效）。每层声明它包含哪些 group。
+             颜色仍按 GROUPS，层带只决定纵向位置 → 颜色与结构是两个独立维度。
+   - NODES ：id 唯一；group 必须是 GROUPS 里的 id；desc/props 用于详情面板。
+   - EDGES ：[source, target, relation] 三元组；source/target 必须是节点 id。
+   下面是一份与具体业务无关的「系统架构」示例数据，仅作占位演示。
+   ============================================================ */
+const GROUPS=[
+  {
+    "id": "input",
+    "label": "输入因子",
+    "color": "#5B8FF0"
+  },
+  {
+    "id": "config",
+    "label": "运行配置",
+    "color": "#A47BE0"
+  },
+  {
+    "id": "turn",
+    "label": "Turn 分支",
+    "color": "#34B3C7"
+  },
+  {
+    "id": "tool",
+    "label": "Tool 分支",
+    "color": "#E8924B"
+  },
+  {
+    "id": "intervention",
+    "label": "介入分支",
+    "color": "#E8B84B"
+  },
+  {
+    "id": "storage",
+    "label": "持久化",
+    "color": "#5FB87A"
+  },
+  {
+    "id": "lease",
+    "label": "租约与所有权",
+    "color": "#9BD24B"
+  },
+  {
+    "id": "failure",
+    "label": "故障注入",
+    "color": "#E0574F"
+  },
+  {
+    "id": "assertion",
+    "label": "验收断言",
+    "color": "#C96C8A"
+  }
+];
+
+const LAYERS=[
+  {
+    "key": 1,
+    "label": "测试输入因子",
+    "en": "Factors",
+    "groups": [
+      "input",
+      "config"
+    ]
+  },
+  {
+    "key": 2,
+    "label": "运行路径与分支",
+    "en": "Branches",
+    "groups": [
+      "turn",
+      "tool",
+      "intervention"
+    ]
+  },
+  {
+    "key": 3,
+    "label": "持久化与互斥",
+    "en": "Durability",
+    "groups": [
+      "storage",
+      "lease"
+    ]
+  },
+  {
+    "key": 4,
+    "label": "故障与恢复",
+    "en": "Faults",
+    "groups": [
+      "failure"
+    ]
+  },
+  {
+    "key": 5,
+    "label": "验收断言",
+    "en": "Assertions",
+    "groups": [
+      "assertion"
+    ]
+  }
+];
+
+const NODES=[
+  {
+    "id": "F1",
+    "label": "session_id",
+    "group": "input",
+    "desc": "会话隔离主键；所有消息、Turn 与工具效果必须限定在同一会话。",
+    "props": [
+      [
+        "因子",
+        "相同 / 不同 session"
+      ],
+      [
+        "风险",
+        "跨会话泄漏"
+      ],
+      [
+        "关联测试",
+        "command identity / repository isolation"
+      ]
+    ]
+  },
+  {
+    "id": "F2",
+    "label": "command_id",
+    "group": "input",
+    "desc": "一次 Agent Turn 的幂等命令标识，重复、并发和冲突输入都必须确定处理。",
+    "props": [
+      [
+        "因子",
+        "首次 / 重复 / 并发"
+      ],
+      [
+        "门禁",
+        "不得重复模型或工具副作用"
+      ]
+    ]
+  },
+  {
+    "id": "F3",
+    "label": "run_id",
+    "group": "input",
+    "desc": "生命周期运行标识；同一 command 不允许静默切换到其他 run。",
+    "props": [
+      [
+        "因子",
+        "一致 / 冲突"
+      ],
+      [
+        "预期",
+        "冲突明确拒绝"
+      ]
+    ]
+  },
+  {
+    "id": "F4",
+    "label": "prompt",
+    "group": "input",
+    "desc": "用户公开输入；同一 command 对应的 prompt 身份必须稳定。",
+    "props": [
+      [
+        "因子",
+        "一致 / 冲突"
+      ],
+      [
+        "存储",
+        "公开消息投影"
+      ]
+    ]
+  },
+  {
+    "id": "F5",
+    "label": "provider/model",
+    "group": "config",
+    "desc": "Turn 绑定的模型供应商与模型；恢复时不得跨供应商注入私有 continuation。",
+    "props": [
+      [
+        "因子",
+        "LM Studio / DeepSeek"
+      ],
+      [
+        "分支",
+        "一致 / 切换"
+      ],
+      [
+        "预期",
+        "切换拒绝"
+      ]
+    ]
+  },
+  {
+    "id": "F6",
+    "label": "tool_calls",
+    "group": "config",
+    "desc": "模型返回的工具调用集合，覆盖无工具、单工具、多工具和未知工具。",
+    "props": [
+      [
+        "因子",
+        "0 / 1 / N"
+      ],
+      [
+        "分支",
+        "known / unknown / exception"
+      ]
+    ]
+  },
+  {
+    "id": "F7",
+    "label": "max_steps",
+    "group": "config",
+    "desc": "单 Turn 最大模型步数，防止无限工具循环。",
+    "props": [
+      [
+        "边界",
+        "1 / 默认 8"
+      ],
+      [
+        "终态",
+        "max_steps_exceeded"
+      ]
+    ]
+  },
+  {
+    "id": "F8",
+    "label": "interventions",
+    "group": "input",
+    "desc": "任务过程中提交的人类补充、纠正或重规划要求。",
+    "props": [
+      [
+        "因子",
+        "无 / 单次 / 多次 / 并发"
+      ],
+      [
+        "边界",
+        "before_model"
+      ]
+    ]
+  },
+  {
+    "id": "F9",
+    "label": "crash_point",
+    "group": "config",
+    "desc": "故障注入位置，覆盖模型中、工具前、工具后、最终封存前与进程重启。",
+    "props": [
+      [
+        "方式",
+        "取消任务 / 注入异常 / 过期租约"
+      ],
+      [
+        "目标",
+        "恢复不重放副作用"
+      ]
+    ]
+  },
+  {
+    "id": "B1",
+    "label": "原子 Turn Claim",
+    "group": "turn",
+    "desc": "以 (session_id, command_id) 原子取得所有权或读取终态。",
+    "props": [
+      [
+        "分支",
+        "owned / busy / terminal / uncertain"
+      ],
+      [
+        "表",
+        "conversation_turns"
+      ]
+    ]
+  },
+  {
+    "id": "B2",
+    "label": "Busy 等待重放",
+    "group": "turn",
+    "desc": "并发重复调用等待当前 owner 完成，然后重放同一终态事件。",
+    "props": [
+      [
+        "预期",
+        "单 owner"
+      ],
+      [
+        "禁止",
+        "并行 gateway/tool"
+      ]
+    ]
+  },
+  {
+    "id": "B3",
+    "label": "Terminal Replay",
+    "group": "turn",
+    "desc": "已完成或失败命令直接重放持久化事件，不再执行模型或工具。",
+    "props": [
+      [
+        "终态",
+        "completed / failed / reconciliation"
+      ],
+      [
+        "输出",
+        "稳定事件序列"
+      ]
+    ]
+  },
+  {
+    "id": "B4",
+    "label": "模型请求",
+    "group": "turn",
+    "desc": "在合法协议消息链上调用 Model Gateway，并保持 provider-neutral。",
+    "props": [
+      [
+        "路径",
+        "model → tool → model"
+      ],
+      [
+        "输出",
+        "text / tool_calls / continuation"
+      ]
+    ]
+  },
+  {
+    "id": "B5",
+    "label": "响应校验",
+    "group": "turn",
+    "desc": "区分文本、工具调用、空响应和模型异常。",
+    "props": [
+      [
+        "空响应",
+        "provider_protocol_error"
+      ],
+      [
+        "模型异常",
+        "retryable provider_error"
+      ]
+    ]
+  },
+  {
+    "id": "B6",
+    "label": "多工具调度",
+    "group": "tool",
+    "desc": "按 tool_call 顺序执行，重启后从未完成索引继续，不能跳过剩余工具。",
+    "props": [
+      [
+        "因子",
+        "单 / 多 tool_calls"
+      ],
+      [
+        "恢复",
+        "next tool index / completed set"
+      ]
+    ]
+  },
+  {
+    "id": "B7",
+    "label": "工具效果 Claim",
+    "group": "tool",
+    "desc": "工具执行前先落 running journal；已完成复用结果，不确定则进入协调。",
+    "props": [
+      [
+        "表",
+        "conversation_tool_effects"
+      ],
+      [
+        "分支",
+        "execute / completed / uncertain"
+      ]
+    ]
+  },
+  {
+    "id": "B8",
+    "label": "未知工具纠错",
+    "group": "tool",
+    "desc": "未知工具产生受控 tool_failed 与 tool 消息，让模型有机会纠正。",
+    "props": [
+      [
+        "副作用",
+        "无"
+      ],
+      [
+        "后续",
+        "再次模型请求"
+      ]
+    ]
+  },
+  {
+    "id": "B9",
+    "label": "介入 Claim",
+    "group": "intervention",
+    "desc": "运行时在 before_model 原子 claim 待处理介入，Engine 不提前吞掉。",
+    "props": [
+      [
+        "状态",
+        "submitted → queued"
+      ],
+      [
+        "所有者",
+        "AgentRuntime"
+      ]
+    ]
+  },
+  {
+    "id": "B10",
+    "label": "成功后 ACK",
+    "group": "intervention",
+    "desc": "介入真正进入合法模型请求且响应有效后才 applied → acknowledged。",
+    "props": [
+      [
+        "失败",
+        "release 保留重试"
+      ],
+      [
+        "并发",
+        "owner fencing"
+      ]
+    ]
+  },
+  {
+    "id": "D1",
+    "label": "公开消息序列",
+    "group": "storage",
+    "desc": "用户与最终助手消息按 session 单调序列持久化，不包含隐藏 reasoning。",
+    "props": [
+      [
+        "表",
+        "conversation_messages"
+      ],
+      [
+        "约束",
+        "session-scoped command id"
+      ]
+    ]
+  },
+  {
+    "id": "D2",
+    "label": "Turn Snapshot",
+    "group": "storage",
+    "desc": "持久化 phase、协议消息、provider/model、事件和最终结果。",
+    "props": [
+      [
+        "表",
+        "conversation_turns"
+      ],
+      [
+        "隐私",
+        "in-flight protected state"
+      ]
+    ]
+  },
+  {
+    "id": "D3",
+    "label": "Tool Effect Journal",
+    "group": "storage",
+    "desc": "记录工具 running/completed/uncertain 及结果，避免重启盲重放。",
+    "props": [
+      [
+        "表",
+        "conversation_tool_effects"
+      ],
+      [
+        "原子性",
+        "effect + resumable state"
+      ]
+    ]
+  },
+  {
+    "id": "D4",
+    "label": "失败 Checkpoint",
+    "group": "storage",
+    "desc": "失败与协调终态也保存 checkpoint，UI/恢复逻辑可识别停止原因。",
+    "props": [
+      [
+        "状态",
+        "failed / retryable / reconciliation"
+      ],
+      [
+        "顺序",
+        "先持久化再发终态事件"
+      ]
+    ]
+  },
+  {
+    "id": "D5",
+    "label": "私有 Continuation",
+    "group": "storage",
+    "desc": "DeepSeek 等 provider 的 continuation 仅绑定当前 turn/tool-call，不进入公开消息。",
+    "props": [
+      [
+        "内容",
+        "reasoning_content"
+      ],
+      [
+        "清理",
+        "完成/失败后封存"
+      ],
+      [
+        "禁止",
+        "跨 turn/provider 注入"
+      ]
+    ]
+  },
+  {
+    "id": "D6",
+    "label": "事件结果封存",
+    "group": "storage",
+    "desc": "Turn 事件序列作为幂等结果保存，重复命令得到一致重放。",
+    "props": [
+      [
+        "事件",
+        "started/tool/text/finished/failed"
+      ],
+      [
+        "要求",
+        "崩溃窗口不丢事件"
+      ]
+    ]
+  },
+  {
+    "id": "D7",
+    "label": "Turn Lease Heartbeat",
+    "group": "lease",
+    "desc": "长模型或工具调用期间续租 Turn owner，防止第二 owner 接管。",
+    "props": [
+      [
+        "周期",
+        "lease / 3"
+      ],
+      [
+        "测试",
+        "短租约 + 阻塞调用"
+      ]
+    ]
+  },
+  {
+    "id": "D8",
+    "label": "介入 Claim Lease",
+    "group": "lease",
+    "desc": "介入 claim 支持心跳与陈旧 owner 回收，避免永久锁死或双重应用。",
+    "props": [
+      [
+        "分支",
+        "active / stale reclaim"
+      ],
+      [
+        "要求",
+        "与模型等待同步续租"
+      ]
+    ]
+  },
+  {
+    "id": "D9",
+    "label": "Schema v7 Migration",
+    "group": "storage",
+    "desc": "从旧 SQLite schema 加法升级 Turn、Tool、介入 claim 与 command prompt digest 字段；v6→v7 一次性清理遗留私有 continuation。",
+    "props": [
+      [
+        "版本",
+        "v4 → v7 / v6 → v7"
+      ],
+      [
+        "门禁",
+        "普通 connection / 重复执行 / 外键检查"
+      ]
+    ]
+  },
+  {
+    "id": "X1",
+    "label": "重复命令",
+    "group": "failure",
+    "desc": "同一 command 连续或并发执行，验证 gateway/tool 仅执行一次。",
+    "props": [
+      [
+        "注入",
+        "retry + concurrent"
+      ],
+      [
+        "预期",
+        "terminal replay"
+      ]
+    ]
+  },
+  {
+    "id": "X2",
+    "label": "模型异常",
+    "group": "failure",
+    "desc": "Provider 抛出临时异常；介入释放、Turn 可重试且失败可见。",
+    "props": [
+      [
+        "终态",
+        "retryable"
+      ],
+      [
+        "重试",
+        "同 command 可恢复"
+      ]
+    ]
+  },
+  {
+    "id": "X3",
+    "label": "空模型响应",
+    "group": "failure",
+    "desc": "既无文本也无工具调用的响应是协议错误，不保存空成功消息。",
+    "props": [
+      [
+        "终态",
+        "provider_protocol_error"
+      ],
+      [
+        "介入",
+        "不得 ACK"
+      ]
+    ]
+  },
+  {
+    "id": "X4",
+    "label": "工具异常",
+    "group": "failure",
+    "desc": "工具可能已产生外部副作用但未确认，必须标记 uncertain 并停止自动重试。",
+    "props": [
+      [
+        "终态",
+        "reconciliation_required"
+      ],
+      [
+        "禁止",
+        "重复 invoke"
+      ]
+    ]
+  },
+  {
+    "id": "X5",
+    "label": "工具中崩溃",
+    "group": "failure",
+    "desc": "工具 running 后进程退出；租约过期恢复时进入协调，不重新执行。",
+    "props": [
+      [
+        "注入",
+        "cancel task"
+      ],
+      [
+        "断点",
+        "effect=running"
+      ]
+    ]
+  },
+  {
+    "id": "X6",
+    "label": "多工具中断",
+    "group": "failure",
+    "desc": "第一个工具完成、后续工具未启动时崩溃；恢复需补齐剩余工具并保留事件。",
+    "props": [
+      [
+        "风险",
+        "跳过剩余 tool"
+      ],
+      [
+        "门禁",
+        "2/2 执行且只执行一次"
+      ]
+    ]
+  },
+  {
+    "id": "X7",
+    "label": "工具后崩溃",
+    "group": "failure",
+    "desc": "工具结果已原子提交但 tool_finished/下一模型前退出，恢复合法协议链。",
+    "props": [
+      [
+        "断点",
+        "after_tool"
+      ],
+      [
+        "要求",
+        "不重放工具"
+      ]
+    ]
+  },
+  {
+    "id": "X8",
+    "label": "最终封存前崩溃",
+    "group": "failure",
+    "desc": "最终文本已生成但 Turn 尚未 finish；恢复应完成封存而非误判协议错误。",
+    "props": [
+      [
+        "断点",
+        "finalizing"
+      ],
+      [
+        "要求",
+        "不重调 provider"
+      ]
+    ]
+  },
+  {
+    "id": "X9",
+    "label": "租约过期竞争",
+    "group": "failure",
+    "desc": "短租约下阻塞模型/工具/介入，验证 heartbeat 与 fencing。",
+    "props": [
+      [
+        "注入",
+        "lease=10ms"
+      ],
+      [
+        "并发",
+        "second owner"
+      ]
+    ]
+  },
+  {
+    "id": "X10",
+    "label": "身份冲突",
+    "group": "failure",
+    "desc": "同 command 改 run_id、prompt、provider 或 model，必须明确拒绝。",
+    "props": [
+      [
+        "风险",
+        "静默重放旧结果"
+      ],
+      [
+        "预期",
+        "ValueError / conflict"
+      ]
+    ]
+  },
+  {
+    "id": "A1",
+    "label": "模型仅调用一次",
+    "group": "assertion",
+    "desc": "重复与并发命令不会增加 gateway 调用次数。",
+    "props": [
+      [
+        "断言",
+        "gateway calls stable"
+      ],
+      [
+        "覆盖",
+        "completed turn replay"
+      ]
+    ]
+  },
+  {
+    "id": "A2",
+    "label": "工具仅执行一次",
+    "group": "assertion",
+    "desc": "任何重试或崩溃恢复都不盲目重复外部工具副作用。",
+    "props": [
+      [
+        "断言",
+        "operations == expected"
+      ],
+      [
+        "失败",
+        "进入 reconciliation"
+      ]
+    ]
+  },
+  {
+    "id": "A3",
+    "label": "协议链合法恢复",
+    "group": "assertion",
+    "desc": "恢复后的 assistant tool_calls 与全部 tool results 顺序合法。",
+    "props": [
+      [
+        "覆盖",
+        "after_model / after_tool / multi-tool"
+      ],
+      [
+        "断言",
+        "provider request roles/order"
+      ]
+    ]
+  },
+  {
+    "id": "A4",
+    "label": "隐藏推理不泄漏",
+    "group": "assertion",
+    "desc": "私有 continuation 不出现在公开 ConversationMessage、事件或 UI 投影。",
+    "props": [
+      [
+        "断言",
+        "public JSON 无 private-chain"
+      ],
+      [
+        "范围",
+        "turn/provider scoped"
+      ]
+    ]
+  },
+  {
+    "id": "A5",
+    "label": "介入只应用一次",
+    "group": "assertion",
+    "desc": "模型成功前不 ACK，长请求期间不被其他 owner 抢占，失败后可重试。",
+    "props": [
+      [
+        "断言",
+        "single claimant"
+      ],
+      [
+        "状态",
+        "queued → applied → acknowledged"
+      ]
+    ]
+  },
+  {
+    "id": "A6",
+    "label": "失败终态可见",
+    "group": "assertion",
+    "desc": "unknown、tool failure、empty、max steps 都产生规范化事件和 checkpoint。",
+    "props": [
+      [
+        "事件",
+        "tool_failed / turn_failed"
+      ],
+      [
+        "用途",
+        "AG-UI 状态展示"
+      ]
+    ]
+  },
+  {
+    "id": "A7",
+    "label": "重放事件一致",
+    "group": "assertion",
+    "desc": "Terminal replay 与首次执行的事件内容和顺序一致，不缺 tool_finished。",
+    "props": [
+      [
+        "断言",
+        "second == first"
+      ],
+      [
+        "存储",
+        "result_json"
+      ]
+    ]
+  },
+  {
+    "id": "A8",
+    "label": "迁移无数据损失",
+    "group": "assertion",
+    "desc": "v4→v7 升级保留会话与旧消息；v6→v7 仅清理一次遗留私有 continuation，后续 v7 重开不重复清理。",
+    "props": [
+      [
+        "检查",
+        "schema versions / FK / indexes"
+      ],
+      [
+        "重复迁移",
+        "幂等"
+      ]
+    ]
+  },
+  {
+    "id": "A9",
+    "label": "Focused Gate",
+    "group": "assertion",
+    "desc": "运行时、真实 turn、lifecycle/介入与迁移测试必须全部通过。",
+    "props": [
+      [
+        "当前基线",
+        "48 expanded passed"
+      ],
+      [
+        "命令",
+        "pytest runtime + integration + workflow"
+      ]
+    ]
+  },
+  {
+    "id": "A10",
+    "label": "Full Python Gate",
+    "group": "assertion",
+    "desc": "全量 Python 回归通过后 Task 2 才能进入 AG-UI API。",
+    "props": [
+      [
+        "最近结果",
+        "227 passed / 4 skipped"
+      ],
+      [
+        "状态",
+        "Task 2 已通过"
+      ]
+    ]
+  }
+];
+
+const EDGES=[
+  [
+    "F1",
+    "B1",
+    "限定会话"
+  ],
+  [
+    "F2",
+    "B1",
+    "幂等主键"
+  ],
+  [
+    "F3",
+    "B1",
+    "绑定运行"
+  ],
+  [
+    "F4",
+    "B1",
+    "绑定输入"
+  ],
+  [
+    "F5",
+    "B1",
+    "绑定供应商"
+  ],
+  [
+    "F6",
+    "B4",
+    "驱动响应"
+  ],
+  [
+    "F7",
+    "B5",
+    "限制循环"
+  ],
+  [
+    "F8",
+    "B9",
+    "提供介入"
+  ],
+  [
+    "F9",
+    "X5",
+    "选择断点"
+  ],
+  [
+    "B1",
+    "B2",
+    "busy"
+  ],
+  [
+    "B1",
+    "B3",
+    "terminal"
+  ],
+  [
+    "B1",
+    "D2",
+    "持久化 claim"
+  ],
+  [
+    "B2",
+    "D7",
+    "依赖续租"
+  ],
+  [
+    "B3",
+    "D6",
+    "读取结果"
+  ],
+  [
+    "B4",
+    "B5",
+    "返回响应"
+  ],
+  [
+    "B5",
+    "B6",
+    "tool_calls"
+  ],
+  [
+    "B5",
+    "D1",
+    "final text"
+  ],
+  [
+    "B6",
+    "B7",
+    "逐个执行"
+  ],
+  [
+    "B6",
+    "B8",
+    "缺少定义"
+  ],
+  [
+    "B7",
+    "D3",
+    "写 effect"
+  ],
+  [
+    "B9",
+    "B10",
+    "成功后确认"
+  ],
+  [
+    "B9",
+    "D8",
+    "claim 租约"
+  ],
+  [
+    "B10",
+    "A5",
+    "一次应用"
+  ],
+  [
+    "D1",
+    "A4",
+    "公开投影"
+  ],
+  [
+    "D2",
+    "D5",
+    "保存私有链"
+  ],
+  [
+    "D2",
+    "D6",
+    "保存事件"
+  ],
+  [
+    "D3",
+    "A2",
+    "防副作用重放"
+  ],
+  [
+    "D4",
+    "A6",
+    "暴露失败"
+  ],
+  [
+    "D5",
+    "A4",
+    "隔离推理"
+  ],
+  [
+    "D6",
+    "A7",
+    "稳定重放"
+  ],
+  [
+    "D7",
+    "X9",
+    "抵御过期"
+  ],
+  [
+    "D8",
+    "X9",
+    "抵御抢占"
+  ],
+  [
+    "D9",
+    "A8",
+    "升级验证"
+  ],
+  [
+    "X1",
+    "A1",
+    "验证"
+  ],
+  [
+    "X1",
+    "A2",
+    "验证"
+  ],
+  [
+    "X2",
+    "A5",
+    "失败释放介入"
+  ],
+  [
+    "X2",
+    "A6",
+    "retryable event"
+  ],
+  [
+    "X3",
+    "A6",
+    "protocol failure"
+  ],
+  [
+    "X4",
+    "D3",
+    "标 uncertain"
+  ],
+  [
+    "X4",
+    "A2",
+    "禁止重试"
+  ],
+  [
+    "X5",
+    "A2",
+    "重启不执行"
+  ],
+  [
+    "X5",
+    "A6",
+    "协调终态"
+  ],
+  [
+    "X6",
+    "B6",
+    "恢复剩余调用"
+  ],
+  [
+    "X6",
+    "A3",
+    "验证完整链"
+  ],
+  [
+    "X6",
+    "A7",
+    "验证事件"
+  ],
+  [
+    "X7",
+    "D3",
+    "读取已完成结果"
+  ],
+  [
+    "X7",
+    "A3",
+    "继续模型"
+  ],
+  [
+    "X7",
+    "A7",
+    "补齐事件"
+  ],
+  [
+    "X8",
+    "D2",
+    "读取 finalizing"
+  ],
+  [
+    "X8",
+    "A1",
+    "不重调模型"
+  ],
+  [
+    "X8",
+    "A7",
+    "完成封存"
+  ],
+  [
+    "X9",
+    "D7",
+    "Turn heartbeat"
+  ],
+  [
+    "X9",
+    "D8",
+    "Intervention heartbeat"
+  ],
+  [
+    "X9",
+    "A5",
+    "single owner"
+  ],
+  [
+    "X10",
+    "B1",
+    "冲突校验"
+  ],
+  [
+    "X10",
+    "A7",
+    "禁止旧结果误配"
+  ],
+  [
+    "A1",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A2",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A3",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A4",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A5",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A6",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A7",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A8",
+    "A9",
+    "focused gate"
+  ],
+  [
+    "A9",
+    "A10",
+    "进入全量回归"
+  ]
+];
+
+/* ============================================================
+   3) 引擎 —— 一般无需改动
+   ============================================================ */
+const NS="http://www.w3.org/2000/svg";
+const COLOR=Object.fromEntries(GROUPS.map(g=>[g.id,g.color]));
+const GLABEL=Object.fromEntries(GROUPS.map(g=>[g.id,g.label]));
+const G2L={};LAYERS.forEach(L=>L.groups.forEach(g=>G2L[g]=L.key));
+const CN=["一","二","三","四","五","六","七","八","九","十"];
+let _seed=20240101; function rnd(){_seed=(_seed*1103515245+12345)&0x7fffffff;return _seed/0x7fffffff;}
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+const $=s=>document.querySelector(s);
+
+const G={nodes:[],links:[],idx:{},nbr:{},alpha:0,view:{x:0,y:0,k:1},drag:null,pan:null,hover:null,
+  raf:0,W:1000,H:780,root:null,bound:false,sel:null,litGroup:null};
+
+function degree(){const d={};EDGES.forEach(e=>{d[e[0]]=(d[e[0]]||0)+1;d[e[1]]=(d[e[1]]||0)+1;});return d;}
+function nodeR(deg,n){return Math.max(8,Math.min(22,7+(deg[n.id]||1)*1.3));}
+function mkNode(n,L,by,li,r,x,y){return {...n,layer:L,by,li,color:COLOR[n.group],r,x,y,vx:0,vy:0,
+  lw:Math.min(String(n.label).length,11)*11+10};}
+
+function geom(){
+  G.LBL=G.W<560?86:150;            // 左侧层标签留白
+  G.padT=44;G.padB=28;
+  G.bandH=(G.H-G.padT-G.padB)/LAYERS.length;
+  G.x0=G.LBL+34;G.x1=G.W-66;
+}
+function bandY(L){return G.padT+G.bandH*(L-0.5);}
+
+function build(){
+  geom();
+  const deg=degree();
+  G.nodes=[];
+  if(LAYOUT==="layered"){
+    const byLayer={};for(let L=1;L<=LAYERS.length;L++)byLayer[L]=[];
+    NODES.forEach(n=>{const L=G2L[n.group]||1;(byLayer[L]||byLayer[1]).push(n);});
+    for(let L=1;L<=LAYERS.length;L++){
+      const arr=byLayer[L];
+      arr.sort((p,q)=>p.group<q.group?-1:p.group>q.group?1:(deg[q.id]||0)-(deg[p.id]||0));
+      const cy=bandY(L),n_=arr.length;
+      arr.forEach((n,i)=>{
+        const r=nodeR(deg,n),t=n_>1?i/(n_-1):.5,x=G.x0+t*(G.x1-G.x0);
+        const jit=((i%3)-1)*Math.min(34,G.bandH*0.30)*(0.45+0.55*rnd());
+        G.nodes.push(mkNode(n,L,cy,i,r,x,cy+jit));
+      });
+    }
+  }else{
+    NODES.forEach((n,i)=>{
+      const r=nodeR(deg,n),a=i*2.39996,rr=70+Math.sqrt(i+1)*34;
+      G.nodes.push(mkNode(n,G2L[n.group]||1,0,i,r,G.W/2+Math.cos(a)*rr,G.H/2+Math.sin(a)*rr*.82));
+    });
+  }
+  G.links=EDGES.map(e=>({s:e[0],t:e[1],label:e[2]}));
+  G.idx=Object.fromEntries(G.nodes.map(n=>[n.id,n]));
+  G.nbr={};G.links.forEach(l=>{(G.nbr[l.s]||(G.nbr[l.s]=new Set())).add(l.t);(G.nbr[l.t]||(G.nbr[l.t]=new Set())).add(l.s);});
+}
+
+function dom(svg){
+  svg.innerHTML="";const root=el("g",{});G.root=root;
+  const gb=el("g",{}),gl=el("g",{}),gn=el("g",{});
+  if(LAYOUT==="layered"){
+    for(let L=1;L<=LAYERS.length;L++){
+      const top=G.padT+G.bandH*(L-1),cy=bandY(L);
+      gb.appendChild(el("rect",{class:"gband-band",x:0,y:top,width:G.W,height:G.bandH}));
+      gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:top,x2:G.W-10,y2:top}));
+      const cap=el("text",{class:"gband-cap",x:22,y:cy-7});cap.textContent="第"+(CN[L-1]||L)+"层";gb.appendChild(cap);
+      const sub=el("text",{class:"gband-sub",x:22,y:cy+13});sub.textContent=LAYERS[L-1].label;gb.appendChild(sub);
+      if(LAYERS[L-1].en){const en=el("text",{class:"gband-cap",x:22,y:cy+30});en.textContent=LAYERS[L-1].en;gb.appendChild(en);}
+    }
+    gb.appendChild(el("line",{class:"gband-line",x1:G.LBL,y1:G.padT+G.bandH*LAYERS.length,x2:G.W-10,y2:G.padT+G.bandH*LAYERS.length}));
+  }
+  G.links.forEach(l=>{
+    l.el=el("line",{class:"glink",stroke:"#5A6B8C","stroke-width":1.1,"stroke-opacity":.30});gl.appendChild(l.el);
+    l.elt=el("text",{class:"gelabel","text-anchor":"middle"});l.elt.textContent=l.label;gl.appendChild(l.elt);
+  });
+  G.nodes.forEach(n=>{
+    const g=el("g",{class:"gnode","data-id":n.id});
+    const core=el("g",{class:"gn-core"});
+    core.appendChild(el("circle",{r:n.r+5,fill:n.color,"fill-opacity":.16}));      // 光晕
+    const c=el("circle",{r:n.r,fill:n.color,"fill-opacity":.92,stroke:"#0B1018","stroke-width":1.5});
+    core.appendChild(c);n.elc=c;g.appendChild(core);
+    const below=(n.li%2===0);                                                      // 交错上下，缓解标签拥挤
+    const lb=el("text",{class:"glabel","text-anchor":"middle",y:below?n.r+14:-(n.r+7)});lb.textContent=n.label;g.appendChild(lb);
+    n.el=g;gn.appendChild(g);
+  });
+  root.appendChild(gb);root.appendChild(gl);root.appendChild(gn);svg.appendChild(root);applyView();markSel();
+}
+function applyView(){if(G.root)G.root.setAttribute("transform",`translate(${G.view.x},${G.view.y}) scale(${G.view.k})`);}
+function kick(a){G.alpha=Math.max(G.alpha,a);if(!G.raf)G.raf=requestAnimationFrame(loop);}
+function loop(){G.raf=0;step();draw();if(G.alpha>0.012||G.drag)G.raf=requestAnimationFrame(loop);}
+function step(){LAYOUT==="layered"?stepLayered():stepForce();}
+
+function stepForce(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const dx=t.x-s.x,dy=t.y-s.y,d=Math.hypot(dx,dy)||1,f=(d-112)*0.015*a,fx=dx/d*f,fy=dy/d*f;
+    s.vx+=fx;s.vy+=fy;t.vx-=fx;t.vy-=fy;}
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<30000){const f=1250*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    let minD=p.r+q.r+16;if(Math.abs(dy)<32)minD=Math.max(minD,(p.lw+q.lw)*0.40);
+    if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+      if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+      if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}
+  }
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vx+=(G.W/2-n.x)*0.006*a;n.vy+=(G.H/2-n.y)*0.006*a;
+    n.x+=n.vx*=.86;n.y+=n.vy*=.86;}
+  G.alpha*=G.drag?1:.965;
+}
+
+function stepLayered(){
+  const N=G.nodes,a=Math.min(G.alpha,1);
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t)continue;
+    const fx=(t.x-s.x)*0.00065*a;s.vx+=fx;t.vx-=fx;}                // 仅横向对齐
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    const p=N[i],q=N[j];let dx=q.x-p.x,dy=q.y-p.y,d2=dx*dx+dy*dy;
+    if(d2<1){dx=rnd()-.5;dy=rnd()-.5;d2=dx*dx+dy*dy;}const d=Math.sqrt(d2);
+    if(d2<42000){const f=1520*a/d2;p.vx-=dx/d*f;p.vy-=dy/d*f;q.vx+=dx/d*f;q.vy+=dy/d*f;}
+    if(p.layer===q.layer){let minD=p.r+q.r+18;if(Math.abs(dy)<42)minD=Math.max(minD,(p.lw+q.lw)*0.52);
+      if(d<minD){const push=(minD-d)*.5*Math.min(a*3,1),ux=dx/d,uy=dy/d;
+        if(!(G.drag&&G.drag.node===p)){p.x-=ux*push;p.y-=uy*push;}
+        if(!(G.drag&&G.drag.node===q)){q.x+=ux*push;q.y+=uy*push;}}}
+  }
+  const yIn=Math.min(54,G.bandH*0.42);
+  for(const n of N){if(G.drag&&G.drag.node===n){n.vx=0;n.vy=0;continue;}
+    n.vy+=(n.by-n.y)*0.085*a;                                       // 回吸到本层中线
+    n.x+=n.vx*=.85;n.y+=n.vy*=.85;
+    if(n.x<G.x0)n.x=G.x0;if(n.x>G.x1)n.x=G.x1;                      // 横向夹在画布内
+    if(n.y<n.by-yIn)n.y=n.by-yIn;if(n.y>n.by+yIn)n.y=n.by+yIn;       // 纵向夹在本层带内
+  }
+  G.alpha*=G.drag?1:.965;
+}
+
+function draw(){
+  for(const l of G.links){const s=G.idx[l.s],t=G.idx[l.t];if(!s||!t||!l.el)continue;
+    l.el.setAttribute("x1",s.x.toFixed(1));l.el.setAttribute("y1",s.y.toFixed(1));
+    l.el.setAttribute("x2",t.x.toFixed(1));l.el.setAttribute("y2",t.y.toFixed(1));
+    if(l.elt){l.elt.setAttribute("x",((s.x+t.x)/2).toFixed(1));l.elt.setAttribute("y",((s.y+t.y)/2-3).toFixed(1));}}
+  for(const n of G.nodes)n.el.setAttribute("transform",`translate(${n.x.toFixed(1)},${n.y.toFixed(1)})`);
+}
+function pt(box,ev){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+  const px=(ev.clientX-r.left)*sx,py=(ev.clientY-r.top)*sx;
+  return {x:(px-G.view.x)/G.view.k,y:(py-G.view.y)/G.view.k,px,py};}
+function bind(svg,box){
+  svg.addEventListener("pointerdown",ev=>{
+    const g=ev.target.closest?ev.target.closest(".gnode"):null;
+    if(g){const n=G.idx[g.dataset.id];if(!n)return;G.drag={node:n,moved:0};
+      try{svg.setPointerCapture(ev.pointerId)}catch(e){}n.el.classList.add("dragging");kick(.7);hidePop();}
+    else{G.pan={x:ev.clientX,y:ev.clientY,vx:G.view.x,vy:G.view.y};try{svg.setPointerCapture(ev.pointerId)}catch(e){}}
+  });
+  svg.addEventListener("pointermove",ev=>{
+    if(G.drag){const p=pt(box,ev),n=G.drag.node;G.drag.moved+=Math.abs(p.x-n.x)+Math.abs(p.y-n.y);
+      n.x=p.x;n.y=p.y;n.vx=0;n.vy=0;kick(.5);}
+    else if(G.pan){const r=box.getBoundingClientRect(),sx=G.W/r.width;
+      G.view.x=G.pan.vx+(ev.clientX-G.pan.x)*sx;G.view.y=G.pan.vy+(ev.clientY-G.pan.y)*sx;applyView();}
+    else{const g=ev.target.closest?ev.target.closest(".gnode"):null;hov(g?g.dataset.id:null,box,ev);}
+  });
+  const end=()=>{if(G.drag){G.drag.node.el.classList.remove("dragging");
+    if(G.drag.moved<5){G.sel=G.drag.node.id;markSel();detail(G.drag.node.id);}G.drag=null;kick(.3);}G.pan=null;};
+  svg.addEventListener("pointerup",end);svg.addEventListener("pointercancel",end);
+  svg.addEventListener("pointerleave",()=>{hov(null);G.pan=null;});
+  svg.addEventListener("wheel",ev=>{ev.preventDefault();const p=pt(box,ev);
+    const k2=Math.max(.4,Math.min(3,G.view.k*Math.exp(-ev.deltaY*0.0016)));
+    G.view.x=p.px-p.x*k2;G.view.y=p.py-p.y*k2;G.view.k=k2;applyView();},{passive:false});
+}
+function markSel(){for(const n of G.nodes){const on=G.sel===n.id;
+  n.elc.setAttribute("stroke",on?"#fff":"#0B1018");n.elc.setAttribute("stroke-width",on?2.5:1.5);}}
+function applyGroupLit(){
+  if(!G.litGroup){for(const n of G.nodes)n.el.classList.remove("dim");
+    for(const l of G.links)l.el.classList.remove("dim");return;}
+  for(const n of G.nodes)n.el.classList.toggle("dim",n.group!==G.litGroup);
+  for(const l of G.links){const a=G.idx[l.s].group===G.litGroup||G.idx[l.t].group===G.litGroup;
+    l.el.classList.toggle("dim",!a);}
+}
+function hov(id,box,ev){
+  if(G.litGroup)return;
+  if(G.hover===id){if(id&&ev)posPop(box,ev);return;}G.hover=id;
+  if(!id){for(const n of G.nodes)n.el.classList.remove("dim","pop");
+    for(const l of G.links){l.el.classList.remove("dim");if(l.elt)l.elt.classList.remove("dim");l.elt.style.opacity=0;}
+    hidePop();return;}
+  const nb=G.nbr[id]||new Set();
+  for(const n of G.nodes){const on=n.id===id||nb.has(n.id);n.el.classList.toggle("dim",!on);n.el.classList.toggle("pop",n.id===id);}
+  for(const l of G.links){const a=l.s===id||l.t===id;l.el.classList.toggle("dim",!a);
+    if(l.elt){l.elt.classList.toggle("dim",!a);l.elt.style.opacity=a?1:0;}}
+  showPop(G.idx[id],box,ev);
+}
+let popEl=null;
+function showPop(n,box,ev){hidePop();if(!n)return;popEl=document.createElement("div");popEl.className="g-pop";
+  popEl.innerHTML=`<b>${esc(n.label)}</b> <span style="color:${n.color}">· ${esc(GLABEL[n.group])}</span>
+    <div style="color:#9AA6BE;margin-top:5px">${esc(n.desc||"")}</div>
+    <div style="color:#6E7A96;margin-top:6px;font-size:11px">点击查看详情</div>`;
+  box.appendChild(popEl);if(ev)posPop(box,ev);}
+function posPop(box,ev){if(!popEl)return;const r=box.getBoundingClientRect();
+  let x=ev.clientX-r.left+14,y=ev.clientY-r.top+12;
+  if(x+popEl.offsetWidth>r.width-8)x=ev.clientX-r.left-popEl.offsetWidth-12;
+  if(y+popEl.offsetHeight>r.height-8)y=ev.clientY-r.top-popEl.offsetHeight-12;
+  popEl.style.left=Math.max(4,x)+"px";popEl.style.top=Math.max(4,y)+"px";}
+function hidePop(){if(popEl){popEl.remove();popEl=null;}}
+function detail(id){
+  const n=G.idx[id],box=$("#g-detail");
+  const nb=[...(G.nbr[id]||[])].map(x=>G.idx[x]).filter(Boolean);
+  box.innerHTML=`<span class="ph">${esc(GLABEL[n.group])}</span>
+    <div class="nm">${esc(n.label)}<span class="gp" style="background:${n.color}22;color:${n.color}">${esc(GLABEL[n.group])}</span></div>
+    <div class="ds">${esc(n.desc||"")}</div>
+    ${(n.props||[]).map(p=>`<div class="pr"><span>${esc(p[0])}</span><b>${esc(p[1])}</b></div>`).join("")}
+    <div class="nbtit">关联节点（${nb.length}）— 点击跳转</div>
+    <div>${nb.map(x=>`<span class="nb" data-go="${x.id}" style="background:${x.color}22;color:${x.color}">${esc(x.label)}</span>`).join("")}</div>`;
+  box.querySelectorAll(".nb").forEach(b=>b.addEventListener("click",()=>{
+    G.sel=b.dataset.go;markSel();detail(b.dataset.go);focusNode(b.dataset.go);}));
+}
+function focusNode(id){const n=G.idx[id];if(!n)return;
+  G.view.k=Math.max(G.view.k,1.1);G.view.x=G.W/2-n.x*G.view.k;G.view.y=G.H/2-n.y*G.view.k;applyView();kick(.2);}
+function legend(){
+  const box=$("#g-legend");box.innerHTML="";
+  GROUPS.forEach(g=>{const d=document.createElement("div");d.className="lg";d.dataset.g=g.id;
+    d.innerHTML=`<span class="sw" style="background:${g.color}"></span>${g.label}`;
+    d.addEventListener("click",()=>{
+      const on=G.litGroup===g.id;G.litGroup=on?null:g.id;
+      box.querySelectorAll(".lg").forEach(x=>x.classList.toggle("active",!on&&x.dataset.g===g.id));
+      if(G.litGroup){hov(null);}applyGroupLit();});
+    box.appendChild(d);});
+}
+function init(){
+  const svg=$("#graph-svg"),box=$("#graph-box");
+  G.W=Math.max(box.clientWidth||0,640);G.H=Math.max(box.clientHeight||0,560);
+  svg.setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+  build();dom(svg);legend();if(!G.bound){bind(svg,box);G.bound=true;}kick(1);
+  $("#g-mode").addEventListener("click",()=>{LAYOUT=LAYOUT==="layered"?"force":"layered";
+    _seed=20240101;G.view={x:0,y:0,k:1};applyView();build();dom(svg);kick(1);});
+  $("#g-reset").addEventListener("click",()=>{G.view={x:0,y:0,k:1};applyView();G.sel=null;markSel();
+    G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));applyGroupLit();
+    $("#g-detail").innerHTML="";$("#g-search").value="";});
+  $("#g-relayout").addEventListener("click",()=>{_seed=(Date.now()&0x7fffffff);build();dom(svg);kick(1);});
+  $("#g-search").addEventListener("input",e=>{
+    const q=e.target.value.trim();if(!q){hov(null);return;}
+    const hit=G.nodes.find(n=>n.label.includes(q)||n.id.toLowerCase()===q.toLowerCase());
+    if(hit){G.sel=hit.id;markSel();detail(hit.id);focusNode(hit.id);
+      G.litGroup=null;$("#g-legend").querySelectorAll(".lg").forEach(x=>x.classList.remove("active"));
+      hov(hit.id,box,null);}});
+}
+if("requestIdleCallback"in window)requestIdleCallback(init);else setTimeout(init,80);
+window.addEventListener("resize",()=>{const box=$("#graph-box");if(!box)return;
+  const w=Math.max(box.clientWidth||0,640),h=Math.max(box.clientHeight||0,560);
+  if(Math.abs(w-G.W)>40){G.W=w;G.H=h;$("#graph-svg").setAttribute("viewBox",`0 0 ${G.W} ${G.H}`);
+    build();dom($("#graph-svg"));kick(.8);}});
+</script>
+</body>
+</html>
