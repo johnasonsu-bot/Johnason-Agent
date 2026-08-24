@@ -15,6 +15,7 @@ from workbench.orchestration.sequential_contracts import (
     ReviewDecision,
     SequentialNodeSpec,
 )
+from workbench.orchestration.planning import ResearchNodeSpec
 
 
 class _FrozenPrivate(BaseModel):
@@ -117,5 +118,69 @@ class ContextResolver:
             node_id=node.node_id,
             project_context_version=common.version,
             project_sources=tuple(entry.source_ref for entry in visible_entries),
+            rendered_prompt="\n".join(sections),
+        )
+
+
+class ResearchPrivateMessage(_FrozenPrivate):
+    agent_id: OpaqueIdentifier
+    content: str = Field(min_length=1, max_length=32_000)
+
+
+class ResearchHandoff(_FrozenPrivate):
+    source_node_id: OpaqueIdentifier
+    target_node_id: OpaqueIdentifier
+    summary: PublicSummary
+    evidence_refs: tuple[OpaqueReference, ...] = Field(min_length=1)
+
+
+class ResearchAgentContextPackage(_FrozenPrivate):
+    agent_id: OpaqueIdentifier
+    node_id: OpaqueIdentifier
+    public_context: tuple[OpaqueReference, ...]
+    private_history: tuple[str, ...]
+    rendered_prompt: str = Field(min_length=1, max_length=128_000)
+
+
+class ResearchContextResolver:
+    """Assemble one research node context without cross-Agent private history."""
+
+    def build(
+        self,
+        node: ResearchNodeSpec,
+        public_context: tuple[OpaqueReference, ...],
+        private_context: tuple[ResearchPrivateMessage, ...],
+        handoffs: tuple[ResearchHandoff, ...],
+    ) -> ResearchAgentContextPackage:
+        owned = tuple(
+            message.content
+            for message in private_context
+            if message.agent_id == node.binding.agent_id
+        )
+        incoming = tuple(
+            handoff for handoff in handoffs if handoff.target_node_id == node.node_id
+        )
+        sections = [
+            "[PUBLIC_CONTEXT]",
+            *public_context,
+            "[/PUBLIC_CONTEXT]",
+            "[AGENT_INSTRUCTION]",
+            node.instruction,
+            "[/AGENT_INSTRUCTION]",
+            "[PRIVATE_HISTORY]",
+            *owned,
+            "[/PRIVATE_HISTORY]",
+            "[STRUCTURED_HANDOFFS]",
+            *(
+                f"summary={handoff.summary}; evidence_refs={','.join(handoff.evidence_refs)}"
+                for handoff in incoming
+            ),
+            "[/STRUCTURED_HANDOFFS]",
+        ]
+        return ResearchAgentContextPackage(
+            agent_id=node.binding.agent_id,
+            node_id=node.node_id,
+            public_context=public_context,
+            private_history=owned,
             rendered_prompt="\n".join(sections),
         )
