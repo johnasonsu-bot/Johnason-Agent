@@ -26,7 +26,6 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
     )
     assert result["target_branch_unchanged"] is True
     assert result["remote_unchanged"] is True
-    assert result["ownership_violation_blocked"] is (fault != "ownership")
     assert result["rejected_commit_exclusion_exit_code"] == 1
     assert result["dependency_order_verified"] is True
     assert len(result["merge_associations"]) == 3
@@ -51,7 +50,7 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault",
-    ("ownership", "backend", "electron", "remote", "missing_evidence", "exception"),
+    ("ownership", "backend", "electron", "remote", "missing_evidence", "key_error", "exception"),
 )
 async def test_fault_injections_write_metadata_only_blocked_result(
     tmp_path: Path, fault: str
@@ -74,7 +73,9 @@ async def test_fault_injections_write_metadata_only_blocked_result(
     assert result["error_kind"]
     assert "main_graph" in result["completed_stages"]
     assert result["target_branch_unchanged"] is True
-    assert result["ownership_violation_blocked"] is True
+    assert result["ownership_violation_blocked"] is (fault != "ownership")
+    assert result["integration_commands"]
+    assert all("duration_ms" in command for command in result["integration_commands"])
     if fault in {"backend", "electron"}:
         assert any(command["exit_code"] != 0 for command in result["integration_commands"])
     if fault == "remote":
@@ -82,6 +83,10 @@ async def test_fault_injections_write_metadata_only_blocked_result(
     if fault == "missing_evidence":
         assert result["integration_commands"]
         assert result["merge_associations"] == []
+    if fault == "key_error":
+        assert result["error_kind"] == "KeyError"
+    if fault == "exception":
+        assert result["error_kind"] == "RuntimeError"
     serialized = json.dumps(result, sort_keys=True)
     assert "github_pat_" not in serialized
     assert str(tmp_path) not in serialized

@@ -17,6 +17,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -393,15 +394,16 @@ async def _exercise_main_graph(
 
 
 def _command(label: str, argv: tuple[str, ...], cwd: Path) -> dict[str, object]:
+    started_at = time.monotonic()
     try:
         completed = subprocess.run(
             argv, cwd=cwd, text=True, capture_output=True, check=False, timeout=420
         )
         output = completed.stdout + completed.stderr
-        return {"label": label, "exit_code": completed.returncode, "result_digest": sha256(output.encode()).hexdigest()}
+        return {"label": label, "exit_code": completed.returncode, "result_digest": sha256(output.encode()).hexdigest(), "duration_ms": int((time.monotonic() - started_at) * 1000)}
     except subprocess.TimeoutExpired as error:
         output = (error.stdout or "") + (error.stderr or "")
-        return {"label": label, "exit_code": 124, "result_digest": sha256(output.encode()).hexdigest()}
+        return {"label": label, "exit_code": 124, "result_digest": sha256(output.encode()).hexdigest(), "duration_ms": int((time.monotonic() - started_at) * 1000)}
 
 
 def _integration_workspace(tool: GitWorkspaceTool, run_id: str) -> Path:
@@ -610,6 +612,7 @@ async def run_development_graph_acceptance(
         "full_backend_passed": backend_command["exit_code"] == 0,
         "full_playwright_passed": electron_command["exit_code"] == 0,
         "integration_branch": integration["integration_branch"],
+        "integration_sha": integration_sha,
         "target_branch_unchanged": tool.resolve_ref(repo=repository, branch="main")
         == original_target_sha,
         "remote_unchanged": remote_before == remote_after,
@@ -653,17 +656,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output", type=Path, default=Path(".runtime/development-graph-results.json")
     )
-    parser.add_argument("--inject", choices=("ownership", "backend", "electron", "remote", "missing_evidence", "exception"))
+    parser.add_argument("--inject", choices=("ownership", "backend", "electron", "remote", "missing_evidence", "key_error", "exception"))
     output = Path(".runtime/development-graph-results.json")
+    result: dict[str, Any] | None = None
     try:
         args = parser.parse_args(argv)
         output = args.output
         run_directory = args.output.parent / f"development-run-{uuid4().hex}"
         result = asyncio.run(run_development_graph_acceptance(run_directory, inject=args.inject))
+        if args.inject == "key_error":
+            raise KeyError("injected key error after measured evidence")
+        if args.inject == "exception":
+            raise RuntimeError("injected exception after measured evidence")
     except SystemExit as error:
         result = {"decision": "BLOCKED", "error_kind": type(error).__name__, "completed_stages": []}
     except Exception as error:
-        result = {"decision": "BLOCKED", "error_kind": type(error).__name__, "completed_stages": []}
+        result = result or {"completed_stages": []}
+        result.update({"decision": "BLOCKED", "error_kind": type(error).__name__})
     _write_result(output, result)
     print(result["decision"])
     return 0 if result["decision"] == "GO_RELEASE_APPROVAL" else 1
