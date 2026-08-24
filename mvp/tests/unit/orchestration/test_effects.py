@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -30,36 +31,48 @@ def test_attempt_preparation_is_a_durable_git_effect(tmp_path: Path) -> None:
     assert completed.result_ref == sha
 
 
+def valid_integration_conflict_result() -> dict[str, object]:
+    head = "b" * 40
+    merge_head = "a" * 40
+    return {
+        "kind": "integration_conflict",
+        "commits": [merge_head],
+        "paths": ["src/shared.py"],
+        "parent_graph": [head, merge_head],
+        "head": head,
+        "merge_head": merge_head,
+    }
+
+
 @pytest.mark.parametrize(
-    "expected_result",
+    "mutation",
     (
-        {
-            "kind": "integration_conflict",
-            "commits": [],
-            "paths": ["src/shared.py"],
-            "parent_graph": ["a" * 40, "b" * 40],
-            "merge_head": "b" * 40,
-        },
-        {
-            "kind": "integration_conflict",
-            "commits": ["a" * 40],
-            "paths": ["src/shared.py"],
-            "parent_graph": [],
-            "merge_head": "a" * 40,
-        },
-        {
-            "kind": "integration_conflict",
-            "commits": ["a" * 40],
-            "paths": ["src/shared.py"],
-            "parent_graph": ["b" * 40, "c" * 40],
-            "merge_head": "a" * 40,
-        },
+        pytest.param(lambda result: result.update(commits=[]), id="empty-commits"),
+        pytest.param(lambda result: result.update(paths=[]), id="empty-paths"),
+        pytest.param(
+            lambda result: result.update(parent_graph=[]), id="empty-parent-graph"
+        ),
+        pytest.param(
+            lambda result: result.update(parent_graph=[result["merge_head"], "c" * 40]),
+            id="head-absent-from-parent-graph",
+        ),
+        pytest.param(
+            lambda result: result.update(commits=[result["head"]]),
+            id="merge-head-absent-from-commits",
+        ),
+        pytest.param(
+            lambda result: result.update(parent_graph=[result["head"], "c" * 40]),
+            id="merge-head-absent-from-parent-graph",
+        ),
     ),
 )
-def test_conflict_effect_requires_nonempty_commits_and_merge_head_parent_membership(
-    tmp_path: Path, expected_result: dict[str, object]
+def test_conflict_effect_rejects_one_malformed_invariant_at_a_time(
+    tmp_path: Path,
+    mutation: Callable[[dict[str, object]], None],
 ) -> None:
     ledger = EffectLedger(tmp_path / "workflow.sqlite3")
+    expected_result = valid_integration_conflict_result()
+    mutation(expected_result)
 
     with pytest.raises(ValueError, match="integration conflict effect metadata"):
         ledger.reserve(
@@ -76,8 +89,7 @@ def test_conflict_effect_requires_head_and_merge_head_in_parent_graph(
     tmp_path: Path,
 ) -> None:
     ledger = EffectLedger(tmp_path / "workflow.sqlite3")
-    head = "b" * 40
-    merge_head = "a" * 40
+    expected_result = valid_integration_conflict_result()
 
     reserved = ledger.reserve(
         "conflict-with-head",
@@ -85,17 +97,10 @@ def test_conflict_effect_requires_head_and_merge_head_in_parent_graph(
         repository_id="1" * 64,
         branch="graph/run/integration",
         base_sha="f" * 40,
-        expected_result={
-            "kind": "integration_conflict",
-            "commits": [merge_head],
-            "paths": ["src/shared.py"],
-            "parent_graph": [head, merge_head],
-            "head": head,
-            "merge_head": merge_head,
-        },
+        expected_result=expected_result,
     )
 
-    assert reserved.expected_result["head"] == head
+    assert reserved.expected_result == expected_result
 
 
 WORKTREE_EXPECTED = {"kind": "worktree", "path_id": "a" * 24}

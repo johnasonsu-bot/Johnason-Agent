@@ -15,6 +15,7 @@ from workbench.orchestration.development import (
     DevelopmentPlan,
     FileOwnership,
     GitOutputContract,
+    InvalidDevelopmentNode,
 )
 from workbench.orchestration.development_graph import (
     DevelopmentGraphError,
@@ -259,6 +260,94 @@ def test_pytest_module_launcher_preserves_existing_addopts(
     _run_allowed_commands(node, tmp_path)
 
     assert observed["PYTEST_ADDOPTS"] == "--maxfail=1 -p no:cacheprovider"
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    (
+        ".venv/bin/python",
+        "{repository_root}/.venv/bin/python",
+    ),
+)
+def test_public_graph_builder_accepts_normalized_repository_local_pytest_launchers(
+    tmp_path: Path, launcher: str
+) -> None:
+    repository_root = tmp_path / "repo"
+    repository_root.mkdir()
+    executable = launcher.format(repository_root=repository_root)
+    command = (executable, "-m", "pytest", "-q")
+    plan = DevelopmentPlan(
+        plan_id="local-launcher-plan.1",
+        nodes=(
+            DevelopmentNodeSpec(
+                node_id="backend",
+                repository_root=repository_root,
+                base_commit="a" * 40,
+                ownership=FileOwnership(writable_paths=("src/backend.py",)),
+                command_policy=CommandPolicy(
+                    allowed_commands=(command,), tests=(command,)
+                ),
+                output=GitOutputContract(branch="graph/local-launcher/backend"),
+            ),
+        ),
+    )
+    tool = GitWorkspaceTool(
+        worktree_root=tmp_path / "worktrees",
+        ledger=EffectLedger(tmp_path / "effects.sqlite"),
+    )
+
+    graph = build_development_graph(
+        open_graph_checkpointer(tmp_path / "development.sqlite"),
+        plan,
+        DevelopmentHarness(),
+        tool,
+    )
+
+    assert graph is not None
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    (
+        "../outside/python",
+        "{outside_root}/python",
+        ".venv/../.venv/bin/python",
+    ),
+)
+def test_public_graph_builder_rejects_escaped_or_non_normalized_pytest_launchers(
+    tmp_path: Path, launcher: str
+) -> None:
+    repository_root = tmp_path / "repo"
+    repository_root.mkdir()
+    executable = launcher.format(outside_root=tmp_path / "outside")
+    command = (executable, "-m", "pytest", "-q")
+    plan = DevelopmentPlan(
+        plan_id="unsafe-launcher-plan.1",
+        nodes=(
+            DevelopmentNodeSpec(
+                node_id="backend",
+                repository_root=repository_root,
+                base_commit="a" * 40,
+                ownership=FileOwnership(writable_paths=("src/backend.py",)),
+                command_policy=CommandPolicy(
+                    allowed_commands=(command,), tests=(command,)
+                ),
+                output=GitOutputContract(branch="graph/unsafe-launcher/backend"),
+            ),
+        ),
+    )
+    tool = GitWorkspaceTool(
+        worktree_root=tmp_path / "worktrees",
+        ledger=EffectLedger(tmp_path / "effects.sqlite"),
+    )
+
+    with pytest.raises(InvalidDevelopmentNode, match="command executable is outside repository"):
+        build_development_graph(
+            open_graph_checkpointer(tmp_path / "development.sqlite"),
+            plan,
+            DevelopmentHarness(),
+            tool,
+        )
 
 
 @pytest.mark.asyncio
@@ -523,6 +612,8 @@ async def test_parallel_human_reviews_are_approved_as_a_branch_keyed_batch(
     assert integrated["status"] == "awaiting_integration_approval"
     assert any(
         snapshot.values.get("status") == "running"
+        and snapshot.values.get("pending_branch_reviews") == {}
+        and "branch_complete" in snapshot.next
         for snapshot in graph.get_state_history(config)
     )
     release = await asyncio.to_thread(
@@ -769,6 +860,10 @@ async def test_merge_arbitration_routes_every_explicit_decision(
     assert routed["status"] == expected_status
     if response["decision"] == "request_replan":
         assert routed["pending_interrupt"] == evidence
+        assert routed["__interrupt__"][0].value == {
+            "kind": "replan",
+            "regression": evidence,
+        }
 
 
 @pytest.mark.asyncio

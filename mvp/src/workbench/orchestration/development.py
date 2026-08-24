@@ -85,9 +85,9 @@ class CommandPolicy(_Frozen):
         for command in (*self.allowed_commands, *self.tests):
             if not command or any(not item or "\x00" in item for item in command):
                 raise ValueError("command argv must contain non-empty strings")
-            if Path(command[0]).name != command[0] or "\\" in command[0]:
-                raise ValueError("command executable is not allowlisted")
-            executable = Path(command[0]).name.lower()
+            executable = self._canonical_executable(
+                command[0], repository_root=repository_root
+            )
             lowered = tuple(item.lower() for item in command[1:])
             if executable == "git":
                 if any(
@@ -143,6 +143,31 @@ class CommandPolicy(_Frozen):
         allowed = set(self.allowed_commands)
         if not set(self.tests).issubset(allowed):
             raise ValueError("tests must be included in allowed commands")
+
+    @staticmethod
+    def _canonical_executable(value: str, *, repository_root: Path | None) -> str:
+        """Allow bare tools plus Python/pytest launchers confined to the repository."""
+        normalized = value.replace("\\", "/")
+        path = PurePosixPath(normalized)
+        windows = PureWindowsPath(value)
+        if path.name == normalized and not windows.drive and not path.is_absolute():
+            return path.name.lower()
+        if repository_root is None:
+            raise ValueError("command executable is not allowlisted")
+        if windows.is_absolute() or windows.drive or ".." in path.parts:
+            raise ValueError("command executable is outside repository")
+        candidate = Path(normalized)
+        resolved = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute()
+            else (repository_root / candidate).resolve(strict=False)
+        )
+        if not resolved.is_relative_to(repository_root):
+            raise ValueError("command executable is outside repository")
+        executable = resolved.name.lower()
+        if executable not in {"python", "python3", "pytest"}:
+            raise ValueError("command executable is not allowlisted")
+        return executable
 
     @staticmethod
     def _canonical_tool(

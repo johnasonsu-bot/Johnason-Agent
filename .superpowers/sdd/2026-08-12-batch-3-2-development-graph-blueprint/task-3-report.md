@@ -114,3 +114,38 @@
   Git-workspace, and related development-plan tests. `compileall` passed for
   all seven Task 3 source/test files. `git diff --check` and the focused secret
   pattern scan completed with no findings.
+
+## Fix round 4
+
+- `build_development_graph` now reaches the existing path-launcher execution
+  support: validation permits only normalized, repository-confined launcher
+  paths whose basename is `python`, `python3`, or `pytest`. Bare allowlisted
+  commands retain their prior policy. Repository escapes, external absolute
+  paths, symlink escapes, non-Python/pytest paths, and non-normalized `..`
+  paths remain rejected.
+- The public graph-builder RED test covered both `.venv/bin/python` and an
+  absolute repository-local launcher; both initially failed because the plan
+  validator rejected path-form executables before graph construction. They are
+  now GREEN. The focused plan tests independently cover the same safe and
+  rejected launcher classes.
+- Conflict-ledger malformed-payload coverage now begins from one complete valid
+  payload and mutates exactly one invariant per case: empty commits, paths, or
+  parent graph; `HEAD` absent from the parent graph; `MERGE_HEAD` absent from
+  commits; and `MERGE_HEAD` absent from the parent graph.
+- Human-review recovery coverage now identifies the post-approval `running`
+  checkpoint with no pending reviews and `branch_complete` scheduled, rather
+  than accepting the initial running checkpoint. Replan arbitration now asserts
+  the final interrupt payload is exactly the original conflict evidence.
+
+### Fix round 4 verification
+
+- RED: the two public `build_development_graph` launcher cases failed with
+  `command executable is not allowlisted`, proving the validation gap.
+- GREEN: `18 passed` for `tests/integration/test_development_graph.py`; `56
+  passed` for `tests/unit/orchestration/test_effects.py`,
+  `tests/unit/orchestration/test_development_plan.py`, and
+  `tests/unit/tools/test_git_workspace.py`.
+- `compileall` and `git diff --check` passed for the seven Task 3 files plus
+  the focused development-plan validator files. The scoped sensitive-pattern
+  scan found only an existing negative fixture that verifies `API_KEY` metadata
+  is rejected; no credential value was added.

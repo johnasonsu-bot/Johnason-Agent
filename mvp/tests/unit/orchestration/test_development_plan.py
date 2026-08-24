@@ -163,6 +163,55 @@ def test_allows_declared_test_output_inside_writable_ownership() -> None:
     assert DevelopmentPlanValidator().validate(candidate).plan == candidate
 
 
+@pytest.mark.parametrize("launcher", (".venv/bin/python", "{repository}/.venv/bin/python"))
+def test_allows_only_normalized_repository_local_python_pytest_launchers(
+    tmp_path: Path, launcher: str
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    command = (launcher.format(repository=repository), "-m", "pytest", "-q")
+    candidate = plan(
+        node(
+            "local-launcher",
+            writes=("src/app.py",),
+            commands=(command,),
+            tests=(command,),
+            repository_root=repository,
+        )
+    )
+
+    assert DevelopmentPlanValidator().validate(candidate).plan == candidate
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    ("../outside/python", "{outside}/python", ".venv/../.venv/bin/python"),
+)
+def test_rejects_escaped_or_non_normalized_python_pytest_launchers(
+    tmp_path: Path, launcher: str
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    command = (
+        launcher.format(outside=tmp_path / "outside"),
+        "-m",
+        "pytest",
+        "-q",
+    )
+    candidate = plan(
+        node(
+            "unsafe-launcher",
+            writes=("src/app.py",),
+            commands=(command,),
+            tests=(command,),
+            repository_root=repository,
+        )
+    )
+
+    with pytest.raises(InvalidDevelopmentNode, match="command executable is outside repository"):
+        DevelopmentPlanValidator().validate(candidate)
+
+
 def test_rejects_repository_symlink_that_resolves_outside(tmp_path: Path) -> None:
     repository = tmp_path / "repo"
     outside = tmp_path / "outside"
