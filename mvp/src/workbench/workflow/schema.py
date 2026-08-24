@@ -335,6 +335,17 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (session_id, command_id),
             FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
         );
+        CREATE TABLE IF NOT EXISTS development_job_resolved_interrupts (
+            graph_run_id TEXT NOT NULL,
+            interrupt_id TEXT NOT NULL,
+            interrupt_kind TEXT NOT NULL,
+            interrupt_digest TEXT NOT NULL,
+            interrupt_payload_json TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            resolved_at REAL NOT NULL,
+            PRIMARY KEY (graph_run_id, interrupt_id),
+            FOREIGN KEY (graph_run_id) REFERENCES development_graph_jobs(graph_run_id)
+        );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
         BEGIN

@@ -45,7 +45,8 @@ class DurableDevelopmentProcessor:
         validated = DevelopmentPlanValidator().validate(plan)
         if not (validated.repository_root / ".git").exists(): raise ValueError("development repository must be Git")
         git_workspace = GitWorkspaceTool(worktree_root=self.worktree_root, ledger=EffectLedger(self.database))
-        graph = build_development_graph(self.checkpointer, validated, self.port, git_workspace)
+        port = self.port.for_plan(validated) if callable(getattr(self.port, "for_plan", None)) else self.port
+        graph = build_development_graph(self.checkpointer, validated, port, git_workspace)
         config = graph_config(graph_run_id, 1)
         fence = await asyncio.to_thread(acquire_graph_execution_fence, self.checkpointer, graph_run_id)
         try:
@@ -57,6 +58,7 @@ class DurableDevelopmentProcessor:
                 return self._result(validated.plan, values)
             elif values.get("status") in _INTERRUPTED_STATUSES:
                 if resume_response is None:
+                    self._attach_canonical_interrupt(graph, config, values)
                     return self._result(validated.plan, values)
                 value = Command(resume=resume_response)
             else:
@@ -68,6 +70,7 @@ class DurableDevelopmentProcessor:
                 # Do not release the fence while the checkpoint write is in flight.
                 await task
                 raise
+            self._attach_canonical_interrupt(graph, config, values)
         finally:
             fence.release()
         return self._result(plan, values)
@@ -104,12 +107,24 @@ class DurableDevelopmentProcessor:
             return DevelopmentProcessResult(status="completed", events=tuple([*events, completed]))
         return DevelopmentProcessResult(status="queued", events=tuple(events))
 
+    async def aclose(self) -> None:
+        connection = getattr(self.checkpointer, "conn", None)
+        if connection is not None:
+            await asyncio.to_thread(connection.close)
+
     @staticmethod
     def _interrupt_identity(graph_run_id: str, state: dict[str, Any]) -> tuple[str, Literal["branch_review", "attempt_reset_approval", "integration_approval", "merge_arbitration", "replan", "release_approval"], str, dict[str, object]] | None:
         status = state.get("status")
         if status not in _INTERRUPTED_STATUSES:
             return None
-        if status == "awaiting_branch_review":
+        canonical = state.get("_canonical_interrupt_payload")
+        if isinstance(canonical, dict) and isinstance(canonical.get("kind"), str):
+            payload = canonical
+            kind_map = {"branch_reviews": "branch_review", "attempt_reset_approval": "attempt_reset_approval", "integration_approval": "integration_approval", "merge_arbitration": "merge_arbitration", "replan": "replan", "release_approval": "release_approval"}
+            mapped = kind_map.get(canonical["kind"])
+            if mapped is None: raise ValueError("unknown canonical development interrupt")
+            kind: Literal["branch_review", "attempt_reset_approval", "integration_approval", "merge_arbitration", "replan", "release_approval"] = mapped
+        elif status == "awaiting_branch_review":
             reviews = state.get("pending_branch_reviews") or {}
             payload: dict[str, object] = {"kind": "branch_review", "reviews": {str(branch): {"attempt": int(value.get("attempt", 0))} for branch, value in reviews.items() if isinstance(value, dict)}}
             kind: Literal["branch_review", "attempt_reset_approval", "integration_approval", "merge_arbitration", "replan", "release_approval"] = "branch_review"
@@ -132,6 +147,17 @@ class DurableDevelopmentProcessor:
         encoded = json.dumps({"graph_run_id": graph_run_id, "kind": kind, "payload": payload}, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(encoded.encode()).hexdigest()
         return f"development-interrupt.{digest[:32]}", kind, digest, payload
+
+    @staticmethod
+    def _attach_canonical_interrupt(graph: object, config: dict[str, object], values: dict[str, Any]) -> None:
+        """Persist the exact LangGraph interrupt value, never a lossy re-creation."""
+        snapshot = graph.get_state(config)
+        for task in getattr(snapshot, "tasks", ()):
+            for item in getattr(task, "interrupts", ()):
+                payload = getattr(item, "value", None)
+                if isinstance(payload, dict):
+                    values["_canonical_interrupt_payload"] = payload
+                    return
 
     @staticmethod
     def _release_identity(graph_run_id: str, state: dict[str, Any]) -> str:

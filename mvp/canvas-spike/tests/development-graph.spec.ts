@@ -64,6 +64,8 @@ test("development graph shows isolated branches and waits for release approval",
     await expect(graph).not.toContainText("reset");
     await graph.getByRole("button", { name: "批准进入目标分支" }).click();
     await expect(graph.getByRole("button", { name: "审批已提交" })).toBeVisible();
+    await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/sessions/ui-session-0/development-runs/development-run.fixture/interrupts/release.fixture" }))).rejects.toThrow("invalid local API request");
+    await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "POST", path: "/sessions/ui-session-0/development-runs/development-run.fixture/interrupts/release.fixture/extra" }))).rejects.toThrow("invalid local API request");
   } finally {
     await app.close();
   }

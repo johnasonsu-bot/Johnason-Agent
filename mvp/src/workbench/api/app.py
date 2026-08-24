@@ -158,6 +158,9 @@ def create_app(settings: AppSettings) -> FastAPI:
             try:
                 if development_worker_started and development_worker is not None:
                     await development_worker.stop()
+                close_development = getattr(settings.development_processor, "aclose", None)
+                if callable(close_development):
+                    await close_development()
                 if research_worker_started and research_worker is not None:
                     await research_worker.stop()
                 if worker_started:

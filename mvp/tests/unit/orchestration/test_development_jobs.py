@@ -84,3 +84,22 @@ def test_development_job_validates_each_interrupt_and_lease_owner(tmp_path) -> N
     jobs.renew(claimed.graph_run_id, owner_id="worker-a", attempt=claimed.attempt, lease_seconds=10)
     with pytest.raises(ValueError, match="lease"):
         jobs.transition(claimed.graph_run_id, owner_id="worker-b", attempt=claimed.attempt, status="completed")
+
+
+def test_resuming_one_interrupt_records_history_and_allows_the_next(tmp_path) -> None:
+    from workbench.conversations.repository import ConversationRepository
+    from workbench.orchestration.development_jobs import DevelopmentJobRepository
+
+    database = tmp_path / "workbench.sqlite"
+    ConversationRepository(database).create_session("session-a")
+    jobs = DevelopmentJobRepository(database)
+    jobs.admit("development-run.1", "session-a", _plan(tmp_path))
+    jobs.mark_needs_human("development-run.1", interrupt_id="integration.1", interrupt_kind="integration_approval", interrupt_payload={"kind":"integration_approval"})
+    resumed = jobs.resume_idempotently("development-run.1", "session-a", "integration.1", {"decision":"approved"}, "resume-integration")
+    assert resumed.interrupt_id is None and resumed.status == "queued"
+    jobs.mark_needs_human("development-run.1", interrupt_id="release.1", interrupt_kind="release_approval", interrupt_payload={"kind":"release_approval"})
+    final = jobs.request_resume("development-run.1", "session-a", {"decision":"approved"}, "release.1")
+    assert final.interrupt_id is None
+    with jobs.store.connect() as connection:
+        history = connection.execute("SELECT interrupt_id FROM development_job_resolved_interrupts ORDER BY resolved_at").fetchall()
+    assert [row["interrupt_id"] for row in history] == ["integration.1", "release.1"]

@@ -83,10 +83,21 @@ class DevelopmentJobRepository:
     def _request_resume(self,c: Any,run: str,session: str,response: dict[str,object],interrupt: str) -> DevelopmentJob:
         row=c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(run,)).fetchone()
         if row is None or row["session_id"] != session: raise KeyError(run)
-        if row["interrupt_id"] != interrupt or not row["interrupt_kind"]: raise ValueError("development interrupt identity does not match")
+        if row["interrupt_id"] != interrupt or not row["interrupt_kind"]:
+            history = c.execute("SELECT response_json FROM development_job_resolved_interrupts WHERE graph_run_id=? AND interrupt_id=?", (run, interrupt)).fetchone()
+            if history is not None and history["response_json"] == json.dumps(response, sort_keys=True, separators=(",", ":")):
+                return self._job(row)
+            raise ValueError("development interrupt identity does not match")
         self._validate_response(row["interrupt_kind"],json.loads(row["interrupt_payload_json"]) if row["interrupt_payload_json"] else {},response)
         encoded=json.dumps(response,sort_keys=True,separators=(",",":"))
-        if row["status"] == "needs_human": c.execute("UPDATE development_graph_jobs SET status='queued',resume_json=?,owner_id=NULL,lease_expires_at=0,interrupt_actor_id='local-user',interrupt_decision=?,updated_at=? WHERE graph_run_id=?",(encoded,str(response.get("decision","approved")),time.time(),run))
+        if row["status"] == "needs_human":
+            now = time.time()
+            c.execute("""INSERT INTO development_job_resolved_interrupts(
+                graph_run_id,interrupt_id,interrupt_kind,interrupt_digest,interrupt_payload_json,response_json,resolved_at
+            ) VALUES (?,?,?,?,?,?,?)""", (run,row["interrupt_id"],row["interrupt_kind"],row["interrupt_digest"],row["interrupt_payload_json"],encoded,now))
+            c.execute("""UPDATE development_graph_jobs SET status='queued',resume_json=?,owner_id=NULL,lease_expires_at=0,
+                interrupt_id=NULL,interrupt_kind=NULL,interrupt_digest=NULL,interrupt_payload_json=NULL,
+                interrupt_actor_id='local-user',interrupt_decision=?,updated_at=? WHERE graph_run_id=?""",(encoded,str(response.get("decision","approved")),now,run))
         elif not (row["status"] in {"queued","running","completed"} and row["resume_json"] == encoded): raise ValueError("development job is not awaiting human input")
         return self._job(c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(run,)).fetchone())
 

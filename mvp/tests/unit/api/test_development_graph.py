@@ -66,7 +66,7 @@ def test_development_projections_reject_credential_signatures_in_allowed_fields(
 
 
 def test_development_projections_reject_absolute_windows_and_traversal_values() -> None:
-    for unsafe in ("/private/worktree", r"C:\\agent\\worktree", "src/../../secret"):
+    for unsafe in ("/private/worktree", r"C:\\agent\\worktree", r"\\server\\share\\worktree", "src/../../secret"):
         event = DomainEvent.new("development.branch.progress", "test", {
             "graph_run_id": "development-run.1", "branch_id": "backend", "attempt": 1,
             "worktree_display_name": unsafe, "worker_branch": "graph/development-run.1/backend",
@@ -74,3 +74,13 @@ def test_development_projections_reject_absolute_windows_and_traversal_values() 
             "test_label": "tests", "test_result": "passed",
         }, run_id="session-1")
         assert map_domain_event(event) == []
+
+
+def test_development_projection_rejects_nested_path_leaks_before_allowlisting() -> None:
+    event = DomainEvent.new("development.branch.progress", "test", {
+        "graph_run_id": "development-run.1", "branch_id": "backend", "attempt": 1,
+        "worktree_display_name": "backend", "worker_branch": "graph/development-run.1/backend",
+        "base_sha": "a" * 40, "commit_sha": "b" * 40, "owned_path_summary": ["src/backend.py"],
+        "test_label": "tests", "test_result": "passed", "ignored": {"host_path": "/private/agent/worktree"},
+    }, run_id="session-1")
+    assert map_domain_event(event) == []

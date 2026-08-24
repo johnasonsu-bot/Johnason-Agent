@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { conversationApi } from "../api";
 import type { DevelopmentBranchRecord, ResearchGraphState } from "./graphReducer";
 
@@ -8,6 +8,8 @@ export function GraphRun({ state, onResume, sessionId }: { state: ResearchGraphS
   const [preference, setPreference] = useState("");
   const [releasePending, setReleasePending] = useState(false);
   const development = state.development;
+  const interruptKey = `${development?.graphRunId ?? ""}:${development?.interruptId ?? ""}:${development?.interruptKind ?? ""}`;
+  useEffect(() => { setReleasePending(false); }, [interruptKey]);
   if (!state.graphRunId && !development?.graphRunId) return null;
   const records = Object.values(state.records);
   const shortSha = (sha: string) => sha ? sha.slice(0, 12) : "—";
