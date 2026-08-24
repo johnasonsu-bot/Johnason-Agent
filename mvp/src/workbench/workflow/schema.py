@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 11
+PHASE1_SCHEMA_VERSION = 12
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -158,6 +158,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             plan_digest TEXT NOT NULL,
             created_at REAL NOT NULL,
             PRIMARY KEY (plan_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS research_plan_versions (
+            plan_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            plan_json TEXT NOT NULL,
+            plan_digest TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (plan_id, version),
+            FOREIGN KEY (plan_id, version)
+                REFERENCES graph_execution_plans(plan_id, version)
         );
         CREATE TABLE IF NOT EXISTS graph_plan_approvals (
             approval_id TEXT PRIMARY KEY,
@@ -315,6 +325,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         )
         BEGIN
             SELECT RAISE(ABORT, 'approved graph plans are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS research_plan_versions_no_update
+        BEFORE UPDATE ON research_plan_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'research plan versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS research_plan_versions_no_delete
+        BEFORE DELETE ON research_plan_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'research plan versions are append-only');
         END;
         """
     )

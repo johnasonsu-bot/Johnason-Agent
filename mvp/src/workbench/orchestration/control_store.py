@@ -52,6 +52,26 @@ class GraphControlStore:
                 (plan.plan_id, plan.version, plan_json, digest),
             )
 
+    def get_plan(self, plan_id: str, version: int) -> ExecutionPlan:
+        with self._store.connect() as connection:
+            row = connection.execute(
+                """SELECT plan_json FROM graph_execution_plans
+                WHERE plan_id = ? AND version = ?""",
+                (plan_id, version),
+            ).fetchone()
+        if row is None:
+            raise KeyError((plan_id, version))
+        return ExecutionPlan.model_validate_json(row["plan_json"])
+
+    def approval_decisions(self, plan_id: str, version: int) -> tuple[str, ...]:
+        with self._store.connect() as connection:
+            rows = connection.execute(
+                """SELECT decision FROM graph_plan_approvals
+                WHERE plan_id = ? AND version = ? ORDER BY created_at, approval_id""",
+                (plan_id, version),
+            ).fetchall()
+        return tuple(str(row["decision"]) for row in rows)
+
     def replace_plan(self, plan: ExecutionPlan) -> None:
         """Replace an unapproved draft only; approvals permanently seal a version."""
         plan_json = _canonical_json(plan.model_dump(mode="json"))
