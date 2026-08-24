@@ -114,3 +114,34 @@ The results JSON records the integration SHA and every merged commit's
 commit digest, approved attempt, declared-command digest, actual test-evidence
 digest, and dependency-commit digest. The target and local bare remote snapshots
 remain unchanged.
+
+## Round 2 fault-boundary evidence
+
+Controller HEAD: `2322003`. The existing normal CLI evidence remains
+`GO_RELEASE_APPROVAL` and `awaiting_release_approval`; this round added command
+durations and integration SHA to its metadata, plus real exception boundaries.
+
+- Ownership probe: passed in `255.33s`; its unowned write reached
+  `GitWorkspaceTool.commit`, was rejected, and created no commit.
+- Backend failure injection: passed in `237.83s`; full integration evidence was
+  produced and the deliberately failing backend command made the decision
+  `BLOCKED`.
+- Electron, missing-merge-evidence, KeyError, and ordinary RuntimeError
+  injections passed in one `1142.13s` run. Every result was metadata-only
+  `BLOCKED`, printed `BLOCKED`, and exited nonzero after the unrelated graph and
+  integration evidence had been generated.
+- Remote mutation was first rejected before mutation because the fixture-only
+  base object was not present in the bare remote. The probe now writes a new
+  local `fault` ref using the bare remote's existing `main` object. The corrected
+  remote case passed in `230.46s`, with the after-snapshot difference causing
+  `BLOCKED`.
+- Invalid CLI argument: exit `1`, stdout `BLOCKED`, atomic result
+  `BLOCKED/SystemExit`, no completed stages. The KeyError and RuntimeError
+  cases verify the same boundary for non-argument exceptions without catching
+  `KeyboardInterrupt`.
+
+Static collection found eight gate tests. `git diff --check` and the targeted
+credential-pattern scan over the runner, tests, result metadata, and this
+report returned clean. The only collection warning is the unregistered local
+`development_graph_gate` marker, used to keep the outer gate out of its own
+temporary full-backend invocation.
