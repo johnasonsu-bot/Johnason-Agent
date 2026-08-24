@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 16
+PHASE1_SCHEMA_VERSION = 17
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -288,6 +288,24 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             PRIMARY KEY (graph_run_id, node_id, attempt),
             FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS development_effects (
+            operation_id TEXT PRIMARY KEY,
+            effect_kind TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            base_sha TEXT NOT NULL,
+            expected_result_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_ref TEXT,
+            exit_code INTEGER,
+            stdout_digest TEXT,
+            stderr_digest TEXT,
+            reconciliation_json TEXT,
+            started_at REAL,
+            completed_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
         );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
