@@ -84,3 +84,19 @@ def test_development_projection_rejects_nested_path_leaks_before_allowlisting() 
         "test_label": "tests", "test_result": "passed", "ignored": {"host_path": "/private/agent/worktree"},
     }, run_id="session-1")
     assert map_domain_event(event) == []
+
+
+def test_branch_review_projection_keeps_only_the_current_canonical_scope() -> None:
+    event = DomainEvent.new("development.interrupt.required", "test", {
+        "graph_run_id": "development-run.1",
+        "interrupt_id": "development-interrupt.current",
+        "interrupt_kind": "branch_review",
+        "pending_branch_ids": ["current-frontend"],
+        "status": "needs_human",
+        # Historical local-review evidence is not a public approval scope.
+        "local_reviews": [{"branch_id": "historic-backend", "decision": "needs_human"}],
+    }, run_id="session-1")
+
+    projected = map_domain_event(event)
+    assert projected[0]["value"]["pending_branch_ids"] == ["current-frontend"]
+    assert "historic-backend" not in json.dumps(projected)

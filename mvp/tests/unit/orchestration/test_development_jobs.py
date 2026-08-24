@@ -196,6 +196,12 @@ def test_all_development_interrupt_kinds_accept_only_scoped_responses(tmp_path, 
     jobs.mark_needs_human("development-run.1", interrupt_id="interrupt.1", interrupt_kind=kind, interrupt_payload=payload)
     if accepted:
         assert jobs.request_resume("development-run.1", "session-a", response, "interrupt.1").status == "queued"
+        with jobs.store.connect() as connection:
+            archived = connection.execute(
+                "SELECT interrupt_digest FROM development_job_resolved_interrupts WHERE graph_run_id=? AND interrupt_id=?",
+                ("development-run.1", "interrupt.1"),
+            ).fetchone()
+        assert archived["interrupt_digest"] == jobs.interrupt_digest("development-run.1", kind, payload)
     else:
         with pytest.raises(ValueError, match="new approved plan"):
             jobs.request_resume("development-run.1", "session-a", response, "interrupt.1")

@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from workbench.orchestration.checkpointer import acquire_graph_execution_fence, graph_config, open_graph_checkpointer
+from workbench.orchestration.contracts import OpaqueIdentifier
 from workbench.orchestration.development import DevelopmentPlan, DevelopmentPlanValidator
 from workbench.orchestration.development_jobs import DevelopmentJobRepository
 from workbench.orchestration.effects import EffectLedger
@@ -99,12 +100,13 @@ class DurableDevelopmentProcessor:
         interrupt = self._interrupt_identity(run_id, state)
         if interrupt is not None:
             interrupt_id, interrupt_kind, digest, payload = interrupt
-            events.append(DevelopmentProcessEvent(event_type="development.interrupt.required", payload={"graph_run_id": run_id, "interrupt_id": interrupt_id, "interrupt_kind": interrupt_kind, "status": "needs_human"}))
+            pending_branch_ids = self._pending_branch_ids(payload, interrupt_kind)
+            events.append(DevelopmentProcessEvent(event_type="development.interrupt.required", payload={"graph_run_id": run_id, "interrupt_id": interrupt_id, "interrupt_kind": interrupt_kind, "pending_branch_ids": list(pending_branch_ids), "status": "needs_human"}))
             return DevelopmentProcessResult(status="needs_human", events=tuple(events), interrupt_id=interrupt_id, interrupt_kind=interrupt_kind, interrupt_digest=digest, interrupt_payload=payload)
         if state.get("status") == "completed":
             # Reuse the scoped release identity so replay clears the stale approval
             # card without inventing an unbounded terminal event payload.
-            completed = DevelopmentProcessEvent(event_type="development.interrupt.required", payload={"graph_run_id": run_id, "interrupt_id": self._release_identity(run_id, state), "interrupt_kind": "release_approval", "status": "completed"})
+            completed = DevelopmentProcessEvent(event_type="development.interrupt.required", payload={"graph_run_id": run_id, "interrupt_id": self._release_identity(run_id, state), "interrupt_kind": "release_approval", "pending_branch_ids": [], "status": "completed"})
             return DevelopmentProcessResult(status="completed", events=tuple([*events, completed]))
         return DevelopmentProcessResult(status="queued", events=tuple(events))
 
@@ -147,6 +149,32 @@ class DurableDevelopmentProcessor:
             kind = "release_approval"
         digest = DevelopmentJobRepository.interrupt_digest(graph_run_id, kind, payload)
         return f"development-interrupt.{digest[:32]}", kind, digest, payload
+
+    @staticmethod
+    def _pending_branch_ids(
+        canonical_payload: dict[str, object],
+        interrupt_kind: str,
+    ) -> tuple[str, ...]:
+        """Project only the current LangGraph branch-review interrupt scope.
+
+        ``local_reviews`` and ``pending_branch_reviews`` are historical/reducer
+        state. They must never determine what the browser is allowed to approve.
+        """
+        if interrupt_kind != "branch_review":
+            return ()
+        if canonical_payload.get("kind") != "branch_reviews":
+            raise ValueError("branch review requires a canonical LangGraph payload")
+        reviews = canonical_payload.get("reviews")
+        if not isinstance(reviews, dict) or not reviews:
+            raise ValueError("branch review canonical payload requires pending reviews")
+        if any(not isinstance(record, dict) for record in reviews.values()):
+            raise ValueError("branch review canonical payload is malformed")
+        identifiers = TypeAdapter(tuple[OpaqueIdentifier, ...]).validate_python(
+            tuple(sorted(reviews))
+        )
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("branch review canonical payload has duplicate branch IDs")
+        return identifiers
 
     @staticmethod
     def _attach_canonical_interrupt(graph: object, config: dict[str, object], values: dict[str, Any]) -> None:

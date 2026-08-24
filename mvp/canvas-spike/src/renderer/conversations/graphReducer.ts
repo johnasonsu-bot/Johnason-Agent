@@ -2,14 +2,14 @@ import type { ConversationEvent } from "../api";
 
 export type ResearchRecord = { branchId: string; attempt: number; stage: string; status: string; decision?: string; findings: string[]; evidenceRefs: string[] };
 export type DevelopmentBranchRecord = { branchId: string; attempt: number; worktreeName: string; workerBranch: string; baseSha: string; commitSha: string; ownedPathSummary: string[]; testLabel: string; testResult: string; status: string; review?: string; findings: string[] };
-export type DevelopmentGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; status?: string; lastSequence?: number; branches: Record<string, DevelopmentBranchRecord>; merge?: Record<string, unknown>; regression?: Record<string, unknown> };
+export type DevelopmentGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; pendingBranchIds: string[]; status?: string; lastSequence?: number; branches: Record<string, DevelopmentBranchRecord>; merge?: Record<string, unknown>; regression?: Record<string, unknown> };
 export type ResearchGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; records: Record<string, ResearchRecord>; supervisor?: Record<string, unknown>; arbitration?: Record<string, unknown>; merge?: Record<string, unknown>; globalReview?: Record<string, unknown>; development?: DevelopmentGraphState };
 
 export const emptyResearchGraphState = (): ResearchGraphState => ({ records: {} });
 const text = (value: unknown) => typeof value === "string" ? value : "";
 const number = (value: unknown) => typeof value === "number" && Number.isInteger(value) ? value : 0;
 const strings = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
-const developmentState = (state: ResearchGraphState): DevelopmentGraphState => state.development ?? { branches: {} };
+const developmentState = (state: ResearchGraphState): DevelopmentGraphState => state.development ?? { branches: {}, pendingBranchIds: [] };
 
 function reduceDevelopmentEvent(state: ResearchGraphState, event: ConversationEvent): ResearchGraphState | null {
   if (!event.name?.startsWith("development.")) return null;
@@ -23,7 +23,7 @@ function reduceDevelopmentEvent(state: ResearchGraphState, event: ConversationEv
     if (!graphRunId) return state;
     // A newer admitted plan is authoritative. Its replay must not inherit old
     // branch evidence or an approval card from a replaced graph run.
-    return next(current.graphRunId && current.graphRunId !== graphRunId ? { graphRunId, branches: {} } : { ...current, graphRunId });
+    return next(current.graphRunId && current.graphRunId !== graphRunId ? { graphRunId, branches: {}, pendingBranchIds: [] } : { ...current, graphRunId });
   }
   if (!graphRunId || (current.graphRunId && graphRunId !== current.graphRunId)) return state;
   if (event.name === "development.branch.progress") {
@@ -43,8 +43,9 @@ function reduceDevelopmentEvent(state: ResearchGraphState, event: ConversationEv
   if (event.name === "development.merge.completed") return next({ ...current, graphRunId, merge: { ...(current.merge ?? {}), ...value } });
   if (event.name === "development.global_verification.decided") return next({ ...current, graphRunId, regression: { ...(current.regression ?? {}), ...value } });
   if (event.name === "development.interrupt.required") {
-    if (text(value.status) === "completed") return next({ ...current, graphRunId, interruptId: undefined, interruptKind: undefined, status: "completed" });
-    return next({ ...current, graphRunId, interruptId: text(value.interrupt_id), interruptKind: text(value.interrupt_kind), status: text(value.status) });
+    if (text(value.status) === "completed") return next({ ...current, graphRunId, interruptId: undefined, interruptKind: undefined, pendingBranchIds: [], status: "completed" });
+    const interruptKind = text(value.interrupt_kind);
+    return next({ ...current, graphRunId, interruptId: text(value.interrupt_id), interruptKind, pendingBranchIds: interruptKind === "branch_review" ? strings(value.pending_branch_ids) : [], status: text(value.status) });
   }
   return state;
 }

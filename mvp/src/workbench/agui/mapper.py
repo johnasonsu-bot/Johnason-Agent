@@ -3,7 +3,7 @@
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from workbench.protocol.events import DomainEvent
 from workbench.orchestration.contracts import OpaqueIdentifier, PublicSummary
@@ -79,7 +79,17 @@ class _DevelopmentInterrupt(_DevelopmentPublic):
     graph_run_id: OpaqueIdentifier
     interrupt_id: OpaqueIdentifier
     interrupt_kind: Literal["branch_review", "attempt_reset_approval", "integration_approval", "merge_arbitration", "replan", "release_approval"]
+    pending_branch_ids: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=64)
     status: Literal["needs_human", "completed"]
+
+    @model_validator(mode="after")
+    def validate_current_branch_scope(self) -> "_DevelopmentInterrupt":
+        if self.interrupt_kind == "branch_review" and self.status == "needs_human":
+            if not self.pending_branch_ids:
+                raise ValueError("branch review requires its current pending branch IDs")
+        elif self.pending_branch_ids:
+            raise ValueError("only a pending branch review may expose branch scope")
+        return self
 
 
 _DEVELOPMENT_MODELS: dict[str, type[_DevelopmentPublic]] = {
@@ -398,6 +408,7 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "graph_run_id",
             "interrupt_id",
             "interrupt_kind",
+            "pending_branch_ids",
             "status",
         ),
     }.get(event_type)

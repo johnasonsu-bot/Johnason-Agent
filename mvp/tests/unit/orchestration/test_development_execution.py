@@ -9,6 +9,7 @@ import pytest
 
 from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract, DevelopmentPlanValidator
 from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
+from workbench.tools.git_workspace import GitWorkspaceTool
 from workbench.runtime.agent_loop import AgentEvent
 
 
@@ -96,6 +97,32 @@ def test_worker_adapter_preserves_existing_mode_and_uses_safe_mode_for_new_files
     )
     asyncio.run(new_adapter.execute("worker", "backend", 1, {"graph_run_id":"run.1", "workspace_path":str(repo)}))
     assert os.stat(new_path).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("extra", ({"delete": "src/backend.py"}, {"intent": "delete"}, {"deletes": ["src/backend.py"]}))
+def test_worker_adapter_rejects_model_delete_intents(repository, extra: dict[str, object]) -> None:
+    repo, _ = repository
+    payload = {"summary": "delete", "edits": [{"path": "src/backend.py", "content": "value = 1\\n"}], **extra}
+    adapter = DevelopmentExecutionAdapter(_Runner(__import__("json").dumps(payload))).for_plan(DevelopmentPlanValidator().validate(_plan(repo)))
+
+    with pytest.raises(ValueError):
+        asyncio.run(adapter.execute("worker", "backend", 1, {"graph_run_id": "run.1", "workspace_path": str(repo)}))
+
+
+def test_worker_adapter_invokes_no_shell_or_git_boundary(repository, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, _ = repository
+    adapter = DevelopmentExecutionAdapter(_Runner(json_edit("src/backend.py"))).for_plan(DevelopmentPlanValidator().validate(_plan(repo)))
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        calls.append("forbidden")
+        raise AssertionError("adapter must not invoke shell or Git workspace effects")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(GitWorkspaceTool, "commit", forbidden)
+    asyncio.run(adapter.execute("worker", "backend", 1, {"graph_run_id": "run.1", "workspace_path": str(repo)}))
+
+    assert calls == []
 
 
 def json_edit(path: str, content: str = "value = 1\\n") -> str:

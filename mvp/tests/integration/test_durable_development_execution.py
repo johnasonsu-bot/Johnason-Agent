@@ -53,6 +53,20 @@ class _ConflictEditRunner:
         yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
 
 
+class _HumanReviewRunner:
+    """Produces two dependency-ordered, human-reviewed branch batches."""
+    async def run_turn(self, command):
+        stage, branch, attempt = command.command_id.split(":", 2)
+        if stage == "worker":
+            text = json.dumps({"summary": f"write {branch}", "edits": [{"path": f"src/{branch}.py", "content": f"value = '{branch}'\n"}]})
+        elif stage == "local_verifier":
+            text = json.dumps({"reviewed_branch_id": branch, "reviewed_attempt": int(attempt), "decision": "needs_human", "findings": ["human approval required"]})
+        else:
+            text = json.dumps({"decision": "approved"})
+        yield AgentEvent(kind="text_delta", session_id=command.session_id, run_id=command.run_id, payload={"text": text})
+        yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
+
+
 def _conflicting_plan(repo: Path, base: str) -> DevelopmentPlan:
     command = ("python", "-m", "pytest", "tests/test_shared.py", "-q")
     return DevelopmentPlan(
@@ -70,6 +84,17 @@ def _conflicting_plan(repo: Path, base: str) -> DevelopmentPlan:
                 command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
                 output=GitOutputContract(branch="graph/development-conflict/frontend"),
             ),
+        ),
+    )
+
+
+def _two_batch_review_plan(repo: Path, base: str) -> DevelopmentPlan:
+    command = ("python", "-m", "pytest", "tests", "-q")
+    return DevelopmentPlan(
+        plan_id="development-two-batch-review-plan.1",
+        nodes=(
+            DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=base, ownership=FileOwnership(writable_paths=("src/backend.py",)), command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)), output=GitOutputContract(branch="graph/two-batch/backend")),
+            DevelopmentNodeSpec(node_id="frontend", repository_root=repo, base_commit=base, depends_on=("backend",), ownership=FileOwnership(writable_paths=("src/frontend.py",)), command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)), output=GitOutputContract(branch="graph/two-batch/frontend")),
         ),
     )
 
@@ -170,3 +195,37 @@ def test_real_processor_worker_and_session_api_resume_merge_rework(tmp_path: Pat
         assert accepted.status_code == 200
         assert accepted.json()["status"] == "queued"
         _wait_for_interrupt(client.app.state.development_jobs, "development-conflict-run.1", "attempt_reset_approval")
+
+
+def test_real_processor_worker_session_api_runs_two_sequential_branch_review_batches(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"; repo.mkdir()
+    for argv in (("init", "-b", "main"), ("config", "user.email", "test@example.invalid"), ("config", "user.name", "Test")):
+        _git(*argv, cwd=repo)
+    (repo / "src").mkdir(); (repo / "tests").mkdir()
+    (repo / "tests" / "test_values.py").write_text("def test_values(): assert True\n")
+    _git("add", ".", cwd=repo); _git("commit", "-m", "base", cwd=repo)
+    settings = WorkbenchSettings(runtime_dir=tmp_path / "runtime")
+    run_id = "development-two-batch-run.1"
+
+    with TestClient(main.build_app(settings, runner=_HumanReviewRunner())) as client:
+        assert client.post("/api/sessions", json={"session_id": "session-a"}).status_code == 200
+        client.app.state.development_jobs.admit(run_id, "session-a", _two_batch_review_plan(repo, _git("rev-parse", "HEAD", cwd=repo)))
+        backend_id, _ = _wait_for_interrupt(client.app.state.development_jobs, run_id, "branch_review")
+        assert client.post(
+            f"/api/sessions/session-a/development-runs/{run_id}/interrupts/{backend_id}",
+            headers={"Idempotency-Key": "approve-backend-review"}, json={"decisions": {"backend": "approved"}},
+        ).status_code == 200
+        frontend_id, _ = _wait_for_interrupt(client.app.state.development_jobs, run_id, "branch_review")
+        assert frontend_id != backend_id
+        stale = client.post(
+            f"/api/sessions/session-a/development-runs/{run_id}/interrupts/{frontend_id}",
+            headers={"Idempotency-Key": "stale-review-scope"}, json={"decisions": {"backend": "approved", "frontend": "approved"}},
+        )
+        assert stale.status_code == 409
+        assert client.post(
+            f"/api/sessions/session-a/development-runs/{run_id}/interrupts/{frontend_id}",
+            headers={"Idempotency-Key": "approve-frontend-review"}, json={"decisions": {"frontend": "approved"}},
+        ).status_code == 200
+
+    scopes = [event.payload["pending_branch_ids"] for event in EventStore(settings.database).read_stream("run:session-a", after_sequence=0) if event.event_type == "development.interrupt.required" and event.payload.get("interrupt_kind") == "branch_review"]
+    assert scopes == [["backend"], ["frontend"]]
