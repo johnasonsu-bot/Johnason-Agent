@@ -162,11 +162,15 @@ def _run_allowed_commands(
         try:
             environment = dict(os.environ)
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            if command[0] == "pytest" or command[:3] in {
-                ("python", "-m", "pytest"),
-                ("python3", "-m", "pytest"),
-            }:
-                environment["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
+            is_pytest = Path(command[0]).name == "pytest" or any(
+                command[index : index + 2] == ("-m", "pytest")
+                for index in range(max(0, len(command) - 1))
+            )
+            if is_pytest:
+                existing = environment.get("PYTEST_ADDOPTS", "").strip()
+                environment["PYTEST_ADDOPTS"] = " ".join(
+                    item for item in (existing, "-p no:cacheprovider") if item
+                )
             result = subprocess.run(
                 command,
                 cwd=workspace,
@@ -550,7 +554,7 @@ def build_development_graph(
             )
         if decision == "request_replan" and set(response) == {"decision"}:
             return Command(
-                update={"pending_interrupt": None, "status": "awaiting_replan"},
+                update={"status": "awaiting_replan"},
                 goto="replan",
             )
         raise DevelopmentGraphError("merge arbitration decision is invalid")

@@ -599,6 +599,7 @@ class GitWorkspaceTool:
         commits: tuple[str, ...],
         conflict: IntegrationConflict,
     ) -> None:
+        head = conflict.parent_graph[0]
         merge_head = conflict.parent_graph[-1]
         record = self.ledger.reserve(
             f"{operation_id}:conflict",
@@ -611,6 +612,7 @@ class GitWorkspaceTool:
                 "commits": list(commits),
                 "paths": list(conflict.paths),
                 "parent_graph": list(conflict.parent_graph),
+                "head": head,
                 "merge_head": merge_head,
             },
         )

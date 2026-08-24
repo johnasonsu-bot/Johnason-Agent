@@ -142,6 +142,7 @@ class EffectLedger:
                 "commits",
                 "paths",
                 "parent_graph",
+                "head",
                 "merge_head",
             },
         )
@@ -463,18 +464,26 @@ class EffectLedger:
             commits = value.get("commits")
             paths = value.get("paths")
             parents = value.get("parent_graph")
+            head = value.get("head")
             merge_head = value.get("merge_head")
             if (
-                set(value) != {"kind", "commits", "paths", "parent_graph", "merge_head"}
+                set(value) != {"kind", "commits", "paths", "parent_graph", "head", "merge_head"}
                 or not isinstance(commits, list)
                 or not isinstance(paths, list)
                 or not isinstance(parents, list)
+                or not commits
                 or not paths
+                or len(parents) < 2
                 or not all(isinstance(item, str) and cls._SHA.fullmatch(item) for item in commits)
                 or not all(isinstance(item, str) and item and len(item) <= 240 for item in paths)
                 or not all(isinstance(item, str) and cls._SHA.fullmatch(item) for item in parents)
+                or not isinstance(head, str)
+                or not cls._SHA.fullmatch(head)
                 or not isinstance(merge_head, str)
                 or not cls._SHA.fullmatch(merge_head)
+                or head not in parents
+                or merge_head not in commits
+                or merge_head not in parents
             ):
                 raise ValueError("integration conflict effect metadata is invalid")
             return

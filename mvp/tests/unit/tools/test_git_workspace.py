@@ -396,6 +396,15 @@ def test_merge_reports_only_real_conflict_paths_for_arbitration(
     assert raised.value.paths == ("README.md",)
     assert first_sha in raised.value.parent_graph
     assert second_sha in raised.value.parent_graph
+    integration_path = workspace._operation_path("op-conflict")
+    head_sha = git("rev-parse", "HEAD", cwd=integration_path)
+    merge_head = git("rev-parse", "MERGE_HEAD", cwd=integration_path)
+    conflict_effect = workspace.ledger.recover("op-conflict:conflict")
+    assert head_sha in raised.value.parent_graph
+    assert merge_head in raised.value.parent_graph
+    assert conflict_effect.expected_result["head"] == head_sha
+    assert conflict_effect.expected_result["merge_head"] == merge_head
+    assert merge_head in conflict_effect.expected_result["parent_graph"]
 
     # A crash after Git reports the conflict must reconstruct the structured
     # arbitration evidence instead of degrading to generic reconciliation.
@@ -410,3 +419,5 @@ def test_merge_reports_only_real_conflict_paths_for_arbitration(
     assert recovered.value.paths == ("README.md",)
     assert first_sha in recovered.value.parent_graph
     assert second_sha in recovered.value.parent_graph
+    assert head_sha in recovered.value.parent_graph
+    assert merge_head in recovered.value.parent_graph

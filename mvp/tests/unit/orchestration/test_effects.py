@@ -30,6 +30,74 @@ def test_attempt_preparation_is_a_durable_git_effect(tmp_path: Path) -> None:
     assert completed.result_ref == sha
 
 
+@pytest.mark.parametrize(
+    "expected_result",
+    (
+        {
+            "kind": "integration_conflict",
+            "commits": [],
+            "paths": ["src/shared.py"],
+            "parent_graph": ["a" * 40, "b" * 40],
+            "merge_head": "b" * 40,
+        },
+        {
+            "kind": "integration_conflict",
+            "commits": ["a" * 40],
+            "paths": ["src/shared.py"],
+            "parent_graph": [],
+            "merge_head": "a" * 40,
+        },
+        {
+            "kind": "integration_conflict",
+            "commits": ["a" * 40],
+            "paths": ["src/shared.py"],
+            "parent_graph": ["b" * 40, "c" * 40],
+            "merge_head": "a" * 40,
+        },
+    ),
+)
+def test_conflict_effect_requires_nonempty_commits_and_merge_head_parent_membership(
+    tmp_path: Path, expected_result: dict[str, object]
+) -> None:
+    ledger = EffectLedger(tmp_path / "workflow.sqlite3")
+
+    with pytest.raises(ValueError, match="integration conflict effect metadata"):
+        ledger.reserve(
+            "conflict-op",
+            effect_kind="git_integration_conflict",
+            repository_id="1" * 64,
+            branch="graph/run/integration",
+            base_sha="f" * 40,
+            expected_result=expected_result,
+        )
+
+
+def test_conflict_effect_requires_head_and_merge_head_in_parent_graph(
+    tmp_path: Path,
+) -> None:
+    ledger = EffectLedger(tmp_path / "workflow.sqlite3")
+    head = "b" * 40
+    merge_head = "a" * 40
+
+    reserved = ledger.reserve(
+        "conflict-with-head",
+        effect_kind="git_integration_conflict",
+        repository_id="1" * 64,
+        branch="graph/run/integration",
+        base_sha="f" * 40,
+        expected_result={
+            "kind": "integration_conflict",
+            "commits": [merge_head],
+            "paths": ["src/shared.py"],
+            "parent_graph": [head, merge_head],
+            "head": head,
+            "merge_head": merge_head,
+        },
+    )
+
+    assert reserved.expected_result["head"] == head
+
+
 WORKTREE_EXPECTED = {"kind": "worktree", "path_id": "a" * 24}
 COMMIT_EXPECTED = {
     "kind": "commit_sha",
