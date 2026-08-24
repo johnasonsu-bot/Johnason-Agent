@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 10
+PHASE1_SCHEMA_VERSION = 11
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -224,6 +224,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (project_id, version)
                 REFERENCES project_context_versions(project_id, version)
         );
+        CREATE TABLE IF NOT EXISTS sequential_execution_records (
+            graph_run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            result_kind TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (graph_run_id, node_id, attempt),
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
         BEGIN
@@ -273,6 +283,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         BEFORE DELETE ON project_context_entries
         BEGIN
             SELECT RAISE(ABORT, 'project context entries are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sequential_execution_records_no_update
+        BEFORE UPDATE ON sequential_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'sequential execution records are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sequential_execution_records_no_delete
+        BEFORE DELETE ON sequential_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'sequential execution records are append-only');
         END;
         CREATE TRIGGER IF NOT EXISTS graph_execution_plans_no_change_when_approved
         BEFORE UPDATE ON graph_execution_plans

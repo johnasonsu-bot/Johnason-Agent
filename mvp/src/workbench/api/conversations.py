@@ -12,16 +12,27 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
+from workbench.agents.repository import AgentProfileRepository
 from workbench.agui.mapper import map_domain_event
 from workbench.conversations.models import ConversationMessage, ConversationSession
 from workbench.conversations.repository import (
     ConversationRepository,
     TurnSnapshotCorruption,
+    TurnStatus,
 )
 from workbench.domain.models import EpochRecord, MissionRecord, ProjectRecord, RunRecord
 from workbench.models.contracts import ModelMessage
+from workbench.orchestration.compiler import MentionSequenceCompiler
+from workbench.orchestration.contracts import (
+    ExecutionPlan,
+    GraphRunRef,
+    PlanEdge,
+    PlanNode,
+    PublicSummary,
+)
+from workbench.orchestration.control_store import GraphControlStore
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 from workbench.runtime.engine_host.client import (
@@ -46,14 +57,50 @@ class TurnRunner(Protocol):
     def run_turn(self, command: RunAgentTurn) -> AsyncIterator[AgentEvent]: ...
 
 
+class SequentialProcessEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_type: Literal[
+        "orchestration.node.progress",
+        "orchestration.handoff.published",
+        "orchestration.review.decided",
+        "orchestration.rework.requested",
+        "orchestration.artifact.published",
+        "orchestration.interrupted",
+    ]
+    payload: dict[str, Any]
+
+
+class SequentialProcessResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["completed", "failed", "needs_human"]
+    events: tuple[SequentialProcessEvent, ...] = ()
+    assistant_summary: PublicSummary | None = None
+
+
+class SequentialOrchestrationProcessor(Protocol):
+    async def process(
+        self, orchestration: dict[str, Any]
+    ) -> SequentialProcessResult: ...
+
+
 class CreateSessionRequest(BaseModel):
     session_id: str = Field(min_length=1)
+
+
+class AgentBindingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    agent_id: str = Field(min_length=1)
+    expected_version: int = Field(ge=1)
 
 
 class MessageRequest(BaseModel):
     content: str
     model: str = "default"
     provider_id: str | None = None
+    agent_bindings: tuple[AgentBindingRequest, ...] = ()
 
 
 class ConversationInterventionRequest(BaseModel):
@@ -69,6 +116,12 @@ class ConversationInterventionRequest(BaseModel):
     ]
     content: str
     context_version: int = Field(default=0, ge=0)
+
+
+class SequentialResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision: Literal["approved"]
 
 
 class SessionPausedError(RuntimeError):
@@ -91,6 +144,9 @@ class ConversationAPI:
     events: EventStore
     runner: object
     engine: SingleAgentEngine | None = None
+    agents: AgentProfileRepository | None = None
+    graph_control: GraphControlStore | None = None
+    sequential_processor: SequentialOrchestrationProcessor | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
     def create_session(self, session_id: str) -> ConversationSession:
@@ -106,10 +162,20 @@ class ConversationAPI:
         content: str,
         model: str,
         provider_id: str | None = None,
+        agent_bindings: tuple[AgentBindingRequest, ...] = (),
     ) -> dict[str, Any]:
         """Persist a turn and return before any model request is awaited."""
         self._require_session(session_id)
         self._require_lifecycle_ownership(session_id)
+        if agent_bindings:
+            return self._enqueue_sequential_message(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                model=model,
+                provider_id=provider_id,
+                agent_bindings=agent_bindings,
+            )
         resolved_provider = self._resolve_provider_id(provider_id)
         reservation_id = self._reserve(
             session_id,
@@ -179,6 +245,147 @@ class ConversationAPI:
             "cursor": f"{sequence}:0" if isinstance(sequence, int) else None,
         }
 
+    def _enqueue_sequential_message(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+    ) -> dict[str, Any]:
+        if model != "default" or provider_id is not None:
+            raise ValueError(
+                "multi-Agent Provider and model are controlled by Agent profiles"
+            )
+        if self.agents is None or self.graph_control is None:
+            raise RuntimeError("sequential orchestration is unavailable")
+        binding_identity = [binding.model_dump(mode="json") for binding in agent_bindings]
+        reservation_id = self._reserve(
+            session_id,
+            command_id,
+            "sequential_message",
+            {"content": content, "agent_bindings": binding_identity},
+        )
+        existing = self.conversations.load_turn_status(session_id, command_id)
+        if existing is not None:
+            orchestration = existing.state.get("orchestration")
+            if not isinstance(orchestration, dict):
+                raise ValueError("turn identity cannot change")
+            return self._sequential_turn_response(existing, orchestration)
+        if self._status(session_id) == "paused":
+            raise SessionPausedError(session_id)
+
+        snapshots = []
+        seen: set[str] = set()
+        for requested in agent_bindings:
+            if requested.agent_id in seen:
+                raise ValueError("Agent bindings must be unique")
+            record = self.agents.get(requested.agent_id)
+            if record.version != requested.expected_version or not record.enabled:
+                raise ValueError("Agent profile version is unavailable")
+            seen.add(requested.agent_id)
+            snapshots.append(self.agents.snapshot(requested.agent_id))
+        draft = MentionSequenceCompiler().compile(content, snapshots)
+        public_plan = ExecutionPlan(
+            plan_id=draft.plan_id,
+            version=draft.version,
+            goal=draft.goal,
+            nodes=tuple(
+                PlanNode(
+                    node_id=node.node_id,
+                    kind=node.kind,
+                    title=node.binding.display_name,
+                )
+                for node in draft.nodes
+            ),
+            edges=tuple(
+                PlanEdge(
+                    source_node_id=source.node_id,
+                    target_node_id=target.node_id,
+                    kind="depends_on",
+                )
+                for source, target in zip(draft.nodes, draft.nodes[1:])
+            ),
+        )
+        identity = self._digest(
+            {
+                "session_id": session_id,
+                "command_id": command_id,
+                "plan_id": draft.plan_id,
+            }
+        )
+        run_ref = GraphRunRef(
+            graph_run_id=f"graph-run.{identity[:32]}",
+            plan_id=draft.plan_id,
+            plan_version=draft.version,
+            generation=1,
+            thread_id=f"graph-thread.{identity[:32]}",
+        )
+        self.graph_control.create_plan(public_plan)
+        self.graph_control.approve_plan(
+            draft.plan_id, draft.version, actor_id=f"session.{identity[:24]}"
+        )
+        self.graph_control.create_run(run_ref)
+        self.conversations.append_message(
+            ConversationMessage(
+                session_id=session_id,
+                command_id=f"{command_id}:user",
+                role="user",
+                content=content,
+            )
+        )
+        orchestration = {
+            "plan_id": draft.plan_id,
+            "plan_version": draft.version,
+            "graph_run_id": run_ref.graph_run_id,
+            "generation": run_ref.generation,
+            "thread_id": run_ref.thread_id,
+            "draft": draft.model_dump(mode="json"),
+        }
+        turn = self.conversations.enqueue_turn(
+            session_id=session_id,
+            command_id=command_id,
+            run_id=self._lifecycle_run_id(session_id),
+            provider_id=snapshots[0].provider_id,
+            model=snapshots[0].model,
+            prompt=content,
+            initial_state={
+                "phase": "sequential_queued",
+                "orchestration": orchestration,
+            },
+        )
+        queued = self._append(
+            session_id,
+            "orchestration.graph.queued",
+            {
+                "command_id": command_id,
+                "plan_id": draft.plan_id,
+                "graph_run_id": run_ref.graph_run_id,
+                "status": "queued",
+            },
+            command_id,
+            ordinal=-1,
+            causation_id=reservation_id,
+        )
+        sequence = queued.get("sequence")
+        response = self._sequential_turn_response(turn, orchestration)
+        response["cursor"] = f"{sequence}:0" if isinstance(sequence, int) else None
+        return response
+
+    @staticmethod
+    def _sequential_turn_response(
+        turn: TurnStatus, orchestration: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "session_id": turn.session_id,
+            "command_id": turn.command_id,
+            "status": turn.status,
+            "plan_id": orchestration["plan_id"],
+            "graph_run_id": orchestration["graph_run_id"],
+        }
+
     async def process_queued_turn(self, session_id: str, command_id: str) -> None:
         """Advance one Worker-owned turn and seal it if the runtime did not."""
         reservation_id = self._reservation_event_id(session_id, command_id)
@@ -191,6 +398,10 @@ class ConversationAPI:
             }:
                 return
             if turn.owner_id is None:
+                return
+            orchestration = turn.state.get("orchestration")
+            if isinstance(orchestration, dict):
+                await self._process_sequential_turn(turn, orchestration)
                 return
             runner_mode = turn.state.get("runner_mode", "python")
             if runner_mode not in {"python", "engine_host"}:
@@ -283,7 +494,12 @@ class ConversationAPI:
                         owner_id=command.owner_id or "",
                         state=state,
                     )
-                elif current is not None and retryable and current.status == "running" and current.owner_id is None:
+                elif (
+                    current is not None
+                    and retryable
+                    and current.status == "running"
+                    and current.owner_id is None
+                ):
                     state = dict(current.state)
                     state.update({"phase": "before_model", "retryable": True})
                     if projected:
@@ -303,8 +519,11 @@ class ConversationAPI:
             if current.status != "running" or current.owner_id != command.owner_id:
                 return
             terminal_name = next(
-                (item.get("name") for item in reversed(projected)
-                 if item.get("name") in {"turn_finished", "turn_failed"}),
+                (
+                    item.get("name")
+                    for item in reversed(projected)
+                    if item.get("name") in {"turn_finished", "turn_failed"}
+                ),
                 "turn_failed",
             )
             terminal_reason = (
@@ -332,7 +551,11 @@ class ConversationAPI:
                 ),
                 "events": [],
                 "runner_mode": runner_mode,
-                **({"reason": terminal_reason} if terminal_reason is not None else {}),
+                **(
+                    {"reason": terminal_reason}
+                    if terminal_reason is not None
+                    else {}
+                ),
             }
             if (
                 terminal_status == "reconciliation_required"
@@ -368,6 +591,113 @@ class ConversationAPI:
                 state=terminal_state,
                 result=projected,
             )
+
+    async def _process_sequential_turn(
+        self, turn: TurnStatus, orchestration: dict[str, Any]
+    ) -> None:
+        if self.sequential_processor is None:
+            raise RuntimeError("sequential orchestration processor is unavailable")
+        result = await self.sequential_processor.process(dict(orchestration))
+        reservation_id = self._reservation_event_id(turn.session_id, turn.command_id)
+        projection_cycle = orchestration.get("projection_cycle", 0)
+        if isinstance(projection_cycle, bool) or not isinstance(projection_cycle, int):
+            raise TurnSnapshotCorruption("invalid orchestration projection cycle")
+        projected: list[dict[str, Any]] = []
+        for event in result.events:
+            projection_identity = self._digest(
+                {"event_type": event.event_type, "payload": dict(event.payload)}
+            )
+            appended = self._append(
+                turn.session_id,
+                event.event_type,
+                dict(event.payload),
+                f"{turn.command_id}:orchestration:{projection_identity}",
+                ordinal=0,
+                causation_id=reservation_id,
+            )
+            if appended:
+                projected.append(appended)
+        next_orchestration = dict(orchestration)
+        next_orchestration["projection_cycle"] = projection_cycle + 1
+        state = {
+            "phase": (
+                "sequential_completed"
+                if result.status == "completed"
+                else "sequential_failed"
+                if result.status == "failed"
+                else "sequential_needs_human"
+            ),
+            "orchestration": next_orchestration,
+        }
+        if result.status == "needs_human":
+            self.conversations.pause_turn_for_interrupt(
+                turn.session_id,
+                turn.command_id,
+                owner_id=turn.owner_id or "",
+                state=state,
+            )
+            return
+        if result.assistant_summary is not None:
+            self.conversations.append_message(
+                ConversationMessage(
+                    session_id=turn.session_id,
+                    command_id=f"{turn.command_id}:assistant",
+                    role="assistant",
+                    content=result.assistant_summary,
+                )
+            )
+        terminal_status = "completed" if result.status == "completed" else "failed"
+        terminal_event = self._append(
+            turn.session_id,
+            (
+                "conversation.turn.finished"
+                if terminal_status == "completed"
+                else "conversation.turn.failed"
+            ),
+            {"command_id": turn.command_id, "status": terminal_status},
+            turn.command_id,
+            ordinal=len(result.events),
+            causation_id=reservation_id,
+            attempt=projection_cycle,
+        )
+        if terminal_event:
+            projected.append(terminal_event)
+        self.conversations.finish_turn(
+            turn.session_id,
+            turn.command_id,
+            owner_id=turn.owner_id or "",
+            status=terminal_status,
+            state=state,
+            result=projected,
+        )
+
+    def resume_sequential_turn(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        resume_command_id: str,
+        response: SequentialResumeRequest,
+    ) -> dict[str, Any]:
+        self._require_session(session_id)
+        self._reserve(
+            session_id,
+            resume_command_id,
+            "sequential_resume",
+            {
+                "target_command_id": command_id,
+                "response": response.model_dump(mode="json"),
+            },
+        )
+        turn = self.conversations.resume_interrupted_turn(
+            session_id,
+            command_id,
+            response=response.model_dump(mode="json"),
+        )
+        orchestration = turn.state.get("orchestration")
+        if not isinstance(orchestration, dict):
+            raise TurnSnapshotCorruption("turn is not a sequential orchestration")
+        return self._sequential_turn_response(turn, orchestration)
 
     def record_worker_retryable(
         self, session_id: str, command_id: str, *, detail: str
@@ -1270,6 +1600,7 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
                 content=payload.content,
                 model=payload.model,
                 provider_id=payload.provider_id,
+                agent_bindings=payload.agent_bindings,
             )
             if result.get("status") in {"queued", "running", "retryable"}:
                 return JSONResponse(status_code=202, content=result)
@@ -1301,6 +1632,29 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         except KeyError as exc:
             raise HTTPException(404, "session not found") from exc
         except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @router.post(
+        "/sessions/{session_id}/orchestrations/{command_id}/resume"
+    )
+    def resume_sequential(
+        session_id: str,
+        command_id: str,
+        payload: SequentialResumeRequest,
+        idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if not idempotency_key:
+            raise HTTPException(400, "Idempotency-Key header is required")
+        try:
+            return api.resume_sequential_turn(
+                session_id=session_id,
+                command_id=command_id,
+                resume_command_id=idempotency_key,
+                response=payload,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "orchestration not found") from exc
+        except (TurnSnapshotCorruption, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @router.post("/sessions/{session_id}/interventions")

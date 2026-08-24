@@ -44,6 +44,8 @@ class ContextResolver:
         private_messages: tuple[PrivateMessage, ...],
         handoffs: tuple[Handoff, ...],
         rework: ReviewDecision | None,
+        *,
+        attempt: int = 1,
     ) -> AgentContextPackage:
         visible_entries = tuple(
             entry
@@ -94,6 +96,20 @@ class ContextResolver:
                     f"findings={'; '.join(applicable_rework.findings)}",
                     f"instructions={applicable_rework.rework_instructions or ''}",
                     "[/REWORK]",
+                ]
+            )
+        if node.kind in {"supervisor", "verifier"}:
+            sections.extend(
+                [
+                    "[REVIEW_DECISION_CONTRACT]",
+                    f"reviewed_node_id={node.review_target_id}",
+                    f"reviewed_attempt={attempt}",
+                    'output_json={"reviewed_node_id":"...","reviewed_attempt":1,'
+                    '"decision":"approved|rejected|needs_human",'
+                    '"findings":[],"evidence_refs":["..."],'
+                    '"rework_instructions":null}',
+                    "Return exactly one JSON object and no prose.",
+                    "[/REVIEW_DECISION_CONTRACT]",
                 ]
             )
         return AgentContextPackage(

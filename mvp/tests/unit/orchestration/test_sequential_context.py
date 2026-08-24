@@ -134,3 +134,29 @@ def test_rework_is_visible_only_to_the_reviewed_node() -> None:
 
     assert "补足故事" in writer_context.rendered_prompt
     assert "补足故事" not in architect_context.rendered_prompt
+
+
+def test_reviewer_context_declares_the_exact_structured_decision_identity() -> None:
+    reviewer = SequentialNodeSpec(
+        node_id="node.supervisor",
+        ordinal=1,
+        kind="supervisor",
+        binding=AgentBindingSnapshot(
+            agent_id="supervisor",
+            display_name="Supervisor",
+            role="supervisor",
+            provider_id="deepseek-primary",
+            model="deepseek-v4-flash",
+            profile_version=1,
+        ),
+        instruction="审核故事",
+        review_target_id="node.product-manager",
+    )
+
+    package = ContextResolver().build(
+        reviewer, project_context(), (), (), None, attempt=2
+    )
+
+    assert "reviewed_node_id=node.product-manager" in package.rendered_prompt
+    assert "reviewed_attempt=2" in package.rendered_prompt
+    assert '"decision":"approved|rejected|needs_human"' in package.rendered_prompt

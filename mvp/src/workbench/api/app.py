@@ -15,7 +15,11 @@ from workbench.agents.repository import AgentProfileRepository
 from workbench.api.agui import stream_run_events
 from workbench.api.agents import agent_router
 from workbench.api.commands import CreateRunRequest, InterventionRequest
-from workbench.api.conversations import ConversationAPI, conversation_router
+from workbench.api.conversations import (
+    ConversationAPI,
+    SequentialOrchestrationProcessor,
+    conversation_router,
+)
 from workbench.api.engine_host import engine_host_router
 from workbench.api.providers import provider_router, vault_router
 from workbench.conversations.repository import ConversationRepository
@@ -24,6 +28,7 @@ from workbench.credentials.vault import CredentialVault
 from workbench.credentials.service import VaultService
 from workbench.domain.models import RunRecord
 from workbench.models.gateway import ModelGateway
+from workbench.orchestration.control_store import GraphControlStore
 from workbench.providers.repository import ProviderRepository
 from workbench.workflow.engine import (
     PauseRun,
@@ -53,6 +58,7 @@ class AppSettings:
     service_instance_id: str | None = None
     runner_lifecycle: RunnerLifecycle | None = None
     host_generation: str | None = None
+    sequential_processor: SequentialOrchestrationProcessor | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -71,6 +77,19 @@ def create_app(settings: AppSettings) -> FastAPI:
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
     event_store = EventStore(settings.database)
+    agent_profiles = AgentProfileRepository(settings.database)
+    sequential_processor = settings.sequential_processor
+    owns_sequential_processor = False
+    if sequential_processor is None and callable(
+        getattr(settings.runner, "run_turn", None)
+    ):
+        from workbench.orchestration.processor import DurableSequentialProcessor
+
+        sequential_processor = DurableSequentialProcessor(
+            database=settings.database,
+            runner=settings.runner,
+        )
+        owns_sequential_processor = True
     conversation_api = ConversationAPI(
         conversations=ConversationRepository(
             settings.database, host_generation=settings.host_generation
@@ -78,6 +97,9 @@ def create_app(settings: AppSettings) -> FastAPI:
         events=event_store,
         runner=settings.runner,
         engine=engine,
+        agents=agent_profiles,
+        graph_control=GraphControlStore(settings.database),
+        sequential_processor=sequential_processor,
     )
     conversation_worker = ConversationTaskWorker(
         conversation_api.conversations, conversation_api
@@ -108,8 +130,16 @@ def create_app(settings: AppSettings) -> FastAPI:
                         if settings.close_gateway and settings.gateway is not None:
                             await settings.gateway.aclose()
                     finally:
-                        if settings.vault is not None:
-                            settings.vault.lock()
+                        try:
+                            if owns_sequential_processor:
+                                close_processor = getattr(
+                                    sequential_processor, "aclose", None
+                                )
+                                if callable(close_processor):
+                                    await close_processor()
+                        finally:
+                            if settings.vault is not None:
+                                settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
 
@@ -135,7 +165,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         return await call_next(request)
 
     app.include_router(conversation_router(conversation_api))
-    app.include_router(agent_router(AgentProfileRepository(settings.database)))
+    app.include_router(agent_router(agent_profiles))
     status_source = settings.runner
     if not (
         hasattr(status_source, "status") and hasattr(status_source, "runner_mode")
