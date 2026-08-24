@@ -521,7 +521,7 @@ async def run_development_graph_acceptance(
         fixture_venv.symlink_to(controller_venv)
     backend_command = _command(
         "integration_backend_full",
-        (sys.executable, "-m", "pytest", "tests/unit", "tests/integration", "tests/acceptance", "-q", "-m", "not development_graph_gate"),
+        (sys.executable, "-m", "pytest", "tests/unit", "tests/integration", "tests/acceptance", "-q", "--ignore=tests/acceptance/test_development_graph_blueprint.py"),
         integration_workspace / "mvp",
     )
     electron_command = _command(
@@ -651,16 +651,45 @@ def _write_result(path: Path, result: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _safe_explicit_output(arguments: list[str]) -> Path | None:
+    """Return exactly one complete --output value without trusting argparse."""
+    values: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--output":
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
+                return None
+            values.append(arguments[index + 1])
+            index += 2
+            continue
+        if argument.startswith("--output="):
+            value = argument.split("=", 1)[1]
+            if not value:
+                return None
+            values.append(value)
+        index += 1
+    return Path(values[0]) if len(values) == 1 else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output", type=Path, default=Path(".runtime/development-graph-results.json")
     )
     parser.add_argument("--inject", choices=("ownership", "backend", "electron", "remote", "missing_evidence", "key_error", "exception"))
-    output = Path(".runtime/development-graph-results.json")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    explicit_output = _safe_explicit_output(arguments)
+    has_output_argument = any(
+        argument == "--output" or argument.startswith("--output=")
+        for argument in arguments
+    )
+    output = explicit_output or Path(".runtime/development-graph-results.json")
     result: dict[str, Any] | None = None
     try:
-        args = parser.parse_args(argv)
+        args = parser.parse_args(arguments)
+        if has_output_argument and explicit_output is None:
+            raise ValueError("invalid repeated or incomplete --output")
         output = args.output
         run_directory = args.output.parent / f"development-run-{uuid4().hex}"
         result = asyncio.run(run_development_graph_acceptance(run_directory, inject=args.inject))

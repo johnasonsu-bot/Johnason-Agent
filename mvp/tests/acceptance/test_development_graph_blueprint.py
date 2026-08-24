@@ -7,7 +7,37 @@ import pytest
 
 from scripts.run_development_graph_acceptance import run_development_graph_acceptance
 
-pytestmark = pytest.mark.development_graph_gate
+
+def test_invalid_cli_overwrites_explicit_output_with_blocked_metadata(tmp_path: Path) -> None:
+    output = tmp_path / "prior-go.json"
+    output.write_text('{"decision": "GO_RELEASE_APPROVAL"}\n', encoding="utf-8")
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+
+    completed = subprocess.run(
+        (sys.executable, str(script), "--output", str(output), "--unknown-option"),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout.strip() == "BLOCKED"
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "completed_stages": [],
+        "decision": "BLOCKED",
+        "error_kind": "SystemExit",
+    }
+
+
+def test_nested_backend_command_ignores_only_this_gate_file() -> None:
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+    source = script.read_text(encoding="utf-8")
+
+    assert "pytest.mark.development_graph_gate" not in source
+    marker_assignment = "pytest" + "mark ="
+    assert marker_assignment not in Path(__file__).read_text(encoding="utf-8")
+    assert "--ignore=tests/acceptance/test_development_graph_blueprint.py" in source
+    assert '"-m", "not development_graph_gate"' not in source
 
 
 @pytest.mark.asyncio
