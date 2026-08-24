@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.11–3.13, pinned LangGraph runtime and SQLite Checkpointer from Batch 3.0, Pydantic 2, FastAPI, existing Python/Engine Host Runner, Artifact Store, React, TypeScript, Electron, Playwright.
 
+**Spec:** `docs/superpowers/specs/2026-08-24-phase-2-4-delivery-design.md`
+
 ## Global Constraints
 
 - Start only after Batch 3.0 reports `GO_LANGGRAPH_RUNTIME`.
@@ -15,6 +17,8 @@
 - Parse explicit `@Agent` mentions in appearance order; do not call Planner A in this batch.
 - Define `SolutionTemplateCompiler` returning the same `ExecutionPlan`; do not implement the template marketplace.
 - Every Agent uses an independent private context and a frozen Agent/Provider/Model snapshot.
+- Agent profiles are backend-persisted facts; renderer `localStorage` is not authoritative.
+- Shared Project Context is immutable, versioned, source-attributed, and verification-aware.
 - Cross-Agent data moves only through structured Handoffs and Artifact/message references.
 - Supervisor and Verifier decisions are structured, evidence-bearing, and can reject, approve, or require human input.
 - Rejection creates a new target Attempt and automatically returns control to the preceding execution node; history is append-only.
@@ -36,7 +40,8 @@
 **Interfaces:**
 - Produces `MentionSequenceCompiler.compile(content, bindings) -> ExecutionPlanDraft`.
 - Produces `SolutionTemplateCompiler.compile_intent(intent, template_id, template_version, bindings) -> ExecutionPlanDraft` protocol.
-- Produces `AgentBindingSnapshot`, `SequentialNodeSpec`, `Handoff`, `ReviewDecision`, `ProgressReport`, and `ArtifactRef`.
+- Produces `AgentBindingSnapshot`, `SequentialNodeSpec`, `Handoff`, `ReviewDecision`, and `ProgressReport`.
+- Consumes the existing `workbench.artifacts.store.ArtifactRef`; it does not define a competing Artifact reference type.
 
 - [ ] **Step 1: Write compiler RED tests**
 
@@ -87,7 +92,88 @@ git commit -m "feat: compile sequential agent plans"
 
 ---
 
-### Task 2: Private Context, Structured Handoff, Review, and HTML Publication
+### Task 2: Persistent Agent Profiles and Versioned Project Context
+
+**Files:**
+- Create: `mvp/src/workbench/agents/__init__.py`
+- Create: `mvp/src/workbench/agents/models.py`
+- Create: `mvp/src/workbench/agents/repository.py`
+- Create: `mvp/src/workbench/orchestration/project_context.py`
+- Create: `mvp/src/workbench/api/agents.py`
+- Modify: `mvp/src/workbench/api/app.py`
+- Modify: `mvp/src/workbench/workflow/schema.py`
+- Test: `mvp/tests/unit/agents/test_repository.py`
+- Test: `mvp/tests/unit/api/test_agents.py`
+- Test: `mvp/tests/unit/orchestration/test_project_context.py`
+
+**Interfaces:**
+- Consumes `AgentBindingSnapshot` from Task 1 and existing Provider IDs from `ProviderRepository`.
+- Produces `AgentProfileRepository.create`, `replace`, `get`, and `list_enabled`.
+- Produces `AgentProfileRecord`, `ProjectContextEntry`, `ProjectContextVersion`, and `ProjectContextRepository`.
+- Produces `ProjectContextRepository.publish(project_id, expected_version, entries) -> ProjectContextVersion` with optimistic concurrency.
+- Produces credential-free Agent profile CRUD under `/api/agents`; request bodies contain Provider references, never secret values.
+
+- [ ] **Step 1: Write persistence and isolation RED tests**
+
+```python
+def test_agent_profile_round_trip_freezes_provider_model_and_role(repository):
+    created = repository.create(agent_profile())
+    loaded = repository.get(created.agent_id)
+    assert loaded.provider_id == "lmstudio"
+    assert loaded.model == "local-agent"
+    assert loaded.role == "worker"
+
+
+def test_project_context_requires_source_and_verification(context_repository):
+    with pytest.raises(InvalidProjectContext):
+        context_repository.publish(
+            "project-1",
+            expected_version=0,
+            entries=[{"key": "goal", "value_ref": "artifact-1"}],
+        )
+
+
+def test_project_context_publish_is_versioned_and_compare_and_swap(context_repository):
+    version = context_repository.publish(
+        "project-1",
+        expected_version=0,
+        entries=[verified_context_entry()],
+    )
+    assert version.version == 1
+    with pytest.raises(ProjectContextConflict):
+        context_repository.publish(
+            "project-1",
+            expected_version=0,
+            entries=[verified_context_entry()],
+        )
+```
+
+- [ ] **Step 2: Run RED**
+
+Run: `cd mvp && .venv/bin/python -m pytest tests/unit/agents/test_repository.py tests/unit/api/test_agents.py tests/unit/orchestration/test_project_context.py -v`
+
+Expected: `workbench.agents` and `workbench.orchestration.project_context` are absent.
+
+- [ ] **Step 3: Add an append-only schema migration**
+
+Add `agent_profiles`, `agent_profile_versions`, `project_context_versions`, and `project_context_entries`. Agent replacement inserts a new profile version. Project Context publication uses one transaction, checks `expected_version`, and appends entries containing `source_ref`, `verification_status`, `visibility`, and `value_ref`; it never stores a credential, raw private history, or Artifact body. Register a narrow Agent router in `api/app.py`; create and replace requests reject fields named `api_key`, `token`, `password`, `credential`, or `secret`.
+
+- [ ] **Step 4: Implement repositories and frozen snapshots**
+
+Use Pydantic models with `frozen=True, extra="forbid"`. Validate IDs with the existing public identifier rules. Resolve Provider IDs without reading credential values. `AgentProfileRepository.snapshot(agent_id)` returns the exact `AgentBindingSnapshot` consumed by Task 1 so a later profile edit cannot alter an enqueued Run.
+
+- [ ] **Step 5: Run GREEN, migration regression, and commit**
+
+Run: `cd mvp && .venv/bin/python -m pytest tests/unit/agents/test_repository.py tests/unit/api/test_agents.py tests/unit/orchestration/test_project_context.py tests/unit/conversations/test_repository.py tests/unit/workflow/test_repository.py -v`
+
+```bash
+git add mvp/src/workbench/agents mvp/src/workbench/api/agents.py mvp/src/workbench/api/app.py mvp/src/workbench/orchestration/project_context.py mvp/src/workbench/workflow/schema.py mvp/tests/unit/agents mvp/tests/unit/api/test_agents.py mvp/tests/unit/orchestration/test_project_context.py
+git commit -m "feat: persist agent and project context snapshots"
+```
+
+---
+
+### Task 3: Private Context, Structured Handoff, Review, and HTML Publication
 
 **Files:**
 - Create: `mvp/src/workbench/orchestration/context.py`
@@ -101,6 +187,7 @@ git commit -m "feat: compile sequential agent plans"
 
 **Interfaces:**
 - Produces `ContextResolver.build(node, common, private_messages, handoffs, rework) -> AgentContextPackage`.
+- Consumes a frozen `ProjectContextVersion`; only entries visible to the target Agent enter the package.
 - Produces `HandoffPublisher.publish(source, target, result) -> Handoff`.
 - Produces `ReviewDecisionParser.parse(text, reviewer, attempt) -> ReviewDecision`.
 - Produces `HtmlArtifactPublisher.publish(output, identifiers) -> ArtifactRef`.
@@ -113,6 +200,14 @@ def test_architect_context_excludes_product_manager_private_history(resolver):
     assert "架构师私有历史" in package.rendered_prompt
     assert "产品经理未发布草稿" not in package.rendered_prompt
     assert "已发布小说" in package.rendered_prompt
+
+
+def test_context_uses_one_source_attributed_project_version(resolver):
+    package = resolver.build(
+        architect_node(), project_context(version=3), private_messages(), [], None
+    )
+    assert package.project_context_version == 3
+    assert package.project_sources == ["artifact:requirements-v2"]
 
 
 def test_rejected_review_requires_evidence_and_rework(parser):
@@ -148,7 +243,7 @@ git commit -m "feat: isolate agent handoffs and reviews"
 
 ---
 
-### Task 3: Sequential LangGraph, Automatic Rework, and Progress
+### Task 4: Sequential LangGraph, Automatic Rework, and Progress
 
 **Files:**
 - Create: `mvp/src/workbench/orchestration/sequential_graph.py`
@@ -199,7 +294,7 @@ git commit -m "feat: run sequential review loops"
 
 ---
 
-### Task 4: Conversation Queue, REST/SSE, and Restart Recovery
+### Task 5: Conversation Queue, REST/SSE, and Restart Recovery
 
 **Files:**
 - Modify: `mvp/src/workbench/api/conversations.py`
@@ -211,6 +306,7 @@ git commit -m "feat: run sequential review loops"
 
 **Interfaces:**
 - Extends message request with ordered `agent_bindings` snapshots.
+- Resolves binding requests through the backend `AgentProfileRepository`; client-supplied Provider/Model values cannot override stored profiles.
 - Creates an immutable mention plan before a GraphRun.
 - Projects safe graph/node/progress/Handoff/review/rework/Artifact events through the existing SSE cursor.
 
@@ -260,10 +356,12 @@ git commit -m "feat: persist sequential graph conversations"
 
 ---
 
-### Task 5: Sequential Graph, Review, Progress, and HTML UI
+### Task 6: Sequential Graph, Review, Progress, and HTML UI
 
 **Files:**
 - Modify: `mvp/canvas-spike/src/renderer/api.ts`
+- Modify: `mvp/canvas-spike/src/renderer/agents/AgentCenter.tsx`
+- Modify: `mvp/canvas-spike/src/renderer/models/agentConfig.ts`
 - Create: `mvp/canvas-spike/src/renderer/conversations/SequentialGraph.tsx`
 - Create: `mvp/canvas-spike/src/renderer/conversations/ReviewCard.tsx`
 - Create: `mvp/canvas-spike/src/renderer/conversations/HtmlArtifactPreview.tsx`
@@ -274,6 +372,7 @@ git commit -m "feat: persist sequential graph conversations"
 
 **Interfaces:**
 - Sends ordered Agent bindings without credentials.
+- Loads and saves versioned Agent profiles through the backend Agent API; `localStorage` is used only for non-authoritative view preferences.
 - Reconstructs all node Attempts, progress, reviews, return edges and Artifact refs from SSE replay.
 
 - [ ] **Step 1: Write UI RED test**
@@ -298,7 +397,7 @@ Run: `cd mvp/canvas-spike && npm test -- --grep "sequential reviews"`
 
 - [ ] **Step 3: Implement ordered binding serialization and event reducer**
 
-Resolve mention names longest-first, block unknown/disabled Agents, and send frozen Agent/Provider/Model/kind bindings. Reducer keys by `(run_id, node_id, attempt, sequence)`, preserves old Attempts, and treats backend replay as authoritative.
+Load Agent profiles from `/api/agents`, save edits through credential-free create/replace calls, resolve mention names longest-first, block unknown/disabled Agents, and submit selected Agent IDs/profile versions. The backend resolves the frozen Provider/Model/kind snapshots. Reducer keys by `(run_id, node_id, attempt, sequence)`, preserves old Attempts, and treats backend replay as authoritative.
 
 - [ ] **Step 4: Render graph, reviews, progress, and sandboxed HTML**
 
@@ -315,7 +414,7 @@ git commit -m "feat: render sequential review graphs"
 
 ---
 
-### Task 6: Exact Cross-Model Acceptance Gate
+### Task 7: Exact Cross-Model Acceptance Gate
 
 **Files:**
 - Create: `mvp/tests/acceptance/test_sequential_multi_agent_baseline.py`
@@ -334,6 +433,8 @@ async def test_exact_story_to_animation_review_loop(harness):
     assert result.ordered_agents == ["product-manager", "supervisor", "architect", "verifier"]
     assert result.review_decisions == ["rejected", "approved", "rejected", "approved"]
     assert result.private_context_leaks == []
+    assert result.project_context_versions == [1]
+    assert result.project_context_sources == ["artifact:story-requirements"]
     assert result.restart_repeated_approved_nodes == []
     assert result.html_artifact_is_sandboxable
     assert result.parent_terminal_events == 1
@@ -374,6 +475,8 @@ Expected: no secret matches and decision is `GO_RESEARCH_GRAPH`.
 
 - Exact `@Agent` order is preserved.
 - Every Agent has an independent private context and frozen model binding.
+- Agent profiles are backend-persisted and every Run freezes an exact profile version.
+- Shared Project Context is versioned, source-attributed, verification-aware, and replayable.
 - All cross-Agent inputs are structured Handoffs.
 - Supervisor and Verifier each reject, trigger rework, then approve.
 - Rework creates new Attempts and preserves review/history evidence.
