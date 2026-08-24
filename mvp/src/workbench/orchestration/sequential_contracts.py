@@ -89,6 +89,12 @@ class Handoff(_FrozenContract):
     evidence_refs: tuple[OpaqueReference, ...] = ()
     output_contract: PublicSummary
 
+    @model_validator(mode="after")
+    def require_distinct_nodes(self) -> Handoff:
+        if self.source_node_id == self.target_node_id:
+            raise ValueError("handoff source and target must differ")
+        return self
+
 
 class ReviewDecision(_FrozenContract):
     reviewer_node_id: OpaqueIdentifier
