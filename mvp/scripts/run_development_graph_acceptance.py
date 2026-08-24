@@ -527,7 +527,7 @@ async def run_development_graph_acceptance(
     )
     if inject == "backend":
         backend_command = _command(
-            "integration_backend_full", (sys.executable, "-m", "pytest", "-m", "development_graph_gate", "-q"), integration_workspace / "mvp"
+            "integration_backend_full", (sys.executable, "-m", "pytest", "tests/__forced_missing__.py", "-q"), integration_workspace / "mvp"
         )
     if inject == "electron":
         electron_command = _command(

@@ -26,7 +26,7 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
     )
     assert result["target_branch_unchanged"] is True
     assert result["remote_unchanged"] is True
-    assert result["ownership_violation_blocked"] is True
+    assert result["ownership_violation_blocked"] is (fault != "ownership")
     assert result["rejected_commit_exclusion_exit_code"] == 1
     assert result["dependency_order_verified"] is True
     assert len(result["merge_associations"]) == 3
