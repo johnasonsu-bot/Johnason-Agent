@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from workbench.orchestration.development import (
     CommandPolicy,
     DevelopmentNodeSpec,
     DevelopmentPlan,
+    DevelopmentPlanValidator,
     FileOwnership,
     GitOutputContract,
     InvalidDevelopmentNode,
@@ -33,6 +35,13 @@ def git(*argv: str, cwd: Path) -> str:
         ["git", *argv], cwd=cwd, check=True, capture_output=True, text=True
     )
     return result.stdout.strip()
+
+
+def trusted_python_launcher(repository: Path, name: str = "python") -> Path:
+    launcher = repository / ".venv" / "bin" / name
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.symlink_to(sys.executable)
+    return launcher
 
 
 @pytest.fixture
@@ -237,7 +246,8 @@ def conflict_graph(
 def test_pytest_module_launcher_preserves_existing_addopts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    command = (str(tmp_path / ".venv" / "bin" / "python"), "-m", "pytest", "-q")
+    launcher = trusted_python_launcher(tmp_path)
+    command = (str(launcher), "-m", "pytest", "-q")
     node = DevelopmentNodeSpec(
         node_id="backend",
         repository_root=tmp_path,
@@ -274,6 +284,7 @@ def test_public_graph_builder_accepts_normalized_repository_local_pytest_launche
 ) -> None:
     repository_root = tmp_path / "repo"
     repository_root.mkdir()
+    trusted_python_launcher(repository_root)
     executable = launcher.format(repository_root=repository_root)
     command = (executable, "-m", "pytest", "-q")
     plan = DevelopmentPlan(
@@ -306,16 +317,72 @@ def test_public_graph_builder_accepts_normalized_repository_local_pytest_launche
     assert graph is not None
 
 
+def test_trusted_path_launcher_builds_and_executes_real_pytest(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    trusted_python_launcher(repository)
+    tests = repository / "tests"
+    tests.mkdir()
+    tests.joinpath("test_launcher.py").write_text("def test_launcher():\n    assert True\n")
+    command = (".venv/bin/python", "-m", "pytest", "tests/test_launcher.py", "-q")
+    node = DevelopmentNodeSpec(
+        node_id="trusted-launcher",
+        repository_root=repository,
+        base_commit="a" * 40,
+        ownership=FileOwnership(writable_paths=("src/app.py",)),
+        command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
+        output=GitOutputContract(branch="graph/trusted-launcher/backend"),
+    )
+    candidate = DevelopmentPlan(plan_id="trusted-launcher-plan.1", nodes=(node,))
+    tool = GitWorkspaceTool(
+        worktree_root=tmp_path / "worktrees",
+        ledger=EffectLedger(tmp_path / "effects.sqlite"),
+    )
+
+    assert build_development_graph(
+        open_graph_checkpointer(tmp_path / "development.sqlite"),
+        candidate,
+        DevelopmentHarness(),
+        tool,
+    ) is not None
+    assert _run_allowed_commands(node, repository)[command].startswith("test:")
+
+
+def test_executor_rejects_launcher_replaced_after_plan_validation(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    launcher = trusted_python_launcher(repository)
+    command = (".venv/bin/python", "-m", "pytest", "-q")
+    node = DevelopmentNodeSpec(
+        node_id="replaced-launcher",
+        repository_root=repository,
+        base_commit="a" * 40,
+        ownership=FileOwnership(writable_paths=("src/app.py",)),
+        command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
+        output=GitOutputContract(branch="graph/replaced-launcher/backend"),
+    )
+    candidate = DevelopmentPlan(plan_id="replaced-launcher-plan.1", nodes=(node,))
+
+    assert DevelopmentPlanValidator().validate(candidate).plan == candidate
+    launcher.unlink()
+    launcher.symlink_to("/bin/sh")
+
+    with pytest.raises(
+        DevelopmentGraphError, match="^declared command launcher is no longer trusted$"
+    ):
+        _run_allowed_commands(node, repository)
+
+
 @pytest.mark.parametrize(
-    "launcher",
+    ("launcher", "message"),
     (
-        "../outside/python",
-        "{outside_root}/python",
-        ".venv/../.venv/bin/python",
+        ("../outside/python", "command launcher must be lexically canonical"),
+        ("{outside_root}/python", "command launcher does not exist"),
+        (".venv/../.venv/bin/python", "command launcher must be lexically canonical"),
     ),
 )
 def test_public_graph_builder_rejects_escaped_or_non_normalized_pytest_launchers(
-    tmp_path: Path, launcher: str
+    tmp_path: Path, launcher: str, message: str
 ) -> None:
     repository_root = tmp_path / "repo"
     repository_root.mkdir()
@@ -341,7 +408,7 @@ def test_public_graph_builder_rejects_escaped_or_non_normalized_pytest_launchers
         ledger=EffectLedger(tmp_path / "effects.sqlite"),
     )
 
-    with pytest.raises(InvalidDevelopmentNode, match="command executable is outside repository"):
+    with pytest.raises(InvalidDevelopmentNode, match=f"^{message}$"):
         build_development_graph(
             open_graph_checkpointer(tmp_path / "development.sqlite"),
             plan,

@@ -471,9 +471,6 @@ class EffectLedger:
                 or not isinstance(commits, list)
                 or not isinstance(paths, list)
                 or not isinstance(parents, list)
-                or not commits
-                or not paths
-                or len(parents) < 2
                 or not all(isinstance(item, str) and cls._SHA.fullmatch(item) for item in commits)
                 or not all(isinstance(item, str) and item and len(item) <= 240 for item in paths)
                 or not all(isinstance(item, str) and cls._SHA.fullmatch(item) for item in parents)
@@ -481,11 +478,22 @@ class EffectLedger:
                 or not cls._SHA.fullmatch(head)
                 or not isinstance(merge_head, str)
                 or not cls._SHA.fullmatch(merge_head)
-                or head not in parents
-                or merge_head not in commits
-                or merge_head not in parents
             ):
                 raise ValueError("integration conflict effect metadata is invalid")
+            if not commits:
+                raise ValueError("integration conflict commits must not be empty")
+            if not paths:
+                raise ValueError("integration conflict paths must not be empty")
+            if not parents:
+                raise ValueError("integration conflict parent graph must not be empty")
+            if len(parents) < 2:
+                raise ValueError("integration conflict parent graph is invalid")
+            if head not in parents:
+                raise ValueError("integration conflict HEAD must belong to parent graph")
+            if merge_head not in commits:
+                raise ValueError("integration conflict MERGE_HEAD must belong to commits")
+            if merge_head not in parents:
+                raise ValueError("integration conflict MERGE_HEAD must belong to parent graph")
             return
         commits = value.get("commits")
         if (

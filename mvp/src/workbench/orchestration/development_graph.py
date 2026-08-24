@@ -160,6 +160,9 @@ def _run_allowed_commands(
     evidence: dict[tuple[str, ...], str] = {}
     for command in dict.fromkeys(node.command_policy.allowed_commands):
         try:
+            execution_command = node.command_policy.execution_command(
+                command, repository_root=workspace
+            )
             environment = dict(os.environ)
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
             is_pytest = Path(command[0]).name == "pytest" or any(
@@ -172,7 +175,7 @@ def _run_allowed_commands(
                     item for item in (existing, "-p no:cacheprovider") if item
                 )
             result = subprocess.run(
-                command,
+                execution_command,
                 cwd=workspace,
                 text=True,
                 capture_output=True,
@@ -181,6 +184,10 @@ def _run_allowed_commands(
                 check=False,
                 env=environment,
             )
+        except ValueError as error:
+            raise DevelopmentGraphError(
+                "declared command launcher is no longer trusted"
+            ) from error
         except (OSError, subprocess.TimeoutExpired) as error:
             raise DevelopmentGraphError("declared test could not complete") from error
         evidence[command] = _evidence_ref(command, result)

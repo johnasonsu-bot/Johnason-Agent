@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -16,6 +17,13 @@ from workbench.orchestration.planning import PlannerCompiler
 
 
 BASE_SHA = "a" * 40
+
+
+def trusted_python_launcher(repository: Path, name: str = "python") -> Path:
+    launcher = repository / ".venv" / "bin" / name
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.symlink_to(sys.executable)
+    return launcher
 
 
 def node(
@@ -163,13 +171,19 @@ def test_allows_declared_test_output_inside_writable_ownership() -> None:
     assert DevelopmentPlanValidator().validate(candidate).plan == candidate
 
 
-@pytest.mark.parametrize("launcher", (".venv/bin/python", "{repository}/.venv/bin/python"))
+@pytest.mark.parametrize("relative", (True, False))
 def test_allows_only_normalized_repository_local_python_pytest_launchers(
-    tmp_path: Path, launcher: str
+    tmp_path: Path, relative: bool
 ) -> None:
     repository = tmp_path / "repo"
     repository.mkdir()
-    command = (launcher.format(repository=repository), "-m", "pytest", "-q")
+    launcher = trusted_python_launcher(repository)
+    command = (
+        ".venv/bin/python" if relative else str(launcher),
+        "-m",
+        "pytest",
+        "-q",
+    )
     candidate = plan(
         node(
             "local-launcher",
@@ -185,7 +199,7 @@ def test_allows_only_normalized_repository_local_python_pytest_launchers(
 
 @pytest.mark.parametrize(
     "launcher",
-    ("../outside/python", "{outside}/python", ".venv/../.venv/bin/python"),
+    ("../outside/python", ".venv/../.venv/bin/python"),
 )
 def test_rejects_escaped_or_non_normalized_python_pytest_launchers(
     tmp_path: Path, launcher: str
@@ -193,7 +207,7 @@ def test_rejects_escaped_or_non_normalized_python_pytest_launchers(
     repository = tmp_path / "repo"
     repository.mkdir()
     command = (
-        launcher.format(outside=tmp_path / "outside"),
+        launcher,
         "-m",
         "pytest",
         "-q",
@@ -208,7 +222,108 @@ def test_rejects_escaped_or_non_normalized_python_pytest_launchers(
         )
     )
 
-    with pytest.raises(InvalidDevelopmentNode, match="command executable is outside repository"):
+    with pytest.raises(
+        InvalidDevelopmentNode, match="command launcher must be lexically canonical"
+    ):
+        DevelopmentPlanValidator().validate(candidate)
+
+
+@pytest.mark.parametrize(
+    "launcher",
+    (
+        "./.venv/bin/python",
+        ".venv//bin/python",
+        ".venv/bin/./python",
+        ".venv/bin/python/",
+    ),
+)
+def test_rejects_lexically_noncanonical_python_launcher(
+    tmp_path: Path, launcher: str
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    trusted_python_launcher(repository)
+    command = (launcher, "-m", "pytest", "-q")
+    candidate = plan(
+        node(
+            "unsafe-launcher",
+            writes=("src/app.py",),
+            commands=(command,),
+            tests=(command,),
+            repository_root=repository,
+        )
+    )
+
+    with pytest.raises(
+        InvalidDevelopmentNode, match="command launcher must be lexically canonical"
+    ):
+        DevelopmentPlanValidator().validate(candidate)
+
+
+def test_rejects_missing_python_launcher_at_validation(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    command = (".venv/bin/python", "-m", "pytest", "-q")
+    candidate = plan(
+        node(
+            "missing-launcher",
+            writes=("src/app.py",),
+            commands=(command,),
+            tests=(command,),
+            repository_root=repository,
+        )
+    )
+
+    with pytest.raises(
+        InvalidDevelopmentNode, match="command launcher does not exist"
+    ):
+        DevelopmentPlanValidator().validate(candidate)
+
+
+def test_rejects_python_named_symlink_to_an_arbitrary_executable(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    launcher = repository / ".venv" / "bin" / "python"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to("/bin/sh")
+    command = (".venv/bin/python", "-m", "pytest", "-q")
+    candidate = plan(
+        node(
+            "arbitrary-launcher",
+            writes=("src/app.py",),
+            commands=(command,),
+            tests=(command,),
+            repository_root=repository,
+        )
+    )
+
+    with pytest.raises(
+        InvalidDevelopmentNode,
+        match="command launcher is not the trusted Python interpreter",
+    ):
+        DevelopmentPlanValidator().validate(candidate)
+
+
+def test_rejects_pytest_path_script_even_when_it_points_to_trusted_python(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    trusted_python_launcher(repository, "pytest")
+    command = (".venv/bin/pytest", "-q")
+    candidate = plan(
+        node(
+            "pytest-script",
+            writes=("src/app.py",),
+            commands=(command,),
+            tests=(command,),
+            repository_root=repository,
+        )
+    )
+
+    with pytest.raises(
+        InvalidDevelopmentNode, match="command executable is not allowlisted"
+    ):
         DevelopmentPlanValidator().validate(candidate)
 
 

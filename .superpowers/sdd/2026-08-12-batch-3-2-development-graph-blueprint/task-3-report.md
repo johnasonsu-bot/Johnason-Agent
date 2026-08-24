@@ -149,3 +149,33 @@
   the focused development-plan validator files. The scoped sensitive-pattern
   scan found only an existing negative fixture that verifies `API_KEY` metadata
   is rejected; no credential value was added.
+
+## Fix round 5
+
+- Path-form launchers now accept only a lexically canonical existing
+  `python`/`python3` path that is the same file as the current trusted
+  interpreter. The check runs when the plan is validated and again immediately
+  before execution. Execution pins the argv launcher to `sys.executable`.
+- Bare tool names retain the existing command policy. Path-form `pytest`,
+  missing launchers, noncanonical spellings, and a Python-named link to an
+  arbitrary executable are rejected.
+- A canonical absolute `sys.executable` remains accepted by controller ruling:
+  it is the exact trusted target that execution pins, not a user-controlled
+  external executable.
+- Added a real pytest execution test after public graph construction and a
+  regression test that replaces the initially trusted launcher before command
+  execution; the executor rejects it before spawning a process.
+- Conflict-effect validation now gives separate exact errors for empty commits,
+  paths, parent graph, missing `HEAD` parent membership, missing `MERGE_HEAD`
+  commit membership, and missing `MERGE_HEAD` parent membership.
+
+### Fix round 5 verification
+
+- RED: 17 new launcher and conflict-invariant assertions failed against the
+  preceding implementation, showing that path launchers were not pinned to the
+  trusted interpreter and conflict errors were not independently classified.
+- GREEN: the focused development graph integration suite passed in three
+  bounded segments (11 + 5 + 4 = 20 tests); development-plan, effect-ledger,
+  and Git-workspace unit suites passed (62 tests).
+- `compileall` and `git diff --check` passed for every changed source and test
+  file. A scoped sensitive-pattern scan found no secret values.

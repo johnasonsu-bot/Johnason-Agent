@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
+import sys
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -146,28 +147,54 @@ class CommandPolicy(_Frozen):
 
     @staticmethod
     def _canonical_executable(value: str, *, repository_root: Path | None) -> str:
-        """Allow bare tools plus Python/pytest launchers confined to the repository."""
-        normalized = value.replace("\\", "/")
-        path = PurePosixPath(normalized)
+        """Allow bare tools and only trusted path-form Python launchers."""
         windows = PureWindowsPath(value)
-        if path.name == normalized and not windows.drive and not path.is_absolute():
-            return path.name.lower()
+        if "/" not in value and "\\" not in value and not windows.drive:
+            return value.lower()
         if repository_root is None:
             raise ValueError("command executable is not allowlisted")
-        if windows.is_absolute() or windows.drive or ".." in path.parts:
-            raise ValueError("command executable is outside repository")
-        candidate = Path(normalized)
-        resolved = (
-            candidate.resolve(strict=False)
-            if candidate.is_absolute()
-            else (repository_root / candidate).resolve(strict=False)
-        )
-        if not resolved.is_relative_to(repository_root):
-            raise ValueError("command executable is outside repository")
-        executable = resolved.name.lower()
-        if executable not in {"python", "python3", "pytest"}:
+        return CommandPolicy._trusted_python_launcher(
+            value, repository_root=repository_root
+        ).name.lower()
+
+    @staticmethod
+    def _trusted_python_launcher(value: str, *, repository_root: Path) -> Path:
+        """Validate a path-form launcher without following a substituted command."""
+        lexical = PurePosixPath(value)
+        windows = PureWindowsPath(value)
+        if (
+            "\\" in value
+            or "//" in value
+            or value.endswith("/")
+            or "." in lexical.parts
+            or ".." in lexical.parts
+            or windows.drive
+            or value != str(lexical)
+        ):
+            raise ValueError("command launcher must be lexically canonical")
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = repository_root / candidate
+        if candidate.name.lower() not in {"python", "python3"}:
             raise ValueError("command executable is not allowlisted")
-        return executable
+        if not candidate.exists():
+            raise ValueError("command launcher does not exist")
+        try:
+            if not candidate.samefile(sys.executable):
+                raise ValueError("command launcher is not the trusted Python interpreter")
+        except OSError as error:
+            raise ValueError("command launcher does not exist") from error
+        return candidate
+
+    def execution_command(
+        self, command: tuple[str, ...], *, repository_root: Path
+    ) -> tuple[str, ...]:
+        """Revalidate path launchers at execution time and pin them to Python."""
+        value = command[0]
+        if "/" not in value and "\\" not in value and not PureWindowsPath(value).drive:
+            return command
+        self._trusted_python_launcher(value, repository_root=repository_root)
+        return (sys.executable, *command[1:])
 
     @staticmethod
     def _canonical_tool(

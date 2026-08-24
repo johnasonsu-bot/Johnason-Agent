@@ -45,23 +45,36 @@ def valid_integration_conflict_result() -> dict[str, object]:
 
 
 @pytest.mark.parametrize(
-    "mutation",
+    ("mutation", "message"),
     (
-        pytest.param(lambda result: result.update(commits=[]), id="empty-commits"),
-        pytest.param(lambda result: result.update(paths=[]), id="empty-paths"),
         pytest.param(
-            lambda result: result.update(parent_graph=[]), id="empty-parent-graph"
+            lambda result: result.update(commits=[]),
+            "integration conflict commits must not be empty",
+            id="empty-commits",
+        ),
+        pytest.param(
+            lambda result: result.update(paths=[]),
+            "integration conflict paths must not be empty",
+            id="empty-paths",
+        ),
+        pytest.param(
+            lambda result: result.update(parent_graph=[]),
+            "integration conflict parent graph must not be empty",
+            id="empty-parent-graph",
         ),
         pytest.param(
             lambda result: result.update(parent_graph=[result["merge_head"], "c" * 40]),
+            "integration conflict HEAD must belong to parent graph",
             id="head-absent-from-parent-graph",
         ),
         pytest.param(
             lambda result: result.update(commits=[result["head"]]),
+            "integration conflict MERGE_HEAD must belong to commits",
             id="merge-head-absent-from-commits",
         ),
         pytest.param(
             lambda result: result.update(parent_graph=[result["head"], "c" * 40]),
+            "integration conflict MERGE_HEAD must belong to parent graph",
             id="merge-head-absent-from-parent-graph",
         ),
     ),
@@ -69,12 +82,13 @@ def valid_integration_conflict_result() -> dict[str, object]:
 def test_conflict_effect_rejects_one_malformed_invariant_at_a_time(
     tmp_path: Path,
     mutation: Callable[[dict[str, object]], None],
+    message: str,
 ) -> None:
     ledger = EffectLedger(tmp_path / "workflow.sqlite3")
     expected_result = valid_integration_conflict_result()
     mutation(expected_result)
 
-    with pytest.raises(ValueError, match="integration conflict effect metadata"):
+    with pytest.raises(ValueError, match=f"^{message}$"):
         ledger.reserve(
             "conflict-op",
             effect_kind="git_integration_conflict",
