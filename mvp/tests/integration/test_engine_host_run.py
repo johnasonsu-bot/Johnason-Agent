@@ -401,10 +401,11 @@ async def test_cancel_is_idempotent_and_emits_one_terminal() -> None:
 async def test_cancel_timeout_fails_run_and_reaps_unavailable_host() -> None:
     client = EngineHostClient(
         fake_host_command("ignore_cancel"),
-        request_timeout=0.05,
+        request_timeout=0.5,
         shutdown_timeout=0.05,
     )
     await client.start()
+    client.request_timeout = 0.05
     consumer = asyncio.create_task(_collect(client.run_turn(turn())))
     try:
         await _wait_until_host_started(client, "run-1")
