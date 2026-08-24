@@ -301,7 +301,12 @@ class PlannerCompiler:
     )
 
     def compile(
-        self, goal: str, catalog: AgentCatalog, resources: ResearchResources
+        self,
+        goal: str,
+        catalog: AgentCatalog,
+        resources: ResearchResources,
+        *,
+        identity_scope: str | None = None,
     ) -> ResearchPlanDraft:
         return build_research_plan(
             goal=goal,
@@ -309,7 +314,7 @@ class PlannerCompiler:
             resources=resources,
             compiler_source="planner",
             compiler_ref="planner:research-v1",
-            identity_material={"goal": goal},
+            identity_material={"goal": goal, "identity_scope": identity_scope},
         )
 
 

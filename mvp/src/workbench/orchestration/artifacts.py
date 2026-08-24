@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from workbench.artifacts.store import ArtifactRef, ArtifactStore
 from workbench.orchestration.contracts import OpaqueIdentifier
+from workbench.orchestration.research_graph import MergeResult
 
 
 class InvalidHtmlArtifact(ValueError):
@@ -67,3 +68,65 @@ class HtmlArtifactPublisher:
             "sandbox_required": True,
         }
         return self.store.put_bytes(candidate.encode("utf-8"), "text/html", metadata)
+
+
+class ResearchReportIdentifiers(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    graph_run_id: OpaqueIdentifier
+    plan_id: OpaqueIdentifier
+    version: int = Field(ge=1)
+
+
+class ResearchReportPublisher:
+    """Publish a verified claim-to-evidence report with metadata-only headers."""
+
+    def __init__(self, store: ArtifactStore) -> None:
+        self.store = store
+
+    def publish(
+        self,
+        goal: str,
+        result: MergeResult,
+        identifiers: ResearchReportIdentifiers,
+    ) -> ArtifactRef:
+        def bullets(values: tuple[str, ...]) -> str:
+            return "\n".join(f"- {value}" for value in values) or "- 无"
+
+        evidence_rows = "\n".join(
+            "| "
+            + claim.claim.replace("|", "\\|")
+            + " | "
+            + ", ".join(claim.evidence_refs).replace("|", "\\|")
+            + " |"
+            for claim in result.claims
+        )
+        report = "\n".join(
+            (
+                f"# {goal}",
+                "",
+                "## 结论",
+                result.summary,
+                "",
+                "## 证据映射",
+                "| 结论 | EvidenceRef |",
+                "|---|---|",
+                evidence_rows,
+                "",
+                "## 排除项",
+                bullets(result.exclusions),
+                "",
+                "## 限制",
+                bullets(result.limitations),
+                "",
+                "## 未决问题",
+                bullets(result.open_questions),
+                "",
+            )
+        )
+        metadata = identifiers.model_dump(mode="json") | {
+            "artifact_kind": "verified_research_report"
+        }
+        return self.store.put_bytes(
+            report.encode("utf-8"), "text/markdown", metadata
+        )

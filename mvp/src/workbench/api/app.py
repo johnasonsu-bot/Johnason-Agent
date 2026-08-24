@@ -22,6 +22,7 @@ from workbench.api.conversations import (
     conversation_router,
 )
 from workbench.api.engine_host import engine_host_router
+from workbench.api.graph_plans import GraphPlanAPI, graph_plan_router
 from workbench.api.providers import provider_router, vault_router
 from workbench.conversations.repository import ConversationRepository
 from workbench.conversations.worker import ConversationTaskWorker
@@ -168,6 +169,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         return await call_next(request)
 
     app.include_router(conversation_router(conversation_api))
+    app.include_router(graph_plan_router(GraphPlanAPI(settings.database)))
     app.include_router(agent_router(agent_profiles))
     app.include_router(
         artifact_router(settings.database, settings.database.parent / "artifacts")

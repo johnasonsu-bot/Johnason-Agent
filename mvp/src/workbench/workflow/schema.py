@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 12
+PHASE1_SCHEMA_VERSION = 13
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -168,6 +168,21 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (plan_id, version),
             FOREIGN KEY (plan_id, version)
                 REFERENCES graph_execution_plans(plan_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS research_plan_owners (
+            plan_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS research_plan_commands (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
         );
         CREATE TABLE IF NOT EXISTS graph_plan_approvals (
             approval_id TEXT PRIMARY KEY,

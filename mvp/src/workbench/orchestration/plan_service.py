@@ -79,8 +79,16 @@ class PlanService:
         goal: str,
         catalog: AgentCatalog,
         resources: ResearchResources,
+        *,
+        identity_scope: str | None = None,
     ) -> ResearchPlanDraft:
-        draft = PlannerCompiler().compile(goal, catalog, resources)
+        draft = PlannerCompiler().compile(
+            goal, catalog, resources, identity_scope=identity_scope
+        )
+        self._persist(draft)
+        return draft
+
+    def persist(self, draft: ResearchPlanDraft) -> ResearchPlanDraft:
         self._persist(draft)
         return draft
 

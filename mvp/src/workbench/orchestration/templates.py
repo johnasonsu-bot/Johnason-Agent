@@ -23,6 +23,8 @@ class SolutionTemplateCompiler:
         inputs: dict[str, Any],
         catalog: AgentCatalog,
         resources: ResearchResources,
+        *,
+        identity_scope: str | None = None,
     ) -> ResearchPlanDraft:
         if (template_id, template_version) not in self.SUPPORTED:
             raise KeyError((template_id, template_version))
@@ -40,5 +42,6 @@ class SolutionTemplateCompiler:
                 "template_id": template_id,
                 "template_version": template_version,
                 "inputs": inputs,
+                "identity_scope": identity_scope,
             },
         )
