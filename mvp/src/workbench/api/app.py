@@ -11,7 +11,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from workbench.adapters.hermes.runner import AgentStepRunner
+from workbench.agents.repository import AgentProfileRepository
 from workbench.api.agui import stream_run_events
+from workbench.api.agents import agent_router
 from workbench.api.commands import CreateRunRequest, InterventionRequest
 from workbench.api.conversations import ConversationAPI, conversation_router
 from workbench.api.engine_host import engine_host_router
@@ -133,6 +135,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         return await call_next(request)
 
     app.include_router(conversation_router(conversation_api))
+    app.include_router(agent_router(AgentProfileRepository(settings.database)))
     status_source = settings.runner
     if not (
         hasattr(status_source, "status") and hasattr(status_source, "runner_mode")

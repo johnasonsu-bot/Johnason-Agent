@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 9
+PHASE1_SCHEMA_VERSION = 10
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -197,6 +197,33 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
         );
+        CREATE TABLE IF NOT EXISTS agent_profiles (
+            agent_id TEXT PRIMARY KEY,
+            current_version INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_profile_versions (
+            agent_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (agent_id, version),
+            FOREIGN KEY (agent_id) REFERENCES agent_profiles(agent_id)
+        );
+        CREATE TABLE IF NOT EXISTS project_context_versions (
+            project_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (project_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS project_context_entries (
+            project_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            entry_json TEXT NOT NULL,
+            PRIMARY KEY (project_id, version, ordinal),
+            FOREIGN KEY (project_id, version)
+                REFERENCES project_context_versions(project_id, version)
+        );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
         BEGIN
@@ -216,6 +243,36 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         BEFORE DELETE ON public_graph_projections
         BEGIN
             SELECT RAISE(ABORT, 'public graph projections are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS agent_profile_versions_no_update
+        BEFORE UPDATE ON agent_profile_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent profile versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS agent_profile_versions_no_delete
+        BEFORE DELETE ON agent_profile_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent profile versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_versions_no_update
+        BEFORE UPDATE ON project_context_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'project context versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_versions_no_delete
+        BEFORE DELETE ON project_context_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'project context versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_entries_no_update
+        BEFORE UPDATE ON project_context_entries
+        BEGIN
+            SELECT RAISE(ABORT, 'project context entries are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_entries_no_delete
+        BEFORE DELETE ON project_context_entries
+        BEGIN
+            SELECT RAISE(ABORT, 'project context entries are append-only');
         END;
         CREATE TRIGGER IF NOT EXISTS graph_execution_plans_no_change_when_approved
         BEFORE UPDATE ON graph_execution_plans
