@@ -473,24 +473,11 @@ async def run_development_graph_acceptance(
 ) -> dict[str, Any]:
     runtime_dir = runtime_dir.resolve()
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    if inject == "exception":
-        raise RuntimeError("injected acceptance exception")
     repository, original_target_sha, remote_before = _create_fixture_repository(runtime_dir)
     calls = DurableCalls(runtime_dir / "acceptance-calls.sqlite")
     ownership_violation_blocked = _ownership_violation_probe(
         repository, original_target_sha, runtime_dir
     )
-    if inject is not None:
-        if inject == "remote":
-            _git(runtime_dir / "offline-remote.git", "update-ref", "refs/heads/fault", original_target_sha)
-        remote_after = _remote_snapshot(runtime_dir / "offline-remote.git")
-        return {
-            "decision": "BLOCKED",
-            "error_kind": f"injected_{inject}",
-            "ownership_violation_blocked": ownership_violation_blocked if inject != "ownership" else False,
-            "remote_unchanged": remote_before == remote_after,
-            "integration_commands": [],
-        }
     arbitration_interrupts = await _exercise_conflict_probe(
         repository=repository, base_sha=original_target_sha, runtime_dir=runtime_dir, calls=calls
     )
@@ -532,16 +519,20 @@ async def run_development_graph_acceptance(
         fixture_venv.symlink_to(controller_venv)
     backend_command = _command(
         "integration_backend_full",
-        (sys.executable, "-m", "pytest", "tests/unit", "tests/integration", "tests/acceptance", "-q"),
+        (sys.executable, "-m", "pytest", "tests/unit", "tests/integration", "tests/acceptance", "-q", "-m", "not development_graph_gate"),
         integration_workspace / "mvp",
     )
     electron_command = _command(
         "integration_electron_playwright_full", ("npm", "test"), integration_workspace / "mvp/canvas-spike"
     )
     if inject == "backend":
-        backend_command = {"label": "integration_backend_full", "exit_code": 1, "result_digest": "injected"}
+        backend_command = _command(
+            "integration_backend_full", (sys.executable, "-m", "pytest", "-m", "development_graph_gate", "-q"), integration_workspace / "mvp"
+        )
     if inject == "electron":
-        electron_command = {"label": "integration_electron_playwright_full", "exit_code": 1, "result_digest": "injected"}
+        electron_command = _command(
+            "integration_electron_playwright_full", ("npm", "test", "--", "--grep", "__forced_missing_gate__"), integration_workspace / "mvp/canvas-spike"
+        )
     if inject == "remote":
         bare = runtime_dir / "offline-remote.git"
         _git(bare, "update-ref", "refs/heads/fault", original_target_sha)
@@ -560,7 +551,27 @@ async def run_development_graph_acceptance(
         if len(candidates) != 1:
             continue
         item = candidates[0]
-        associations.append({"branch": node.node_id, "attempt": item["attempt"], "test_evidence_count": len(item["test_evidence"]), "approved": final_reviews.get((node.node_id, int(item["attempt"]))) == "approved"})
+        dependency_commits = [
+            next(
+                str(candidate["commit_sha"])
+                for candidate in branch_results
+                if isinstance(candidate, dict)
+                and candidate["branch_id"] == dependency
+                and candidate["commit_sha"] in commits
+            )
+            for dependency in node.depends_on
+        ]
+        associations.append({
+            "branch": node.node_id,
+            "attempt": item["attempt"],
+            "commit_sha": item["commit_sha"],
+            "commit_digest": sha256(str(item["commit_sha"]).encode()).hexdigest(),
+            "declared_command_digest": sha256("\0".join(node.command_policy.tests[0]).encode()).hexdigest(),
+            "actual_test_evidence_digest": sha256("\0".join(item["test_evidence"]).encode()).hexdigest(),
+            "dependency_commit_digest": sha256("\0".join(dependency_commits).encode()).hexdigest(),
+            "test_evidence_count": len(item["test_evidence"]),
+            "approved": final_reviews.get((node.node_id, int(item["attempt"]))) == "approved",
+        })
     dependency_order_verified = (
         len(commits) == len(plan.nodes)
         and all(commits.index(next(item["commit_sha"] for item in branch_results if isinstance(item, dict) and item["branch_id"] == node.node_id and item["commit_sha"] in commits)) > max((commits.index(next(item["commit_sha"] for item in branch_results if isinstance(item, dict) and item["branch_id"] == dependency and item["commit_sha"] in commits)) for dependency in node.depends_on), default=-1) for node in plan.nodes)
@@ -603,10 +614,13 @@ async def run_development_graph_acceptance(
         == original_target_sha,
         "remote_unchanged": remote_before == remote_after,
         "status": release.get("status"),
+        "completed_stages": ["conflict_probe", "main_graph", "integration_commands"],
+        "error_kind": f"injected_{inject}" if inject else "",
     }
     result["decision"] = (
         "GO_RELEASE_APPROVAL"
-        if len(result["worker_worktrees"]) >= 3 and distinct_worktrees
+        if inject is None
+        and len(result["worker_worktrees"]) >= 3 and distinct_worktrees
         and result["all_local_reviews_approved"]
         and result["full_backend_passed"]
         and result["full_playwright_passed"]
@@ -640,13 +654,17 @@ def main(argv: list[str] | None = None) -> int:
         "--output", type=Path, default=Path(".runtime/development-graph-results.json")
     )
     parser.add_argument("--inject", choices=("ownership", "backend", "electron", "remote", "missing_evidence", "exception"))
-    args = parser.parse_args(argv)
+    output = Path(".runtime/development-graph-results.json")
     try:
+        args = parser.parse_args(argv)
+        output = args.output
         run_directory = args.output.parent / f"development-run-{uuid4().hex}"
         result = asyncio.run(run_development_graph_acceptance(run_directory, inject=args.inject))
-    except (AssertionError, GitWorkspaceError, subprocess.SubprocessError, TimeoutError, OSError, RuntimeError, ValueError) as error:
-        result = {"decision": "BLOCKED", "error_kind": type(error).__name__}
-    _write_result(args.output, result)
+    except SystemExit as error:
+        result = {"decision": "BLOCKED", "error_kind": type(error).__name__, "completed_stages": []}
+    except Exception as error:
+        result = {"decision": "BLOCKED", "error_kind": type(error).__name__, "completed_stages": []}
+    _write_result(output, result)
     print(result["decision"])
     return 0 if result["decision"] == "GO_RELEASE_APPROVAL" else 1
 

@@ -9,6 +9,7 @@ from scripts.run_development_graph_acceptance import run_development_graph_accep
 
 
 @pytest.mark.asyncio
+@pytest.mark.development_graph_gate
 async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) -> None:
     result = await run_development_graph_acceptance(tmp_path)
 
@@ -29,7 +30,12 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
     assert result["dependency_order_verified"] is True
     assert len(result["merge_associations"]) == 3
     assert all(
-        item["approved"] and item["test_evidence_count"]
+        item["approved"]
+        and item["test_evidence_count"]
+        and item["commit_sha"]
+        and item["declared_command_digest"]
+        and item["actual_test_evidence_digest"]
+        and item["dependency_commit_digest"]
         for item in result["merge_associations"]
     )
     assert all(command["exit_code"] == 0 for command in result["integration_commands"])
@@ -65,6 +71,16 @@ async def test_fault_injections_write_metadata_only_blocked_result(
     result = json.loads(output.read_text(encoding="utf-8"))
     assert result["decision"] == "BLOCKED"
     assert result["error_kind"]
+    assert "main_graph" in result["completed_stages"]
+    assert result["target_branch_unchanged"] is True
+    assert result["ownership_violation_blocked"] is True
+    if fault in {"backend", "electron"}:
+        assert any(command["exit_code"] != 0 for command in result["integration_commands"])
+    if fault == "remote":
+        assert result["remote_unchanged"] is False
+    if fault == "missing_evidence":
+        assert result["integration_commands"]
+        assert result["merge_associations"] == []
     serialized = json.dumps(result, sort_keys=True)
     assert "github_pat_" not in serialized
     assert str(tmp_path) not in serialized
