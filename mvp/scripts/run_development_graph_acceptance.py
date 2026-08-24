@@ -537,7 +537,7 @@ async def run_development_graph_acceptance(
         )
     if inject == "remote":
         bare = runtime_dir / "offline-remote.git"
-        _git(bare, "update-ref", "refs/heads/fault", original_target_sha)
+        _git(bare, "update-ref", "refs/heads/fault", _git(bare, "rev-parse", "refs/heads/main"))
     remote_after = _remote_snapshot(runtime_dir / "offline-remote.git")
     if inject == "ownership":
         ownership_violation_blocked = False
