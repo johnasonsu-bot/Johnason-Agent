@@ -317,6 +317,12 @@ class PlannerCompiler:
             identity_material={"goal": goal, "identity_scope": identity_scope},
         )
 
+    def validate_development(self, plan: Any):
+        """Stable compiler extension point for future solution templates."""
+        from workbench.orchestration.development import DevelopmentPlanValidator
+
+        return DevelopmentPlanValidator().validate(plan)
+
 
 def _node_id(seed: str, role: str, suffix: str = "") -> str:
     return f"node.{uuid5(NAMESPACE_URL, f'{seed}:{role}:{suffix}').hex}"
