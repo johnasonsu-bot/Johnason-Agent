@@ -42,7 +42,15 @@ function isApiRequest(value: unknown): value is ApiRequest {
     const orchestrationResumePath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orchestrations\/[A-Za-z0-9_-]{1,128}\/resume$/.exec(request.path);
     const agentPath = /^\/agents(?:\/[A-Za-z0-9_-]{1,64})?$/.exec(request.path);
     const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}$/i.exec(request.path);
-    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath) return false;
+    const graphPlanPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/plans(?:\/[A-Za-z0-9._:-]{1,128}\/versions\/\d+(?:\/(approve|replan))?)?$/.exec(request.path);
+    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath && !graphPlanPath) return false;
+    if (graphPlanPath) {
+      const operation = graphPlanPath[1];
+      return (!operation && request.method === "GET")
+        || (operation === "approve" && request.method === "POST")
+        || (operation === "replan" && request.method === "POST")
+        || (/\/plans$/.test(request.path) && request.method === "POST");
+    }
     if (artifactPath) return request.method === "GET";
     if (agentPath) {
       return (request.path === "/agents" && ["GET", "POST"].includes(request.method))

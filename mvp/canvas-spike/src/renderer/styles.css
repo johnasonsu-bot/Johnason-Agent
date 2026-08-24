@@ -73,6 +73,7 @@ h1, h2, h3, p { margin-top: 0; }
 .conversation-status-pill { color: #1769d1; border: 1px solid #b6d2f5; border-radius: 999px; background: #f1f7ff; padding: 6px 9px; font-size: 10px; }
 .conversation-source, .conversation-status { padding: 5px 20px; color: #788296; font-size: 10px; }
 .conversation-status.running { color: #1769d1; }
+.conversation-execution-panels { min-width: 0; max-height: 420px; overflow: auto; }
 .conversation-main > [aria-label="AG-UI conversation timeline"] { min-width: 0; overflow: auto !important; padding: 14px 20px 8px !important; background: #f8f9fb !important; }
 .v4-composer { position: relative; margin: 0 17px 14px; padding: 7px 10px 7px; border: 1px solid #cbd4e1; border-radius: 14px; background: #fff; box-shadow: 0 8px 22px rgba(31,43,65,.1); z-index: 10; }
 .v4-composer textarea { display: block; width: 100%; min-height: 40px; resize: none; padding: 6px 4px; border: 0; outline: 0; color: #172235; line-height: 1.5; }
@@ -319,6 +320,21 @@ input, select { min-height: 37px; border: 1px solid #ccd6e3; border-radius: 7px;
 .review-card small { color: #788296; font-size: 8px; }
 .human-approval { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; padding: 9px; border: 1px solid #b8d5f5; border-radius: 8px; background: #eef6ff; font-size: 10px; }
 .sequential-warning { margin: 8px 0 0; padding: 7px 9px; border: 1px solid #ead7ae; border-radius: 7px; background: #fffaf0; color: #7a5100; font-size: 9px; }
+.research-plan-launch { padding: 8px 20px; border-block: 1px solid #e7ebf0; background: #fbfcfe; }
+.research-plan-launch button, .research-plan footer button { border: 0; border-radius: 7px; padding: 7px 11px; background: #0e2841; color: #fff; font-weight: 700; }
+.research-plan { max-height: 340px; overflow: auto; padding: 12px 20px; border-block: 1px solid #dce5ef; background: #f7faff; }
+.research-plan > header, .research-run > header, .research-plan > footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.research-plan h3, .research-run h3 { margin: 2px 0; font-size: 14px; }
+.research-plan p { margin: 7px 0; color: #526173; font-size: 10px; }
+.research-plan-nodes { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 6px; }
+.research-plan-nodes article, .research-lanes article, .research-reduce-flow article { padding: 8px; border: 1px solid #dbe4ef; border-radius: 8px; background: #fff; }
+.research-plan-nodes small, .research-plan-nodes em { display: block; margin-top: 3px; color: #667085; font-size: 8px; font-style: normal; }
+.research-plan > footer { margin-top: 9px; color: #667085; font-size: 9px; }
+.research-run { max-height: 340px; overflow: auto; padding: 12px 20px; border-bottom: 1px solid #dce5ef; background: #fff; }
+.research-run code { color: #667085; font-size: 8px; }
+.research-lanes { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 7px; margin-top: 8px; }
+.research-lanes p, .research-reduce-flow p { margin: 5px 0 0; color: #526173; font-size: 9px; }
+.research-reduce-flow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin-top: 8px; }
 .html-artifact { display: grid; gap: 8px; padding: 10px; }
 .html-artifact header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .html-artifact header div { min-width: 0; }

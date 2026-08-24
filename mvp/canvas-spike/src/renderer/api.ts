@@ -166,3 +166,25 @@ export const conversationApi = {
   resume: (sessionId: string, commandId: string) => request<{ status: string }>(`/sessions/${encodeURIComponent(sessionId)}/resume`, { method: "POST", headers: { "Idempotency-Key": commandId } }),
   resumeOrchestration: (sessionId: string, targetCommandId: string, commandId: string) => request<{ status: string }>(`/sessions/${encodeURIComponent(sessionId)}/orchestrations/${encodeURIComponent(targetCommandId)}/resume`, { method: "POST", body: JSON.stringify({ decision: "approved" }), headers: { "Idempotency-Key": commandId } }),
 };
+
+export type ResearchPlanNode = { node_id: string; kind: string; semantic_role: string; agent_id: string; display_name: string; agent_origin: "configured" | "temporary_proposal"; provider_id: string; model: string; tool_ids: string[]; skill_refs: string[] };
+export type ResearchPlan = { plan_id: string; version: number; status: "draft" | "approved"; goal: string; graph_run_id: string | null; parallel_worker_count: number; max_concurrency: number; temporary_agents: string[]; nodes: ResearchPlanNode[]; edges: Array<{ source_node_id: string; target_node_id: string; kind: string }>; artifact_contract: { media_type: string; required_sections: string[] }; diff?: { changed_roles: string[] } };
+
+export const graphPlanApi = {
+  propose: (sessionId: string, goal: string, commandId: string) => request<ResearchPlan>(`/sessions/${encodeURIComponent(sessionId)}/plans`, {
+    method: "POST",
+    headers: { "Idempotency-Key": commandId },
+    body: JSON.stringify({ goal, source: "planner", source_refs: ["artifact:public-research-input"], max_concurrency: 4 }),
+  }),
+  get: (sessionId: string, planId: string, version: number) => request<ResearchPlan>(`/sessions/${encodeURIComponent(sessionId)}/plans/${encodeURIComponent(planId)}/versions/${version}`),
+  approve: (sessionId: string, planId: string, version: number, commandId: string) => request<ResearchPlan>(`/sessions/${encodeURIComponent(sessionId)}/plans/${encodeURIComponent(planId)}/versions/${version}/approve`, {
+    method: "POST",
+    headers: { "Idempotency-Key": commandId },
+    body: JSON.stringify({ actor_id: "local-user" }),
+  }),
+  replan: (sessionId: string, planId: string, version: number, reason: string, roles: string[], commandId: string) => request<ResearchPlan>(`/sessions/${encodeURIComponent(sessionId)}/plans/${encodeURIComponent(planId)}/versions/${version}/replan`, {
+    method: "POST",
+    headers: { "Idempotency-Key": commandId },
+    body: JSON.stringify({ reason, affected_roles: roles }),
+  }),
+};

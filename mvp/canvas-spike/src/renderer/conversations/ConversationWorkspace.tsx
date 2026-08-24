@@ -10,6 +10,9 @@ import { agentModelProfileFor, loadAgentModelProfiles, mergeAgentRecords, ordere
 import { HtmlArtifactPreview } from "./HtmlArtifactPreview";
 import { SequentialGraph } from "./SequentialGraph";
 import { emptySequentialState, reduceSequentialEvent } from "./sequentialReducer";
+import { PlanApproval } from "./PlanApproval";
+import { GraphRun } from "./GraphRun";
+import { emptyResearchGraphState, reduceResearchEvent } from "./graphReducer";
 
 const seededTitles: Record<string, string> = {
   "ui-session-0": "Jira 看板配置修复指引",
@@ -131,6 +134,7 @@ export function ConversationWorkspace() {
   const [canvasOpen, setCanvasOpen] = useState(true);
   const [modelProfiles, setModelProfiles] = useState<AgentModelProfile[]>(loadAgentModelProfiles);
   const [sequential, setSequential] = useState(emptySequentialState);
+  const [research, setResearch] = useState(emptyResearchGraphState);
   const [selectedModel, setSelectedModel] = useState("local-agent");
   const [selectedProviderId, setSelectedProviderId] = useState("lmstudio");
   const cursorsRef = useRef<Record<string, string>>(loadConversationCursors());
@@ -152,6 +156,7 @@ export function ConversationWorkspace() {
     const storedTimeline = loadConversationTimeline(sessionId);
     setEntries(storedTimeline.length ? storedTimeline : (sessionId === "ui-session-0" ? initialTimeline : []));
     setSequential(emptySequentialState());
+    setResearch(emptyResearchGraphState());
     setStatus("准备就绪 · ready");
     setSource("Task 3 REST/SSE");
     const consume = async () => {
@@ -167,7 +172,10 @@ export function ConversationWorkspace() {
           return true;
         });
         const mapped = fresh.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry));
-        if (fresh.length) setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
+        if (fresh.length) {
+          setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
+          setResearch((current) => fresh.reduce(reduceResearchEvent, current));
+        }
         if (mapped.length) {
           setEntries((current) => {
             const next = current.concat(mapped);
@@ -286,7 +294,11 @@ export function ConversationWorkspace() {
       <header className="conversation-header"><div className="conversation-heading"><div className="agent-avatar agent-avatar-blue">{group[0]?.slice(0, 1) ?? "苏"}</div><div><h2 data-testid="conversation-title">{title}</h2><p>项目实施讨论 · 持续上下文 · {group.length > 1 ? `${group.length} Agents` : "单 Agent"}</p></div></div><div className="conversation-header-actions"><div className="agent-stack" data-testid="agent-avatar-stack" aria-label="当前会话 Agent">{group.slice(0, 3).map((agent) => <span key={agent}>{agent.slice(0, 1)}</span>)}{group.length > 3 && <span>+{group.length - 3}</span>}</div><button type="button" className="quiet" onClick={togglePause}>{paused ? "恢复" : "暂停"}</button><button type="button" className="quiet" aria-label="会话详情">⋯</button></div></header>
       <div className="conversation-source" data-testid="conversation-source">来源 · {source} · session {sessionId}</div>
       <div className={`conversation-status ${status.includes("执行中") ? "running" : ""}`} data-testid="conversation-status" aria-live="polite">{status}</div>
-      <SequentialGraph state={sequential} profiles={modelProfiles} onApprove={approveOrchestration} />
+      <div className="conversation-execution-panels">
+        <SequentialGraph state={sequential} profiles={modelProfiles} onApprove={approveOrchestration} />
+        <PlanApproval sessionId={sessionId} onApproved={() => setStatus("研究计划已批准 · approved")} />
+        <GraphRun state={research} />
+      </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
       <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} />
     </main>
