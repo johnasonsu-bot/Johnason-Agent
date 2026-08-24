@@ -145,3 +145,14 @@ credential-pattern scan over the runner, tests, result metadata, and this
 report returned clean. The only collection warning is the unregistered local
 `development_graph_gate` marker, used to keep the outer gate out of its own
 temporary full-backend invocation.
+
+Final normal CLI rerun at controller HEAD `cdbf1e1` returned
+`GO_RELEASE_APPROVAL`. Its integration SHA was
+`754985b3937dff8c5c0a8692893ead553d58a01f`; backend completed with exit `0`,
+digest `0d18599d45c236c487df5fb30a031eb24c8e562eefe2770342eaf0e3c934fbdc`,
+and duration `144782ms`; Electron/Playwright completed with exit `0`, digest
+`5685fe8aac0aeeddd2503fb883cdcde379c708589f9c2931154dd2bd1b1b79ef`, and
+duration `66928ms`. It recorded three worktrees and three approved merge
+associations, with target and local bare remote unchanged, rejected commit
+excluded, ownership probe blocked, and final status
+`awaiting_release_approval`.
