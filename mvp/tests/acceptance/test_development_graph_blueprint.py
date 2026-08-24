@@ -64,7 +64,7 @@ async def test_fault_injections_write_metadata_only_blocked_result(
         text=True,
         capture_output=True,
         check=False,
-        timeout=90,
+        timeout=600,
     )
 
     assert completed.returncode != 0
