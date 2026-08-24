@@ -107,6 +107,8 @@ class DevelopmentJobRepository:
         row=c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(run,)).fetchone()
         if row is None or row["session_id"] != session: raise KeyError(run)
         if row["interrupt_id"] != interrupt or not row["interrupt_kind"]:
+            if row["interrupt_id"] is not None and row["interrupt_id"] != interrupt:
+                raise ValueError("development interrupt identity does not match")
             history = c.execute("SELECT response_json FROM development_job_resolved_interrupts WHERE graph_run_id=? AND interrupt_id=?", (run, interrupt)).fetchone()
             if history is not None and history["response_json"] == json.dumps(response, sort_keys=True, separators=(",", ":")):
                 return self._job(row)

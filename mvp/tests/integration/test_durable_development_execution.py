@@ -217,6 +217,12 @@ def test_real_processor_worker_session_api_runs_two_sequential_branch_review_bat
         ).status_code == 200
         frontend_id, _ = _wait_for_interrupt(client.app.state.development_jobs, run_id, "branch_review")
         assert frontend_id != backend_id
+        archived_backend = client.post(
+            f"/api/sessions/session-a/development-runs/{run_id}/interrupts/{backend_id}",
+            headers={"Idempotency-Key": "replay-archived-backend-review"}, json={"decisions": {"backend": "approved"}},
+        )
+        assert archived_backend.status_code == 409
+        assert _wait_for_interrupt(client.app.state.development_jobs, run_id, "branch_review")[0] == frontend_id
         stale = client.post(
             f"/api/sessions/session-a/development-runs/{run_id}/interrupts/{frontend_id}",
             headers={"Idempotency-Key": "stale-review-scope"}, json={"decisions": {"backend": "approved", "frontend": "approved"}},
