@@ -30,6 +30,7 @@ from workbench.credentials.service import VaultService
 from workbench.domain.models import RunRecord
 from workbench.models.gateway import ModelGateway
 from workbench.orchestration.control_store import GraphControlStore
+from workbench.orchestration.project_context import ProjectContextRepository
 from workbench.providers.repository import ProviderRepository
 from workbench.workflow.engine import (
     PauseRun,
@@ -100,6 +101,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         engine=engine,
         agents=agent_profiles,
         graph_control=GraphControlStore(settings.database),
+        project_contexts=ProjectContextRepository(settings.database),
         sequential_processor=sequential_processor,
     )
     conversation_worker = ConversationTaskWorker(

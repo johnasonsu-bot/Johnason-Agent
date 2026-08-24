@@ -33,6 +33,7 @@ from workbench.orchestration.contracts import (
     PublicSummary,
 )
 from workbench.orchestration.control_store import GraphControlStore
+from workbench.orchestration.project_context import ProjectContextRepository
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 from workbench.runtime.engine_host.client import (
@@ -97,11 +98,19 @@ class AgentBindingRequest(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+class ProjectContextBindingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    project_id: str = Field(min_length=1)
+    version: int = Field(ge=1)
+
+
 class MessageRequest(BaseModel):
     content: str
     model: str = "default"
     provider_id: str | None = None
     agent_bindings: tuple[AgentBindingRequest, ...] = ()
+    project_context: ProjectContextBindingRequest | None = None
 
 
 class ConversationInterventionRequest(BaseModel):
@@ -147,6 +156,7 @@ class ConversationAPI:
     engine: SingleAgentEngine | None = None
     agents: AgentProfileRepository | None = None
     graph_control: GraphControlStore | None = None
+    project_contexts: ProjectContextRepository | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
@@ -164,6 +174,7 @@ class ConversationAPI:
         model: str,
         provider_id: str | None = None,
         agent_bindings: tuple[AgentBindingRequest, ...] = (),
+        project_context: ProjectContextBindingRequest | None = None,
     ) -> dict[str, Any]:
         """Persist a turn and return before any model request is awaited."""
         self._require_session(session_id)
@@ -176,6 +187,7 @@ class ConversationAPI:
                 model=model,
                 provider_id=provider_id,
                 agent_bindings=agent_bindings,
+                project_context=project_context,
             )
         resolved_provider = self._resolve_provider_id(provider_id)
         reservation_id = self._reserve(
@@ -255,6 +267,7 @@ class ConversationAPI:
         model: str,
         provider_id: str | None,
         agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
     ) -> dict[str, Any]:
         if model != "default" or provider_id is not None:
             raise ValueError(
@@ -267,7 +280,15 @@ class ConversationAPI:
             session_id,
             command_id,
             "sequential_message",
-            {"content": content, "agent_bindings": binding_identity},
+            {
+                "content": content,
+                "agent_bindings": binding_identity,
+                "project_context": (
+                    project_context.model_dump(mode="json")
+                    if project_context is not None
+                    else None
+                ),
+            },
         )
         existing = self.conversations.load_turn_status(session_id, command_id)
         if existing is not None:
@@ -289,6 +310,13 @@ class ConversationAPI:
             seen.add(requested.agent_id)
             snapshots.append(self.agents.snapshot(requested.agent_id))
         draft = MentionSequenceCompiler().compile(content, snapshots)
+        frozen_project_context = None
+        if project_context is not None:
+            if self.project_contexts is None:
+                raise RuntimeError("Project Context is unavailable")
+            frozen_project_context = self.project_contexts.get(
+                project_context.project_id, project_context.version
+            )
         public_plan = ExecutionPlan(
             plan_id=draft.plan_id,
             version=draft.version,
@@ -344,6 +372,11 @@ class ConversationAPI:
             "generation": run_ref.generation,
             "thread_id": run_ref.thread_id,
             "draft": draft.model_dump(mode="json"),
+            **(
+                {"project_context": frozen_project_context.model_dump(mode="json")}
+                if frozen_project_context is not None
+                else {}
+            ),
         }
         turn = self.conversations.enqueue_turn(
             session_id=session_id,
@@ -1602,6 +1635,7 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
                 model=payload.model,
                 provider_id=payload.provider_id,
                 agent_bindings=payload.agent_bindings,
+                project_context=payload.project_context,
             )
             if result.get("status") in {"queued", "running", "retryable"}:
                 return JSONResponse(status_code=202, content=result)

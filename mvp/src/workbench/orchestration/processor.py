@@ -121,12 +121,14 @@ class _DurableExecutionPort:
         runner: TurnRunner,
         conversations: ConversationRepository,
         artifacts: ArtifactStore,
+        project_context: ProjectContextVersion,
     ) -> None:
         self.draft = draft
         self.graph_run_id = graph_run_id
         self.nodes = {node.node_id: node for node in draft.nodes}
         self.conversations = conversations
         self.artifacts = artifacts
+        self.project_context = project_context
         self.executor = SequentialNodeExecutor(
             graph_run_id=graph_run_id,
             runner=runner,
@@ -153,7 +155,7 @@ class _DurableExecutionPort:
         rework = self._latest_rework(node_id)
         context = ContextResolver().build(
             node,
-            self._project_context(),
+            self.project_context,
             tuple(
                 PrivateMessage(
                     agent_id=node.binding.agent_id,
@@ -230,24 +232,6 @@ class _DurableExecutionPort:
         rejected = [decision for decision in decisions if decision.decision == "rejected"]
         return rejected[-1] if rejected else None
 
-    def _project_context(self) -> ProjectContextVersion:
-        digest = hashlib.sha256(self.graph_run_id.encode()).hexdigest()[:24]
-        return ProjectContextVersion(
-            project_id=f"project.{digest}",
-            version=1,
-            created_at=1.0,
-            entries=(
-                ProjectContextEntry(
-                    key="user-intent",
-                    value_ref=f"conversation.message.{digest}",
-                    source_ref=f"source.user.{digest}",
-                    verification_status="verified",
-                    visibility="shared",
-                ),
-            ),
-        )
-
-
 class DurableSequentialProcessor:
     def __init__(
         self,
@@ -274,12 +258,14 @@ class DurableSequentialProcessor:
         graph_run_id = str(orchestration["graph_run_id"])
         thread_id = str(orchestration["thread_id"])
         generation = int(orchestration["generation"])
+        project_context = self._project_context(orchestration, graph_run_id)
         port = _DurableExecutionPort(
             draft=draft,
             graph_run_id=graph_run_id,
             runner=self.runner,
             conversations=self.conversations,
             artifacts=self.artifacts,
+            project_context=project_context,
         )
         graph = build_sequential_graph(self.checkpointer, port)
         config = graph_config(thread_id, 1)
@@ -439,6 +425,29 @@ class DurableSequentialProcessor:
             if orchestration.get("graph_run_id") == graph_run_id:
                 return orchestration["draft"]
         raise KeyError(graph_run_id)
+
+    @staticmethod
+    def _project_context(
+        orchestration: dict[str, Any], graph_run_id: str
+    ) -> ProjectContextVersion:
+        persisted = orchestration.get("project_context")
+        if persisted is not None:
+            return ProjectContextVersion.model_validate(persisted)
+        digest = hashlib.sha256(graph_run_id.encode()).hexdigest()[:24]
+        return ProjectContextVersion(
+            project_id=f"project.{digest}",
+            version=1,
+            created_at=1.0,
+            entries=(
+                ProjectContextEntry(
+                    key="user-intent",
+                    value_ref=f"conversation.message.{digest}",
+                    source_ref=f"source.user.{digest}",
+                    verification_status="verified",
+                    visibility="shared",
+                ),
+            ),
+        )
 
     @staticmethod
     def _next_node_id(
