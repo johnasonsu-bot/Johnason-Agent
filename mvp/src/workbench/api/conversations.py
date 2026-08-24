@@ -67,6 +67,7 @@ class SequentialProcessEvent(BaseModel):
         "orchestration.rework.requested",
         "orchestration.artifact.published",
         "orchestration.interrupted",
+        "orchestration.warning",
     ]
     payload: dict[str, Any]
 

@@ -13,7 +13,7 @@ const allowedApiRequests = new Set([
   "GET /api/engine-host/status",
 ]);
 
-interface ApiRequest { method: "GET" | "POST" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }
+interface ApiRequest { method: "GET" | "POST" | "PUT" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }
 interface BackendHandshake { service: string; instance_id: string; port: number; }
 interface BackendProcess {
   child: ChildProcessWithoutNullStreams;
@@ -35,11 +35,20 @@ let quitting = false;
 function isApiRequest(value: unknown): value is ApiRequest {
   if (!value || typeof value !== "object") return false;
   const request = value as Partial<ApiRequest>;
-  if ((request.method !== "GET" && request.method !== "POST" && request.method !== "DELETE") || typeof request.path !== "string") return false;
+  if ((request.method !== "GET" && request.method !== "POST" && request.method !== "PUT" && request.method !== "DELETE") || typeof request.path !== "string") return false;
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
     const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
     const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events|interventions|pause|resume))?)?$/.exec(request.path);
-    if (!providerPath && !conversationPath) return false;
+    const orchestrationResumePath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orchestrations\/[A-Za-z0-9_-]{1,128}\/resume$/.exec(request.path);
+    const agentPath = /^\/agents(?:\/[A-Za-z0-9_-]{1,64})?$/.exec(request.path);
+    const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}$/i.exec(request.path);
+    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath) return false;
+    if (artifactPath) return request.method === "GET";
+    if (agentPath) {
+      return (request.path === "/agents" && ["GET", "POST"].includes(request.method))
+        || (request.path !== "/agents" && request.method === "PUT");
+    }
+    if (orchestrationResumePath) return request.method === "POST";
     if (conversationPath) {
       const operation = conversationPath[1];
       return (operation === "events" && request.method === "GET")

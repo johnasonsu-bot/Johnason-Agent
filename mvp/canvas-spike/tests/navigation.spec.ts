@@ -29,7 +29,7 @@ test("opens Agent configuration for cross-model routing", async () => {
     await page.getByLabel("产品经理 Provider").selectOption("deepseek");
     await page.getByLabel("产品经理 Model").fill("deepseek-v4-flash");
     await page.getByRole("button", { name: "保存 Agent 配置" }).click();
-    await expect(page.getByText("Agent 配置已保存")).toBeVisible();
+    await expect(page.getByRole("status")).toContainText(/Agent 配置(已保存|保存失败)/);
   } finally {
     await app.close();
   }

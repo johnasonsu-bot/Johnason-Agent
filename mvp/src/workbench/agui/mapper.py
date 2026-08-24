@@ -38,6 +38,7 @@ _CUSTOM_TYPES = {
     "orchestration.rework.requested",
     "orchestration.artifact.published",
     "orchestration.interrupted",
+    "orchestration.warning",
 }
 
 
@@ -181,6 +182,12 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "attempt",
             "kind",
             "status",
+        ),
+        "orchestration.warning": (
+            "graph_run_id",
+            "node_id",
+            "attempt",
+            "code",
         ),
     }.get(event_type)
     return {key: payload[key] for key in fields or () if key in payload}

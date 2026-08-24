@@ -109,9 +109,24 @@ export const engineHostApi = {
 
 export type ConversationEvent = { type?: string; name?: string; delta?: string; result?: string; toolCallName?: string; value?: Record<string, unknown>; runId?: string; sequence?: number; eventId?: string; cursor?: string };
 
-export type ConversationResponse = { session_id: string; command_id: string; status: string; cursor?: string | null; events?: ConversationEvent[] };
+export type AgentProfileRecord = { agent_id: string; display_name: string; role: "worker" | "supervisor" | "verifier"; provider_id: string; model: string; enabled: boolean; tool_ids: string[]; skill_refs: string[]; version: number; created_at: number };
+export type AgentProfileInput = Omit<AgentProfileRecord, "version" | "created_at">;
 
-const sendMessage = (sessionId: string, content: string, commandId: string, model = "default", providerId?: string) => request<ConversationResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: "POST", body: JSON.stringify({ content, model, provider_id: providerId }), headers: { "Idempotency-Key": commandId } });
+export const agentApi = {
+  list: () => request<AgentProfileRecord[]>("/agents"),
+  create: (profile: AgentProfileInput) => request<AgentProfileRecord>("/agents", { method: "POST", body: JSON.stringify(profile) }),
+  replace: (profile: AgentProfileInput, expectedVersion: number) => request<AgentProfileRecord>(`/agents/${encodeURIComponent(profile.agent_id)}`, { method: "PUT", body: JSON.stringify({ ...profile, expected_version: expectedVersion }) }),
+};
+
+export type ArtifactContent = { artifact_id: string; media_type: string; content: string; digest: string };
+export const artifactApi = {
+  read: (artifactId: string) => request<ArtifactContent>(`/artifacts/${encodeURIComponent(artifactId)}`),
+};
+
+export type AgentBinding = { agent_id: string; expected_version: number };
+export type ConversationResponse = { session_id: string; command_id: string; status: string; cursor?: string | null; events?: ConversationEvent[]; plan_id?: string; graph_run_id?: string };
+
+const sendMessage = (sessionId: string, content: string, commandId: string, model = "default", providerId?: string, agentBindings: AgentBinding[] = []) => request<ConversationResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: "POST", body: JSON.stringify(agentBindings.length ? { content, agent_bindings: agentBindings } : { content, model, provider_id: providerId }), headers: { "Idempotency-Key": commandId } });
 
 export function isRetryableConversationError(error: unknown): boolean {
   if (!(error instanceof ApiRequestError) || error.status !== 503) return false;
@@ -149,4 +164,5 @@ export const conversationApi = {
   }),
   pause: (sessionId: string, commandId: string) => request<{ status: string }>(`/sessions/${encodeURIComponent(sessionId)}/pause`, { method: "POST", headers: { "Idempotency-Key": commandId } }),
   resume: (sessionId: string, commandId: string) => request<{ status: string }>(`/sessions/${encodeURIComponent(sessionId)}/resume`, { method: "POST", headers: { "Idempotency-Key": commandId } }),
+  resumeOrchestration: (sessionId: string, targetCommandId: string, commandId: string) => request<{ status: string }>(`/sessions/${encodeURIComponent(sessionId)}/orchestrations/${encodeURIComponent(targetCommandId)}/resume`, { method: "POST", body: JSON.stringify({ decision: "approved" }), headers: { "Idempotency-Key": commandId } }),
 };

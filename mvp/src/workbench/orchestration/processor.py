@@ -326,6 +326,13 @@ class DurableSequentialProcessor:
                     event_type="orchestration.node.progress", payload=dict(record)
                 )
             )
+        for warning in after.get("warnings", []):
+            events.append(
+                SequentialProcessEvent(
+                    event_type="orchestration.warning",
+                    payload={"graph_run_id": graph_run_id, **dict(warning)},
+                )
+            )
         after_attempts = after.get("attempts", {})
         nodes = {
             node.node_id: node

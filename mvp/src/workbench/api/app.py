@@ -14,6 +14,7 @@ from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.agents.repository import AgentProfileRepository
 from workbench.api.agui import stream_run_events
 from workbench.api.agents import agent_router
+from workbench.api.artifacts import artifact_router
 from workbench.api.commands import CreateRunRequest, InterventionRequest
 from workbench.api.conversations import (
     ConversationAPI,
@@ -166,6 +167,9 @@ def create_app(settings: AppSettings) -> FastAPI:
 
     app.include_router(conversation_router(conversation_api))
     app.include_router(agent_router(agent_profiles))
+    app.include_router(
+        artifact_router(settings.database, settings.database.parent / "artifacts")
+    )
     status_source = settings.runner
     if not (
         hasattr(status_source, "status") and hasattr(status_source, "runner_mode")
