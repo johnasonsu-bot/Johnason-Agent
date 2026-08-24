@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path, PurePosixPath
+import stat
 import tempfile
 from typing import Any
 
@@ -115,9 +116,16 @@ class DevelopmentExecutionAdapter:
             candidate = cls._candidate(workspace, candidate.relative_to(workspace).as_posix())
             candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if candidate.parent.is_symlink(): raise ValueError("worker edit parent changed")
+            preserved_mode = None
+            if candidate.exists():
+                if candidate.is_symlink() or not candidate.is_file():
+                    raise ValueError("worker edit cannot replace a nonregular file")
+                preserved_mode = stat.S_IMODE(candidate.stat().st_mode)
             descriptor, temporary = tempfile.mkstemp(prefix=".development-edit-", dir=candidate.parent)
             try:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    if preserved_mode is not None:
+                        os.fchmod(handle.fileno(), preserved_mode)
                     handle.write(content); handle.flush(); os.fsync(handle.fileno())
                 os.replace(temporary, candidate)
             except BaseException:

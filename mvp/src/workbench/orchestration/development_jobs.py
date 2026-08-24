@@ -55,8 +55,28 @@ class DevelopmentJobRepository:
         with self.store.connect() as c: row=c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(graph_run_id,)).fetchone()
         return self._job(row).plan
 
-    def mark_needs_human(self, graph_run_id: str, *, interrupt_id: str, interrupt_kind: DevelopmentInterruptKind, interrupt_payload: dict[str, object], owner_id: str | None = None, attempt: int | None = None) -> DevelopmentJob:
-        encoded=json.dumps(interrupt_payload,sort_keys=True,separators=(",",":")); digest=hashlib.sha256(encoded.encode()).hexdigest(); now=time.time()
+    @staticmethod
+    def interrupt_digest(
+        graph_run_id: str,
+        interrupt_kind: DevelopmentInterruptKind,
+        interrupt_payload: dict[str, object],
+    ) -> str:
+        """Hash the exact processor interrupt identity, not only its payload."""
+        encoded = json.dumps(
+            {
+                "graph_run_id": graph_run_id,
+                "kind": interrupt_kind,
+                "payload": interrupt_payload,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    def mark_needs_human(self, graph_run_id: str, *, interrupt_id: str, interrupt_kind: DevelopmentInterruptKind, interrupt_payload: dict[str, object], interrupt_digest: str | None = None, owner_id: str | None = None, attempt: int | None = None) -> DevelopmentJob:
+        encoded=json.dumps(interrupt_payload,sort_keys=True,separators=(",",":")); digest=self.interrupt_digest(graph_run_id, interrupt_kind, interrupt_payload); now=time.time()
+        if interrupt_digest is not None and interrupt_digest != digest:
+            raise ValueError("development interrupt digest does not match the canonical payload")
         with self.store.connect() as c:
             c.execute("BEGIN IMMEDIATE"); row=c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(graph_run_id,)).fetchone()
             if row is None: c.rollback(); raise KeyError(graph_run_id)
@@ -67,7 +87,7 @@ class DevelopmentJobRepository:
         return self._job(row)
 
     @staticmethod
-    def _validate_response(kind: str, payload: dict[str, object], response: dict[str, object]) -> None:
+    def _validate_response(kind: str, payload: dict[str, object], response: dict[str, object], plan: DevelopmentPlan) -> None:
         if kind in {"release_approval","integration_approval","attempt_reset_approval"}:
             if response != {"decision":"approved"}: raise ValueError(f"{kind} requires an explicit scoped approval")
         elif kind == "branch_review":
@@ -75,7 +95,10 @@ class DevelopmentJobRepository:
             if set(response)!={"decisions"} or not isinstance(decisions,dict) or decisions!={name:"approved" for name in expected}: raise ValueError("branch reviews require every pending branch approval")
         elif kind == "merge_arbitration":
             if response.get("decision") in {"retry_merge","request_replan"} and set(response)=={"decision"}: return
-            if response.get("decision")=="rework_branch" and set(response)=={"decision","target_branch"} and response.get("target_branch") in payload.get("branches",[]): return
+            # The interrupt payload is evidence only.  The immutable admitted plan
+            # is the authority for a rework target across retries and restarts.
+            allowed_target_ids = {node.node_id for node in plan.nodes}
+            if response.get("decision")=="rework_branch" and set(response)=={"decision","target_branch"} and response.get("target_branch") in allowed_target_ids: return
             raise ValueError("merge arbitration response is outside the pending graph")
         elif kind == "replan": raise ValueError("replan interrupt requires a new approved plan version")
         else: raise ValueError("unknown development interrupt")
@@ -88,7 +111,8 @@ class DevelopmentJobRepository:
             if history is not None and history["response_json"] == json.dumps(response, sort_keys=True, separators=(",", ":")):
                 return self._job(row)
             raise ValueError("development interrupt identity does not match")
-        self._validate_response(row["interrupt_kind"],json.loads(row["interrupt_payload_json"]) if row["interrupt_payload_json"] else {},response)
+        plan = self._job(row).plan
+        self._validate_response(row["interrupt_kind"],json.loads(row["interrupt_payload_json"]) if row["interrupt_payload_json"] else {},response, plan)
         encoded=json.dumps(response,sort_keys=True,separators=(",",":"))
         if row["status"] == "needs_human":
             now = time.time()
@@ -137,7 +161,7 @@ class DevelopmentJobRepository:
     def transition(self,graph_run_id: str,*,owner_id: str,attempt: int,status: DevelopmentJobStatus,interrupt_id: str|None=None,interrupt_kind: DevelopmentInterruptKind|None=None,interrupt_digest: str|None=None,interrupt_payload: dict[str,object]|None=None) -> None:
         if status == "needs_human":
             if not interrupt_id or not interrupt_kind or interrupt_payload is None: raise ValueError("development interrupt metadata is required")
-            self.mark_needs_human(graph_run_id,interrupt_id=interrupt_id,interrupt_kind=interrupt_kind,interrupt_payload=interrupt_payload,owner_id=owner_id,attempt=attempt); return
+            self.mark_needs_human(graph_run_id,interrupt_id=interrupt_id,interrupt_kind=interrupt_kind,interrupt_payload=interrupt_payload,interrupt_digest=interrupt_digest,owner_id=owner_id,attempt=attempt); return
         now=time.time()
         with self.store.connect() as c: changed=c.execute("UPDATE development_graph_jobs SET status=?,owner_id=NULL,lease_expires_at=0,updated_at=? WHERE graph_run_id=? AND owner_id=? AND attempt=? AND status='running' AND lease_expires_at>?",(status,now,graph_run_id,owner_id,attempt,now)).rowcount
         if changed != 1: raise ValueError("development job lease is not owned")

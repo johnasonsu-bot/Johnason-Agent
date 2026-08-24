@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 
 from workbench.orchestration.checkpointer import acquire_graph_execution_fence, graph_config, open_graph_checkpointer
 from workbench.orchestration.development import DevelopmentPlan, DevelopmentPlanValidator
+from workbench.orchestration.development_jobs import DevelopmentJobRepository
 from workbench.orchestration.effects import EffectLedger
 from workbench.orchestration.development_graph import build_development_graph, initial_development_state, invoke_development_to_boundary
 from workbench.tools.git_workspace import GitWorkspaceTool
@@ -144,8 +145,7 @@ class DurableDevelopmentProcessor:
         else:
             payload = {"kind": "release_approval", "integration_branch": str((state.get("merge_evidence") or {}).get("integration_branch", "")), "target_branch": str(state.get("target_branch", ""))}
             kind = "release_approval"
-        encoded = json.dumps({"graph_run_id": graph_run_id, "kind": kind, "payload": payload}, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(encoded.encode()).hexdigest()
+        digest = DevelopmentJobRepository.interrupt_digest(graph_run_id, kind, payload)
         return f"development-interrupt.{digest[:32]}", kind, digest, payload
 
     @staticmethod

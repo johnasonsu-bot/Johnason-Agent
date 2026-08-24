@@ -48,6 +48,25 @@ jobs.mark_needs_human("development-run.fixture", interrupt_id="release.fixture",
   if (result.status !== 0) throw new Error(result.stderr || "development fixture setup failed");
 }
 
+function appendDevelopmentInterrupt(runtimeDir: string, interruptId: string, interruptKind: string): void {
+  const script = String.raw`
+import sys
+from pathlib import Path
+from workbench.protocol.events import DomainEvent
+from workbench.workflow.event_store import EventStore
+
+store = EventStore(Path(sys.argv[1]) / "workbench.sqlite")
+store.append(DomainEvent.new("development.interrupt.required", "fixture", {
+  "graph_run_id": "development-run.fixture",
+  "interrupt_id": sys.argv[2],
+  "interrupt_kind": sys.argv[3],
+  "status": "needs_human",
+}, run_id="ui-session-0"), command_id=f"development-fixture-next-{sys.argv[2]}")
+`;
+  const result = spawnSync(python, ["-c", script, runtimeDir, interruptId, interruptKind], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(result.stderr || "development fixture event append failed");
+}
+
 test("development graph shows isolated branches and waits for release approval", async ({}, testInfo) => {
   const runtimeDir = testInfo.outputPath("runtime");
   installDevelopmentGraphFixtures(runtimeDir);
@@ -64,6 +83,8 @@ test("development graph shows isolated branches and waits for release approval",
     await expect(graph).not.toContainText("reset");
     await graph.getByRole("button", { name: "批准进入目标分支" }).click();
     await expect(graph.getByRole("button", { name: "审批已提交" })).toBeVisible();
+    appendDevelopmentInterrupt(runtimeDir, "integration.fixture.next", "integration_approval");
+    await expect(graph.getByRole("button", { name: "批准临时集成" })).toBeVisible();
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/sessions/ui-session-0/development-runs/development-run.fixture/interrupts/release.fixture" }))).rejects.toThrow("invalid local API request");
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "POST", path: "/sessions/ui-session-0/development-runs/development-run.fixture/interrupts/release.fixture/extra" }))).rejects.toThrow("invalid local API request");
   } finally {

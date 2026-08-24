@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from workbench.orchestration.development_processor import DurableDevelopmentProcessor
 
@@ -30,3 +35,13 @@ def test_processor_projects_task3_state_to_stable_metadata_only_events() -> None
     ]
     assert first.interrupt_id == second.interrupt_id
     assert "private_environment" not in str(first.events)
+
+
+def test_processor_aclose_closes_its_owned_checkpointer(tmp_path: Path) -> None:
+    processor = DurableDevelopmentProcessor(
+        database=tmp_path / "workbench.sqlite", port=object(), worktree_root=tmp_path / "worktrees"
+    )
+    connection = processor.checkpointer.conn
+    asyncio.run(processor.aclose())
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")

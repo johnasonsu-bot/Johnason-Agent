@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
+import json
 
 import pytest
 
@@ -103,3 +105,97 @@ def test_resuming_one_interrupt_records_history_and_allows_the_next(tmp_path) ->
     with jobs.store.connect() as connection:
         history = connection.execute("SELECT interrupt_id FROM development_job_resolved_interrupts ORDER BY resolved_at").fetchall()
     assert [row["interrupt_id"] for row in history] == ["integration.1", "release.1"]
+
+
+def test_merge_arbitration_rework_targets_only_persisted_plan_nodes(tmp_path) -> None:
+    """The interrupt payload is evidence, never an authority for branch IDs."""
+    from workbench.conversations.repository import ConversationRepository
+    from workbench.orchestration.development_jobs import DevelopmentJobRepository
+
+    database = tmp_path / "workbench.sqlite"
+    ConversationRepository(database).create_session("session-a")
+    jobs = DevelopmentJobRepository(database)
+    jobs.admit("development-run.1", "session-a", _plan(tmp_path))
+    jobs.mark_needs_human(
+        "development-run.1",
+        interrupt_id="arbitration.1",
+        interrupt_kind="merge_arbitration",
+        interrupt_payload={"kind": "merge_arbitration", "branches": ["forged-branch"]},
+    )
+
+    with pytest.raises(ValueError, match="outside the pending graph"):
+        jobs.request_resume(
+            "development-run.1", "session-a",
+            {"decision": "rework_branch", "target_branch": "forged-branch"},
+            "arbitration.1",
+        )
+    resumed = jobs.request_resume(
+        "development-run.1", "session-a",
+        {"decision": "rework_branch", "target_branch": "backend"},
+        "arbitration.1",
+    )
+    assert resumed.status == "queued"
+
+
+def test_transition_rejects_tampered_processor_digest_and_archives_exact_digest(tmp_path) -> None:
+    from workbench.conversations.repository import ConversationRepository
+    from workbench.orchestration.development_jobs import DevelopmentJobRepository
+
+    database = tmp_path / "workbench.sqlite"
+    ConversationRepository(database).create_session("session-a")
+    jobs = DevelopmentJobRepository(database)
+    jobs.admit("development-run.1", "session-a", _plan(tmp_path))
+    claimed = jobs.claim_next(owner_id="worker-a", lease_seconds=10)
+    assert claimed is not None
+    payload = {"kind": "release_approval", "target_branch": "main"}
+    exact = hashlib.sha256(json.dumps({"graph_run_id": "development-run.1", "kind": "release_approval", "payload": payload}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    with pytest.raises(ValueError, match="digest"):
+        jobs.transition(
+            "development-run.1", owner_id="worker-a", attempt=claimed.attempt,
+            status="needs_human", interrupt_id="release.1", interrupt_kind="release_approval",
+            interrupt_digest="0" * 64, interrupt_payload=payload,
+        )
+    jobs.transition(
+        "development-run.1", owner_id="worker-a", attempt=claimed.attempt,
+        status="needs_human", interrupt_id="release.1", interrupt_kind="release_approval",
+        interrupt_digest=exact, interrupt_payload=payload,
+    )
+    waiting = jobs.resolve_plan("development-run.1")
+    assert waiting.plan_id == "development-plan.1"
+    jobs.request_resume("development-run.1", "session-a", {"decision": "approved"}, "release.1")
+    with jobs.store.connect() as connection:
+        archived = connection.execute(
+            "SELECT interrupt_digest FROM development_job_resolved_interrupts WHERE graph_run_id=? AND interrupt_id=?",
+            ("development-run.1", "release.1"),
+        ).fetchone()
+    assert archived["interrupt_digest"] == exact
+
+
+@pytest.mark.parametrize(
+    ("kind", "payload", "response", "accepted"),
+    (
+        ("branch_review", {"kind": "branch_review", "reviews": {"backend": {"attempt": 1}}}, {"decisions": {"backend": "approved"}}, True),
+        ("attempt_reset_approval", {"kind": "attempt_reset_approval"}, {"decision": "approved"}, True),
+        ("integration_approval", {"kind": "integration_approval"}, {"decision": "approved"}, True),
+        ("merge_arbitration", {"kind": "merge_arbitration"}, {"decision": "retry_merge"}, True),
+        ("merge_arbitration", {"kind": "merge_arbitration"}, {"decision": "request_replan"}, True),
+        ("merge_arbitration", {"kind": "merge_arbitration"}, {"decision": "rework_branch", "target_branch": "backend"}, True),
+        ("replan", {"kind": "replan"}, {"decision": "approved"}, False),
+        ("release_approval", {"kind": "release_approval"}, {"decision": "approved"}, True),
+    ),
+)
+def test_all_development_interrupt_kinds_accept_only_scoped_responses(tmp_path, kind, payload, response, accepted) -> None:
+    from workbench.conversations.repository import ConversationRepository
+    from workbench.orchestration.development_jobs import DevelopmentJobRepository
+
+    database = tmp_path / "workbench.sqlite"
+    ConversationRepository(database).create_session("session-a")
+    jobs = DevelopmentJobRepository(database)
+    jobs.admit("development-run.1", "session-a", _plan(tmp_path))
+    jobs.mark_needs_human("development-run.1", interrupt_id="interrupt.1", interrupt_kind=kind, interrupt_payload=payload)
+    if accepted:
+        assert jobs.request_resume("development-run.1", "session-a", response, "interrupt.1").status == "queued"
+    else:
+        with pytest.raises(ValueError, match="new approved plan"):
+            jobs.request_resume("development-run.1", "session-a", response, "interrupt.1")
