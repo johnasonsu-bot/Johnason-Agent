@@ -63,3 +63,35 @@ The one warning is the existing Starlette TestClient/httpx deprecation.
 - `.runtime/development-graph-results.json` contains metadata and decisions
   only. Credential-pattern scans of this result and this report return no
   matches.
+
+## Round 1 acceptance hardening
+
+The acceptance fixture is now a local clone of the current repository HEAD
+through a local bare remote. It runs the full backend suite and the complete
+Electron/Playwright suite from the temporary integration checkout, not from
+the controller checkout. The controller Python virtual environment and local
+`node_modules` are symlinked there only as untracked execution tooling.
+
+- Backend and Electron command records contain only a stable label, exit code,
+  and output digest. A nonzero exit blocks the decision.
+- Worktree evidence comes from `git worktree list --porcelain` plus completed
+  `EffectLedger` records. Result metadata uses only display names, graph branch
+  names, and SHA digests; no worktree paths are emitted.
+- An explicit unowned-write probe asks `GitWorkspaceTool.commit` to commit an
+  unowned file. It is rejected and the branch head remains unchanged.
+- The local bare remote is snapshotted before and after the graph by URL digest,
+  refs digest, bare HEAD, and ref count. Any difference blocks release.
+- Every integration commit is associated with one approved branch attempt and
+  that attempt's declared-test evidence; merge order is checked against the
+  plan dependencies. The rejected frontend commit must produce exactly Git
+  exit code 1 for `merge-base --is-ancestor`.
+- CLI exceptions write an atomic metadata-only `BLOCKED` result, print
+  `BLOCKED`, and exit nonzero. Parameterized ownership, backend, Electron,
+  remote, missing-evidence, and exception injections all exercise that boundary.
+
+Fresh focused results:
+
+```text
+development graph primary acceptance: 1 passed in 264.88s
+CLI BLOCKED fault injections: 6 passed in 30.35s
+```

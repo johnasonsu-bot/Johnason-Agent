@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter
+from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -36,7 +37,7 @@ from workbench.orchestration.development_graph import (
     invoke_development_to_boundary,
 )
 from workbench.orchestration.effects import EffectLedger
-from workbench.tools.git_workspace import GitWorkspaceTool
+from workbench.tools.git_workspace import GitWorkspaceError, GitWorkspaceTool
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -101,43 +102,63 @@ class DurableCalls:
         return 0 if row is None else int(row[0])
 
 
-def _create_fixture_repository(root: Path) -> tuple[Path, str]:
+def _create_fixture_repository(root: Path) -> tuple[Path, str, dict[str, object]]:
+    """Clone the current Git HEAD through an offline bare remote fixture."""
+    source = Path(__file__).resolve().parents[2]
+    source_head = _git(source, "rev-parse", "HEAD")
+    bare = root / "offline-remote.git"
+    _git(root, "init", "--bare", str(bare))
+    seed = root / "seed"
+    _git(root, "clone", "--no-local", str(source), str(seed))
+    _git(seed, "remote", "add", "fixture", str(bare))
+    _git(seed, "push", "fixture", f"{source_head}:refs/heads/main")
     repository = root / "fixture-repository"
-    repository.mkdir(parents=True)
-    _git(repository, "init", "-b", "main")
+    _git(root, "clone", "--no-local", str(bare), str(repository))
+    _git(repository, "checkout", "-B", "main", "origin/main")
     _git(repository, "config", "user.name", "Development Acceptance")
     _git(repository, "config", "user.email", "development-acceptance@example.invalid")
     for relative, content in {
-        "backend/service.py": "def state() -> str:\n    return 'base'\n",
-        "frontend/view.tsx": "export const view = 'base';\n",
-        "shared/conflict.txt": "base\n",
-        "tests/test_backend_slice.py": (
+        "mvp/acceptance_fixture/backend.py": "def state() -> str:\n    return 'base'\n",
+        "mvp/acceptance_fixture/frontend.ts": "export const view = 'base';\n",
+        "mvp/acceptance_fixture/shared/conflict.txt": "base\n",
+        "mvp/acceptance_fixture/tests/test_backend_slice.py": (
             "from pathlib import Path\n\n"
             "def test_backend_slice():\n"
-            "    assert Path('backend/service.py').exists()\n"
+            "    assert Path('mvp/acceptance_fixture/backend.py').exists()\n"
         ),
-        "tests/test_frontend_slice.py": (
+        "mvp/acceptance_fixture/tests/test_frontend_slice.py": (
             "from pathlib import Path\n\n"
             "def test_frontend_slice():\n"
-            "    assert Path('frontend/view.tsx').exists()\n"
+            "    assert Path('mvp/acceptance_fixture/frontend.ts').exists()\n"
         ),
-        "tests/test_contract_slice.py": (
+        "mvp/acceptance_fixture/tests/test_contract_slice.py": (
             "from pathlib import Path\n\n"
             "def test_contract_slice():\n"
-            "    assert Path('tests/test_contract_slice.py').exists()\n"
+            "    assert Path('mvp/acceptance_fixture/tests/test_contract_slice.py').exists()\n"
         ),
-        "tests/test_conflict_slice.py": (
+        "mvp/acceptance_fixture/tests/test_conflict_slice.py": (
             "from pathlib import Path\n\n"
             "def test_conflict_slice():\n"
-            "    assert Path('shared/conflict.txt').exists()\n"
+            "    assert Path('mvp/acceptance_fixture/shared/conflict.txt').exists()\n"
         ),
     }.items():
         path = repository / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-    _git(repository, "add", "backend", "frontend", "shared", "tests")
+    _git(repository, "add", "mvp/acceptance_fixture")
     _git(repository, "commit", "-m", "fixture base")
-    return repository, _git(repository, "rev-parse", "HEAD")
+    return repository, _git(repository, "rev-parse", "HEAD"), _remote_snapshot(bare)
+
+
+def _remote_snapshot(bare: Path) -> dict[str, object]:
+    url = str(bare)
+    refs = _git(bare, "for-each-ref", "--format=%(refname):%(objectname)")
+    return {
+        "url_digest": sha256(url.encode()).hexdigest(),
+        "refs_digest": sha256(refs.encode()).hexdigest(),
+        "bare_head": _git(bare, "rev-parse", "HEAD"),
+        "ref_count": len([line for line in refs.splitlines() if line]),
+    }
 
 
 def _node(
@@ -185,26 +206,26 @@ class FixturePort:
                 raise RuntimeError("simulated restart after one branch approval")
             workspace = Path(str(state["workspace_path"]))
             if branch == "backend":
-                (workspace / "backend/service.py").write_text(
+                (workspace / "mvp/acceptance_fixture/backend.py").write_text(
                     f"def state() -> str:\n    return 'backend-{attempt}'\n",
                     encoding="utf-8",
                 )
             elif branch == "frontend":
-                (workspace / "frontend/view.tsx").write_text(
+                (workspace / "mvp/acceptance_fixture/frontend.ts").write_text(
                     f"export const view = 'frontend-{attempt}';\n", encoding="utf-8"
                 )
             elif branch == "tests":
-                (workspace / "tests/test_contract_slice.py").write_text(
+                (workspace / "mvp/acceptance_fixture/tests/test_contract_slice.py").write_text(
                     "from pathlib import Path\n\n"
                     "def test_contract_slice():\n"
-                    "    assert Path('backend/service.py').exists()\n"
-                    "    assert Path('frontend/view.tsx').exists()\n",
+                    "    assert Path('mvp/acceptance_fixture/backend.py').exists()\n"
+                    "    assert Path('mvp/acceptance_fixture/frontend.ts').exists()\n",
                     encoding="utf-8",
                 )
             elif branch == "conflict-backend":
-                (workspace / "shared/conflict.txt").write_text("backend\n", encoding="utf-8")
+                (workspace / "mvp/acceptance_fixture/shared/conflict.txt").write_text("backend\n", encoding="utf-8")
             elif branch == "conflict-frontend":
-                (workspace / "shared/conflict.txt").write_text("frontend\n", encoding="utf-8")
+                (workspace / "mvp/acceptance_fixture/shared/conflict.txt").write_text("frontend\n", encoding="utf-8")
             else:
                 raise AssertionError(branch)
             return f"{branch} attempt {attempt} completed"
@@ -236,16 +257,16 @@ async def _exercise_conflict_probe(
                 repository,
                 base_sha,
                 node_id="conflict-backend",
-                writable_paths=("shared/conflict.txt",),
-                test_path="tests/test_conflict_slice.py",
+                writable_paths=("mvp/acceptance_fixture/shared/conflict.txt",),
+                test_path="mvp/acceptance_fixture/tests/test_conflict_slice.py",
                 branch="graph/development-conflict-probe/conflict-backend",
             ),
             _node(
                 repository,
                 base_sha,
                 node_id="conflict-frontend",
-                writable_paths=("shared/conflict.txt",),
-                test_path="tests/test_conflict_slice.py",
+                writable_paths=("mvp/acceptance_fixture/shared/conflict.txt",),
+                test_path="mvp/acceptance_fixture/tests/test_conflict_slice.py",
                 branch="graph/development-conflict-probe/conflict-frontend",
                 depends_on=("conflict-backend",),
             ),
@@ -279,7 +300,7 @@ async def _exercise_conflict_probe(
         arbitration.get("status") != "awaiting_arbitration"
         or not isinstance(evidence, dict)
         or evidence.get("status") != "conflict"
-        or evidence.get("conflict_paths") != ["shared/conflict.txt"]
+        or evidence.get("conflict_paths") != ["mvp/acceptance_fixture/shared/conflict.txt"]
     ):
         raise AssertionError("real merge conflict did not reach arbitration")
     replanned = await _to_boundary(
@@ -301,16 +322,16 @@ async def _exercise_main_graph(
                 repository,
                 base_sha,
                 node_id="backend",
-                writable_paths=("backend/service.py",),
-                test_path="tests/test_backend_slice.py",
+                writable_paths=("mvp/acceptance_fixture/backend.py",),
+                test_path="mvp/acceptance_fixture/tests/test_backend_slice.py",
                 branch=f"graph/{run_id}/backend",
             ),
             _node(
                 repository,
                 base_sha,
                 node_id="frontend",
-                writable_paths=("frontend/view.tsx",),
-                test_path="tests/test_frontend_slice.py",
+                writable_paths=("mvp/acceptance_fixture/frontend.ts",),
+                test_path="mvp/acceptance_fixture/tests/test_frontend_slice.py",
                 branch=f"graph/{run_id}/frontend",
                 depends_on=("backend",),
             ),
@@ -318,8 +339,8 @@ async def _exercise_main_graph(
                 repository,
                 base_sha,
                 node_id="tests",
-                writable_paths=("tests/test_contract_slice.py",),
-                test_path="tests/test_contract_slice.py",
+                writable_paths=("mvp/acceptance_fixture/tests/test_contract_slice.py",),
+                test_path="mvp/acceptance_fixture/tests/test_contract_slice.py",
                 branch=f"graph/{run_id}/tests",
                 depends_on=("frontend",),
             ),
@@ -371,24 +392,105 @@ async def _exercise_main_graph(
     return release, plan, tool, run_id
 
 
-def _canvas_regression() -> bool:
-    canvas = Path(__file__).resolve().parents[1] / "canvas-spike"
-    completed = subprocess.run(
-        ("npm", "test", "--", "--grep", "development graph"),
-        cwd=canvas,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=240,
+def _command(label: str, argv: tuple[str, ...], cwd: Path) -> dict[str, object]:
+    try:
+        completed = subprocess.run(
+            argv, cwd=cwd, text=True, capture_output=True, check=False, timeout=420
+        )
+        output = completed.stdout + completed.stderr
+        return {"label": label, "exit_code": completed.returncode, "result_digest": sha256(output.encode()).hexdigest()}
+    except subprocess.TimeoutExpired as error:
+        output = (error.stdout or "") + (error.stderr or "")
+        return {"label": label, "exit_code": 124, "result_digest": sha256(output.encode()).hexdigest()}
+
+
+def _integration_workspace(tool: GitWorkspaceTool, run_id: str) -> Path:
+    operation_id = f"{run_id}:merge:1"
+    return tool.worktree_root / sha256(operation_id.encode()).hexdigest()[:24]
+
+
+def _worktree_evidence(
+    *, repository: Path, tool: GitWorkspaceTool, run_id: str, plan: DevelopmentPlan
+) -> tuple[list[dict[str, object]], bool]:
+    records = _git(repository, "worktree", "list", "--porcelain").splitlines()
+    observed: dict[str, tuple[Path, str]] = {}
+    path: Path | None = None
+    head: str | None = None
+    branch: str | None = None
+    for line in [*records, ""]:
+        if line.startswith("worktree "):
+            path, head, branch = Path(line[9:]), None, None
+        elif line.startswith("HEAD "):
+            head = line[5:]
+        elif line.startswith("branch refs/heads/"):
+            branch = line[18:]
+        elif not line and path is not None:
+            if branch and head:
+                observed[branch] = (path.resolve(), head)
+            path = None
+    evidence: list[dict[str, object]] = []
+    paths: set[Path] = set()
+    for node in plan.nodes:
+        item = observed.get(node.output.branch)
+        effect = tool.ledger.recover(f"{run_id}:{node.node_id}:worktree")
+        if item is None or effect.status != "completed":
+            return [], False
+        workspace_path, head_sha = item
+        paths.add(workspace_path)
+        evidence.append({
+            "display_name": node.node_id,
+            "branch": node.output.branch,
+            "head_digest": sha256(head_sha.encode()).hexdigest(),
+            "worktree_effect": effect.status,
+        })
+    return evidence, len(paths) == len(plan.nodes)
+
+
+def _ownership_violation_probe(repository: Path, base_sha: str, runtime_dir: Path) -> bool:
+    tool = GitWorkspaceTool(
+        worktree_root=runtime_dir / "ownership-worktrees",
+        ledger=EffectLedger(runtime_dir / "ownership-effects.sqlite"),
     )
-    return completed.returncode == 0
+    workspace = tool.create(
+        operation_id="ownership-probe:worktree", repo=repository, base_sha=base_sha,
+        branch="graph/ownership-probe/worker",
+    )
+    unowned = workspace.path / "mvp/acceptance_fixture/unowned.txt"
+    unowned.write_text("must not commit\n", encoding="utf-8")
+    before = _git(workspace.path, "rev-parse", "HEAD")
+    try:
+        tool.commit(
+            operation_id="ownership-probe:commit", workspace=workspace,
+            owned_paths=("mvp/acceptance_fixture/owned.txt",), message="must fail",
+        )
+    except GitWorkspaceError:
+        return _git(workspace.path, "rev-parse", "HEAD") == before
+    return False
 
 
-async def run_development_graph_acceptance(runtime_dir: Path) -> dict[str, Any]:
+async def run_development_graph_acceptance(
+    runtime_dir: Path, *, inject: str | None = None
+) -> dict[str, Any]:
     runtime_dir = runtime_dir.resolve()
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    repository, original_target_sha = _create_fixture_repository(runtime_dir)
+    if inject == "exception":
+        raise RuntimeError("injected acceptance exception")
+    repository, original_target_sha, remote_before = _create_fixture_repository(runtime_dir)
     calls = DurableCalls(runtime_dir / "acceptance-calls.sqlite")
+    ownership_violation_blocked = _ownership_violation_probe(
+        repository, original_target_sha, runtime_dir
+    )
+    if inject is not None:
+        if inject == "remote":
+            _git(runtime_dir / "offline-remote.git", "update-ref", "refs/heads/fault", original_target_sha)
+        remote_after = _remote_snapshot(runtime_dir / "offline-remote.git")
+        return {
+            "decision": "BLOCKED",
+            "error_kind": f"injected_{inject}",
+            "ownership_violation_blocked": ownership_violation_blocked if inject != "ownership" else False,
+            "remote_unchanged": remote_before == remote_after,
+            "integration_commands": [],
+        }
     arbitration_interrupts = await _exercise_conflict_probe(
         repository=repository, base_sha=original_target_sha, runtime_dir=runtime_dir, calls=calls
     )
@@ -409,83 +511,142 @@ async def run_development_graph_acceptance(runtime_dir: Path) -> dict[str, Any]:
     )
     integration = dict(release["merge_evidence"])
     integration_sha = str(integration["integration_sha"])
-    rejected_commit_excluded = subprocess.run(
+    exclusion = subprocess.run(
         ("git", "merge-base", "--is-ancestor", frontend_attempt_one, integration_sha),
         cwd=repository,
         text=True,
         capture_output=True,
         check=False,
-    ).returncode != 0
-    worker_worktrees = sorted(
-        {
-            str(item["worker_branch"]).rsplit("/", 1)[-1]
-            for item in branch_results
-            if isinstance(item, dict)
-        }
     )
-    regression = dict(release.get("regression") or {})
-    full_backend_passed = (
-        regression.get("decision") == "approved"
-        and len(regression.get("test_evidence", ())) == len(plan.nodes)
+    rejected_commit_excluded = exclusion.returncode == 1
+    worktrees, distinct_worktrees = _worktree_evidence(
+        repository=repository, tool=tool, run_id=run_id, plan=plan
     )
-    full_playwright_passed = _canvas_regression()
+    integration_workspace = _integration_workspace(tool, run_id)
+    node_modules = integration_workspace / "mvp/canvas-spike/node_modules"
+    if not node_modules.exists():
+        node_modules.symlink_to(Path(__file__).resolve().parents[1] / "canvas-spike/node_modules")
+    controller_venv = Path(sys.executable).parent.parent
+    fixture_venv = integration_workspace / "mvp/.venv"
+    if not fixture_venv.exists():
+        fixture_venv.symlink_to(controller_venv)
+    backend_command = _command(
+        "integration_backend_full",
+        (sys.executable, "-m", "pytest", "tests/unit", "tests/integration", "tests/acceptance", "-q"),
+        integration_workspace / "mvp",
+    )
+    electron_command = _command(
+        "integration_electron_playwright_full", ("npm", "test"), integration_workspace / "mvp/canvas-spike"
+    )
+    if inject == "backend":
+        backend_command = {"label": "integration_backend_full", "exit_code": 1, "result_digest": "injected"}
+    if inject == "electron":
+        electron_command = {"label": "integration_electron_playwright_full", "exit_code": 1, "result_digest": "injected"}
+    if inject == "remote":
+        bare = runtime_dir / "offline-remote.git"
+        _git(bare, "update-ref", "refs/heads/fault", original_target_sha)
+    remote_after = _remote_snapshot(runtime_dir / "offline-remote.git")
+    if inject == "ownership":
+        ownership_violation_blocked = False
+    worktree_evidence = [*worktrees]
+    final_reviews = {
+        (str(item["branch_id"]), int(item["attempt"])): str(item["decision"])
+        for item in local_reviews if isinstance(item, dict)
+    }
+    associations: list[dict[str, object]] = []
+    commits = list(integration.get("commits", []))
+    for node in plan.nodes:
+        candidates = [item for item in branch_results if isinstance(item, dict) and item["branch_id"] == node.node_id and item["commit_sha"] in commits]
+        if len(candidates) != 1:
+            continue
+        item = candidates[0]
+        associations.append({"branch": node.node_id, "attempt": item["attempt"], "test_evidence_count": len(item["test_evidence"]), "approved": final_reviews.get((node.node_id, int(item["attempt"]))) == "approved"})
+    dependency_order_verified = (
+        len(commits) == len(plan.nodes)
+        and all(commits.index(next(item["commit_sha"] for item in branch_results if isinstance(item, dict) and item["branch_id"] == node.node_id and item["commit_sha"] in commits)) > max((commits.index(next(item["commit_sha"] for item in branch_results if isinstance(item, dict) and item["branch_id"] == dependency and item["commit_sha"] in commits)) for dependency in node.depends_on), default=-1) for node in plan.nodes)
+    )
     repeated = [
         branch
         for branch in ("backend",)
         if calls.count("main", "worker", branch, 1) != 1
     ]
+    if inject == "missing_evidence":
+        associations = []
     result: dict[str, Any] = {
         "run_id": run_id,
-        "worker_worktrees": worker_worktrees,
+        "worker_worktrees": worktree_evidence,
         "local_review_states": [
             {"branch": item["branch_id"], "attempt": item["attempt"], "decision": item["decision"]}
             for item in local_reviews
             if isinstance(item, dict)
         ],
-        "all_local_reviews_approved": all(
-            final_reviews.get(branch) == "approved" for branch in ("backend", "frontend", "tests")
-        ),
+        "all_local_reviews_approved": all(value == "approved" for value in {branch: decision for (branch, _), decision in final_reviews.items()}.values()),
         "arbitration_interrupts": arbitration_interrupts,
+        "ownership_violation_blocked": ownership_violation_blocked,
         "rejected_commit_excluded": rejected_commit_excluded,
+        "rejected_commit_exclusion_exit_code": exclusion.returncode,
         "restart_repeated_approved_branches": repeated,
-        "declared_tests": ["backend", "frontend", "tests"],
-        "full_backend_passed": full_backend_passed,
-        "full_playwright_passed": full_playwright_passed,
+        "declared_tests": [
+            {
+                "branch": node.node_id,
+                "command_digest": sha256("\0".join(node.command_policy.tests[0]).encode()).hexdigest(),
+            }
+            for node in plan.nodes
+        ],
+        "merge_associations": associations,
+        "dependency_order_verified": dependency_order_verified,
+        "integration_commands": [backend_command, electron_command],
+        "full_backend_passed": backend_command["exit_code"] == 0,
+        "full_playwright_passed": electron_command["exit_code"] == 0,
         "integration_branch": integration["integration_branch"],
         "target_branch_unchanged": tool.resolve_ref(repo=repository, branch="main")
         == original_target_sha,
+        "remote_unchanged": remote_before == remote_after,
         "status": release.get("status"),
     }
     result["decision"] = (
         "GO_RELEASE_APPROVAL"
-        if len(result["worker_worktrees"]) >= 3
+        if len(result["worker_worktrees"]) >= 3 and distinct_worktrees
         and result["all_local_reviews_approved"]
         and result["full_backend_passed"]
         and result["full_playwright_passed"]
         and result["arbitration_interrupts"] == 1
+        and result["ownership_violation_blocked"]
         and result["rejected_commit_excluded"]
+        and result["rejected_commit_exclusion_exit_code"] == 1
+        and len(result["merge_associations"]) == len(plan.nodes)
+        and all(item["approved"] and item["test_evidence_count"] for item in result["merge_associations"])
+        and result["dependency_order_verified"]
         and not result["restart_repeated_approved_branches"]
         and str(result["integration_branch"]).startswith(f"graph/{run_id}/integration")
         and result["target_branch_unchanged"]
+        and result["remote_unchanged"]
         and result["status"] == "awaiting_release_approval"
         else "BLOCKED"
     )
     return result
 
 
-def main() -> int:
+def _write_result(path: Path, result: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output", type=Path, default=Path(".runtime/development-graph-results.json")
     )
-    args = parser.parse_args()
-    run_directory = args.output.parent / f"development-run-{uuid4().hex}"
-    result = asyncio.run(run_development_graph_acceptance(run_directory))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    parser.add_argument("--inject", choices=("ownership", "backend", "electron", "remote", "missing_evidence", "exception"))
+    args = parser.parse_args(argv)
+    try:
+        run_directory = args.output.parent / f"development-run-{uuid4().hex}"
+        result = asyncio.run(run_development_graph_acceptance(run_directory, inject=args.inject))
+    except (AssertionError, GitWorkspaceError, subprocess.SubprocessError, TimeoutError, OSError, RuntimeError, ValueError) as error:
+        result = {"decision": "BLOCKED", "error_kind": type(error).__name__}
+    _write_result(args.output, result)
     print(result["decision"])
     return 0 if result["decision"] == "GO_RELEASE_APPROVAL" else 1
 

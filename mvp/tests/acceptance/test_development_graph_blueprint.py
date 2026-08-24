@@ -1,4 +1,7 @@
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -20,5 +23,48 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
         f"graph/{result['run_id']}/integration"
     )
     assert result["target_branch_unchanged"] is True
+    assert result["remote_unchanged"] is True
+    assert result["ownership_violation_blocked"] is True
+    assert result["rejected_commit_exclusion_exit_code"] == 1
+    assert result["dependency_order_verified"] is True
+    assert len(result["merge_associations"]) == 3
+    assert all(
+        item["approved"] and item["test_evidence_count"]
+        for item in result["merge_associations"]
+    )
+    assert all(command["exit_code"] == 0 for command in result["integration_commands"])
+    assert {command["label"] for command in result["integration_commands"]} == {
+        "integration_backend_full",
+        "integration_electron_playwright_full",
+    }
     assert result["status"] == "awaiting_release_approval"
     assert result["decision"] == "GO_RELEASE_APPROVAL"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    ("ownership", "backend", "electron", "remote", "missing_evidence", "exception"),
+)
+async def test_fault_injections_write_metadata_only_blocked_result(
+    tmp_path: Path, fault: str
+) -> None:
+    output = tmp_path / f"{fault}.json"
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+    completed = await __import__("asyncio").to_thread(
+        subprocess.run,
+        (sys.executable, str(script), "--output", str(output), "--inject", fault),
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=90,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout.strip() == "BLOCKED"
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["decision"] == "BLOCKED"
+    assert result["error_kind"]
+    serialized = json.dumps(result, sort_keys=True)
+    assert "github_pat_" not in serialized
+    assert str(tmp_path) not in serialized
