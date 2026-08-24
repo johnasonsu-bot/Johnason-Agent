@@ -39,6 +39,8 @@ from workbench.orchestration.project_context import ProjectContextRepository
 from workbench.orchestration.research_jobs import ResearchJobRepository
 from workbench.orchestration.research_processor import DurableResearchProcessor
 from workbench.orchestration.research_worker import ResearchTaskWorker
+from workbench.orchestration.development_jobs import DevelopmentJobRepository
+from workbench.orchestration.development_worker import DevelopmentTaskWorker
 from workbench.providers.repository import ProviderRepository
 from workbench.workflow.engine import (
     PauseRun,
@@ -69,6 +71,7 @@ class AppSettings:
     runner_lifecycle: RunnerLifecycle | None = None
     host_generation: str | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
+    development_processor: object | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -87,6 +90,8 @@ def create_app(settings: AppSettings) -> FastAPI:
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
     event_store = EventStore(settings.database)
+    development_jobs = DevelopmentJobRepository(settings.database)
+    development_worker = DevelopmentTaskWorker(development_jobs, settings.development_processor, event_store) if settings.development_processor is not None else None
     agent_profiles = AgentProfileRepository(settings.database)
     sequential_processor = settings.sequential_processor
     owns_sequential_processor = False
@@ -111,6 +116,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         graph_control=GraphControlStore(settings.database),
         project_contexts=ProjectContextRepository(settings.database),
         sequential_processor=sequential_processor,
+        development_jobs=development_jobs,
     )
     conversation_worker = ConversationTaskWorker(
         conversation_api.conversations, conversation_api
@@ -134,6 +140,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         lifecycle_started = False
         worker_started = False
         research_worker_started = False
+        development_worker_started = False
         try:
             if settings.runner_lifecycle is not None:
                 await settings.runner_lifecycle.start()
@@ -143,9 +150,14 @@ def create_app(settings: AppSettings) -> FastAPI:
             if research_worker is not None:
                 await research_worker.start()
                 research_worker_started = True
+            if development_worker is not None:
+                await development_worker.start()
+                development_worker_started = True
             yield
         finally:
             try:
+                if development_worker_started and development_worker is not None:
+                    await development_worker.stop()
                 if research_worker_started and research_worker is not None:
                     await research_worker.stop()
                 if worker_started:
@@ -175,6 +187,7 @@ def create_app(settings: AppSettings) -> FastAPI:
                                     settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
+    app.state.development_jobs = development_jobs
 
     @app.middleware("http")
     async def authenticate_local_control_plane(request: Request, call_next):

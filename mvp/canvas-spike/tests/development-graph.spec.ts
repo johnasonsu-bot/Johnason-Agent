@@ -16,6 +16,7 @@ from workbench.models.profiles import ProviderProfileRecord
 from workbench.protocol.events import DomainEvent
 from workbench.providers.repository import ProviderRepository
 from workbench.workflow.event_store import EventStore
+from workbench.orchestration.development_jobs import DevelopmentJobRepository
 
 db = Path(sys.argv[1]) / "workbench.sqlite"
 providers = ProviderRepository(db)
@@ -32,6 +33,9 @@ events = [
 store = EventStore(db)
 for index, (kind, payload) in enumerate(events):
     store.append(DomainEvent.new(kind, "fixture", payload, run_id="ui-session-0"), command_id=f"development-fixture-{index}")
+jobs = DevelopmentJobRepository(db)
+jobs.admit("development-run.fixture", "ui-session-0")
+jobs.mark_needs_human("development-run.fixture", interrupt_id="release.fixture", interrupt_kind="release_approval", interrupt_payload={"kind":"release_approval"})
 `;
   const result = spawnSync(python, ["-c", script, runtimeDir], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr || "development fixture setup failed");
@@ -51,6 +55,8 @@ test("development graph shows isolated branches and waits for release approval",
     await expect(graph.getByRole("button", { name: "批准进入目标分支" })).toBeVisible();
     await expect(graph).not.toContainText("secret-value");
     await expect(graph).not.toContainText("reset");
+    await graph.getByRole("button", { name: "批准进入目标分支" }).click();
+    await expect(graph.getByRole("button", { name: "审批已提交" })).toBeVisible();
   } finally {
     await app.close();
   }

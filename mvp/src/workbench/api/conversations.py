@@ -34,6 +34,7 @@ from workbench.orchestration.contracts import (
 )
 from workbench.orchestration.control_store import GraphControlStore
 from workbench.orchestration.project_context import ProjectContextRepository
+from workbench.orchestration.development_jobs import DevelopmentJobRepository
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
 from workbench.runtime.engine_host.client import (
@@ -140,6 +141,12 @@ class SequentialResumeRequest(BaseModel):
     decision: Literal["approved"]
 
 
+class DevelopmentInterruptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    decision: Literal["approved"]
+
+
 class SessionPausedError(RuntimeError):
     pass
 
@@ -164,6 +171,7 @@ class ConversationAPI:
     graph_control: GraphControlStore | None = None
     project_contexts: ProjectContextRepository | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
+    development_jobs: DevelopmentJobRepository | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
     def create_session(self, session_id: str) -> ConversationSession:
@@ -1696,6 +1704,34 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         except KeyError as exc:
             raise HTTPException(404, "orchestration not found") from exc
         except (TurnSnapshotCorruption, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @router.post(
+        "/sessions/{session_id}/development-runs/{graph_run_id}/interrupts/{interrupt_id}"
+    )
+    def resume_development_interrupt(
+        session_id: str,
+        graph_run_id: str,
+        interrupt_id: str,
+        payload: DevelopmentInterruptRequest,
+        idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if not idempotency_key:
+            raise HTTPException(400, "Idempotency-Key header is required")
+        if api.development_jobs is None:
+            raise HTTPException(503, "development graph control is unavailable")
+        try:
+            job = api.development_jobs.resume_idempotently(
+                graph_run_id, session_id, interrupt_id, payload.model_dump(mode="json"), idempotency_key
+            )
+            return {
+                "graph_run_id": job.graph_run_id,
+                "interrupt_id": interrupt_id,
+                "status": job.status,
+            }
+        except KeyError as exc:
+            raise HTTPException(404, "development graph interrupt not found") from exc
+        except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @router.post("/sessions/{session_id}/interventions")

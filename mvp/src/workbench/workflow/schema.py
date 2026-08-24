@@ -210,6 +210,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS research_graph_jobs (
             graph_run_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
+            plan_json TEXT,
             status TEXT NOT NULL,
             owner_id TEXT,
             lease_expires_at REAL NOT NULL,
@@ -306,6 +307,32 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             completed_at REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS development_graph_jobs (
+            graph_run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner_id TEXT,
+            lease_expires_at REAL NOT NULL DEFAULT 0,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            resume_json TEXT,
+            interrupt_id TEXT,
+            interrupt_kind TEXT,
+            interrupt_digest TEXT,
+            interrupt_payload_json TEXT,
+            interrupt_actor_id TEXT,
+            interrupt_decision TEXT,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS development_job_commands (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
         );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
@@ -427,6 +454,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection, "research_graph_jobs", "resume_json", "TEXT"
     )
+    _add_column_if_missing(connection, "development_graph_jobs", "plan_json", "TEXT")
     _add_column_if_missing(
         connection, "research_graph_jobs", "next_attempt_at", "REAL NOT NULL DEFAULT 0"
     )
@@ -445,6 +473,10 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         SET enqueue_sequence = rowid
         WHERE enqueue_sequence IS NULL
         """
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS idx_development_graph_jobs_queue
+        ON development_graph_jobs(status, lease_expires_at, updated_at)"""
     )
     connection.execute(
         """

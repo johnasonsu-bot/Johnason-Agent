@@ -307,7 +307,7 @@ export function ConversationWorkspace() {
       <div className="conversation-execution-panels">
         <SequentialGraph state={sequential} profiles={modelProfiles} onApprove={approveOrchestration} />
         <PlanApproval sessionId={sessionId} onApproved={() => setStatus("研究计划已批准并排队 · queued")} />
-        <GraphRun state={research} onResume={resumeResearch} />
+        <GraphRun state={research} onResume={resumeResearch} sessionId={sessionId} />
       </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
       <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} />

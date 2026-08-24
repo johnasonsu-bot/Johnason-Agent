@@ -1,8 +1,93 @@
 """Pure projection from domain events to AG-UI wire events."""
 
-from typing import Any
+import re
+from typing import Annotated, Any, Literal
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError
 
 from workbench.protocol.events import DomainEvent
+from workbench.orchestration.contracts import OpaqueIdentifier, PublicSummary
+
+
+_SHA = re.compile(r"[0-9a-f]{40}\Z")
+
+
+def _sha(value: str) -> str:
+    if not _SHA.fullmatch(value):
+        raise ValueError("must be a full SHA")
+    return value
+
+
+Sha = Annotated[str, AfterValidator(_sha)]
+
+
+class _DevelopmentPublic(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _DevelopmentPlan(_DevelopmentPublic):
+    plan_id: OpaqueIdentifier
+    graph_run_id: OpaqueIdentifier
+    status: Literal["approved"]
+
+
+class _DevelopmentBranch(_DevelopmentPublic):
+    graph_run_id: OpaqueIdentifier
+    branch_id: OpaqueIdentifier
+    attempt: int = Field(ge=1)
+    worktree_display_name: PublicSummary | None = None
+    worker_branch: OpaqueIdentifier
+    base_sha: Sha
+    commit_sha: Sha
+    owned_path_summary: tuple[OpaqueIdentifier, ...] = Field(max_length=64)
+    test_label: PublicSummary
+    test_result: Literal["passed", "failed", "pending"]
+    status: Literal["running", "completed", "failed"] | None = None
+
+
+class _DevelopmentReview(_DevelopmentPublic):
+    graph_run_id: OpaqueIdentifier
+    branch_id: OpaqueIdentifier
+    attempt: int = Field(ge=1)
+    decision: Literal["approved", "rejected", "needs_human"]
+    findings: tuple[PublicSummary, ...] = Field(max_length=32)
+
+
+class _DevelopmentMerge(_DevelopmentPublic):
+    graph_run_id: OpaqueIdentifier
+    status: Literal["merged", "conflict"]
+    integration_branch: OpaqueIdentifier
+    base_sha: Sha
+    commits: tuple[Sha, ...] = Field(min_length=1, max_length=64)
+    integration_sha: Sha | None = None
+    conflict_paths: tuple[OpaqueIdentifier, ...] = Field(default=(), max_length=64)
+    conflict_evidence: tuple[PublicSummary, ...] = Field(default=(), max_length=32)
+
+
+class _DevelopmentVerification(_DevelopmentPublic):
+    graph_run_id: OpaqueIdentifier
+    decision: Literal["approved", "rework_merge", "rework_branch", "request_replan"]
+    test_label: PublicSummary
+    test_result: Literal["passed", "failed", "pending"]
+    global_verifier: Literal["approved", "rejected", "needs_human"]
+    findings: tuple[PublicSummary, ...] = Field(default=(), max_length=32)
+
+
+class _DevelopmentInterrupt(_DevelopmentPublic):
+    graph_run_id: OpaqueIdentifier
+    interrupt_id: OpaqueIdentifier
+    interrupt_kind: Literal["release_approval"]
+    status: Literal["awaiting_release_approval"]
+
+
+_DEVELOPMENT_MODELS: dict[str, type[_DevelopmentPublic]] = {
+    "development.plan.approved": _DevelopmentPlan,
+    "development.branch.progress": _DevelopmentBranch,
+    "development.local_review.decided": _DevelopmentReview,
+    "development.merge.completed": _DevelopmentMerge,
+    "development.global_verification.decided": _DevelopmentVerification,
+    "development.interrupt.required": _DevelopmentInterrupt,
+}
 
 
 _SIMPLE_TYPES = {
@@ -96,7 +181,10 @@ def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
             "conversation.turn.failed": "turn_failed",
             "conversation.turn.retryable": "turn_retryable",
         }.get(event.event_type, event.event_type)
-        result["value"] = _public_custom_payload(event.event_type, payload)
+        value = _public_custom_payload(event.event_type, payload)
+        if event.event_type in _DEVELOPMENT_MODELS and not value:
+            return []
+        result["value"] = value
     return [result]
 
 
@@ -270,7 +358,6 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "graph_run_id",
             "branch_id",
             "attempt",
-            "worktree_name",
             "worktree_display_name",
             "worker_branch",
             "base_sha",
@@ -312,4 +399,11 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "status",
         ),
     }.get(event_type)
-    return {key: payload[key] for key in fields or () if key in payload}
+    projected = {key: payload[key] for key in fields or () if key in payload}
+    model = _DEVELOPMENT_MODELS.get(event_type)
+    if model is None:
+        return projected
+    try:
+        return model.model_validate(projected).model_dump(mode="json", exclude_none=True)
+    except ValidationError:
+        return {}

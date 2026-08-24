@@ -2,7 +2,7 @@ import type { ConversationEvent } from "../api";
 
 export type ResearchRecord = { branchId: string; attempt: number; stage: string; status: string; decision?: string; findings: string[]; evidenceRefs: string[] };
 export type DevelopmentBranchRecord = { branchId: string; attempt: number; worktreeName: string; workerBranch: string; baseSha: string; commitSha: string; ownedPathSummary: string[]; testLabel: string; testResult: string; status: string; review?: string; findings: string[] };
-export type DevelopmentGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; status?: string; branches: Record<string, DevelopmentBranchRecord>; merge?: Record<string, unknown>; regression?: Record<string, unknown> };
+export type DevelopmentGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; status?: string; lastSequence?: number; branches: Record<string, DevelopmentBranchRecord>; merge?: Record<string, unknown>; regression?: Record<string, unknown> };
 export type ResearchGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; records: Record<string, ResearchRecord>; supervisor?: Record<string, unknown>; arbitration?: Record<string, unknown>; merge?: Record<string, unknown>; globalReview?: Record<string, unknown>; development?: DevelopmentGraphState };
 
 export const emptyResearchGraphState = (): ResearchGraphState => ({ records: {} });
@@ -16,22 +16,28 @@ function reduceDevelopmentEvent(state: ResearchGraphState, event: ConversationEv
   const value = event.value ?? {};
   const current = developmentState(state);
   const graphRunId = text(value.graph_run_id) || current.graphRunId;
-  if (event.name === "development.plan.approved") return { ...state, development: { graphRunId, branches: {} } };
+  if (!graphRunId || (current.graphRunId && graphRunId !== current.graphRunId)) return state;
+  const sequence = number(event.sequence);
+  if (sequence && current.lastSequence && sequence <= current.lastSequence) return state;
+  const next = <T extends DevelopmentGraphState>(update: T): ResearchGraphState => ({ ...state, development: { ...update, lastSequence: sequence || current.lastSequence } });
+  if (event.name === "development.plan.approved") return next(current.graphRunId ? { ...current, graphRunId } : { graphRunId, branches: {} });
   if (event.name === "development.branch.progress") {
     const record: DevelopmentBranchRecord = { branchId: text(value.branch_id), attempt: number(value.attempt), worktreeName: text(value.worktree_display_name) || text(value.worktree_name), workerBranch: text(value.worker_branch), baseSha: text(value.base_sha), commitSha: text(value.commit_sha), ownedPathSummary: strings(value.owned_path_summary), testLabel: text(value.test_label), testResult: text(value.test_result), status: text(value.status), findings: [] };
     const key = `${record.branchId}:${record.attempt}`;
-    return { ...state, development: { ...current, graphRunId, branches: { ...current.branches, [key]: record } } };
+    const existing = current.branches[key];
+    return next({ ...current, graphRunId, branches: { ...current.branches, [key]: existing ? { ...record, review: existing.review, findings: existing.findings } : record } });
   }
   if (event.name === "development.local_review.decided") {
     const branchId = text(value.branch_id);
     const attempt = number(value.attempt);
     const key = `${branchId}:${attempt}`;
     const existing = current.branches[key];
-    return { ...state, development: { ...current, graphRunId, branches: existing ? { ...current.branches, [key]: { ...existing, review: text(value.decision), findings: strings(value.findings) } } : current.branches } };
+    const placeholder: DevelopmentBranchRecord = { branchId, attempt, worktreeName: "", workerBranch: "", baseSha: "", commitSha: "", ownedPathSummary: [], testLabel: "", testResult: "pending", status: "", findings: [] };
+    return next({ ...current, graphRunId, branches: { ...current.branches, [key]: { ...(existing ?? placeholder), review: text(value.decision), findings: strings(value.findings) } } });
   }
-  if (event.name === "development.merge.completed") return { ...state, development: { ...current, graphRunId, merge: value } };
-  if (event.name === "development.global_verification.decided") return { ...state, development: { ...current, graphRunId, regression: value } };
-  if (event.name === "development.interrupt.required") return { ...state, development: { ...current, graphRunId, interruptId: text(value.interrupt_id), interruptKind: text(value.interrupt_kind), status: text(value.status) } };
+  if (event.name === "development.merge.completed") return next({ ...current, graphRunId, merge: { ...(current.merge ?? {}), ...value } });
+  if (event.name === "development.global_verification.decided") return next({ ...current, graphRunId, regression: { ...(current.regression ?? {}), ...value } });
+  if (event.name === "development.interrupt.required") return next({ ...current, graphRunId, interruptId: text(value.interrupt_id), interruptKind: text(value.interrupt_kind), status: text(value.status) });
   return state;
 }
 

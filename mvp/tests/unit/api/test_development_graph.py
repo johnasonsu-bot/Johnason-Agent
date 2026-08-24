@@ -48,3 +48,20 @@ def test_development_projection_is_metadata_only() -> None:
     assert "API_KEY" not in body
     assert "secret-value" not in body
     assert "reset" not in body
+
+
+def test_development_projections_reject_credential_signatures_in_allowed_fields() -> None:
+    event = DomainEvent.new(
+        "development.local_review.decided",
+        "test",
+        {
+            "graph_run_id": "development-run.1",
+            "branch_id": "backend",
+            "attempt": 1,
+            "decision": "rejected",
+            "findings": ["authorization: Bearer secret-value"],
+        },
+        run_id="session-1",
+    )
+
+    assert map_domain_event(event) == []

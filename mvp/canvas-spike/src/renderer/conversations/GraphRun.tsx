@@ -1,10 +1,10 @@
 import { useState } from "react";
-import { graphPlanApi } from "../api";
+import { conversationApi } from "../api";
 import type { DevelopmentBranchRecord, ResearchGraphState } from "./graphReducer";
 
 const labels: Record<string, string> = { research: "研究", compare: "比较", fact_check: "事实核验", gap_analysis: "缺口分析" };
 
-export function GraphRun({ state, onResume }: { state: ResearchGraphState; onResume(preference?: string): void }) {
+export function GraphRun({ state, onResume, sessionId }: { state: ResearchGraphState; onResume(preference?: string): void; sessionId: string }) {
   const [preference, setPreference] = useState("");
   const [releasePending, setReleasePending] = useState(false);
   const development = state.development;
@@ -15,7 +15,7 @@ export function GraphRun({ state, onResume }: { state: ResearchGraphState; onRes
   const approveRelease = () => {
     if (!development?.graphRunId || !development.interruptId || development.interruptKind !== "release_approval") return;
     setReleasePending(true);
-    void graphPlanApi.resumeInterrupt(development.graphRunId, development.interruptId, `development-release-${development.graphRunId}-${Date.now()}`).catch(() => setReleasePending(false));
+    void conversationApi.resumeDevelopmentInterrupt(sessionId, development.graphRunId, development.interruptId, `development-release-${sessionId}-${Date.now()}`).catch(() => setReleasePending(false));
   };
   return <>
     {state.graphRunId && <section className="research-run" aria-label="研究图运行">
@@ -32,9 +32,9 @@ export function GraphRun({ state, onResume }: { state: ResearchGraphState; onRes
     </section>}
     {development?.graphRunId && <section className="development-run" aria-label="开发图运行">
       <header><div><small>Development Graph</small><h3>隔离开发证据</h3></div><code>{development.graphRunId}</code></header>
-      <div className="development-lanes">{Object.values(development.branches).map((record) => <article key={`${record.branchId}:${record.attempt}`}><strong>{record.branchId} · 独立 Worktree</strong><p>Worktree · {record.worktreeName || "—"}</p><p>分支 · {record.workerBranch || "—"}</p><p>Base · <code>{shortSha(record.baseSha)}</code>　Commit · <code>{shortSha(record.commitSha)}</code></p><p>负责文件 · {record.ownedPathSummary.length} 项</p><p>{record.testLabel || "声明测试"}{testStatus(record)}</p>{record.review && <p>{record.review === "approved" ? "局部审核通过" : record.review === "rejected" ? "局部审核未通过" : "等待人工局部审核"}</p>}</article>)}</div>
+      <div className="development-lanes">{Object.values(development.branches).map((record) => <article key={`${record.branchId}:${record.attempt}`}><strong>{record.branchId} · 独立 Worktree</strong><p>Worktree · {record.worktreeName || "—"}</p><p>分支 · {record.workerBranch || "—"}</p><p>Base · <code>{shortSha(record.baseSha)}</code>　Commit · <code>{shortSha(record.commitSha)}</code></p><p>负责文件 · {record.ownedPathSummary.length} 项</p><p>{record.testLabel || "声明测试"}{testStatus(record)}</p>{record.review && <p>{record.review === "approved" ? "局部审核通过" : record.review === "rejected" ? "局部审核未通过" : "等待人工局部审核"}</p>}{record.findings.length > 0 && <p>发现 · {record.findings.join("；")}</p>}</article>)}</div>
       <div className="development-reduce-flow">
-        {development.merge && <article><strong>临时集成分支</strong><p>{String(development.merge.status) === "conflict" ? "合并冲突，需仲裁" : "合并证据已记录"}</p><p>{String(development.merge.integration_branch ?? "—")}</p>{Array.isArray(development.merge.conflict_paths) && development.merge.conflict_paths.length > 0 && <p>冲突文件 · {(development.merge.conflict_paths as string[]).join("、")}</p>}</article>}
+        {development.merge && <article><strong>临时集成分支</strong><p>{String(development.merge.status) === "conflict" ? "合并冲突，需仲裁" : "合并证据已记录"}</p><p>{String(development.merge.integration_branch ?? "—")}</p><p>Integration · <code>{shortSha(String(development.merge.integration_sha ?? ""))}</code></p>{Array.isArray(development.merge.conflict_paths) && development.merge.conflict_paths.length > 0 && <p>冲突文件 · {(development.merge.conflict_paths as string[]).join("、")}</p>}</article>}
         {development.regression && <article><strong>全局验证</strong><p>{String(development.regression.test_label ?? "临时集成分支测试")}{String(development.regression.test_result) === "passed" ? "通过" : "未通过"}</p><p>Global Verifier · {String(development.regression.global_verifier ?? development.regression.decision ?? "待验证") === "approved" ? "通过" : "待处理"}</p></article>}
         {development.interruptKind === "release_approval" && development.interruptId && <article><strong>等待发布审批</strong><p>不会自动合并到目标分支。</p><button type="button" disabled={releasePending} onClick={approveRelease}>{releasePending ? "审批已提交" : "批准进入目标分支"}</button></article>}
       </div>
