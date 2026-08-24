@@ -1,0 +1,57 @@
+import { _electron as electron, expect, test } from "@playwright/test";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+
+const python = path.resolve("../.venv/bin/python");
+
+function installDevelopmentGraphFixtures(runtimeDir: string): void {
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  const script = String.raw`
+import sys
+from pathlib import Path
+from workbench.agents.repository import AgentProfileRepository
+from workbench.conversations.repository import ConversationRepository
+from workbench.models.profiles import ProviderProfileRecord
+from workbench.protocol.events import DomainEvent
+from workbench.providers.repository import ProviderRepository
+from workbench.workflow.event_store import EventStore
+
+db = Path(sys.argv[1]) / "workbench.sqlite"
+providers = ProviderRepository(db)
+providers.save(ProviderProfileRecord(id="lmstudio", name="LM Studio", protocol="openai", base_url="http://127.0.0.1:1234/v1"))
+ConversationRepository(db).create_session("ui-session-0")
+events = [
+  ("development.plan.approved", {"graph_run_id":"development-run.fixture", "plan_id":"development-plan.fixture", "status":"approved"}),
+  ("development.branch.progress", {"graph_run_id":"development-run.fixture", "branch_id":"backend", "attempt":1, "worktree_display_name":"backend-worktree", "worker_branch":"graph/development-run.fixture/backend", "base_sha":"a" * 40, "commit_sha":"b" * 40, "owned_path_summary":["mvp/src/workbench/api/conversations.py"], "test_label":"Backend unit tests", "test_result":"passed", "private_environment":{"API_KEY":"secret-value"}, "raw_command":["git", "reset", "--hard"]}),
+  ("development.local_review.decided", {"graph_run_id":"development-run.fixture", "branch_id":"backend", "attempt":1, "decision":"approved", "findings":[]}),
+  ("development.merge.completed", {"graph_run_id":"development-run.fixture", "status":"merged", "integration_branch":"graph/development-run.fixture/integration", "base_sha":"a" * 40, "commits":["b" * 40], "integration_sha":"c" * 40}),
+  ("development.global_verification.decided", {"graph_run_id":"development-run.fixture", "decision":"approved", "test_label":"临时集成分支测试", "test_result":"passed", "global_verifier":"approved"}),
+  ("development.interrupt.required", {"graph_run_id":"development-run.fixture", "interrupt_id":"release.fixture", "interrupt_kind":"release_approval", "status":"awaiting_release_approval"}),
+]
+store = EventStore(db)
+for index, (kind, payload) in enumerate(events):
+    store.append(DomainEvent.new(kind, "fixture", payload, run_id="ui-session-0"), command_id=f"development-fixture-{index}")
+`;
+  const result = spawnSync(python, ["-c", script, runtimeDir], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error(result.stderr || "development fixture setup failed");
+}
+
+test("development graph shows isolated branches and waits for release approval", async ({}, testInfo) => {
+  const runtimeDir = testInfo.outputPath("runtime");
+  installDevelopmentGraphFixtures(runtimeDir);
+  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
+  try {
+    const page = await app.firstWindow();
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    const graph = page.getByRole("region", { name: "开发图运行" });
+    await expect(graph.getByText("backend · 独立 Worktree")).toBeVisible();
+    await expect(graph.getByText("临时集成分支测试通过")).toBeVisible();
+    await expect(graph.getByRole("button", { name: "批准进入目标分支" })).toBeVisible();
+    await expect(graph).not.toContainText("secret-value");
+    await expect(graph).not.toContainText("reset");
+  } finally {
+    await app.close();
+  }
+});

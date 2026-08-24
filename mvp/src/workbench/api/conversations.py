@@ -69,6 +69,12 @@ class SequentialProcessEvent(BaseModel):
         "orchestration.artifact.published",
         "orchestration.interrupted",
         "orchestration.warning",
+        "development.plan.approved",
+        "development.branch.progress",
+        "development.local_review.decided",
+        "development.merge.completed",
+        "development.global_verification.decided",
+        "development.interrupt.required",
     ]
     payload: dict[str, Any]
 
