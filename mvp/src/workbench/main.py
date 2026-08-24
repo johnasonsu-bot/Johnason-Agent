@@ -29,6 +29,8 @@ from workbench.runtime.engine_host.client import EngineHostClient
 from workbench.runtime.engine_host.selector import RunnerSelector
 from workbench.settings import WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
+from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
+from workbench.orchestration.development_processor import DurableDevelopmentProcessor
 
 
 def build_app(
@@ -102,6 +104,7 @@ def build_app(
             service_instance_id=service_instance_id,
             runner_lifecycle=runner_lifecycle,
             host_generation=getattr(selected_runner, "host_generation", None),
+            development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
         )
     )
     app.state.agent_runtime = agent_runtime

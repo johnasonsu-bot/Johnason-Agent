@@ -44,7 +44,9 @@ function isApiRequest(value: unknown): value is ApiRequest {
     const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}$/i.exec(request.path);
     const graphPlanPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/plans(?:\/[A-Za-z0-9._:-]{1,128}\/versions\/\d+(?:\/(approve|replan))?)?$/.exec(request.path);
     const graphInterruptPath = /^\/graph-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
-    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath && !graphPlanPath && !graphInterruptPath) return false;
+    const developmentInterruptPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/development-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
+    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath && !graphPlanPath && !graphInterruptPath && !developmentInterruptPath) return false;
+    if (developmentInterruptPath) return request.method === "POST";
     if (graphInterruptPath) return request.method === "POST";
     if (graphPlanPath) {
       const operation = graphPlanPath[1];

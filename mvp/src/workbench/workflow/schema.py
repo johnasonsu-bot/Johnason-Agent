@@ -311,6 +311,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS development_graph_jobs (
             graph_run_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
             status TEXT NOT NULL,
             owner_id TEXT,
             lease_expires_at REAL NOT NULL DEFAULT 0,
@@ -454,7 +455,11 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection, "research_graph_jobs", "resume_json", "TEXT"
     )
-    _add_column_if_missing(connection, "development_graph_jobs", "plan_json", "TEXT")
+    # ``DevelopmentJobRepository`` refuses rows without this immutable snapshot.
+    # Legacy rows cannot be resumed safely, so preserve them as failed audit rows
+    # while rebuilding the table with the admission invariant enforced by SQLite.
+    if not _column_is_not_null(connection, "development_graph_jobs", "plan_json"):
+        _migrate_development_job_plan_snapshot(connection)
     _add_column_if_missing(
         connection, "research_graph_jobs", "next_attempt_at", "REAL NOT NULL DEFAULT 0"
     )
@@ -577,3 +582,38 @@ def _add_column_if_missing(
     if any(_pragma_value(row, "name", 1) == column for row in columns):
         return
     connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def _column_is_not_null(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(
+        _pragma_value(row, "name", 1) == column and bool(_pragma_value(row, "notnull", 3))
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    )
+
+
+def _migrate_development_job_plan_snapshot(connection: sqlite3.Connection) -> None:
+    """Rebuild the small job table; a legacy missing plan is terminal, never runnable."""
+    connection.execute("DROP INDEX IF EXISTS idx_development_graph_jobs_queue")
+    connection.execute("ALTER TABLE development_graph_jobs RENAME TO development_graph_jobs_legacy")
+    connection.execute(
+        """CREATE TABLE development_graph_jobs (
+        graph_run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, plan_json TEXT NOT NULL,
+        status TEXT NOT NULL, owner_id TEXT, lease_expires_at REAL NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 0, resume_json TEXT, interrupt_id TEXT,
+        interrupt_kind TEXT, interrupt_digest TEXT, interrupt_payload_json TEXT,
+        interrupt_actor_id TEXT, interrupt_decision TEXT, updated_at REAL NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id))"""
+    )
+    columns = {str(_pragma_value(row, "name", 1)) for row in connection.execute("PRAGMA table_info(development_graph_jobs_legacy)").fetchall()}
+    plan = "plan_json" if "plan_json" in columns else "NULL"
+    connection.execute(
+        f"""INSERT INTO development_graph_jobs
+        SELECT graph_run_id, session_id, COALESCE({plan}, '{{}}'),
+        CASE WHEN {plan} IS NULL THEN 'failed' ELSE status END,
+        CASE WHEN {plan} IS NULL THEN NULL ELSE owner_id END,
+        CASE WHEN {plan} IS NULL THEN 0 ELSE lease_expires_at END,
+        attempt, resume_json, interrupt_id, interrupt_kind, interrupt_digest,
+        interrupt_payload_json, interrupt_actor_id, interrupt_decision, updated_at
+        FROM development_graph_jobs_legacy"""
+    )
+    connection.execute("DROP TABLE development_graph_jobs_legacy")

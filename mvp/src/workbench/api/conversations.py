@@ -144,7 +144,9 @@ class SequentialResumeRequest(BaseModel):
 class DevelopmentInterruptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    decision: Literal["approved"]
+    decision: Literal["approved", "retry_merge", "request_replan", "rework_branch"] | None = None
+    decisions: dict[str, Literal["approved"]] | None = None
+    target_branch: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class SessionPausedError(RuntimeError):
@@ -1722,7 +1724,7 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
             raise HTTPException(503, "development graph control is unavailable")
         try:
             job = api.development_jobs.resume_idempotently(
-                graph_run_id, session_id, interrupt_id, payload.model_dump(mode="json"), idempotency_key
+                graph_run_id, session_id, interrupt_id, payload.model_dump(mode="json", exclude_none=True), idempotency_key
             )
             return {
                 "graph_run_id": job.graph_run_id,

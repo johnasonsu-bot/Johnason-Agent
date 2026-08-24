@@ -17,6 +17,11 @@ export function GraphRun({ state, onResume, sessionId }: { state: ResearchGraphS
     setReleasePending(true);
     void conversationApi.resumeDevelopmentInterrupt(sessionId, development.graphRunId, development.interruptId, `development-release-${sessionId}-${Date.now()}`).catch(() => setReleasePending(false));
   };
+  const resumeDevelopment = (response: Record<string, unknown>) => {
+    if (!development?.graphRunId || !development.interruptId) return;
+    setReleasePending(true);
+    void conversationApi.resumeDevelopmentInterrupt(sessionId, development.graphRunId, development.interruptId, `development-interrupt-${sessionId}-${Date.now()}`, response).catch(() => setReleasePending(false));
+  };
   return <>
     {state.graphRunId && <section className="research-run" aria-label="研究图运行">
     <header><div><small>Research Graph</small><h3>并行研究执行</h3></div><code>{state.graphRunId}</code></header>
@@ -36,6 +41,11 @@ export function GraphRun({ state, onResume, sessionId }: { state: ResearchGraphS
       <div className="development-reduce-flow">
         {development.merge && <article><strong>临时集成分支</strong><p>{String(development.merge.status) === "conflict" ? "合并冲突，需仲裁" : "合并证据已记录"}</p><p>{String(development.merge.integration_branch ?? "—")}</p><p>Integration · <code>{shortSha(String(development.merge.integration_sha ?? ""))}</code></p>{Array.isArray(development.merge.conflict_paths) && development.merge.conflict_paths.length > 0 && <p>冲突文件 · {(development.merge.conflict_paths as string[]).join("、")}</p>}</article>}
         {development.regression && <article><strong>全局验证</strong><p>{String(development.regression.test_label ?? "临时集成分支测试")}{String(development.regression.test_result) === "passed" ? "通过" : "未通过"}</p><p>Global Verifier · {String(development.regression.global_verifier ?? development.regression.decision ?? "待验证") === "approved" ? "通过" : "待处理"}</p></article>}
+        {development.interruptKind === "branch_review" && development.interruptId && <article><strong>分支审核等待人工决定</strong><p>只会批准当前已完成的隔离分支。</p><button type="button" disabled={releasePending} onClick={() => resumeDevelopment({ decisions: Object.fromEntries(Object.values(development.branches).filter((item) => item.review === "needs_human").map((item) => [item.branchId, "approved"])) })}>{releasePending ? "审批已提交" : "批准分支审核并继续"}</button></article>}
+        {development.interruptKind === "attempt_reset_approval" && development.interruptId && <article><strong>重置尝试等待审批</strong><p>仅在隔离 Worktree 内恢复已审核的基线。</p><button type="button" disabled={releasePending} onClick={() => resumeDevelopment({ decision: "approved" })}>{releasePending ? "审批已提交" : "批准隔离分支重置"}</button></article>}
+        {development.interruptKind === "integration_approval" && development.interruptId && <article><strong>临时集成等待审批</strong><p>不会触碰目标分支。</p><button type="button" disabled={releasePending} onClick={() => resumeDevelopment({ decision: "approved" })}>{releasePending ? "审批已提交" : "批准临时集成"}</button></article>}
+        {development.interruptKind === "merge_arbitration" && development.interruptId && <article><strong>合并冲突等待仲裁</strong><button type="button" disabled={releasePending} onClick={() => resumeDevelopment({ decision: "retry_merge" })}>重试临时集成</button></article>}
+        {development.interruptKind === "replan" && <article><strong>需要重新规划</strong><p>需由已批准的新开发计划替代当前运行；不会接受浏览器传入的命令。</p></article>}
         {development.interruptKind === "release_approval" && development.interruptId && <article><strong>等待发布审批</strong><p>不会自动合并到目标分支。</p><button type="button" disabled={releasePending} onClick={approveRelease}>{releasePending ? "审批已提交" : "批准进入目标分支"}</button></article>}
       </div>
     </section>}

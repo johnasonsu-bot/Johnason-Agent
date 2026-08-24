@@ -10,6 +10,8 @@ from workbench.orchestration.contracts import OpaqueIdentifier, PublicSummary
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SECRET_OR_CREDENTIAL = re.compile(r"(?:\b(?:token|secret|credential|password)\b|api[_ -]?(?:key|token)|authorization|bearer\s+|github_pat_|gh[pousr]_|sk-|AKIA)", re.IGNORECASE)
+_UNSAFE_PATH = re.compile(r"(?:^/|^[A-Za-z]:[\\/]|(?:^|[\\/])\.\.(?:[\\/]|$)|\\)")
 
 
 def _sha(value: str) -> str:
@@ -76,8 +78,8 @@ class _DevelopmentVerification(_DevelopmentPublic):
 class _DevelopmentInterrupt(_DevelopmentPublic):
     graph_run_id: OpaqueIdentifier
     interrupt_id: OpaqueIdentifier
-    interrupt_kind: Literal["release_approval"]
-    status: Literal["awaiting_release_approval"]
+    interrupt_kind: Literal["branch_review", "attempt_reset_approval", "integration_approval", "merge_arbitration", "replan", "release_approval"]
+    status: Literal["needs_human", "completed"]
 
 
 _DEVELOPMENT_MODELS: dict[str, type[_DevelopmentPublic]] = {
@@ -399,6 +401,8 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "status",
         ),
     }.get(event_type)
+    if event_type in _DEVELOPMENT_MODELS and _unsafe_development_payload(payload):
+        return {}
     projected = {key: payload[key] for key in fields or () if key in payload}
     model = _DEVELOPMENT_MODELS.get(event_type)
     if model is None:
@@ -407,3 +411,14 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
         return model.model_validate(projected).model_dump(mode="json", exclude_none=True)
     except ValidationError:
         return {}
+
+
+def _unsafe_development_payload(value: Any) -> bool:
+    """Reject leakage even when it is hidden in an otherwise ignored nested field."""
+    if isinstance(value, dict):
+        return any(_unsafe_development_payload(key) or _unsafe_development_payload(item) for key, item in value.items())
+    if isinstance(value, (tuple, list)):
+        return any(_unsafe_development_payload(item) for item in value)
+    if isinstance(value, str):
+        return bool(_SECRET_OR_CREDENTIAL.search(value) or _UNSAFE_PATH.search(value))
+    return False
