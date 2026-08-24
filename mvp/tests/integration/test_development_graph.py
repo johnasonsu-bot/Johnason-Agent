@@ -176,7 +176,7 @@ async def test_workers_commit_in_isolation_and_merge_only_approved(
     )
     config = graph_config("development-run", 3)
 
-    paused = await asyncio.to_thread(
+    reset_paused = await asyncio.to_thread(
         invoke_development_to_boundary,
         graph,
         initial_development_state(
@@ -185,6 +185,13 @@ async def test_workers_commit_in_isolation_and_merge_only_approved(
             generation=1,
             git_workspace=tool,
         ),
+        config,
+    )
+    assert reset_paused["status"] == "awaiting_attempt_reset_approval"
+    paused = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        Command(resume={"decision": "approved"}),
         config,
     )
     assert paused["status"] == "awaiting_integration_approval"
@@ -264,6 +271,13 @@ async def test_reverse_declared_dependencies_merge_in_topological_order(
         ),
         config,
     )
+    assert paused["status"] == "awaiting_attempt_reset_approval"
+    paused = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        Command(resume={"decision": "approved"}),
+        config,
+    )
     assert paused["status"] == "awaiting_integration_approval"
 
     release = await asyncio.to_thread(
@@ -309,6 +323,7 @@ async def test_parallel_human_reviews_are_approved_as_a_branch_keyed_batch(
         ),
         config,
     )
+    assert paused["status"] == "awaiting_branch_review"
     assert set(paused["pending_branch_reviews"]) == {"backend", "frontend"}
 
     integrated = await asyncio.to_thread(
@@ -462,6 +477,13 @@ async def test_global_rework_and_replan_routes_stay_inside_graph_boundaries(
         ),
         config,
     )
+    reset = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        Command(resume={"decision": "approved"}),
+        config,
+    )
+    assert reset["status"] == "awaiting_attempt_reset_approval"
     rework = await asyncio.to_thread(
         invoke_development_to_boundary,
         graph,

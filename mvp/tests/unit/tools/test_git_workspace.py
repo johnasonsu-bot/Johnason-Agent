@@ -395,3 +395,18 @@ def test_merge_reports_only_real_conflict_paths_for_arbitration(
 
     assert raised.value.paths == ("README.md",)
     assert first_sha in raised.value.parent_graph
+    assert second_sha in raised.value.parent_graph
+
+    # A crash after Git reports the conflict must reconstruct the structured
+    # arbitration evidence instead of degrading to generic reconciliation.
+    with pytest.raises(IntegrationConflict) as recovered:
+        workspace.merge_to_integration(
+            operation_id="op-conflict",
+            repo=repo,
+            base_sha=base_sha,
+            integration_branch="graph/r1/integration",
+            commits=(first_sha, second_sha),
+        )
+    assert recovered.value.paths == ("README.md",)
+    assert first_sha in recovered.value.parent_graph
+    assert second_sha in recovered.value.parent_graph

@@ -345,6 +345,16 @@ class GitWorkspaceTool:
                 raise GitWorkspaceError("recorded integration cannot be verified")
             return record.result_ref
         if record.status != "reserved":
+            recovered = self._recover_integration_conflict(
+                operation_id=operation_id,
+                repository=repository,
+                path=path,
+                integration_branch=integration_branch,
+                base_sha=base_sha,
+                commits=commits,
+            )
+            if recovered is not None:
+                raise recovered
             raise GitWorkspaceError("merge effect requires reconciliation")
         self.ledger.mark_started(operation_id)
         completed: subprocess.CompletedProcess[str] | None = None
@@ -371,12 +381,17 @@ class GitWorkspaceTool:
                     check=False,
                 )
                 if completed.returncode != 0:
-                    conflict_paths = self._conflict_paths(path)
-                    if conflict_paths:
-                        raise IntegrationConflict(
-                            paths=conflict_paths,
-                            parent_graph=self._merge_parent_graph(path),
+                    conflict = self._integration_conflict(path)
+                    if conflict is not None:
+                        self._record_integration_conflict(
+                            operation_id=operation_id,
+                            repository=repository,
+                            integration_branch=integration_branch,
+                            base_sha=base_sha,
+                            commits=commits,
+                            conflict=conflict,
                         )
+                        raise conflict
                     raise GitWorkspaceError("integration merge could not complete")
                 merged_sha = self._run(path, "rev-parse", "HEAD").stdout.strip()
                 parents = self._run(
@@ -555,12 +570,87 @@ class GitWorkspaceTool:
         ).stdout
         return tuple(sorted(self._nul_paths(output)))
 
-    def _merge_parent_graph(self, path: Path) -> tuple[str, ...]:
+    def _merge_parent_graph(self, path: Path, merge_head: str) -> tuple[str, ...]:
         output = self._run(path, "rev-list", "--parents", "-n", "1", "HEAD").stdout
         values = output.split()
         if not values or any(not _SHA.fullmatch(value) for value in values):
             raise GitWorkspaceError("integration parent graph cannot be verified")
-        return tuple(values)
+        return tuple(dict.fromkeys((*values, merge_head)))
+
+    def _integration_conflict(self, path: Path) -> IntegrationConflict | None:
+        conflict_paths = self._conflict_paths(path)
+        merge_head = self._run(
+            path, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False
+        ).stdout.strip()
+        if not conflict_paths or not _SHA.fullmatch(merge_head):
+            return None
+        return IntegrationConflict(
+            paths=conflict_paths,
+            parent_graph=self._merge_parent_graph(path, merge_head),
+        )
+
+    def _record_integration_conflict(
+        self,
+        *,
+        operation_id: str,
+        repository: Path,
+        integration_branch: str,
+        base_sha: str,
+        commits: tuple[str, ...],
+        conflict: IntegrationConflict,
+    ) -> None:
+        merge_head = conflict.parent_graph[-1]
+        record = self.ledger.reserve(
+            f"{operation_id}:conflict",
+            effect_kind="git_integration_conflict",
+            repository_id=self._repository_id(repository),
+            branch=integration_branch,
+            base_sha=base_sha,
+            expected_result={
+                "kind": "integration_conflict",
+                "commits": list(commits),
+                "paths": list(conflict.paths),
+                "parent_graph": list(conflict.parent_graph),
+                "merge_head": merge_head,
+            },
+        )
+        if record.status == "completed":
+            return
+        if record.status != "reserved":
+            raise GitWorkspaceError("integration conflict requires reconciliation")
+        self.ledger.mark_started(record.operation_id)
+        self.ledger.mark_completed(
+            record.operation_id,
+            result_ref=merge_head,
+            exit_code=1,
+            stdout="",
+            stderr="",
+        )
+
+    def _recover_integration_conflict(
+        self,
+        *,
+        operation_id: str,
+        repository: Path,
+        path: Path,
+        integration_branch: str,
+        base_sha: str,
+        commits: tuple[str, ...],
+    ) -> IntegrationConflict | None:
+        if not path.is_dir():
+            return None
+        conflict = self._integration_conflict(path)
+        if conflict is None:
+            return None
+        self._record_integration_conflict(
+            operation_id=operation_id,
+            repository=repository,
+            integration_branch=integration_branch,
+            base_sha=base_sha,
+            commits=commits,
+            conflict=conflict,
+        )
+        return conflict
 
     def _reject_clean_filters(self, path: Path, dirty_paths: tuple[str, ...]) -> None:
         if ".gitattributes" in dirty_paths:

@@ -84,6 +84,7 @@ class EffectLedger:
         "git_attempt_prepare": "prepared_base",
         "git_commit": "commit_sha",
         "git_integration_merge": "integration_sha",
+        "git_integration_conflict": "integration_conflict",
     }
     _IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
     _HEX_64 = re.compile(r"^[0-9a-f]{64}$")
@@ -139,6 +140,9 @@ class EffectLedger:
                 "owned_paths",
                 "message_digest",
                 "commits",
+                "paths",
+                "parent_graph",
+                "merge_head",
             },
         )
         if expected_result.get("kind") not in {
@@ -146,6 +150,7 @@ class EffectLedger:
             "prepared_base",
             "commit_sha",
             "integration_sha",
+            "integration_conflict",
         }:
             raise ValueError("effect metadata kind is not allowlisted")
         if expected_result.get("kind") != self._EFFECT_KINDS[effect_kind]:
@@ -454,6 +459,25 @@ class EffectLedger:
             ):
                 raise ValueError("commit effect metadata is invalid")
             return
+        if effect_kind == "git_integration_conflict":
+            commits = value.get("commits")
+            paths = value.get("paths")
+            parents = value.get("parent_graph")
+            merge_head = value.get("merge_head")
+            if (
+                set(value) != {"kind", "commits", "paths", "parent_graph", "merge_head"}
+                or not isinstance(commits, list)
+                or not isinstance(paths, list)
+                or not isinstance(parents, list)
+                or not paths
+                or not all(isinstance(item, str) and cls._SHA.fullmatch(item) for item in commits)
+                or not all(isinstance(item, str) and item and len(item) <= 240 for item in paths)
+                or not all(isinstance(item, str) and cls._SHA.fullmatch(item) for item in parents)
+                or not isinstance(merge_head, str)
+                or not cls._SHA.fullmatch(merge_head)
+            ):
+                raise ValueError("integration conflict effect metadata is invalid")
+            return
         commits = value.get("commits")
         if (
             set(value) != {"kind", "commits"}
@@ -486,6 +510,7 @@ class EffectLedger:
             "git_attempt_prepare": "verified_attempt_prepare",
             "git_commit": "verified_commit",
             "git_integration_merge": "verified_integration",
+            "git_integration_conflict": "verified_integration_conflict",
         }[effect_kind]
         if evidence != {"reason": expected_reason, "verified_sha": result_ref}:
             raise ValueError("Git reconciliation metadata is invalid")

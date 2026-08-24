@@ -296,6 +296,8 @@ def build_development_graph(
             raise DevelopmentGraphError("worker branch is outside the validated plan")
         workspace = workspace_for(state, node)
         if attempt > 1:
+            if state.get("attempt_reset_approved") is not True:
+                raise DevelopmentGraphError("retry worker requires reset approval")
             git_workspace.prepare_attempt(
                 operation_id=f"{state['run_id']}:{branch}:attempt:{attempt}:prepare",
                 workspace=workspace,
@@ -350,7 +352,7 @@ def build_development_graph(
             return Command(
                 update={"local_reviews": [record]},
                 goto=Send(
-                    "worker",
+                    "attempt_reset_gate",
                     {"branch": branch, "attempt": attempt + 1, "run_id": state["run_id"]},
                 ),
             )
@@ -379,7 +381,10 @@ def build_development_graph(
     def human_review_queue(state: DevelopmentState) -> Command | dict[str, object]:
         if not state.get("pending_branch_reviews"):
             return {}
-        return Command(goto="human_branch_reviews")
+        return Command(
+            update={"status": "awaiting_branch_review"},
+            goto="human_branch_reviews",
+        )
 
     def human_branch_reviews(state: DevelopmentState) -> Command | dict[str, object]:
         pending = dict(state.get("pending_branch_reviews", {}))
@@ -392,7 +397,10 @@ def build_development_graph(
         }:
             raise DevelopmentGraphError("branch reviews require explicit approval")
         return Command(
-            update={"pending_branch_reviews": {branch: None for branch in pending}},
+            update={
+                "pending_branch_reviews": {branch: None for branch in pending},
+                "status": "running",
+            },
             goto=[
                 Send(
                     "branch_complete",
@@ -405,6 +413,49 @@ def build_development_graph(
                 )
                 for branch, record in sorted(pending.items())
             ],
+        )
+
+    def attempt_reset_approval(state: DevelopmentState) -> Command:
+        branch = str(state["branch"])
+        attempt = int(state["attempt"])
+        node = nodes.get(branch)
+        if node is None or attempt < 2:
+            raise DevelopmentGraphError("attempt reset is outside the validated plan")
+        workspace = workspace_for(state, node)
+        response = interrupt(
+            {
+                "kind": "attempt_reset_approval",
+                "branch": branch,
+                "current_head": git_workspace.status(workspace).head_sha,
+                "baseline_sha": validated.base_commit,
+            }
+        )
+        if response != {"decision": "approved"}:
+            raise DevelopmentGraphError("attempt reset requires explicit approval")
+        return Command(
+            update={"status": "running"},
+            goto=Send(
+                "worker",
+                {
+                    "branch": branch,
+                    "attempt": attempt,
+                    "run_id": state["run_id"],
+                    "attempt_reset_approved": True,
+                },
+            ),
+        )
+
+    def attempt_reset_gate(state: DevelopmentState) -> Command:
+        return Command(
+            update={"status": "awaiting_attempt_reset_approval"},
+            goto=Send(
+                "attempt_reset_approval",
+                {
+                    "branch": state["branch"],
+                    "attempt": state["attempt"],
+                    "run_id": state["run_id"],
+                },
+            ),
         )
 
     def integration_gate(state: DevelopmentState) -> Command | dict[str, object]:
@@ -465,9 +516,44 @@ def build_development_graph(
         ).model_dump(mode="json")
         return Command(update={"merge_attempt": attempt, "merge_evidence": evidence}, goto="global_verifier")
 
-    def arbitration(state: DevelopmentState) -> dict[str, object]:
-        interrupt({"kind": "merge_arbitration", "evidence": state.get("pending_interrupt")})
-        return {"status": "awaiting_arbitration"}
+    def arbitration(state: DevelopmentState) -> Command:
+        response = interrupt(
+            {"kind": "merge_arbitration", "evidence": state.get("pending_interrupt")}
+        )
+        if not isinstance(response, dict):
+            raise DevelopmentGraphError("merge arbitration requires a structured decision")
+        decision = response.get("decision")
+        if decision == "retry_merge" and set(response) == {"decision"}:
+            return Command(
+                update={"pending_interrupt": None, "status": "running"},
+                goto="integration_gate",
+            )
+        if decision == "rework_branch" and set(response) == {"decision", "target_branch"}:
+            target = response["target_branch"]
+            if not isinstance(target, str) or target not in nodes:
+                raise DevelopmentGraphError("merge arbitration selected an unknown branch")
+            next_attempt = int(state.get("attempts", {}).get(target, 0)) + 1
+            return Command(
+                update={
+                    "pending_interrupt": None,
+                    "status": "running",
+                    "branch_outcomes": {target: {"decision": "rework_pending"}},
+                },
+                goto=Send(
+                    "attempt_reset_gate",
+                    {
+                        "branch": target,
+                        "attempt": next_attempt,
+                        "run_id": state["graph_run_id"],
+                    },
+                ),
+            )
+        if decision == "request_replan" and set(response) == {"decision"}:
+            return Command(
+                update={"pending_interrupt": None, "status": "awaiting_replan"},
+                goto="replan",
+            )
+        raise DevelopmentGraphError("merge arbitration decision is invalid")
 
     def global_verifier(state: DevelopmentState) -> Command:
         evidence = state.get("merge_evidence") or {}
@@ -500,7 +586,7 @@ def build_development_graph(
             if target not in nodes:
                 raise DevelopmentGraphError("global verifier selected an unknown branch")
             next_attempt = int(state.get("attempts", {}).get(target, 0)) + 1
-            return Command(update={"regression": payload, "branch_outcomes": {target: {"decision": "rework_pending"}}}, goto=Send("worker", {"branch": target, "attempt": next_attempt, "run_id": state["graph_run_id"]}))
+            return Command(update={"regression": payload, "branch_outcomes": {target: {"decision": "rework_pending"}}}, goto=Send("attempt_reset_gate", {"branch": target, "attempt": next_attempt, "run_id": state["graph_run_id"]}))
         return Command(update={"regression": payload, "pending_interrupt": payload, "status": "awaiting_replan"}, goto="replan")
 
     def release_approval(state: DevelopmentState) -> dict[str, object]:
@@ -522,7 +608,9 @@ def build_development_graph(
     graph = StateGraph(DevelopmentState)
     graph.add_node("dispatch", dispatch)
     graph.add_node("worker", worker, destinations=("local_verifier",))
-    graph.add_node("local_verifier", local_verifier, destinations=("worker", "branch_complete", "human_review_queue"))
+    graph.add_node("local_verifier", local_verifier, destinations=("attempt_reset_gate", "branch_complete", "human_review_queue"))
+    graph.add_node("attempt_reset_gate", attempt_reset_gate, destinations=("attempt_reset_approval",))
+    graph.add_node("attempt_reset_approval", attempt_reset_approval, destinations=("worker",))
     graph.add_node("branch_complete", branch_complete, destinations=("dispatch",))
     graph.add_node("human_review_queue", human_review_queue, destinations=("human_branch_reviews",))
     graph.add_node("human_branch_reviews", human_branch_reviews, destinations=("branch_complete",))
