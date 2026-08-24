@@ -23,6 +23,7 @@ from workbench.orchestration.plan_service import (
     PlanService,
     PlanStateError,
 )
+from workbench.orchestration.research_jobs import ResearchJobRepository
 from workbench.orchestration.planning import (
     AgentCatalog,
     PlanValidationError,
@@ -60,6 +61,12 @@ class PlanReplanRequest(_Request):
     affected_roles: tuple[ResearchSemanticRole, ...] = Field(min_length=1)
 
 
+class GraphInterruptRequest(_Request):
+    actor_id: OpaqueIdentifier
+    decision: Literal["approved"]
+    preference: PublicSummary | None = None
+
+
 class GraphPlanAPI:
     SAFE_TOOLS = frozenset({"public.read"})
     SAFE_SKILLS = frozenset({"skill:research"})
@@ -71,6 +78,7 @@ class GraphPlanAPI:
         self.control = GraphControlStore(database)
         self.agents = AgentProfileRepository(database)
         self.providers = ProviderRepository(database)
+        self.jobs = ResearchJobRepository(database)
 
     def propose(
         self, session_id: str, command_id: str, request: PlanProposalRequest
@@ -170,8 +178,9 @@ class GraphPlanAPI:
                 thread_id=f"research-thread.{digest[:32]}",
             )
             self.control.create_run(run)
+            self.jobs.admit(run.graph_run_id, session_id)
             response = self._response(self.plans.get(plan_id, version), graph_run_id=run.graph_run_id)
-            response["status"] = "approved"
+            response["status"] = "queued"
             return response
 
         return self._idempotent(session_id, command_id, identity, action)
@@ -205,6 +214,53 @@ class GraphPlanAPI:
             return response
 
         return self._idempotent(session_id, command_id, identity, action)
+
+    def resume_interrupt(
+        self,
+        graph_run_id: str,
+        interrupt_id: str,
+        command_id: str,
+        request: GraphInterruptRequest,
+    ) -> dict[str, Any]:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT owner.session_id FROM graph_run_refs AS run
+                JOIN research_plan_owners AS owner ON owner.plan_id = run.plan_id
+                WHERE run.graph_run_id = ?""",
+                (graph_run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(graph_run_id)
+        session_id = str(row["session_id"])
+        identity = request.model_dump(mode="json") | {
+            "operation": "resume_interrupt",
+            "graph_run_id": graph_run_id,
+            "interrupt_id": interrupt_id,
+        }
+
+        def action() -> dict[str, Any]:
+            response: dict[str, object] = {"decision": request.decision}
+            if request.preference is not None:
+                response["preference"] = request.preference
+            job = self.jobs.request_resume(
+                graph_run_id,
+                session_id,
+                response,
+                interrupt_id=interrupt_id,
+                actor_id=request.actor_id,
+            )
+            return {
+                "graph_run_id": job.graph_run_id,
+                "interrupt_id": interrupt_id,
+                "status": job.status,
+            }
+
+        return self._idempotent(
+            session_id,
+            command_id,
+            identity,
+            action,
+        )
 
     def _catalog(self) -> AgentCatalog:
         candidates: list[ResearchAgentCandidate] = []
@@ -373,5 +429,34 @@ def graph_plan_router(api: GraphPlanAPI) -> APIRouter:
                 session_id, plan_id, version, key(idempotency_key), payload
             )
         )
+
+    return router
+
+
+def graph_interrupt_router(api: GraphPlanAPI) -> APIRouter:
+    router = APIRouter(prefix="/api/graph-runs", tags=["graph-interrupts"])
+
+    @router.post("/{graph_run_id}/interrupts/{interrupt_id}")
+    def resume_interrupt(
+        graph_run_id: str,
+        interrupt_id: str,
+        payload: GraphInterruptRequest,
+        idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    ):
+        if not idempotency_key:
+            raise HTTPException(400, "Idempotency-Key header is required")
+        try:
+            return api.resume_interrupt(
+                graph_run_id,
+                interrupt_id,
+                idempotency_key,
+                payload,
+            )
+        except KeyError as error:
+            raise HTTPException(404, "graph interrupt not found") from error
+        except PlanStateError as error:
+            raise HTTPException(409, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
 
     return router

@@ -22,7 +22,11 @@ from workbench.api.conversations import (
     conversation_router,
 )
 from workbench.api.engine_host import engine_host_router
-from workbench.api.graph_plans import GraphPlanAPI, graph_plan_router
+from workbench.api.graph_plans import (
+    GraphPlanAPI,
+    graph_interrupt_router,
+    graph_plan_router,
+)
 from workbench.api.providers import provider_router, vault_router
 from workbench.conversations.repository import ConversationRepository
 from workbench.conversations.worker import ConversationTaskWorker
@@ -32,6 +36,9 @@ from workbench.domain.models import RunRecord
 from workbench.models.gateway import ModelGateway
 from workbench.orchestration.control_store import GraphControlStore
 from workbench.orchestration.project_context import ProjectContextRepository
+from workbench.orchestration.research_jobs import ResearchJobRepository
+from workbench.orchestration.research_processor import DurableResearchProcessor
+from workbench.orchestration.research_worker import ResearchTaskWorker
 from workbench.providers.repository import ProviderRepository
 from workbench.workflow.engine import (
     PauseRun,
@@ -108,21 +115,39 @@ def create_app(settings: AppSettings) -> FastAPI:
     conversation_worker = ConversationTaskWorker(
         conversation_api.conversations, conversation_api
     )
+    research_processor = None
+    research_worker = None
+    if callable(getattr(settings.runner, "run_turn", None)):
+        research_processor = DurableResearchProcessor(
+            database=settings.database,
+            runner=settings.runner,
+        )
+        research_worker = ResearchTaskWorker(
+            ResearchJobRepository(settings.database),
+            research_processor,
+            event_store,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.conversation_worker = conversation_worker
         lifecycle_started = False
         worker_started = False
+        research_worker_started = False
         try:
             if settings.runner_lifecycle is not None:
                 await settings.runner_lifecycle.start()
                 lifecycle_started = True
             await conversation_worker.start()
             worker_started = True
+            if research_worker is not None:
+                await research_worker.start()
+                research_worker_started = True
             yield
         finally:
             try:
+                if research_worker_started and research_worker is not None:
+                    await research_worker.stop()
                 if worker_started:
                     await conversation_worker.stop()
             finally:
@@ -142,8 +167,12 @@ def create_app(settings: AppSettings) -> FastAPI:
                                 if callable(close_processor):
                                     await close_processor()
                         finally:
-                            if settings.vault is not None:
-                                settings.vault.lock()
+                            try:
+                                if research_processor is not None:
+                                    await research_processor.aclose()
+                            finally:
+                                if settings.vault is not None:
+                                    settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
 
@@ -169,7 +198,9 @@ def create_app(settings: AppSettings) -> FastAPI:
         return await call_next(request)
 
     app.include_router(conversation_router(conversation_api))
-    app.include_router(graph_plan_router(GraphPlanAPI(settings.database)))
+    graph_api = GraphPlanAPI(settings.database)
+    app.include_router(graph_plan_router(graph_api))
+    app.include_router(graph_interrupt_router(graph_api))
     app.include_router(agent_router(agent_profiles))
     app.include_router(
         artifact_router(settings.database, settings.database.parent / "artifacts")

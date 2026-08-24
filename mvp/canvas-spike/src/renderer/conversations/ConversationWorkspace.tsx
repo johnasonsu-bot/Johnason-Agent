@@ -154,6 +154,7 @@ export function ConversationWorkspace() {
     const seen = seenEventsRef.current[sessionId] ?? new Set<string>();
     seenEventsRef.current[sessionId] = seen;
     const storedTimeline = loadConversationTimeline(sessionId);
+    let hydratedGraph = false;
     setEntries(storedTimeline.length ? storedTimeline : (sessionId === "ui-session-0" ? initialTimeline : []));
     setSequential(emptySequentialState());
     setResearch(emptyResearchGraphState());
@@ -163,7 +164,7 @@ export function ConversationWorkspace() {
       if (!active || watcherGenerationRef.current !== generation) return;
       try {
         await conversationApi.createSession(sessionId);
-        const events = await conversationApi.events(sessionId, storedTimeline.length ? cursorsRef.current[sessionId] : undefined);
+        const events = await conversationApi.events(sessionId, hydratedGraph ? cursorsRef.current[sessionId] : undefined);
         if (!active || watcherGenerationRef.current !== generation) return;
         const fresh = events.filter((event) => {
           const id = event.cursor ?? event.eventId ?? `${event.sequence ?? ""}:${event.name ?? event.type ?? ""}`;
@@ -172,7 +173,11 @@ export function ConversationWorkspace() {
           return true;
         });
         const mapped = fresh.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry));
-        if (fresh.length) {
+        if (!hydratedGraph) {
+          setSequential(events.reduce(reduceSequentialEvent, emptySequentialState()));
+          setResearch(events.reduce(reduceResearchEvent, emptyResearchGraphState()));
+          hydratedGraph = true;
+        } else if (fresh.length) {
           setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
           setResearch((current) => fresh.reduce(reduceResearchEvent, current));
         }
@@ -287,6 +292,11 @@ export function ConversationWorkspace() {
     }).catch((error: unknown) => setStatus(`审批失败 · ${describeConversationError(error)}`));
   };
   const htmlArtifact = Object.values(sequential.artifacts).filter((item) => item.mediaType === "text/html").at(-1);
+  const resumeResearch = (preference?: string) => {
+    if (!research.graphRunId || !research.interruptId) return;
+    setStatus("人工审核已批准 · queued");
+    void graphPlanApi.resumeInterrupt(research.graphRunId, research.interruptId, createConversationCommandId("research-interrupt", sessionId), preference).catch((error: unknown) => setStatus(`审核恢复失败 · ${describeConversationError(error)}`));
+  };
 
   return <section className="conversation-workspace" aria-label="会话工作区">
     <SessionSidebar group={group} activeSessionId={sessionId} onCreateGroup={createGroup} onSessionChange={selectSession} agentProfiles={modelProfiles} />
@@ -296,8 +306,8 @@ export function ConversationWorkspace() {
       <div className={`conversation-status ${status.includes("执行中") ? "running" : ""}`} data-testid="conversation-status" aria-live="polite">{status}</div>
       <div className="conversation-execution-panels">
         <SequentialGraph state={sequential} profiles={modelProfiles} onApprove={approveOrchestration} />
-        <PlanApproval sessionId={sessionId} onApproved={() => setStatus("研究计划已批准 · approved")} />
-        <GraphRun state={research} />
+        <PlanApproval sessionId={sessionId} onApproved={() => setStatus("研究计划已批准并排队 · queued")} />
+        <GraphRun state={research} onResume={resumeResearch} />
       </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
       <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} />

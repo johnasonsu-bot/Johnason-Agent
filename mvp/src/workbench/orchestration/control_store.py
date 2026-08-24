@@ -213,6 +213,25 @@ class GraphControlStore:
                 connection.rollback()
                 raise
 
+    def get_run(self, graph_run_id: str) -> GraphRunRef:
+        with self._store.connect() as connection:
+            row = connection.execute(
+                """SELECT graph_run_id, plan_id, version, generation, thread_id,
+                          checkpoint_ref
+                FROM graph_run_refs WHERE graph_run_id = ?""",
+                (graph_run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(graph_run_id)
+        return GraphRunRef(
+            graph_run_id=row["graph_run_id"],
+            plan_id=row["plan_id"],
+            plan_version=row["version"],
+            generation=row["generation"],
+            thread_id=row["thread_id"],
+            checkpoint_ref=row["checkpoint_ref"],
+        )
+
     def append_projection(self, event: PublicGraphEvent) -> None:
         event_json = _canonical_json(event.model_dump(mode="json"))
         with self._store.connect() as connection:

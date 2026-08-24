@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from workbench.adapters.hermes.runner import AgentStepResult
 from workbench.api.app import AppSettings, create_app
+from workbench.orchestration.research_jobs import ResearchJobRepository
 
 from tests.unit.api.test_sequential_orchestration import configure
 
@@ -74,6 +75,10 @@ def test_plan_approval_is_idempotent_and_session_scoped(tmp_path: Path) -> None:
 
     assert first.status_code == 200
     assert replay.json() == first.json()
-    assert first.json()["status"] == "approved"
+    assert first.json()["status"] == "queued"
     assert first.json()["graph_run_id"].startswith("research-run.")
     assert foreign.status_code == 404
+    jobs = ResearchJobRepository(database).list_for_session("s1")
+    assert len(jobs) == 1
+    assert jobs[0].graph_run_id == first.json()["graph_run_id"]
+    assert jobs[0].status in {"queued", "running", "completed", "needs_human"}

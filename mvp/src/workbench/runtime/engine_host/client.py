@@ -482,6 +482,8 @@ class EngineHostClient:
         self, command: RunAgentTurn
     ) -> AsyncIterator[AgentEvent]:
         """Start one accepted G1 Run and stream its public Agent events."""
+        if command.allowed_tool_ids or command.allowed_skill_refs:
+            raise HostRunRejected("engine-host G1 has no scoped tool or skill manifest")
         host_run_id = command.host_run_id or command.run_id
         if command.provider_id != "lmstudio":
             raise HostRunRejected("secret-bearing provider is unavailable in G1")

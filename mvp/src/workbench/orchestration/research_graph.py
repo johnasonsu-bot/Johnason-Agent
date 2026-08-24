@@ -503,10 +503,25 @@ def build_research_graph(
         response = interrupt(
             {"kind": "arbitration", "decision": state.get("pending_interrupt")}
         )
-        if response != {"decision": "approved"}:
+        if not isinstance(response, dict) or response.get("decision") != "approved":
             raise ValueError("arbitration requires explicit approval")
+        preference = response.get("preference")
+        arbitration = dict(state.get("arbitration") or {})
+        arbitration.update(
+            {
+                "decision": "resolved",
+                "resolution": preference
+                if isinstance(preference, str) and preference.strip()
+                else "approved by human arbitration",
+            }
+        )
         return Command(
-            update={"pending_interrupt": None, "status": "running"}, goto="merge"
+            update={
+                "arbitration": arbitration,
+                "pending_interrupt": None,
+                "status": "running",
+            },
+            goto="merge",
         )
 
     def human_replan(state: ResearchState) -> dict[str, object]:

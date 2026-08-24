@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 13
+PHASE1_SCHEMA_VERSION = 16
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -207,6 +207,36 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (plan_id, version)
                 REFERENCES graph_execution_plans(plan_id, version)
         );
+        CREATE TABLE IF NOT EXISTS research_graph_jobs (
+            graph_run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner_id TEXT,
+            lease_expires_at REAL NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            resume_json TEXT,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            interrupt_id TEXT,
+            interrupt_kind TEXT,
+            interrupt_digest TEXT,
+            interrupt_payload_json TEXT,
+            interrupt_actor_id TEXT,
+            interrupt_decision TEXT,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS research_execution_records (
+            graph_run_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            branch_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (graph_run_id, stage, branch_id, attempt),
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
         CREATE TABLE IF NOT EXISTS graph_external_effect_refs (
             effect_ref_id TEXT PRIMARY KEY,
             graph_run_id TEXT NOT NULL,
@@ -319,6 +349,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'sequential execution records are append-only');
         END;
+        CREATE TRIGGER IF NOT EXISTS research_execution_records_no_update
+        BEFORE UPDATE ON research_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'research execution records are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS research_execution_records_no_delete
+        BEFORE DELETE ON research_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'research execution records are append-only');
+        END;
         CREATE TRIGGER IF NOT EXISTS graph_execution_plans_no_change_when_approved
         BEFORE UPDATE ON graph_execution_plans
         WHEN EXISTS (
@@ -366,11 +406,32 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection, "conversation_turns", "enqueue_sequence", "INTEGER"
     )
+    _add_column_if_missing(
+        connection, "research_graph_jobs", "resume_json", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "research_graph_jobs", "next_attempt_at", "REAL NOT NULL DEFAULT 0"
+    )
+    for column in (
+        "interrupt_id",
+        "interrupt_kind",
+        "interrupt_digest",
+        "interrupt_payload_json",
+        "interrupt_actor_id",
+        "interrupt_decision",
+    ):
+        _add_column_if_missing(connection, "research_graph_jobs", column, "TEXT")
     connection.execute(
         """
         UPDATE conversation_turns
         SET enqueue_sequence = rowid
         WHERE enqueue_sequence IS NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_research_graph_jobs_queue
+        ON research_graph_jobs(status, next_attempt_at, lease_expires_at, updated_at)
         """
     )
     connection.execute(

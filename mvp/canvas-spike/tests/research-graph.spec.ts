@@ -31,6 +31,8 @@ for item in (
 ): agents.create(AgentProfileWrite(agent_id=item[0], display_name=item[1], role=item[2], provider_id=item[3], model=item[4]))
 ConversationRepository(db).create_session("ui-session-0")
 events = []
+events.append(("research.branch.progress", {"graph_run_id":"research-run.old","node_id":"node.old","branch_id":"research","attempt":9,"stage":"worker","status":"completed","evidence_refs":["evidence:old"]}))
+events.append(("research.plan.approved", {"graph_run_id":"research-run.fixture","plan_id":"plan.fixture","version":1,"status":"approved"}))
 for branch in ("research", "compare", "fact_check", "gap_analysis"):
     events.append(("research.branch.progress", {"graph_run_id":"research-run.fixture","node_id":f"node.{branch}","branch_id":branch,"attempt":1,"stage":"worker","status":"completed","evidence_refs":[f"evidence:{branch}:1"]}))
 events.extend([
@@ -39,6 +41,7 @@ events.extend([
     ("research.local_review.decided", {"graph_run_id":"research-run.fixture","node_id":"node.fact-check.verifier","branch_id":"fact_check","attempt":2,"stage":"local_verifier","decision":"approved","evidence_refs":["review:fact-check:2"]}),
     ("research.supervisor.decided", {"graph_run_id":"research-run.fixture","decision":"continue_to_merge","conflicts":["claim-a-vs-b"],"evidence_refs":["evidence:supervisor"]}),
     ("research.arbitration.decided", {"graph_run_id":"research-run.fixture","decision":"resolved","resolution":"采用高等级证据","evidence_refs":["evidence:arbitration"]}),
+    ("research.interrupt.required", {"graph_run_id":"research-run.fixture","interrupt_id":"interrupt.fixture","interrupt_kind":"arbitration","interrupt_digest":"digest-fixture","status":"needs_human"}),
     ("research.merge.completed", {"graph_run_id":"research-run.fixture","artifact_id":"artifact:report","claim_count":4,"evidence_refs":["evidence:report"]}),
     ("research.global_review.decided", {"graph_run_id":"research-run.fixture","decision":"approved","evidence_refs":["evidence:global"]}),
 ])
@@ -65,8 +68,15 @@ test("approves a plan then shows parallel review and arbitration", async ({}, te
     await expect(plan).toContainText("已批准");
     const graph = page.getByRole("region", { name: "研究图运行" });
     await expect(graph.getByText(/局部审核未通过/)).toBeVisible();
+    await expect(graph.getByText("Attempt 9", { exact: false })).toHaveCount(0);
     await expect(graph.getByText("冲突仲裁")).toBeVisible();
     await expect(graph.getByText("全局审核通过")).toBeVisible();
+    await expect(graph.getByRole("button", { name: "批准仲裁并继续" })).toHaveCount(0);
+    await page.evaluate(() => localStorage.setItem("hermes.v4.conversation-timelines", JSON.stringify({
+      "ui-session-0": [{ id: "persisted", kind: "user", title: "你", content: "已保存会话", status: "刚刚" }],
+    })));
+    await page.reload();
+    await expect(page.getByRole("region", { name: "研究图运行" })).toContainText("全局审核通过");
   } finally {
     await app.close();
   }

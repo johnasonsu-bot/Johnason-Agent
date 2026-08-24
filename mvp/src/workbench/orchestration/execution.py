@@ -69,6 +69,8 @@ class SequentialNodeExecutor:
             prompt=package.rendered_prompt,
             model=node.binding.model,
             provider_id=node.binding.provider_id,
+            allowed_tool_ids=node.binding.tool_ids,
+            allowed_skill_refs=node.binding.skill_refs,
         )
         text: list[str] = []
         used_tools = False

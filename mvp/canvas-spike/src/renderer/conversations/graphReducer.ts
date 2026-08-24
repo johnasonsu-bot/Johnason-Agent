@@ -1,7 +1,7 @@
 import type { ConversationEvent } from "../api";
 
 export type ResearchRecord = { branchId: string; attempt: number; stage: string; status: string; decision?: string; findings: string[]; evidenceRefs: string[] };
-export type ResearchGraphState = { graphRunId?: string; records: Record<string, ResearchRecord>; supervisor?: Record<string, unknown>; arbitration?: Record<string, unknown>; merge?: Record<string, unknown>; globalReview?: Record<string, unknown> };
+export type ResearchGraphState = { graphRunId?: string; interruptId?: string; interruptKind?: string; records: Record<string, ResearchRecord>; supervisor?: Record<string, unknown>; arbitration?: Record<string, unknown>; merge?: Record<string, unknown>; globalReview?: Record<string, unknown> };
 
 export const emptyResearchGraphState = (): ResearchGraphState => ({ records: {} });
 const text = (value: unknown) => typeof value === "string" ? value : "";
@@ -11,6 +11,11 @@ const strings = (value: unknown) => Array.isArray(value) ? value.filter((item): 
 export function reduceResearchEvent(state: ResearchGraphState, event: ConversationEvent): ResearchGraphState {
   const value = event.value ?? {};
   const graphRunId = text(value.graph_run_id) || state.graphRunId;
+  if (event.name === "research.plan.approved") {
+    return graphRunId && graphRunId !== state.graphRunId
+      ? { graphRunId, records: {} }
+      : { ...state, graphRunId };
+  }
   if (event.name === "research.branch.progress" || event.name === "research.local_review.decided") {
     const record: ResearchRecord = { branchId: text(value.branch_id), attempt: number(value.attempt), stage: text(value.stage), status: text(value.status || value.decision), ...(value.decision ? { decision: text(value.decision) } : {}), findings: strings(value.findings), evidenceRefs: strings(value.evidence_refs) };
     const key = `${record.branchId}:${record.attempt}:${record.stage}`;
@@ -18,7 +23,9 @@ export function reduceResearchEvent(state: ResearchGraphState, event: Conversati
   }
   if (event.name === "research.supervisor.decided") return { ...state, graphRunId, supervisor: value };
   if (event.name === "research.arbitration.decided") return { ...state, graphRunId, arbitration: value };
-  if (event.name === "research.merge.completed") return { ...state, graphRunId, merge: value };
-  if (event.name === "research.global_review.decided") return { ...state, graphRunId, globalReview: value };
+  if (event.name === "research.interrupt.required") return { ...state, graphRunId, interruptId: text(value.interrupt_id), interruptKind: text(value.interrupt_kind) };
+  if (event.name === "research.merge.completed") return { ...state, graphRunId, interruptId: undefined, interruptKind: undefined, merge: value };
+  if (event.name === "research.global_review.decided") return { ...state, graphRunId, interruptId: undefined, interruptKind: undefined, globalReview: value };
+  if (event.name === "research.run.completed" || event.name === "research.run.failed") return { ...state, graphRunId, interruptId: undefined, interruptKind: undefined };
   return state;
 }

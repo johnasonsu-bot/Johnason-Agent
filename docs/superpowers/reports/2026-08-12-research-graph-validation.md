@@ -31,10 +31,34 @@ Batch 3.1 sequential fallback remains `GO_RESEARCH_GRAPH`.
 - Runtime result: `mvp/.runtime/research-graph-results.json`.
 - Credential/private-context marker result: no matches.
 
-## Next implementation boundary
+## Production binding added after the gate
 
-The gate validates the research graph, checkpoint recovery, replan semantics and
-Artifact contract. The next task must bind plan approval to a durable runtime
-admission service and publish real checkpoint-derived Domain Events. Frontend
-fixture events are not evidence of production execution and must not be used as
-the completion criterion for that task.
+- Plan approval now creates one idempotent durable job instead of an in-memory
+  start request.
+- A leased background Worker executes the approved graph through the configured
+  real model Runner and renews ownership during long model calls.
+- Node results are append-only and are reused after restart before any model call,
+  preventing a committed Agent result from being generated twice.
+- Checkpoint-derived research events are persisted to the conversation SSE stream.
+- Human arbitration is durable and can be approved from the graph-run UI/API.
+- Merge publishes the verified report to the real Artifact store.
+- Every graph node uses an independent conversation context, including nodes that
+  share one configured Agent profile; structured handoff remains explicit state.
+- Frozen per-node Tool/Skill allowlists are enforced both in the model manifest
+  and at invocation; the G1 Host fails closed to the Python runner for scoped turns.
+- Lease ownership is fenced by owner and attempt, with persistent bounded backoff;
+  heartbeat loss cancels the local processor before another attempt can commit.
+- Human interrupts have durable IDs, kinds, payload digests, actors and decisions;
+  branch review, arbitration and replan no longer share a generic `current` action.
+- Merge claims may cite only Worker evidence produced by the same graph run.
+- Browser reload performs full graph-state replay before cursor polling and removes
+  obsolete approval controls after Merge or Global Verifier completion.
+
+## Fresh cumulative regression
+
+- Backend unit, integration and acceptance: `654 passed, 6 skipped`.
+- Electron/Playwright: `36 passed` (frontend build included).
+- Known non-blocking warning: the existing Starlette TestClient/httpx deprecation.
+
+The next implementation boundary is the Development Graph: code-producing
+Workers, sandbox validation, patch review, test execution, and release approval.
