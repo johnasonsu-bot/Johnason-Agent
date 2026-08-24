@@ -7,9 +7,10 @@ import pytest
 
 from scripts.run_development_graph_acceptance import run_development_graph_acceptance
 
+pytestmark = pytest.mark.development_graph_gate
+
 
 @pytest.mark.asyncio
-@pytest.mark.development_graph_gate
 async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) -> None:
     result = await run_development_graph_acceptance(tmp_path)
 
