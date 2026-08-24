@@ -95,3 +95,22 @@ Fresh focused results:
 development graph primary acceptance: 1 passed in 264.88s
 CLI BLOCKED fault injections: 6 passed in 30.35s
 ```
+
+## Round 2 controller evidence
+
+Controller HEAD: `b203f24`. The integration checkout excludes only this module's
+`development_graph_gate` marker from its full backend run; the outer controller
+executes the gate separately. The fresh normal CLI result is
+`GO_RELEASE_APPROVAL`, with integration branch
+`graph/development-acceptance/integration` and final state
+`awaiting_release_approval`.
+
+Recorded integration command evidence (exit code / result digest):
+
+- Backend full regression: `0` / `c0e5b4084d93a0e7eac25fc3cce9e58745c23694537b813865d2e6765e039ea3`.
+- Electron/Playwright full regression: `0` / `c47e1733d9b6f4194efe442adf66824259a71f37c634e9414f46b0b9322d98fd`.
+
+The results JSON records the integration SHA and every merged commit's
+commit digest, approved attempt, declared-command digest, actual test-evidence
+digest, and dependency-commit digest. The target and local bare remote snapshots
+remain unchanged.
