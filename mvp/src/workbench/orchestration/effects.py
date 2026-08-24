@@ -81,6 +81,7 @@ def _require_fields(value: dict[str, object], allowed: set[str]) -> None:
 class EffectLedger:
     _EFFECT_KINDS = {
         "git_worktree_create": "worktree",
+        "git_attempt_prepare": "prepared_base",
         "git_commit": "commit_sha",
         "git_integration_merge": "integration_sha",
     }
@@ -131,10 +132,18 @@ class EffectLedger:
         )
         _require_fields(
             expected_result,
-            {"kind", "path_id", "owned_paths", "message_digest", "commits"},
+            {
+                "kind",
+                "path_id",
+                "baseline_sha",
+                "owned_paths",
+                "message_digest",
+                "commits",
+            },
         )
         if expected_result.get("kind") not in {
             "worktree",
+            "prepared_base",
             "commit_sha",
             "integration_sha",
         }:
@@ -426,6 +435,13 @@ class EffectLedger:
             ):
                 raise ValueError("worktree effect metadata is invalid")
             return
+        if effect_kind == "git_attempt_prepare":
+            baseline = value.get("baseline_sha")
+            if set(value) != {"kind", "baseline_sha"} or not isinstance(
+                baseline, str
+            ) or not cls._SHA.fullmatch(baseline):
+                raise ValueError("attempt preparation effect metadata is invalid")
+            return
         if effect_kind == "git_commit":
             paths = value.get("owned_paths")
             if (
@@ -466,11 +482,11 @@ class EffectLedger:
             if evidence != {"reason": "verified_worktree", "branch": result_ref}:
                 raise ValueError("worktree reconciliation metadata is invalid")
             return
-        expected_reason = (
-            "verified_commit"
-            if effect_kind == "git_commit"
-            else "verified_integration"
-        )
+        expected_reason = {
+            "git_attempt_prepare": "verified_attempt_prepare",
+            "git_commit": "verified_commit",
+            "git_integration_merge": "verified_integration",
+        }[effect_kind]
         if evidence != {"reason": expected_reason, "verified_sha": result_ref}:
             raise ValueError("Git reconciliation metadata is invalid")
 

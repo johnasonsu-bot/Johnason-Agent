@@ -29,7 +29,12 @@ from workbench.orchestration.development import (
     DevelopmentPlanValidator,
     ValidatedDevelopmentPlan,
 )
-from workbench.tools.git_workspace import GitWorkspace, GitWorkspaceError, GitWorkspaceTool
+from workbench.tools.git_workspace import (
+    GitWorkspace,
+    GitWorkspaceError,
+    GitWorkspaceTool,
+    IntegrationConflict,
+)
 
 
 class DevelopmentGraphError(RuntimeError):
@@ -48,6 +53,18 @@ def _replace_mapping(
     existing: dict[str, object], incoming: dict[str, object]
 ) -> dict[str, object]:
     return dict(existing) | dict(incoming)
+
+
+def _merge_pending_reviews(
+    existing: dict[str, object], incoming: dict[str, object]
+) -> dict[str, object]:
+    merged = dict(existing)
+    for branch, value in incoming.items():
+        if value is None:
+            merged.pop(branch, None)
+        else:
+            merged[branch] = value
+    return merged
 
 
 def _ordered_records(
@@ -79,6 +96,7 @@ class DevelopmentState(TypedDict, total=False):
     merge_evidence: dict[str, object] | None
     regression: dict[str, object] | None
     pending_interrupt: dict[str, object] | None
+    pending_branch_reviews: Annotated[dict[str, object], _merge_pending_reviews]
 
 
 def initial_development_state(
@@ -86,6 +104,7 @@ def initial_development_state(
     *,
     graph_run_id: str,
     generation: int,
+    git_workspace: GitWorkspaceTool,
     target_branch: str = "main",
 ) -> DevelopmentState:
     validated = plan if isinstance(plan, ValidatedDevelopmentPlan) else DevelopmentPlanValidator().validate(plan)
@@ -96,7 +115,9 @@ def initial_development_state(
         "status": "running",
         "base_sha": validated.base_commit,
         # The graph never checks out, updates, or otherwise mutates this branch.
-        "original_target_sha": validated.base_commit,
+        "original_target_sha": git_workspace.resolve_ref(
+            repo=validated.repository_root, branch=target_branch
+        ),
         "target_branch": target_branch,
         "worker_branches": [node.node_id for node in validated.plan.nodes],
         "attempts": {},
@@ -108,6 +129,7 @@ def initial_development_state(
         "merge_evidence": None,
         "regression": None,
         "pending_interrupt": None,
+        "pending_branch_reviews": {},
     }
 
 
@@ -140,7 +162,10 @@ def _run_allowed_commands(
         try:
             environment = dict(os.environ)
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            if len(command) >= 3 and command[0] in {"python", "python3", "pytest"}:
+            if command[0] == "pytest" or command[:3] in {
+                ("python", "-m", "pytest"),
+                ("python3", "-m", "pytest"),
+            }:
                 environment["PYTEST_ADDOPTS"] = "-p no:cacheprovider"
             result = subprocess.run(
                 command,
@@ -174,6 +199,24 @@ def _integration_workspace_path(tool: GitWorkspaceTool, operation_id: str) -> Pa
     return tool.worktree_root / sha256(operation_id.encode()).hexdigest()[:24]
 
 
+def _topological_nodes(nodes: tuple[DevelopmentNodeSpec, ...]) -> tuple[DevelopmentNodeSpec, ...]:
+    """Return a deterministic dependency order independent of plan declaration order."""
+    by_id = {node.node_id: node for node in nodes}
+    remaining = {node.node_id: set(node.depends_on) for node in nodes}
+    ordered: list[DevelopmentNodeSpec] = []
+    while remaining:
+        ready = sorted(node_id for node_id, deps in remaining.items() if not deps)
+        if not ready:
+            raise DevelopmentGraphError("validated development dependencies are cyclic")
+        for node_id in ready:
+            ordered.append(by_id[node_id])
+            remaining.pop(node_id)
+        completed = set(ready)
+        for deps in remaining.values():
+            deps.difference_update(completed)
+    return tuple(ordered)
+
+
 def build_development_graph(
     checkpointer: BaseCheckpointSaver,
     plan: DevelopmentPlan | ValidatedDevelopmentPlan,
@@ -182,6 +225,7 @@ def build_development_graph(
 ) -> CompiledStateGraph:
     validated = plan if isinstance(plan, ValidatedDevelopmentPlan) else DevelopmentPlanValidator().validate(plan)
     nodes = {node.node_id: node for node in validated.plan.nodes}
+    ordered_nodes = _topological_nodes(validated.plan.nodes)
     candidate_paths = tuple(
         sorted(
             {
@@ -251,6 +295,12 @@ def build_development_graph(
         if node is None:
             raise DevelopmentGraphError("worker branch is outside the validated plan")
         workspace = workspace_for(state, node)
+        if attempt > 1:
+            git_workspace.prepare_attempt(
+                operation_id=f"{state['run_id']}:{branch}:attempt:{attempt}:prepare",
+                workspace=workspace,
+                baseline_sha=validated.base_commit,
+            )
         worker_state = dict(state) | {"workspace_path": str(workspace.path)}
         summary = _execute(port, stage="worker", branch=branch, attempt=attempt, state=worker_state)  # type: ignore[arg-type]
         if not isinstance(summary, str) or not summary.strip():
@@ -305,7 +355,13 @@ def build_development_graph(
                 ),
             )
         if decision.decision == "needs_human":
-            return Command(update={"local_reviews": [record], "pending_interrupt": record, "status": "awaiting_branch_review"}, goto="branch_review")
+            return Command(
+                update={
+                    "local_reviews": [record],
+                    "pending_branch_reviews": {branch: record},
+                },
+                goto="human_review_queue",
+            )
         return Command(
             update={"local_reviews": [record]},
             goto=Send(
@@ -320,12 +376,36 @@ def build_development_graph(
         result = dict(state["result"])
         return Command(update={"branch_outcomes": {branch: {"decision": "approved", "result": result}}}, goto="dispatch")
 
-    def branch_review(state: DevelopmentState) -> Command:
-        response = interrupt({"kind": "branch_review", "review": state.get("pending_interrupt")})
-        if response != {"decision": "approved"}:
-            raise DevelopmentGraphError("branch review requires explicit approval")
-        pending = state.get("pending_interrupt") or {}
-        return Command(update={"pending_interrupt": None, "status": "running"}, goto=Send("branch_complete", {"branch": str(pending["branch_id"]), "attempt": int(pending["attempt"]), "review": pending, "result": pending["result"]}))
+    def human_review_queue(state: DevelopmentState) -> Command | dict[str, object]:
+        if not state.get("pending_branch_reviews"):
+            return {}
+        return Command(goto="human_branch_reviews")
+
+    def human_branch_reviews(state: DevelopmentState) -> Command | dict[str, object]:
+        pending = dict(state.get("pending_branch_reviews", {}))
+        if not pending:
+            return {}
+        response = interrupt({"kind": "branch_reviews", "reviews": pending})
+        decisions = response.get("decisions") if isinstance(response, dict) else None
+        if not isinstance(decisions, dict) or decisions != {
+            branch: "approved" for branch in pending
+        }:
+            raise DevelopmentGraphError("branch reviews require explicit approval")
+        return Command(
+            update={"pending_branch_reviews": {branch: None for branch in pending}},
+            goto=[
+                Send(
+                    "branch_complete",
+                    {
+                        "branch": branch,
+                        "attempt": int(record["attempt"]),
+                        "review": record,
+                        "result": record["result"],
+                    },
+                )
+                for branch, record in sorted(pending.items())
+            ],
+        )
 
     def integration_gate(state: DevelopmentState) -> Command | dict[str, object]:
         outcomes = state.get("branch_outcomes", {})
@@ -338,7 +418,7 @@ def build_development_graph(
     def integration_approval(state: DevelopmentState) -> Command:
         commits = tuple(
             str(state["branch_outcomes"][node.node_id]["result"]["commit_sha"])
-            for node in validated.plan.nodes
+            for node in ordered_nodes
         )
         response = interrupt({"kind": "integration_approval", "commits": commits, "target_branch": state["target_branch"], "original_target_sha": state["original_target_sha"]})
         if response != {"decision": "approved"}:
@@ -349,7 +429,7 @@ def build_development_graph(
         attempt = int(state.get("merge_attempt", 0)) + 1
         commits = tuple(
             str(state["branch_outcomes"][node.node_id]["result"]["commit_sha"])
-            for node in validated.plan.nodes
+            for node in ordered_nodes
         )
         integration_branch = _integration_branch(validated.plan.plan_id, attempt)
         operation_id = f"{state['graph_run_id']}:merge:{attempt}"
@@ -361,16 +441,20 @@ def build_development_graph(
                 integration_branch=integration_branch,
                 commits=commits,
             )
-        except GitWorkspaceError:
+        except IntegrationConflict as conflict:
             evidence = MergeEvidence(
                 status="conflict",
                 integration_branch=integration_branch,
                 base_sha=validated.base_commit,
                 commits=commits,
                 candidate_paths=candidate_paths,
-                conflict_evidence=("integration merge failed; content was not auto-resolved",),
+                parent_graph=conflict.parent_graph,
+                conflict_paths=conflict.paths,
+                conflict_evidence=("integration merge conflict was not auto-resolved",),
             ).model_dump(mode="json")
             return Command(update={"merge_attempt": attempt, "merge_evidence": evidence, "pending_interrupt": evidence, "status": "awaiting_arbitration"}, goto="arbitration")
+        except GitWorkspaceError as error:
+            raise DevelopmentGraphError("integration merge could not complete") from error
         evidence = MergeEvidence(
             status="merged",
             integration_branch=integration_branch,
@@ -400,7 +484,7 @@ def build_development_graph(
         )
         test_evidence: list[str] = []
         seen: set[tuple[str, ...]] = set()
-        for node in validated.plan.nodes:
+        for node in ordered_nodes:
             if node.command_policy.tests not in seen:
                 seen.add(node.command_policy.tests)
                 test_evidence.extend(_run_declared_tests(node, workspace.path))
@@ -421,6 +505,11 @@ def build_development_graph(
 
     def release_approval(state: DevelopmentState) -> dict[str, object]:
         evidence = state.get("merge_evidence") or {}
+        current_target_sha = git_workspace.resolve_ref(
+            repo=validated.repository_root, branch=str(state["target_branch"])
+        )
+        if current_target_sha != state["original_target_sha"]:
+            raise DevelopmentGraphError("target branch changed before release approval")
         response = interrupt({"kind": "release_approval", "integration_branch": evidence.get("integration_branch"), "target_branch": state["target_branch"], "commits": evidence.get("commits", ()), "tests": (state.get("regression") or {}).get("test_evidence", ())})
         if response != {"decision": "approved"}:
             raise DevelopmentGraphError("release approval requires explicit approval")
@@ -433,9 +522,10 @@ def build_development_graph(
     graph = StateGraph(DevelopmentState)
     graph.add_node("dispatch", dispatch)
     graph.add_node("worker", worker, destinations=("local_verifier",))
-    graph.add_node("local_verifier", local_verifier, destinations=("worker", "branch_complete", "branch_review"))
+    graph.add_node("local_verifier", local_verifier, destinations=("worker", "branch_complete", "human_review_queue"))
     graph.add_node("branch_complete", branch_complete, destinations=("dispatch",))
-    graph.add_node("branch_review", branch_review, destinations=("branch_complete",))
+    graph.add_node("human_review_queue", human_review_queue, destinations=("human_branch_reviews",))
+    graph.add_node("human_branch_reviews", human_branch_reviews, destinations=("branch_complete",))
     graph.add_node("integration_gate", integration_gate, destinations=("integration_approval",))
     graph.add_node("integration_approval", integration_approval, destinations=("merge",))
     graph.add_node("merge", merge, destinations=("global_verifier", "arbitration"))

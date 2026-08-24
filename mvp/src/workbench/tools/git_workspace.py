@@ -20,6 +20,15 @@ class GitWorkspaceError(RuntimeError):
     pass
 
 
+class IntegrationConflict(GitWorkspaceError):
+    """A real Git content conflict, carrying bounded evidence for arbitration."""
+
+    def __init__(self, *, paths: tuple[str, ...], parent_graph: tuple[str, ...]) -> None:
+        super().__init__("integration merge has content conflicts")
+        self.paths = paths
+        self.parent_graph = parent_graph
+
+
 @dataclass(frozen=True)
 class GitWorkspace:
     repository: Path
@@ -114,6 +123,72 @@ class GitWorkspaceTool:
         head_sha = self._run(path, "rev-parse", "HEAD").stdout.strip()
         dirty_paths = self._dirty_paths(path)
         return GitStatus(branch=branch, head_sha=head_sha, dirty_paths=dirty_paths)
+
+    def resolve_ref(self, *, repo: Path, branch: str) -> str:
+        """Resolve a local branch head without changing any repository state."""
+        repository = self._repository(repo)
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,239}", branch)
+            or ".." in branch.split("/")
+        ):
+            raise GitWorkspaceError("target branch is invalid")
+        result = self._run(repository, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+        sha = result.stdout.strip()
+        self._require_sha(sha)
+        return sha
+
+    def prepare_attempt(
+        self,
+        *,
+        operation_id: str,
+        workspace: GitWorkspace,
+        baseline_sha: str,
+    ) -> GitWorkspace:
+        """Durably reset an isolated retry branch to its approved baseline."""
+        path = self._workspace_path(workspace)
+        self._require_sha(baseline_sha)
+        self._run(workspace.repository, "cat-file", "-e", f"{baseline_sha}^{{commit}}")
+        record = self.ledger.reserve(
+            operation_id,
+            effect_kind="git_attempt_prepare",
+            repository_id=self._repository_id(workspace.repository),
+            branch=workspace.branch,
+            base_sha=baseline_sha,
+            expected_result={"kind": "prepared_base", "baseline_sha": baseline_sha},
+        )
+        if record.status == "completed":
+            status = self.status(workspace)
+            if status.branch != workspace.branch or status.head_sha != baseline_sha or status.dirty_paths:
+                raise GitWorkspaceError("recorded attempt preparation cannot be verified")
+            return workspace
+        if record.status != "reserved":
+            raise GitWorkspaceError("attempt preparation requires reconciliation")
+        status = self.status(workspace)
+        if status.branch != workspace.branch or status.dirty_paths:
+            raise GitWorkspaceError("attempt workspace is not clean")
+        self.ledger.mark_started(operation_id)
+        completed: subprocess.CompletedProcess[str] | None = None
+        try:
+            completed = self._run(path, "reset", "--hard", baseline_sha)
+            status = self.status(workspace)
+            if status.branch != workspace.branch or status.head_sha != baseline_sha or status.dirty_paths:
+                raise GitWorkspaceError("attempt preparation did not restore baseline")
+            self.ledger.mark_completed(
+                operation_id,
+                result_ref=baseline_sha,
+                exit_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+            return workspace
+        except Exception:
+            self.ledger.mark_unknown(
+                operation_id,
+                exit_code=completed.returncode if completed else None,
+                stdout=completed.stdout if completed else "",
+                stderr=completed.stderr if completed else "",
+            )
+            raise
 
     def commit(
         self,
@@ -293,7 +368,16 @@ class GitWorkspaceTool:
                     "--no-verify",
                     "--no-gpg-sign",
                     commit_sha,
+                    check=False,
                 )
+                if completed.returncode != 0:
+                    conflict_paths = self._conflict_paths(path)
+                    if conflict_paths:
+                        raise IntegrationConflict(
+                            paths=conflict_paths,
+                            parent_graph=self._merge_parent_graph(path),
+                        )
+                    raise GitWorkspaceError("integration merge could not complete")
                 merged_sha = self._run(path, "rev-parse", "HEAD").stdout.strip()
                 parents = self._run(
                     path,
@@ -459,6 +543,24 @@ class GitWorkspaceTool:
                     paths.append(records[index])
             index += 1
         return tuple(sorted(set(paths)))
+
+    def _conflict_paths(self, path: Path) -> tuple[str, ...]:
+        output = self._run(
+            path,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+            "-z",
+            check=False,
+        ).stdout
+        return tuple(sorted(self._nul_paths(output)))
+
+    def _merge_parent_graph(self, path: Path) -> tuple[str, ...]:
+        output = self._run(path, "rev-list", "--parents", "-n", "1", "HEAD").stdout
+        values = output.split()
+        if not values or any(not _SHA.fullmatch(value) for value in values):
+            raise GitWorkspaceError("integration parent graph cannot be verified")
+        return tuple(values)
 
     def _reject_clean_filters(self, path: Path, dirty_paths: tuple[str, ...]) -> None:
         if ".gitattributes" in dirty_paths:

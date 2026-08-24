@@ -54,6 +54,8 @@ class MergeEvidence(_Frozen):
     commits: tuple[OpaqueReference, ...] = Field(min_length=1)
     candidate_paths: tuple[OpaqueIdentifier, ...] = Field(min_length=1)
     integration_sha: OpaqueReference | None = None
+    parent_graph: tuple[OpaqueReference, ...] = ()
+    conflict_paths: tuple[OpaqueIdentifier, ...] = ()
     conflict_evidence: tuple[PublicSummary, ...] = ()
 
     @model_validator(mode="after")
@@ -62,8 +64,12 @@ class MergeEvidence(_Frozen):
             raise ValueError("only a merged integration has an integration SHA")
         if self.status == "conflict" and not self.conflict_evidence:
             raise ValueError("conflict evidence is required")
+        if self.status == "conflict" and not self.conflict_paths:
+            raise ValueError("conflict paths are required")
         if self.status == "merged" and self.conflict_evidence:
             raise ValueError("merged integration cannot carry conflict evidence")
+        if self.status == "merged" and self.conflict_paths:
+            raise ValueError("merged integration cannot carry conflict paths")
         return self
 
 

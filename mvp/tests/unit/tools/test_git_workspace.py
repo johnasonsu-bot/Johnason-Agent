@@ -4,7 +4,11 @@ import subprocess
 import pytest
 
 from workbench.orchestration.effects import EffectLedger
-from workbench.tools.git_workspace import GitWorkspaceError, GitWorkspaceTool
+from workbench.tools.git_workspace import (
+    GitWorkspaceError,
+    GitWorkspaceTool,
+    IntegrationConflict,
+)
 
 
 def git(*argv: str, cwd: Path) -> str:
@@ -256,6 +260,48 @@ def test_commit_records_only_owned_paths_and_verifies_sha(
     ) == created
 
 
+def test_prepare_attempt_resets_rejected_commit_to_immutable_baseline(
+    tmp_path: Path,
+    repository: tuple[Path, str],
+) -> None:
+    repo, base_sha = repository
+    workspace = tool(tmp_path)
+    created = workspace.create(
+        operation_id="op-create",
+        repo=repo,
+        base_sha=base_sha,
+        branch="graph/r1/worker/api",
+    )
+    (created.path / "owned.py").write_text("first attempt\n")
+    rejected_sha = workspace.commit(
+        operation_id="op-commit-1",
+        workspace=created,
+        owned_paths=("owned.py",),
+        message="rejected attempt",
+    )
+
+    prepared = workspace.prepare_attempt(
+        operation_id="op-prepare-2",
+        workspace=created,
+        baseline_sha=base_sha,
+    )
+
+    assert prepared == created
+    assert git("rev-parse", "HEAD", cwd=created.path) == base_sha
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", rejected_sha, "HEAD"],
+        cwd=created.path,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).returncode != 0
+    assert workspace.prepare_attempt(
+        operation_id="op-prepare-2",
+        workspace=created,
+        baseline_sha=base_sha,
+    ) == created
+
+
 def test_merge_uses_temporary_integration_branch_and_preserves_target(
     tmp_path: Path,
     repository: tuple[Path, str],
@@ -303,3 +349,49 @@ def test_merge_uses_temporary_integration_branch_and_preserves_target(
             integration_branch="release/integration",
             commits=(commit_sha,),
         )
+
+
+def test_merge_reports_only_real_conflict_paths_for_arbitration(
+    tmp_path: Path,
+    repository: tuple[Path, str],
+) -> None:
+    repo, base_sha = repository
+    workspace = tool(tmp_path)
+    first = workspace.create(
+        operation_id="op-first",
+        repo=repo,
+        base_sha=base_sha,
+        branch="graph/r1/worker/first",
+    )
+    second = workspace.create(
+        operation_id="op-second",
+        repo=repo,
+        base_sha=base_sha,
+        branch="graph/r1/worker/second",
+    )
+    (first.path / "README.md").write_text("first\n")
+    first_sha = workspace.commit(
+        operation_id="op-first-commit",
+        workspace=first,
+        owned_paths=("README.md",),
+        message="first change",
+    )
+    (second.path / "README.md").write_text("second\n")
+    second_sha = workspace.commit(
+        operation_id="op-second-commit",
+        workspace=second,
+        owned_paths=("README.md",),
+        message="second change",
+    )
+
+    with pytest.raises(IntegrationConflict) as raised:
+        workspace.merge_to_integration(
+            operation_id="op-conflict",
+            repo=repo,
+            base_sha=base_sha,
+            integration_branch="graph/r1/integration",
+            commits=(first_sha, second_sha),
+        )
+
+    assert raised.value.paths == ("README.md",)
+    assert first_sha in raised.value.parent_graph

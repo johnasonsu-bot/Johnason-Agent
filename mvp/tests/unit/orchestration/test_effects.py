@@ -5,6 +5,31 @@ import pytest
 from workbench.orchestration.effects import EffectConflict, EffectLedger
 
 
+def test_attempt_preparation_is_a_durable_git_effect(tmp_path: Path) -> None:
+    ledger = EffectLedger(tmp_path / "workflow.sqlite3")
+    sha = "a" * 40
+
+    reserved = ledger.reserve(
+        "prepare-attempt-2",
+        effect_kind="git_attempt_prepare",
+        repository_id="b" * 64,
+        branch="graph/run/worker/backend",
+        base_sha=sha,
+        expected_result={"kind": "prepared_base", "baseline_sha": sha},
+    )
+    ledger.mark_started(reserved.operation_id)
+    completed = ledger.mark_completed(
+        reserved.operation_id,
+        result_ref=sha,
+        exit_code=0,
+        stdout="",
+        stderr="",
+    )
+
+    assert completed.effect_kind == "git_attempt_prepare"
+    assert completed.result_ref == sha
+
+
 WORKTREE_EXPECTED = {"kind": "worktree", "path_id": "a" * 24}
 COMMIT_EXPECTED = {
     "kind": "commit_sha",
