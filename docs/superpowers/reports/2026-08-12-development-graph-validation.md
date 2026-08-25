@@ -187,3 +187,46 @@ The final commit after this verification changes this report only. Therefore
 the branch HEAD will advance without changing either tested source blob; the
 blob identities above, rather than the post-report HEAD, bind the Round 3 quick
 evidence and avoid a self-referential HEAD/report loop.
+
+## Round 4 multi-output fail-closed evidence
+
+Execution commit `3bc7b2e31c8796698e3184fc7ee9e8d3ee99d57d` fixes two
+result-boundary gaps. Repeated complete `--output` options are attempted
+independently, so an unwritable first candidate cannot leave a later stale
+`GO_RELEASE_APPROVAL` result intact. Output-write failures are represented only
+by their exception class; neither the rejected path nor exception text is
+serialized. The command-line parser also disables option abbreviation. An
+unrecognized `--out` value is not treated as a trusted output candidate, the
+default result boundary is changed to `BLOCKED`, and the unrelated file named
+after `--out` is left unchanged.
+
+The tested source identities are:
+
+- Runner Git blob `da5cd1dbd53c85053731648e7e76c0c744cbc3c6`
+  (`sha256:f282a69dd3c820995f931fc8e60da44b32ef4e7d6812f06990b56391e2bfb6d9`).
+- Acceptance-test Git blob `b9c3e51d5bd9cd34679008fc230b4a6003ce0b01`
+  (`sha256:2914b5cb2576e7a4e86513731f3939d8a187baed6b896fb02f6b4bfe4fb063ad`).
+
+Fresh quick boundary verification against that commit passed nine tests, with
+the eight long-running graph cases deselected, in `3.89s`.
+
+After the code-and-test commit, the normal CLI was rerun in full and exited
+`0` with stdout `GO_RELEASE_APPROVAL`. The new metadata result has SHA-256
+`f0af83711489b63bfcc3690b1da7ce1b67b6752bfe0e00deb9f1a5a2bb44ed60`
+and records:
+
+- Integration SHA `267427563a6ca0f6557e2c978138df2b77d0fb6c` and final status
+  `awaiting_release_approval`.
+- Backend full regression exit `0`, digest
+  `b2c72b47c94daefd629dff591901364e3e0835c66093a4c39a46a5b2ae7d9d24`,
+  duration `157870ms`.
+- Electron/Playwright full regression exit `0`, digest
+  `3bf45bf1d92d392589fcaa52c77e9151e005ae284bf8efa8d4acafa395e7c046`,
+  duration `74383ms`.
+- Three distinct worker worktrees and three approved merge associations;
+  dependency order verified, rejected commit excluded with exact exit code
+  `1`, ownership violation blocked, no approved worker replayed after restart,
+  target branch unchanged, and offline bare remote unchanged.
+
+This Round 4 report update is documentation-only; the execution commit and
+source blob identities above remain the binding identities for the fresh gate.
