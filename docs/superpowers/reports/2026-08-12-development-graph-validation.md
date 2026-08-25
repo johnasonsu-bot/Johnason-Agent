@@ -156,3 +156,34 @@ duration `66928ms`. It recorded three worktrees and three approved merge
 associations, with target and local bare remote unchanged, rejected commit
 excluded, ownership probe blocked, and final status
 `awaiting_release_approval`.
+
+## Round 3 result-boundary evidence
+
+The stale-output and invalid-argument boundary was tested at execution commit
+`2f67c200b964b0dad38bb2ce64ec4b88d21e7cc7`. The exact tested source blobs were:
+
+- Runner Git blob `a09061e29216a75a57c2ae327f0faae32f61fedc`
+  (`sha256:80435177e1cb04cff22c123d58bd5f2937f3468e132a24f63dd87b2c367520f0`).
+- Acceptance-test Git blob `df90919807e5abecb9ba33568376f85be3808c64`
+  (`sha256:8c915891bd587f8c3e1b672d0bf4cf8712e1ab43240d5ea1537b00429d6486fc`).
+
+Fresh quick verification against those blobs passed seven boundary tests, with
+eight long-running graph cases deselected, in `2.75s`. A separate direct CLI
+probe using an unknown option exited `1`, printed `BLOCKED`, and atomically
+wrote exactly `{"completed_stages":[],"decision":"BLOCKED","error_kind":"SystemExit"}`.
+
+The existing `.runtime/development-graph-results.json` has SHA-256
+`fa3380071536a6fb2e6db319a9791b0df4fd897cec2eb73cadde96d61b42aaef`. It records
+`GO_RELEASE_APPROVAL`, integration SHA
+`a53ba7180de1c2f75d1faa4acb513103bb42d4b9`, backend exit `0` with result digest
+`cc65795d4903cc450ba8ece94d14659df25c59482efd61153b88b0f774fd828b`, and
+Electron/Playwright exit `0` with result digest
+`dbf5cf33bf0ce6bccd821db7241170b37c0d808b374e46d17da7e3dbc5d80119`.
+That result schema does not store the controller commit or runner/test blob
+identities, so this file is retained only as historical full-graph evidence; it
+is not represented as a full regression run of execution commit `2f67c20`.
+
+The final commit after this verification changes this report only. Therefore
+the branch HEAD will advance without changing either tested source blob; the
+blob identities above, rather than the post-report HEAD, bind the Round 3 quick
+evidence and avoid a self-referential HEAD/report loop.
