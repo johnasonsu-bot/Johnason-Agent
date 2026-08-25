@@ -29,6 +29,77 @@ def test_invalid_cli_overwrites_explicit_output_with_blocked_metadata(tmp_path: 
     }
 
 
+@pytest.mark.parametrize(
+    "arguments,output_names",
+    (
+        (("--output={first}", "--unknown-option"), ("first",)),
+        (("--output", "{first}", "--output={first}"), ("first",)),
+        (("--output", "{first}", "--output", "{second}"), ("first", "second")),
+        (("--output", "{first}", "--output"), ("first",)),
+    ),
+)
+def test_invalid_output_forms_clear_every_safely_identified_stale_go(
+    tmp_path: Path, arguments: tuple[str, ...], output_names: tuple[str, ...]
+) -> None:
+    outputs = {
+        name: tmp_path / f"{name}.json" for name in ("first", "second")
+    }
+    for output in outputs.values():
+        output.write_text('{"decision": "GO_RELEASE_APPROVAL"}\n', encoding="utf-8")
+    rendered = tuple(
+        argument.format(first=outputs["first"], second=outputs["second"])
+        for argument in arguments
+    )
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+
+    completed = subprocess.run(
+        (sys.executable, str(script), *rendered),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout.strip() == "BLOCKED"
+    expected_error = (
+        "SystemExit"
+        if "--unknown-option" in arguments or arguments[-1] == "--output"
+        else "ValueError"
+    )
+    for name in output_names:
+        assert json.loads(outputs[name].read_text(encoding="utf-8")) == {
+            "completed_stages": [],
+            "decision": "BLOCKED",
+            "error_kind": expected_error,
+        }
+
+
+def test_missing_output_without_safe_candidate_replaces_default_stale_go(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / ".runtime/development-graph-results.json"
+    output.parent.mkdir()
+    output.write_text('{"decision": "GO_RELEASE_APPROVAL"}\n', encoding="utf-8")
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+
+    completed = subprocess.run(
+        (sys.executable, str(script), "--output"),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout.strip() == "BLOCKED"
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "completed_stages": [],
+        "decision": "BLOCKED",
+        "error_kind": "SystemExit",
+    }
+
+
 def test_nested_backend_command_ignores_only_this_gate_file() -> None:
     script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
     source = script.read_text(encoding="utf-8")

@@ -651,25 +651,37 @@ def _write_result(path: Path, result: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _safe_explicit_output(arguments: list[str]) -> Path | None:
-    """Return exactly one complete --output value without trusting argparse."""
+def _safe_output_candidates(arguments: list[str]) -> tuple[Path, ...]:
+    """Collect complete --output values without trusting argparse."""
     values: list[str] = []
     index = 0
     while index < len(arguments):
         argument = arguments[index]
         if argument == "--output":
             if index + 1 >= len(arguments) or arguments[index + 1].startswith("-"):
-                return None
+                index += 1
+                continue
             values.append(arguments[index + 1])
             index += 2
             continue
         if argument.startswith("--output="):
             value = argument.split("=", 1)[1]
             if not value:
-                return None
+                index += 1
+                continue
             values.append(value)
         index += 1
-    return Path(values[0]) if len(values) == 1 else None
+    return tuple(dict.fromkeys(Path(value) for value in values))
+
+
+def _safe_explicit_output(arguments: list[str]) -> Path | None:
+    """Return one complete output only when the option occurs exactly once."""
+    occurrences = sum(
+        argument == "--output" or argument.startswith("--output=")
+        for argument in arguments
+    )
+    candidates = _safe_output_candidates(arguments)
+    return candidates[0] if occurrences == 1 and len(candidates) == 1 else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -679,12 +691,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--inject", choices=("ownership", "backend", "electron", "remote", "missing_evidence", "key_error", "exception"))
     arguments = list(sys.argv[1:] if argv is None else argv)
+    output_candidates = _safe_output_candidates(arguments)
     explicit_output = _safe_explicit_output(arguments)
     has_output_argument = any(
         argument == "--output" or argument.startswith("--output=")
         for argument in arguments
     )
     output = explicit_output or Path(".runtime/development-graph-results.json")
+    write_outputs = (output,)
     result: dict[str, Any] | None = None
     try:
         args = parser.parse_args(arguments)
@@ -699,10 +713,13 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("injected exception after measured evidence")
     except SystemExit as error:
         result = {"decision": "BLOCKED", "error_kind": type(error).__name__, "completed_stages": []}
+        write_outputs = output_candidates or (Path(".runtime/development-graph-results.json"),)
     except Exception as error:
         result = result or {"completed_stages": []}
         result.update({"decision": "BLOCKED", "error_kind": type(error).__name__})
-    _write_result(output, result)
+        write_outputs = output_candidates or (output,)
+    for result_output in write_outputs:
+        _write_result(result_output, result)
     print(result["decision"])
     return 0 if result["decision"] == "GO_RELEASE_APPROVAL" else 1
 
