@@ -10,6 +10,7 @@ from workbench.orchestration.development import (
     DevelopmentPlanValidator,
     FileOwnership,
     GitOutputContract,
+    IntegrationRegressionPolicy,
     InvalidDevelopmentNode,
     OwnershipConflict,
 )
@@ -48,7 +49,15 @@ def node(
 
 
 def plan(*nodes: DevelopmentNodeSpec) -> DevelopmentPlan:
-    return DevelopmentPlan(plan_id="development-plan.1", nodes=nodes)
+    command = (("python", "-m", "pytest"),)
+    return DevelopmentPlan(
+        plan_id="development-plan.1",
+        nodes=nodes,
+        integration_regression_policy=IntegrationRegressionPolicy(
+            backend=CommandPolicy(allowed_commands=command, tests=command),
+            electron_playwright=CommandPolicy(allowed_commands=command, tests=command),
+        ),
+    )
 
 
 def test_rejects_overlapping_writable_ownership() -> None:
@@ -410,3 +419,79 @@ def test_planner_exposes_development_validation_extension() -> None:
     candidate = plan(node("backend", writes=("mvp/src/workbench/api/app.py",)))
 
     assert PlannerCompiler().validate_development(candidate).plan == candidate
+
+
+def test_integration_regression_policy_is_an_immutable_approved_plan_snapshot() -> None:
+    backend = CommandPolicy(
+        allowed_commands=(("python", "-m", "pytest", "tests/unit", "-q"),),
+        tests=(("python", "-m", "pytest", "tests/unit", "-q"),),
+    )
+    electron = CommandPolicy(
+        allowed_commands=(("playwright", "test", "--reporter=line"),),
+        tests=(("playwright", "test", "--reporter=line"),),
+    )
+    policy = IntegrationRegressionPolicy(
+        backend=backend,
+        electron_playwright=electron,
+    )
+    candidate = plan(node("backend", writes=("src/backend.py",))).model_copy(
+        update={"integration_regression_policy": policy}
+    )
+
+    validated = DevelopmentPlanValidator().validate(candidate)
+
+    assert validated.plan.integration_regression_policy == policy
+    with pytest.raises(Exception):
+        policy.backend = electron  # type: ignore[misc]
+
+
+def test_integration_policy_allows_only_repository_scoped_npm_test_launcher(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    allowed = CommandPolicy(
+        allowed_commands=(("npm", "test", "--prefix", "mvp/canvas-spike"),),
+        tests=(("npm", "test", "--prefix", "mvp/canvas-spike"),),
+    )
+    allowed.validate_commands(
+        repository_root=repository,
+        writable_paths=("mvp",),
+    )
+
+    for command in (
+        ("npm", "run", "arbitrary"),
+        ("npm", "test", "--prefix", "../outside"),
+        ("npm", "test", "--", "--update-snapshots"),
+    ):
+        policy = CommandPolicy(allowed_commands=(command,), tests=(command,))
+        with pytest.raises(ValueError):
+            policy.validate_commands(
+                repository_root=repository,
+                writable_paths=("mvp",),
+            )
+
+
+def test_plan_requires_integration_regression_policy() -> None:
+    candidate = DevelopmentPlan(
+        plan_id="development-plan.1",
+        nodes=(node("backend", writes=("src/backend.py",)),),
+    )
+    with pytest.raises(InvalidDevelopmentNode, match="integration regression policy"):
+        DevelopmentPlanValidator().validate(candidate)
+
+
+def test_transitively_ordered_same_file_ownership_is_allowed() -> None:
+    command = (("python", "-m", "pytest", "-q"),)
+    policy = IntegrationRegressionPolicy(
+        backend=CommandPolicy(allowed_commands=command, tests=command),
+        electron_playwright=CommandPolicy(allowed_commands=command, tests=command),
+    )
+    candidate = DevelopmentPlan(
+        plan_id="development-plan.1",
+        nodes=(
+            node("a", writes=("src/shared.py",)),
+            node("b", writes=("src/b.py",), depends_on=("a",)),
+            node("c", writes=("src/shared.py",), depends_on=("b",)),
+        ),
+        integration_regression_policy=policy,
+    )
+    assert DevelopmentPlanValidator().validate(candidate).plan == candidate

@@ -17,7 +17,7 @@ from workbench.protocol.events import DomainEvent
 from workbench.providers.repository import ProviderRepository
 from workbench.workflow.event_store import EventStore
 from workbench.orchestration.development_jobs import DevelopmentJobRepository
-from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract
+from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract, IntegrationRegressionPolicy
 
 db = Path(sys.argv[1]) / "workbench.sqlite"
 providers = ProviderRepository(db)
@@ -35,12 +35,16 @@ store = EventStore(db)
 for index, (kind, payload) in enumerate(events):
     store.append(DomainEvent.new(kind, "fixture", payload, run_id="ui-session-0"), command_id=f"development-fixture-{index}")
 jobs = DevelopmentJobRepository(db)
+regression = (("python", "-m", "pytest", "-q"),)
 plan = DevelopmentPlan(plan_id="development-plan.fixture", nodes=(DevelopmentNodeSpec(
     node_id="backend", repository_root=Path.cwd().parent, base_commit="a" * 40,
     ownership=FileOwnership(writable_paths=("src/workbench/api/conversations.py",)),
     command_policy=CommandPolicy(allowed_commands=(("python", "-m", "pytest", "-q"),), tests=(("python", "-m", "pytest", "-q"),)),
     output=GitOutputContract(branch="graph/development-run.fixture/backend"),
-),))
+),), integration_regression_policy=IntegrationRegressionPolicy(
+    backend=CommandPolicy(allowed_commands=regression, tests=regression),
+    electron_playwright=CommandPolicy(allowed_commands=regression, tests=regression),
+))
 jobs.admit("development-run.fixture", "ui-session-0", plan)
 jobs.mark_needs_human("development-run.fixture", interrupt_id="branch.fixture.current" if sys.argv[3] == "branch_review" else "release.fixture", interrupt_kind=sys.argv[3], interrupt_payload={"kind":"branch_reviews", "reviews":{"frontend":{"attempt":1}}} if sys.argv[3] == "branch_review" else {"kind":"release_approval"})
 `;
@@ -84,11 +88,12 @@ test("development graph shows isolated branches and waits for release approval",
     const graph = page.getByRole("region", { name: "开发图运行" });
     await expect(graph.getByText("backend · 独立 Worktree")).toBeVisible();
     await expect(graph.getByText("临时集成分支测试通过")).toBeVisible();
-    await expect(graph.getByRole("button", { name: "批准进入目标分支" })).toBeVisible();
+    await expect(graph.getByRole("button", { name: "确认验收结果" })).toBeVisible();
+    await expect(graph).not.toContainText("进入目标分支");
     await expect(graph).not.toContainText("secret-value");
     await expect(graph).not.toContainText("reset");
-    await graph.getByRole("button", { name: "批准进入目标分支" }).click();
-    await expect(graph.getByRole("button", { name: "审批已提交" })).toBeVisible();
+    await graph.getByRole("button", { name: "确认验收结果" }).click();
+    await expect(graph.getByRole("button", { name: "验收结果已确认" })).toBeVisible();
     appendDevelopmentInterrupt(runtimeDir, "integration.fixture.next", "integration_approval");
     await expect(graph.getByRole("button", { name: "批准临时集成" })).toBeVisible();
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/sessions/ui-session-0/development-runs/development-run.fixture/interrupts/release.fixture" }))).rejects.toThrow("invalid local API request");

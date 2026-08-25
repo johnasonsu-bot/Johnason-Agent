@@ -12,6 +12,7 @@ from workbench.orchestration.development import (
     DevelopmentPlan,
     FileOwnership,
     GitOutputContract,
+    IntegrationRegressionPolicy,
 )
 
 
@@ -31,7 +32,11 @@ def _plan(tmp_path) -> DevelopmentPlan:
         command_policy=CommandPolicy(allowed_commands=(("python", "-m", "pytest", "-q"),), tests=(("python", "-m", "pytest", "-q"),)),
         output=GitOutputContract(branch="graph/development-run/backend"),
     )
-    return DevelopmentPlan(plan_id="development-plan.1", nodes=(node,))
+    regression = (("python", "-m", "pytest", "-q"),)
+    return DevelopmentPlan(plan_id="development-plan.1", nodes=(node,), integration_regression_policy=IntegrationRegressionPolicy(
+        backend=CommandPolicy(allowed_commands=regression, tests=regression),
+        electron_playwright=CommandPolicy(allowed_commands=regression, tests=regression),
+    ))
 
 
 def test_development_job_resume_is_session_scoped_and_idempotent(tmp_path) -> None:
@@ -98,10 +103,14 @@ def test_resuming_one_interrupt_records_history_and_allows_the_next(tmp_path) ->
     jobs.admit("development-run.1", "session-a", _plan(tmp_path))
     jobs.mark_needs_human("development-run.1", interrupt_id="integration.1", interrupt_kind="integration_approval", interrupt_payload={"kind":"integration_approval"})
     resumed = jobs.resume_idempotently("development-run.1", "session-a", "integration.1", {"decision":"approved"}, "resume-integration")
-    assert resumed.interrupt_id is None and resumed.status == "queued"
+    assert resumed.interrupt_id == "integration.1" and resumed.status == "queued"
+    assert resumed.interrupt_kind == "integration_approval"
+    assert resumed.interrupt_digest == jobs.interrupt_digest(
+        "development-run.1", "integration_approval", {"kind": "integration_approval"}
+    )
     jobs.mark_needs_human("development-run.1", interrupt_id="release.1", interrupt_kind="release_approval", interrupt_payload={"kind":"release_approval"})
     final = jobs.request_resume("development-run.1", "session-a", {"decision":"approved"}, "release.1")
-    assert final.interrupt_id is None
+    assert final.interrupt_id == "release.1"
     with jobs.store.connect() as connection:
         history = connection.execute("SELECT interrupt_id FROM development_job_resolved_interrupts ORDER BY resolved_at").fetchall()
     assert [row["interrupt_id"] for row in history] == ["integration.1", "release.1"]

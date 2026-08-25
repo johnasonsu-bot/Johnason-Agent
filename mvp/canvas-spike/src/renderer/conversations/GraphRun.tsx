@@ -48,7 +48,7 @@ export function GraphRun({ state, onResume, sessionId }: { state: ResearchGraphS
         {development.interruptKind === "integration_approval" && development.interruptId && <article><strong>临时集成等待审批</strong><p>不会触碰目标分支。</p><button type="button" disabled={releasePending} onClick={() => resumeDevelopment({ decision: "approved" })}>{releasePending ? "审批已提交" : "批准临时集成"}</button></article>}
         {development.interruptKind === "merge_arbitration" && development.interruptId && <article><strong>合并冲突等待仲裁</strong><button type="button" disabled={releasePending} onClick={() => resumeDevelopment({ decision: "retry_merge" })}>重试临时集成</button></article>}
         {development.interruptKind === "replan" && <article><strong>需要重新规划</strong><p>需由已批准的新开发计划替代当前运行；不会接受浏览器传入的命令。</p></article>}
-        {development.interruptKind === "release_approval" && development.interruptId && <article><strong>等待发布审批</strong><p>不会自动合并到目标分支。</p><button type="button" disabled={releasePending} onClick={approveRelease}>{releasePending ? "审批已提交" : "批准进入目标分支"}</button></article>}
+        {development.interruptKind === "release_approval" && development.interruptId && <article><strong>等待验收确认</strong><p>仅确认当前集成结果；不会合并或发布到目标分支。</p><button type="button" disabled={releasePending} onClick={approveRelease}>{releasePending ? "验收结果已确认" : "确认验收结果"}</button></article>}
       </div>
     </section>}
   </>;

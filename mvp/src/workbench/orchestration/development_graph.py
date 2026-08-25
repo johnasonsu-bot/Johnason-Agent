@@ -41,6 +41,12 @@ class DevelopmentGraphError(RuntimeError):
     pass
 
 
+class AllowedCommandFailed(DevelopmentGraphError):
+    def __init__(self, evidence_ref: str) -> None:
+        super().__init__("allowed command failed")
+        self.evidence_ref = evidence_ref
+
+
 class DevelopmentExecutionPort(Protocol):
     """Worker and review boundary; Git operations remain in ``GitWorkspaceTool``."""
 
@@ -97,6 +103,7 @@ class DevelopmentState(TypedDict, total=False):
     regression: dict[str, object] | None
     pending_interrupt: dict[str, object] | None
     pending_branch_reviews: Annotated[dict[str, object], _merge_pending_reviews]
+    dependency_baseline_sha: str
 
 
 def initial_development_state(
@@ -192,13 +199,59 @@ def _run_allowed_commands(
             raise DevelopmentGraphError("declared test could not complete") from error
         evidence[command] = _evidence_ref(command, result)
         if result.returncode != 0:
-            raise DevelopmentGraphError("allowed command failed")
+            raise AllowedCommandFailed(evidence[command])
     return evidence
 
 
 def _run_declared_tests(node: DevelopmentNodeSpec, workspace: Path) -> tuple[str, ...]:
     evidence = _run_allowed_commands(node, workspace)
     return tuple(evidence[command] for command in node.command_policy.tests)
+
+
+def _run_integration_regression(
+    plan: DevelopmentPlan,
+    node: DevelopmentNodeSpec,
+    workspace: Path,
+) -> tuple[tuple[str, ...], dict[str, str], dict[str, list[str]]]:
+    policy = plan.integration_regression_policy
+    if policy is None:
+        return (), {}, {}
+    evidence: list[str] = []
+    summary: dict[str, str] = {}
+    suite_evidence: dict[str, list[str]] = {}
+    for label, command_policy in (
+        ("backend", policy.backend),
+        ("electron_playwright", policy.electron_playwright),
+    ):
+        suite_node = node.model_copy(update={"command_policy": command_policy})
+        working_directory = (
+            policy.backend_working_directory
+            if label == "backend"
+            else policy.electron_playwright_working_directory
+        )
+        suite_workspace = (
+            workspace
+            if working_directory is None
+            else (workspace / working_directory).resolve(strict=False)
+        )
+        if not suite_workspace.is_relative_to(workspace.resolve(strict=False)):
+            raise DevelopmentGraphError(
+                "integration regression working directory is outside repository"
+            )
+        try:
+            current_evidence = _run_declared_tests(suite_node, suite_workspace)
+            evidence.extend(current_evidence)
+            suite_evidence[label] = list(current_evidence)
+        except AllowedCommandFailed as error:
+            summary[label] = "failed"
+            suite_evidence[label] = [error.evidence_ref]
+            evidence.append(error.evidence_ref)
+        except DevelopmentGraphError:
+            summary[label] = "failed"
+            suite_evidence[label] = []
+        else:
+            summary[label] = "passed"
+    return tuple(evidence), summary, suite_evidence
 
 
 def _integration_branch(plan_id: str, attempt: int) -> str:
@@ -250,12 +303,13 @@ def build_development_graph(
     def workspace_for(state: DevelopmentState, node: DevelopmentNodeSpec) -> GitWorkspace:
         run_id = str(state["run_id"])
         attempt = int(state["attempt"])
+        baseline_sha = str(state.get("dependency_baseline_sha", validated.base_commit))
         operation_id = f"{run_id}:{node.node_id}:worktree"
         if attempt == 1:
             return git_workspace.create(
                 operation_id=operation_id,
                 repo=validated.repository_root,
-                base_sha=validated.base_commit,
+                base_sha=baseline_sha,
                 branch=node.output.branch,
             )
         # A local rejection creates a later commit in the same isolated branch.
@@ -264,8 +318,51 @@ def build_development_graph(
             repository=validated.repository_root,
             path=_integration_workspace_path(git_workspace, operation_id),
             branch=node.output.branch,
-            base_sha=validated.base_commit,
+            base_sha=baseline_sha,
         )
+
+    def dependency_baseline(
+        state: DevelopmentState, node: DevelopmentNodeSpec
+    ) -> str:
+        if not node.depends_on:
+            return validated.base_commit
+        outcomes = state.get("branch_outcomes", {})
+        commits = tuple(
+            str(outcomes[dependency]["result"]["commit_sha"])
+            for dependency in node.depends_on
+        )
+        if len(commits) == 1:
+            return commits[0]
+        try:
+            return git_workspace.merge_to_integration(
+                operation_id=f"{state['graph_run_id']}:{node.node_id}:dependency-baseline",
+                repo=validated.repository_root,
+                base_sha=validated.base_commit,
+                integration_branch=f"graph/{validated.plan.plan_id}/dependencies-{node.node_id}/integration",
+                commits=commits,
+            )
+        except (GitWorkspaceError, IntegrationConflict) as error:
+            raise DevelopmentGraphError(
+                "dependency baseline integration could not complete"
+            ) from error
+
+    def retry_baseline(state: DevelopmentState, branch: str) -> str:
+        if isinstance(state.get("dependency_baseline_sha"), str):
+            return str(state["dependency_baseline_sha"])
+        result = state.get("result")
+        if isinstance(result, dict) and isinstance(
+            result.get("dependency_baseline_sha"), str
+        ):
+            return str(result["dependency_baseline_sha"])
+        matches = [
+            item
+            for item in state.get("branch_results", [])
+            if item.get("branch_id") == branch
+            and isinstance(item.get("dependency_baseline_sha"), str)
+        ]
+        if not matches:
+            raise DevelopmentGraphError("retry requires an immutable dependency baseline")
+        return str(max(matches, key=lambda item: int(item.get("attempt", 0)))["dependency_baseline_sha"])
 
     def dispatch(state: DevelopmentState) -> Command | dict[str, object]:
         outcomes = state.get("branch_outcomes", {})
@@ -285,7 +382,12 @@ def build_development_graph(
         sends = [
             Send(
                 "worker",
-                {"branch": node.node_id, "attempt": 1, "run_id": state["graph_run_id"]},
+                {
+                    "branch": node.node_id,
+                    "attempt": 1,
+                    "run_id": state["graph_run_id"],
+                    "dependency_baseline_sha": dependency_baseline(state, node),
+                },
             )
             for node in candidates
             if node.node_id not in active
@@ -312,7 +414,7 @@ def build_development_graph(
             git_workspace.prepare_attempt(
                 operation_id=f"{state['run_id']}:{branch}:attempt:{attempt}:prepare",
                 workspace=workspace,
-                baseline_sha=validated.base_commit,
+                baseline_sha=str(state["dependency_baseline_sha"]),
             )
         worker_state = dict(state) | {"workspace_path": str(workspace.path)}
         summary = _execute(port, stage="worker", branch=branch, attempt=attempt, state=worker_state)  # type: ignore[arg-type]
@@ -333,7 +435,10 @@ def build_development_graph(
             changed_paths=node.ownership.writable_paths,
             test_evidence=test_evidence,
             summary=summary,
-        ).model_dump(mode="json") | {"stage": "worker"}
+        ).model_dump(mode="json") | {
+            "stage": "worker",
+            "dependency_baseline_sha": str(state["dependency_baseline_sha"]),
+        }
         update: dict[str, object] = {
             "attempts": {branch: attempt},
             "branch_results": [result],
@@ -364,7 +469,12 @@ def build_development_graph(
                 update={"local_reviews": [record]},
                 goto=Send(
                     "attempt_reset_gate",
-                    {"branch": branch, "attempt": attempt + 1, "run_id": state["run_id"]},
+                    {
+                        "branch": branch,
+                        "attempt": attempt + 1,
+                        "run_id": state["run_id"],
+                        "dependency_baseline_sha": state["result"]["dependency_baseline_sha"],
+                    },
                 ),
             )
         if decision.decision == "needs_human":
@@ -433,12 +543,13 @@ def build_development_graph(
         if node is None or attempt < 2:
             raise DevelopmentGraphError("attempt reset is outside the validated plan")
         workspace = workspace_for(state, node)
+        baseline_sha = retry_baseline(state, branch)
         response = interrupt(
             {
                 "kind": "attempt_reset_approval",
                 "branch": branch,
                 "current_head": git_workspace.status(workspace).head_sha,
-                "baseline_sha": validated.base_commit,
+                "baseline_sha": baseline_sha,
             }
         )
         if response != {"decision": "approved"}:
@@ -452,6 +563,7 @@ def build_development_graph(
                     "attempt": attempt,
                     "run_id": state["run_id"],
                     "attempt_reset_approved": True,
+                    "dependency_baseline_sha": baseline_sha,
                 },
             ),
         )
@@ -465,6 +577,7 @@ def build_development_graph(
                     "branch": state["branch"],
                     "attempt": state["attempt"],
                     "run_id": state["run_id"],
+                    "dependency_baseline_sha": state["dependency_baseline_sha"],
                 },
             ),
         )
@@ -556,6 +669,7 @@ def build_development_graph(
                         "branch": target,
                         "attempt": next_attempt,
                         "run_id": state["graph_run_id"],
+                        "dependency_baseline_sha": retry_baseline(state, target),
                     },
                 ),
             )
@@ -579,15 +693,24 @@ def build_development_graph(
             branch=str(evidence["integration_branch"]),
             base_sha=validated.base_commit,
         )
-        test_evidence: list[str] = []
-        seen: set[tuple[str, ...]] = set()
-        for node in ordered_nodes:
-            if node.command_policy.tests not in seen:
-                seen.add(node.command_policy.tests)
-                test_evidence.extend(_run_declared_tests(node, workspace.path))
-        value = _execute(port, stage="global_verifier", branch="global", attempt=merge_attempt, state=state)
-        regression = RegressionResult.model_validate(value)
-        payload = regression.model_copy(update={"test_evidence": tuple(test_evidence)}).model_dump(mode="json")
+        regression_evidence, regression_summary, suite_evidence = _run_integration_regression(
+            validated.plan, ordered_nodes[0], workspace.path
+        )
+        if regression_summary and "failed" in regression_summary.values():
+            regression = RegressionResult(
+                decision="request_replan",
+                findings=("approved integration regression failed",),
+            )
+        else:
+            value = _execute(port, stage="global_verifier", branch="global", attempt=merge_attempt, state=state)
+            regression = RegressionResult.model_validate(value)
+        payload = regression.model_copy(
+            update={"test_evidence": regression_evidence}
+        ).model_dump(mode="json") | {
+            "integration_sha": integration_sha,
+            "summary": regression_summary,
+            "suite_evidence": suite_evidence,
+        }
         if regression.decision == "approved":
             return Command(update={"regression": payload, "status": "awaiting_release_approval"}, goto="release_approval")
         if regression.decision == "rework_merge":
@@ -597,7 +720,7 @@ def build_development_graph(
             if target not in nodes:
                 raise DevelopmentGraphError("global verifier selected an unknown branch")
             next_attempt = int(state.get("attempts", {}).get(target, 0)) + 1
-            return Command(update={"regression": payload, "branch_outcomes": {target: {"decision": "rework_pending"}}}, goto=Send("attempt_reset_gate", {"branch": target, "attempt": next_attempt, "run_id": state["graph_run_id"]}))
+            return Command(update={"regression": payload, "branch_outcomes": {target: {"decision": "rework_pending"}}}, goto=Send("attempt_reset_gate", {"branch": target, "attempt": next_attempt, "run_id": state["graph_run_id"], "dependency_baseline_sha": retry_baseline(state, target)}))
         return Command(update={"regression": payload, "pending_interrupt": payload, "status": "awaiting_replan"}, goto="replan")
 
     def release_approval(state: DevelopmentState) -> dict[str, object]:

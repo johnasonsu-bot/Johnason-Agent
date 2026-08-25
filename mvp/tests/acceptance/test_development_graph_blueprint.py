@@ -197,6 +197,7 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
     assert result["remote_unchanged"] is True
     assert result["rejected_commit_exclusion_exit_code"] == 1
     assert result["dependency_order_verified"] is True
+    assert result["dependency_baseline_verified"] is True
     assert len(result["merge_associations"]) == 3
     assert all(
         item["approved"]
@@ -208,6 +209,7 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
         for item in result["merge_associations"]
     )
     assert all(command["exit_code"] == 0 for command in result["integration_commands"])
+    assert all(command["evidence_refs"] for command in result["integration_commands"])
     assert {command["label"] for command in result["integration_commands"]} == {
         "integration_backend_full",
         "integration_electron_playwright_full",
@@ -244,7 +246,7 @@ async def test_fault_injections_write_metadata_only_blocked_result(
     assert result["target_branch_unchanged"] is True
     assert result["ownership_violation_blocked"] is (fault != "ownership")
     assert result["integration_commands"]
-    assert all("duration_ms" in command for command in result["integration_commands"])
+    assert all("evidence_refs" in command for command in result["integration_commands"])
     if fault in {"backend", "electron"}:
         assert any(command["exit_code"] != 0 for command in result["integration_commands"])
     if fault == "remote":

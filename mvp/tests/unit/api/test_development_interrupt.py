@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 import subprocess
 
-from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract
+from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract, IntegrationRegressionPolicy
 
 from workbench.api.app import AppSettings, create_app
 
@@ -23,7 +23,8 @@ def _approved_plan(tmp_path) -> DevelopmentPlan:
     subprocess.run(("git", "add", "."), cwd=repo, check=True, capture_output=True)
     subprocess.run(("git", "commit", "-m", "base"), cwd=repo, check=True, capture_output=True)
     sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, text=True, capture_output=True).stdout.strip()
-    return DevelopmentPlan(plan_id="development-plan.1", nodes=(DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=sha, ownership=FileOwnership(writable_paths=("src/backend.py",)), command_policy=CommandPolicy(allowed_commands=(("python", "-m", "pytest", "-q"),), tests=(("python", "-m", "pytest", "-q"),)), output=GitOutputContract(branch="graph/development-run/backend")),))
+    regression = (("python", "-m", "pytest", "-q"),)
+    return DevelopmentPlan(plan_id="development-plan.1", nodes=(DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=sha, ownership=FileOwnership(writable_paths=("src/backend.py",)), command_policy=CommandPolicy(allowed_commands=regression, tests=regression), output=GitOutputContract(branch="graph/development-run/backend")),), integration_regression_policy=IntegrationRegressionPolicy(backend=CommandPolicy(allowed_commands=regression, tests=regression), electron_playwright=CommandPolicy(allowed_commands=regression, tests=regression)))
 
 
 def test_release_interrupt_requires_its_own_session_and_scoped_decision(tmp_path) -> None:

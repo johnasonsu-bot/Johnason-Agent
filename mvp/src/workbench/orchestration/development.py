@@ -220,6 +220,10 @@ class CommandPolicy(_Frozen):
             if not lowered or lowered[0] != "test":
                 raise ValueError("Playwright command is not allowlisted")
             return executable, arguments[1:]
+        if executable == "npm":
+            if not lowered or lowered[0] != "test":
+                raise ValueError("npm command is not allowlisted")
+            return executable, arguments[1:]
         if executable == "go":
             if not lowered or lowered[0] not in {"test", "vet"}:
                 raise ValueError("Go command is not allowlisted")
@@ -248,12 +252,13 @@ class CommandPolicy(_Frozen):
             "cargo": {"--target-dir"},
         }.get(executable, set())
         input_options = {
-            "pytest": {"-c", "--confcutdir", "--rootdir"},
+            "pytest": {"-c", "--confcutdir", "--rootdir", "--ignore"},
             "ruff": {"--config"},
             "mypy": {"--config-file"},
             "pyright": {"--project"},
             "tsc": {"--project"},
             "playwright": {"--config"},
+            "npm": {"--prefix"},
             "go": set(),
             "cargo": {"--manifest-path"},
         }.get(executable, set())
@@ -263,9 +268,10 @@ class CommandPolicy(_Frozen):
             "mypy": {"--python-version"},
             "pyright": {"--pythonversion", "--pythonplatform", "--level"},
             "tsc": {"--target", "--module", "--moduleResolution".lower()},
-            "playwright": {"--grep", "--project", "--workers", "--retries"},
+            "playwright": {"--grep", "--project", "--workers", "--retries", "--reporter"},
             "go": {"-run", "-count"},
             "cargo": {"--package", "--features"},
+            "npm": set(),
         }.get(executable, set())
         flag_options = {
             "pytest": {"-q", "-v", "-x", "--quiet", "--verbose", "--disable-warnings", "--strict-markers", "--no-header", "--no-summary"},
@@ -276,6 +282,7 @@ class CommandPolicy(_Frozen):
             "playwright": {"--headed", "--debug", "--list", "--reporter=line"},
             "go": {"-v", "-race", "-short"},
             "cargo": {"--locked", "--offline", "--all-targets", "--all-features"},
+            "npm": {"--silent"},
         }.get(executable, set())
         index = 0
         while index < len(arguments):
@@ -365,9 +372,19 @@ class DevelopmentNodeSpec(_Frozen):
         return value.resolve(strict=False)
 
 
+class IntegrationRegressionPolicy(_Frozen):
+    """Approved, immutable commands for the integration release gate."""
+
+    backend: CommandPolicy
+    electron_playwright: CommandPolicy
+    backend_working_directory: str | None = None
+    electron_playwright_working_directory: str | None = None
+
+
 class DevelopmentPlan(_Frozen):
     plan_id: OpaqueIdentifier
     nodes: tuple[DevelopmentNodeSpec, ...] = Field(min_length=1)
+    integration_regression_policy: IntegrationRegressionPolicy | None = None
 
 
 class ValidatedDevelopmentPlan(_Frozen):
@@ -391,6 +408,8 @@ class DevelopmentPlanValidator:
             raise InvalidDevelopmentNode("development plan requires one repository root")
         if len(bases) != 1 or any(not _SHA.fullmatch(value) for value in bases):
             raise InvalidDevelopmentNode("base commit must be one exact 40-character SHA")
+        if plan.integration_regression_policy is None:
+            raise InvalidDevelopmentNode("integration regression policy is required")
         canonical_writes: dict[str, tuple[str, ...]] = {}
         for node in plan.nodes:
             if node.node_id in node.depends_on or not set(node.depends_on).issubset(nodes):
@@ -408,6 +427,29 @@ class DevelopmentPlanValidator:
                 )
             except ValueError as error:
                 raise InvalidDevelopmentNode(str(error)) from error
+        if plan.integration_regression_policy is not None:
+            all_writable_paths = tuple(
+                path for paths in canonical_writes.values() for path in paths
+            )
+            try:
+                for working_directory in (
+                    plan.integration_regression_policy.backend_working_directory,
+                    plan.integration_regression_policy.electron_playwright_working_directory,
+                ):
+                    if working_directory is not None:
+                        self.canonical_repository_path(
+                            next(iter(roots)), working_directory
+                        )
+                plan.integration_regression_policy.backend.validate_commands(
+                    repository_root=next(iter(roots)),
+                    writable_paths=all_writable_paths,
+                )
+                plan.integration_regression_policy.electron_playwright.validate_commands(
+                    repository_root=next(iter(roots)),
+                    writable_paths=all_writable_paths,
+                )
+            except ValueError as error:
+                raise InvalidDevelopmentNode(str(error)) from error
         self._require_acyclic(nodes)
         for index, left in enumerate(plan.nodes):
             for right in plan.nodes[index + 1 :]:
@@ -416,10 +458,9 @@ class DevelopmentPlanValidator:
                     for left_path in canonical_writes[left.node_id]
                     for right_path in canonical_writes[right.node_id]
                 )
-                ordered = (
-                    left.node_id in right.depends_on
-                    or right.node_id in left.depends_on
-                )
+                ordered = self._depends_transitively(
+                    nodes, left.node_id, right.node_id
+                ) or self._depends_transitively(nodes, right.node_id, left.node_id)
                 if overlaps and not ordered:
                     raise OwnershipConflict(
                         f"writable ownership overlaps: {left.node_id}/{right.node_id}"
@@ -498,3 +539,20 @@ class DevelopmentPlanValidator:
 
         for node_id in nodes:
             visit(node_id)
+
+    @staticmethod
+    def _depends_transitively(
+        nodes: dict[str, DevelopmentNodeSpec],
+        node_id: str,
+        dependency_id: str,
+    ) -> bool:
+        pending = list(nodes[node_id].depends_on)
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == dependency_id:
+                return True
+            if current not in visited:
+                visited.add(current)
+                pending.extend(nodes[current].depends_on)
+        return False

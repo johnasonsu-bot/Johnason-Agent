@@ -22,10 +22,15 @@ def test_processor_projects_task3_state_to_stable_metadata_only_events() -> None
     plan = SimpleNamespace(plan_id="development-plan.1", nodes=(node,))
     state = {
         "graph_run_id": "development-run.1", "status": "awaiting_release_approval", "base_sha": "a" * 40,
-        "branch_results": [{"branch_id": "backend", "attempt": 1, "commit_sha": "b" * 40}],
+        "branch_results": [{"branch_id": "backend", "attempt": 1, "commit_sha": "b" * 40, "dependency_baseline_sha": "d" * 40}],
         "local_reviews": [{"branch_id": "backend", "attempt": 1, "decision": "approved", "findings": []}],
         "merge_evidence": {"status": "merged", "integration_branch": "graph/development-run.1/integration", "base_sha": "a" * 40, "commits": ["b" * 40], "integration_sha": "c" * 40},
-        "regression": {"decision": "approved", "findings": []},
+        "regression": {
+            "decision": "approved",
+            "findings": [],
+            "integration_sha": "c" * 40,
+            "summary": {"backend": "passed", "electron_playwright": "passed"},
+        },
     }
 
     first = processor._result(plan, state)
@@ -36,6 +41,13 @@ def test_processor_projects_task3_state_to_stable_metadata_only_events() -> None
         "development.merge.completed", "development.global_verification.decided", "development.interrupt.required",
     ]
     assert first.interrupt_id == second.interrupt_id
+    assert first.events[1].payload["base_sha"] == "d" * 40
+    verification = first.events[-2].payload
+    assert verification["integration_sha"] == "c" * 40
+    assert verification["summary"] == {
+        "backend": "passed",
+        "electron_playwright": "passed",
+    }
     assert "private_environment" not in str(first.events)
 
 
@@ -87,3 +99,70 @@ def test_processor_aclose_closes_its_owned_checkpointer(tmp_path: Path) -> None:
     asyncio.run(processor.aclose())
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         connection.execute("SELECT 1")
+
+
+def test_processor_rejects_resume_identity_that_is_not_the_current_checkpoint_interrupt() -> None:
+    processor = object.__new__(DurableDevelopmentProcessor)
+    current_payload = {
+        "kind": "release_approval",
+        "integration_branch": "graph/run/integration",
+        "target_branch": "main",
+    }
+    current_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "graph_run_id": "development-run.1",
+                "kind": "release_approval",
+                "payload": current_payload,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    class Graph:
+        def get_state(self, _config):
+            interrupt = SimpleNamespace(value=current_payload)
+            return SimpleNamespace(
+                values={"status": "awaiting_release_approval"},
+                tasks=(SimpleNamespace(interrupts=(interrupt,)),),
+            )
+
+    assert processor._resume_matches_current_interrupt(
+            Graph(),
+            {},
+            "development-run.1",
+            resume_interrupt_id="development-interrupt.stale",
+            resume_interrupt_digest="0" * 64,
+        ) is False
+
+    assert processor._resume_matches_current_interrupt(
+        Graph(),
+        {},
+        "development-run.1",
+        resume_interrupt_id=f"development-interrupt.{current_digest[:32]}",
+        resume_interrupt_digest=current_digest,
+    ) is True
+
+
+def test_release_confirmation_does_not_publish_a_completed_or_target_merge_event() -> None:
+    processor = object.__new__(DurableDevelopmentProcessor)
+    plan = SimpleNamespace(plan_id="development-plan.1", nodes=())
+    state = {
+        "graph_run_id": "development-run.1",
+        "status": "completed",
+        "target_branch": "main",
+        "merge_evidence": {
+            "status": "merged",
+            "integration_branch": "graph/run/integration",
+            "integration_sha": "c" * 40,
+        },
+    }
+
+    result = processor._result(plan, state)
+
+    assert result.status == "completed"
+    assert all(
+        event.event_type != "development.interrupt.required"
+        for event in result.events
+    )

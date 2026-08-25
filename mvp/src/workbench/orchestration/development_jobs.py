@@ -82,7 +82,7 @@ class DevelopmentJobRepository:
             if row is None: c.rollback(); raise KeyError(graph_run_id)
             if owner_id is not None and (row["owner_id"] != owner_id or int(row["attempt"]) != attempt or row["status"] != "running" or float(row["lease_expires_at"]) <= now): c.rollback(); raise ValueError("development job lease is not owned")
             old=(row["interrupt_id"],row["interrupt_kind"],row["interrupt_digest"])
-            if row["interrupt_id"] is not None and old != (interrupt_id,interrupt_kind,digest): c.rollback(); raise ValueError("development interrupt identity cannot change")
+            if row["interrupt_id"] is not None and row["resume_json"] is None and old != (interrupt_id,interrupt_kind,digest): c.rollback(); raise ValueError("development interrupt identity cannot change")
             c.execute("""UPDATE development_graph_jobs SET status='needs_human',owner_id=NULL,lease_expires_at=0,interrupt_id=?,interrupt_kind=?,interrupt_digest=?,interrupt_payload_json=?,resume_json=NULL,updated_at=? WHERE graph_run_id=?""",(interrupt_id,interrupt_kind,digest,encoded,now,graph_run_id)); row=c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(graph_run_id,)).fetchone(); c.commit()
         return self._job(row)
 
@@ -122,7 +122,6 @@ class DevelopmentJobRepository:
                 graph_run_id,interrupt_id,interrupt_kind,interrupt_digest,interrupt_payload_json,response_json,resolved_at
             ) VALUES (?,?,?,?,?,?,?)""", (run,row["interrupt_id"],row["interrupt_kind"],row["interrupt_digest"],row["interrupt_payload_json"],encoded,now))
             c.execute("""UPDATE development_graph_jobs SET status='queued',resume_json=?,owner_id=NULL,lease_expires_at=0,
-                interrupt_id=NULL,interrupt_kind=NULL,interrupt_digest=NULL,interrupt_payload_json=NULL,
                 interrupt_actor_id='local-user',interrupt_decision=?,updated_at=? WHERE graph_run_id=?""",(encoded,str(response.get("decision","approved")),now,run))
         elif not (row["status"] in {"queued","running","completed"} and row["resume_json"] == encoded): raise ValueError("development job is not awaiting human input")
         return self._job(c.execute("SELECT * FROM development_graph_jobs WHERE graph_run_id=?",(run,)).fetchone())

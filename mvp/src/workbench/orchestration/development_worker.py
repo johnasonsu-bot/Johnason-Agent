@@ -40,7 +40,10 @@ class DevelopmentTaskWorker:
                 except asyncio.TimeoutError: pass
                 continue
             heartbeat=asyncio.create_task(self._heartbeat(job.graph_run_id,job.attempt))
-            processor=asyncio.create_task(self.processor.process(job.graph_run_id,job.plan,resume_response=job.resume_response))
+            process_kwargs={"resume_response":job.resume_response}
+            if job.resume_response is not None:
+                process_kwargs.update({"resume_interrupt_id":job.interrupt_id,"resume_interrupt_digest":job.interrupt_digest})
+            processor=asyncio.create_task(self.processor.process(job.graph_run_id,job.plan,**process_kwargs))
             try:
                 done,_=await asyncio.wait({processor,heartbeat},return_when=asyncio.FIRST_COMPLETED)
                 if heartbeat in done: heartbeat.result(); raise RuntimeError("development heartbeat stopped unexpectedly")

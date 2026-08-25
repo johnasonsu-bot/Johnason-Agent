@@ -7,17 +7,24 @@ import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import pytest
 
 import workbench.main as main
 from workbench.conversations.repository import ConversationRepository
-from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract
+from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract, IntegrationRegressionPolicy
 from workbench.runtime.agent_loop import AgentEvent
 from workbench.settings import WorkbenchSettings
 from workbench.workflow.event_store import EventStore
+from workbench.tools.git_workspace import GitWorkspaceTool, IntegrationConflict
 
 
 def _git(*argv: str, cwd: Path) -> str:
     return subprocess.run(("git", *argv), cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _regression_policy(command: tuple[str, ...]) -> IntegrationRegressionPolicy:
+    policy = CommandPolicy(allowed_commands=(command,), tests=(command,))
+    return IntegrationRegressionPolicy(backend=policy, electron_playwright=policy)
 
 
 class _EditRunner:
@@ -85,6 +92,7 @@ def _conflicting_plan(repo: Path, base: str) -> DevelopmentPlan:
                 output=GitOutputContract(branch="graph/development-conflict/frontend"),
             ),
         ),
+        integration_regression_policy=_regression_policy(command),
     )
 
 
@@ -96,6 +104,7 @@ def _two_batch_review_plan(repo: Path, base: str) -> DevelopmentPlan:
             DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=base, ownership=FileOwnership(writable_paths=("src/backend.py",)), command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)), output=GitOutputContract(branch="graph/two-batch/backend")),
             DevelopmentNodeSpec(node_id="frontend", repository_root=repo, base_commit=base, depends_on=("backend",), ownership=FileOwnership(writable_paths=("src/frontend.py",)), command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)), output=GitOutputContract(branch="graph/two-batch/frontend")),
         ),
+        integration_regression_policy=_regression_policy(command),
     )
 
 
@@ -123,7 +132,7 @@ def test_build_app_worker_commits_a_model_owned_edit_in_an_isolated_worktree(tmp
     _git("add", ".", cwd=repo); _git("commit", "-m", "base", cwd=repo)
     base = _git("rev-parse", "HEAD", cwd=repo)
     command = ("python", "-m", "pytest", "tests/test_backend.py", "-q")
-    plan = DevelopmentPlan(plan_id="development-plan.1", nodes=(DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=base, ownership=FileOwnership(writable_paths=("src/backend.py",)), command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)), output=GitOutputContract(branch="graph/run/backend")),))
+    plan = DevelopmentPlan(plan_id="development-plan.1", nodes=(DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=base, ownership=FileOwnership(writable_paths=("src/backend.py",)), command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)), output=GitOutputContract(branch="graph/run/backend")),), integration_regression_policy=_regression_policy(command))
     settings = WorkbenchSettings(runtime_dir=tmp_path / "runtime")
     app = main.build_app(settings, runner=_EditRunner())
     with TestClient(app) as client:
@@ -150,7 +159,7 @@ def test_build_app_worker_commits_a_model_owned_edit_in_an_isolated_worktree(tmp
     assert _git("show", "graph/run/backend:src/backend.py", cwd=repo) == "value = 1"
 
 
-def test_real_processor_worker_and_session_api_resume_merge_rework(tmp_path: Path) -> None:
+def test_real_processor_worker_and_session_api_resume_merge_rework(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = tmp_path / "repo"; repo.mkdir()
     for argv in (("init", "-b", "main"), ("config", "user.email", "test@example.invalid"), ("config", "user.name", "Test")):
         _git(*argv, cwd=repo)
@@ -160,6 +169,20 @@ def test_real_processor_worker_and_session_api_resume_merge_rework(tmp_path: Pat
     _git("add", ".", cwd=repo); _git("commit", "-m", "base", cwd=repo)
     plan = _conflicting_plan(repo, _git("rev-parse", "HEAD", cwd=repo))
     settings = WorkbenchSettings(runtime_dir=tmp_path / "runtime")
+    original_merge = GitWorkspaceTool.merge_to_integration
+    injected = False
+
+    def conflict_once(self, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise IntegrationConflict(
+                paths=("src/shared.txt",),
+                parent_graph=(kwargs["base_sha"], kwargs["commits"][0]),
+            )
+        return original_merge(self, **kwargs)
+
+    monkeypatch.setattr(GitWorkspaceTool, "merge_to_integration", conflict_once)
 
     with TestClient(main.build_app(settings, runner=_ConflictEditRunner())) as client:
         assert client.post("/api/sessions", json={"session_id": "session-a"}).status_code == 200

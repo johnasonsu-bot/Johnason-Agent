@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract, DevelopmentPlanValidator
+from workbench.orchestration.development import CommandPolicy, DevelopmentNodeSpec, DevelopmentPlan, FileOwnership, GitOutputContract, DevelopmentPlanValidator, IntegrationRegressionPolicy
 from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
 from workbench.tools.git_workspace import GitWorkspaceTool
 from workbench.runtime.agent_loop import AgentEvent
@@ -26,7 +26,8 @@ def repository(tmp_path: Path) -> tuple[Path, str]:
 
 def _plan(repo: Path, *, owned: tuple[str, ...] = ("src/backend.py",)) -> DevelopmentPlan:
     sha = subprocess.run(("git", "rev-parse", "HEAD"), cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
-    return DevelopmentPlan(plan_id="development-plan.1", nodes=(DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=sha, ownership=FileOwnership(writable_paths=owned), command_policy=CommandPolicy(allowed_commands=(("python", "-m", "pytest", "-q"),), tests=(("python", "-m", "pytest", "-q"),)), output=GitOutputContract(branch="graph/run/backend")),))
+    regression = (("python", "-m", "pytest", "-q"),)
+    return DevelopmentPlan(plan_id="development-plan.1", nodes=(DevelopmentNodeSpec(node_id="backend", repository_root=repo, base_commit=sha, ownership=FileOwnership(writable_paths=owned), command_policy=CommandPolicy(allowed_commands=regression, tests=regression), output=GitOutputContract(branch="graph/run/backend")),), integration_regression_policy=IntegrationRegressionPolicy(backend=CommandPolicy(allowed_commands=regression, tests=regression), electron_playwright=CommandPolicy(allowed_commands=regression, tests=regression)))
 
 
 class _Runner:

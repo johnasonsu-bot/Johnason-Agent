@@ -228,5 +228,45 @@ and records:
   `1`, ownership violation blocked, no approved worker replayed after restart,
   target branch unchanged, and offline bare remote unchanged.
 
-This Round 4 report update is documentation-only; the execution commit and
-source blob identities above remain the binding identities for the fresh gate.
+## Round 5 checkpoint-bound regression and dependency baseline evidence
+
+The development graph now binds every resume response to the persisted
+interrupt ID and digest and consumes it only when that identity exactly matches
+the current LangGraph checkpoint interrupt. If the checkpoint has already
+advanced, the processor projects the current interrupt back to the durable job
+without replaying the stale response. A focused transition-crash test proves
+that an integration approval retained by the durable job cannot be replayed
+into the later release-approval checkpoint after a crash between processor
+result and job transition.
+
+Dependency workers no longer start from the plan's original SHA. A single
+dependency uses its approved commit directly; multiple dependencies use a
+ledger-managed dependency integration SHA. Both first attempts and approved
+retries use the same immutable baseline. The integration tests verify that a
+successor reads its predecessor's content, that serial edits to one file do not
+manufacture a conflict, and that an explicit integration conflict still reaches
+all arbitration routes.
+
+The approved plan now carries an immutable integration regression policy with
+repository-scoped working directories and validated argv launchers. The graph,
+not the outer acceptance controller, runs the complete backend and
+Electron/Playwright suites on the integration worktree. Suite status, bounded
+evidence references, and the tested integration SHA are checkpointed before a
+release interrupt can appear. The acceptance controller derives its decision
+only from that checkpoint evidence.
+
+Fresh evidence after the final review fixes:
+
+- Focused Development/API regression: `111 passed` in `43.38s`.
+- Complete backend unit/integration/acceptance regression outside the nested
+  gate: `792 passed, 6 skipped` in `144.16s`.
+- Normal graph-owned full acceptance: `1 passed` in `230.17s`, ending at
+  `awaiting_release_approval` with both suites approved.
+- Backend and Electron failure injections: `2 passed` in `245.87s`. Both failed
+  closed at replan without release approval and retained suite evidence.
+- Renderer Development Graph build and Playwright regression: `2 passed` in
+  `3.8s`; the release card says “确认验收结果” and explicitly disclaims merge or
+  publication to the target branch.
+
+These results bind the Round 5 implementation and checkpoint evidence described
+above; no graph-external test result is appended to manufacture a release GO.

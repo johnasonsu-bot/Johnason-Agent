@@ -14,10 +14,10 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 from typing import Any
 from uuid import uuid4
 
@@ -31,6 +31,7 @@ from workbench.orchestration.development import (
     DevelopmentPlan,
     FileOwnership,
     GitOutputContract,
+    IntegrationRegressionPolicy,
 )
 from workbench.orchestration.development_graph import (
     build_development_graph,
@@ -38,7 +39,7 @@ from workbench.orchestration.development_graph import (
     invoke_development_to_boundary,
 )
 from workbench.orchestration.effects import EffectLedger
-from workbench.tools.git_workspace import GitWorkspaceError, GitWorkspaceTool
+from workbench.tools.git_workspace import GitWorkspaceError, GitWorkspaceTool, IntegrationConflict
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -118,6 +119,26 @@ def _create_fixture_repository(root: Path) -> tuple[Path, str, dict[str, object]
     _git(repository, "checkout", "-B", "main", "origin/main")
     _git(repository, "config", "user.name", "Development Acceptance")
     _git(repository, "config", "user.email", "development-acceptance@example.invalid")
+    for relative in (
+        "mvp/src/workbench/orchestration/development.py",
+        "mvp/src/workbench/orchestration/development_graph.py",
+        "mvp/src/workbench/orchestration/development_jobs.py",
+        "mvp/src/workbench/orchestration/development_processor.py",
+        "mvp/src/workbench/orchestration/development_worker.py",
+        "mvp/tests/unit/orchestration/test_development_plan.py",
+        "mvp/tests/unit/orchestration/test_development_jobs.py",
+        "mvp/tests/unit/orchestration/test_development_worker.py",
+        "mvp/tests/unit/orchestration/test_development_execution.py",
+        "mvp/tests/unit/api/test_development_interrupt.py",
+        "mvp/tests/integration/test_development_graph.py",
+        "mvp/tests/integration/test_development_processor.py",
+        "mvp/tests/integration/test_durable_development_execution.py",
+        "mvp/canvas-spike/src/renderer/conversations/GraphRun.tsx",
+        "mvp/canvas-spike/tests/development-graph.spec.ts",
+    ):
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / relative, destination)
     for relative, content in {
         "mvp/acceptance_fixture/backend.py": "def state() -> str:\n    return 'base'\n",
         "mvp/acceptance_fixture/frontend.ts": "export const view = 'base';\n",
@@ -146,7 +167,14 @@ def _create_fixture_repository(root: Path) -> tuple[Path, str, dict[str, object]
         path = repository / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-    _git(repository, "add", "mvp/acceptance_fixture")
+    source_venv = source / "mvp" / ".venv"
+    source_node_modules = source / "mvp" / "canvas-spike" / "node_modules"
+    (repository / "mvp" / ".venv").symlink_to(source_venv, target_is_directory=True)
+    (repository / "mvp" / "canvas-spike" / "node_modules").symlink_to(
+        source_node_modules, target_is_directory=True
+    )
+    _git(repository, "add", "mvp/acceptance_fixture", "mvp/src", "mvp/tests", "mvp/canvas-spike/src", "mvp/canvas-spike/tests")
+    _git(repository, "add", "-f", "mvp/.venv", "mvp/canvas-spike/node_modules")
     _git(repository, "commit", "-m", "fixture base")
     return repository, _git(repository, "rev-parse", "HEAD"), _remote_snapshot(bare)
 
@@ -181,6 +209,46 @@ def _node(
         ownership=FileOwnership(writable_paths=writable_paths),
         command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
         output=GitOutputContract(branch=branch),
+    )
+
+
+def _integration_regression_policy(inject: str | None) -> IntegrationRegressionPolicy:
+    backend_command = (
+        sys.executable,
+        "-m",
+        "pytest",
+        "tests/unit",
+        "tests/integration",
+        "tests/acceptance",
+        "-q",
+        "--ignore=tests/acceptance/test_development_graph_blueprint.py",
+    )
+    electron_command = ("npm", "test")
+    if inject == "backend":
+        backend_command = (
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/__forced_missing__.py",
+            "-q",
+        )
+    if inject == "electron":
+        electron_command = (
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/__forced_missing_electron__.py",
+            "-q",
+        )
+    return IntegrationRegressionPolicy(
+        backend=CommandPolicy(
+            allowed_commands=(backend_command,), tests=(backend_command,), timeout_seconds=420
+        ),
+        electron_playwright=CommandPolicy(
+            allowed_commands=(electron_command,), tests=(electron_command,), timeout_seconds=420
+        ),
+        backend_working_directory="mvp",
+        electron_playwright_working_directory="mvp/canvas-spike",
     )
 
 
@@ -272,11 +340,18 @@ async def _exercise_conflict_probe(
                 depends_on=("conflict-backend",),
             ),
         ),
+        integration_regression_policy=_integration_regression_policy(None),
     )
     tool = GitWorkspaceTool(
         worktree_root=runtime_dir / "conflict-worktrees",
         ledger=EffectLedger(runtime_dir / "conflict-effects.sqlite"),
     )
+    def injected_conflict(**_kwargs):
+        raise IntegrationConflict(
+            paths=("mvp/acceptance_fixture/shared/conflict.txt",),
+            parent_graph=(base_sha, "f" * 40),
+        )
+    tool.merge_to_integration = injected_conflict  # type: ignore[method-assign]
     graph = build_development_graph(
         open_graph_checkpointer(runtime_dir / "conflict-checkpoints.sqlite"),
         plan,
@@ -313,7 +388,7 @@ async def _exercise_conflict_probe(
 
 
 async def _exercise_main_graph(
-    *, repository: Path, base_sha: str, runtime_dir: Path, calls: DurableCalls
+    *, repository: Path, base_sha: str, runtime_dir: Path, calls: DurableCalls, inject: str | None
 ) -> tuple[dict[str, object], DevelopmentPlan, GitWorkspaceTool, str]:
     run_id = "development-acceptance"
     plan = DevelopmentPlan(
@@ -346,6 +421,7 @@ async def _exercise_main_graph(
                 depends_on=("frontend",),
             ),
         ),
+        integration_regression_policy=_integration_regression_policy(inject),
     )
     tool = GitWorkspaceTool(
         worktree_root=runtime_dir / "main-worktrees",
@@ -388,27 +464,10 @@ async def _exercise_main_graph(
     release = await _to_boundary(
         restarted, Command(resume={"decision": "approved"}), config
     )
-    if release.get("status") != "awaiting_release_approval":
+    expected_status = "awaiting_replan" if inject in {"backend", "electron"} else "awaiting_release_approval"
+    if release.get("status") != expected_status:
         raise AssertionError("global regression did not stop for release approval")
     return release, plan, tool, run_id
-
-
-def _command(label: str, argv: tuple[str, ...], cwd: Path) -> dict[str, object]:
-    started_at = time.monotonic()
-    try:
-        completed = subprocess.run(
-            argv, cwd=cwd, text=True, capture_output=True, check=False, timeout=420
-        )
-        output = completed.stdout + completed.stderr
-        return {"label": label, "exit_code": completed.returncode, "result_digest": sha256(output.encode()).hexdigest(), "duration_ms": int((time.monotonic() - started_at) * 1000)}
-    except subprocess.TimeoutExpired as error:
-        output = (error.stdout or "") + (error.stderr or "")
-        return {"label": label, "exit_code": 124, "result_digest": sha256(output.encode()).hexdigest(), "duration_ms": int((time.monotonic() - started_at) * 1000)}
-
-
-def _integration_workspace(tool: GitWorkspaceTool, run_id: str) -> Path:
-    operation_id = f"{run_id}:merge:1"
-    return tool.worktree_root / sha256(operation_id.encode()).hexdigest()[:24]
 
 
 def _worktree_evidence(
@@ -484,7 +543,7 @@ async def run_development_graph_acceptance(
         repository=repository, base_sha=original_target_sha, runtime_dir=runtime_dir, calls=calls
     )
     release, plan, tool, run_id = await _exercise_main_graph(
-        repository=repository, base_sha=original_target_sha, runtime_dir=runtime_dir, calls=calls
+        repository=repository, base_sha=original_target_sha, runtime_dir=runtime_dir, calls=calls, inject=inject
     )
     branch_results = list(release.get("branch_results", []))
     local_reviews = list(release.get("local_reviews", []))
@@ -511,30 +570,19 @@ async def run_development_graph_acceptance(
     worktrees, distinct_worktrees = _worktree_evidence(
         repository=repository, tool=tool, run_id=run_id, plan=plan
     )
-    integration_workspace = _integration_workspace(tool, run_id)
-    node_modules = integration_workspace / "mvp/canvas-spike/node_modules"
-    if not node_modules.exists():
-        node_modules.symlink_to(Path(__file__).resolve().parents[1] / "canvas-spike/node_modules")
-    controller_venv = Path(sys.executable).parent.parent
-    fixture_venv = integration_workspace / "mvp/.venv"
-    if not fixture_venv.exists():
-        fixture_venv.symlink_to(controller_venv)
-    backend_command = _command(
-        "integration_backend_full",
-        (sys.executable, "-m", "pytest", "tests/unit", "tests/integration", "tests/acceptance", "-q", "--ignore=tests/acceptance/test_development_graph_blueprint.py"),
-        integration_workspace / "mvp",
-    )
-    electron_command = _command(
-        "integration_electron_playwright_full", ("npm", "test"), integration_workspace / "mvp/canvas-spike"
-    )
-    if inject == "backend":
-        backend_command = _command(
-            "integration_backend_full", (sys.executable, "-m", "pytest", "tests/__forced_missing__.py", "-q"), integration_workspace / "mvp"
-        )
-    if inject == "electron":
-        electron_command = _command(
-            "integration_electron_playwright_full", ("npm", "test", "--", "--grep", "__forced_missing_gate__"), integration_workspace / "mvp/canvas-spike"
-        )
+    regression = dict(release.get("regression") or {})
+    regression_summary = dict(regression.get("summary") or {})
+    suite_evidence = dict(regression.get("suite_evidence") or {})
+    backend_command = {
+        "label": "integration_backend_full",
+        "exit_code": 0 if regression_summary.get("backend") == "passed" else 1,
+        "evidence_refs": list(suite_evidence.get("backend", [])),
+    }
+    electron_command = {
+        "label": "integration_electron_playwright_full",
+        "exit_code": 0 if regression_summary.get("electron_playwright") == "passed" else 1,
+        "evidence_refs": list(suite_evidence.get("electron_playwright", [])),
+    }
     if inject == "remote":
         bare = runtime_dir / "offline-remote.git"
         _git(bare, "update-ref", "refs/heads/fault", _git(bare, "rev-parse", "refs/heads/main"))
@@ -571,6 +619,9 @@ async def run_development_graph_acceptance(
             "declared_command_digest": sha256("\0".join(node.command_policy.tests[0]).encode()).hexdigest(),
             "actual_test_evidence_digest": sha256("\0".join(item["test_evidence"]).encode()).hexdigest(),
             "dependency_commit_digest": sha256("\0".join(dependency_commits).encode()).hexdigest(),
+            "dependency_baseline_verified": item.get("dependency_baseline_sha") == (
+                dependency_commits[0] if len(dependency_commits) == 1 else original_target_sha
+            ),
             "test_evidence_count": len(item["test_evidence"]),
             "approved": final_reviews.get((node.node_id, int(item["attempt"]))) == "approved",
         })
@@ -608,6 +659,9 @@ async def run_development_graph_acceptance(
         ],
         "merge_associations": associations,
         "dependency_order_verified": dependency_order_verified,
+        "dependency_baseline_verified": bool(associations) and all(
+            item["dependency_baseline_verified"] for item in associations
+        ),
         "integration_commands": [backend_command, electron_command],
         "full_backend_passed": backend_command["exit_code"] == 0,
         "full_playwright_passed": electron_command["exit_code"] == 0,
@@ -617,7 +671,7 @@ async def run_development_graph_acceptance(
         == original_target_sha,
         "remote_unchanged": remote_before == remote_after,
         "status": release.get("status"),
-        "completed_stages": ["conflict_probe", "main_graph", "integration_commands"],
+        "completed_stages": ["conflict_probe", "main_graph", "integration_regression"],
         "error_kind": f"injected_{inject}" if inject else "",
     }
     result["decision"] = (
@@ -634,6 +688,7 @@ async def run_development_graph_acceptance(
         and len(result["merge_associations"]) == len(plan.nodes)
         and all(item["approved"] and item["test_evidence_count"] for item in result["merge_associations"])
         and result["dependency_order_verified"]
+        and result["dependency_baseline_verified"]
         and not result["restart_repeated_approved_branches"]
         and str(result["integration_branch"]).startswith(f"graph/{run_id}/integration")
         and result["target_branch_unchanged"]

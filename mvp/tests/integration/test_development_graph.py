@@ -17,6 +17,7 @@ from workbench.orchestration.development import (
     DevelopmentPlanValidator,
     FileOwnership,
     GitOutputContract,
+    IntegrationRegressionPolicy,
     InvalidDevelopmentNode,
 )
 from workbench.orchestration.development_graph import (
@@ -27,7 +28,7 @@ from workbench.orchestration.development_graph import (
     invoke_development_to_boundary,
 )
 from workbench.orchestration.effects import EffectLedger
-from workbench.tools.git_workspace import GitWorkspaceTool
+from workbench.tools.git_workspace import GitWorkspaceTool, IntegrationConflict
 
 
 def git(*argv: str, cwd: Path) -> str:
@@ -42,6 +43,11 @@ def trusted_python_launcher(repository: Path, name: str = "python") -> Path:
     launcher.parent.mkdir(parents=True, exist_ok=True)
     launcher.symlink_to(sys.executable)
     return launcher
+
+
+def regression_policy(command: tuple[str, ...]) -> IntegrationRegressionPolicy:
+    policy = CommandPolicy(allowed_commands=(command,), tests=(command,))
+    return IntegrationRegressionPolicy(backend=policy, electron_playwright=policy)
 
 
 @pytest.fixture
@@ -89,7 +95,13 @@ def development_plan_fixture(
                 output=GitOutputContract(branch=f"graph/{run_name}/{branch}"),
             )
         )
-    return DevelopmentPlan(plan_id=plan_id, nodes=tuple(nodes))
+    return DevelopmentPlan(
+        plan_id=plan_id,
+        nodes=tuple(nodes),
+        integration_regression_policy=regression_policy(
+            nodes[0].command_policy.tests[0]
+        ),
+    )
 
 
 class DevelopmentHarness:
@@ -222,6 +234,7 @@ def conflict_graph(
                 output=GitOutputContract(branch=f"graph/{run_id}/frontend"),
             ),
         ),
+        integration_regression_policy=regression_policy(command),
     )
 
     class ConflictHarness(ApprovalHarness):
@@ -237,6 +250,12 @@ def conflict_graph(
         worktree_root=tmp_path / "worktrees",
         ledger=EffectLedger(tmp_path / "effects.sqlite"),
     )
+    def injected_conflict(**_kwargs):
+        raise IntegrationConflict(
+            paths=("src/shared.txt",),
+            parent_graph=(base_sha, "f" * 40),
+        )
+    tool.merge_to_integration = injected_conflict  # type: ignore[method-assign]
     graph = build_development_graph(
         open_graph_checkpointer(tmp_path / "development.sqlite"), plan, ConflictHarness(), tool
     )
@@ -301,6 +320,7 @@ def test_public_graph_builder_accepts_normalized_repository_local_pytest_launche
                 output=GitOutputContract(branch="graph/local-launcher/backend"),
             ),
         ),
+        integration_regression_policy=regression_policy(command),
     )
     tool = GitWorkspaceTool(
         worktree_root=tmp_path / "worktrees",
@@ -333,7 +353,11 @@ def test_trusted_path_launcher_builds_and_executes_real_pytest(tmp_path: Path) -
         command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
         output=GitOutputContract(branch="graph/trusted-launcher/backend"),
     )
-    candidate = DevelopmentPlan(plan_id="trusted-launcher-plan.1", nodes=(node,))
+    candidate = DevelopmentPlan(
+        plan_id="trusted-launcher-plan.1",
+        nodes=(node,),
+        integration_regression_policy=regression_policy(command),
+    )
     tool = GitWorkspaceTool(
         worktree_root=tmp_path / "worktrees",
         ledger=EffectLedger(tmp_path / "effects.sqlite"),
@@ -361,7 +385,11 @@ def test_executor_rejects_launcher_replaced_after_plan_validation(tmp_path: Path
         command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
         output=GitOutputContract(branch="graph/replaced-launcher/backend"),
     )
-    candidate = DevelopmentPlan(plan_id="replaced-launcher-plan.1", nodes=(node,))
+    candidate = DevelopmentPlan(
+        plan_id="replaced-launcher-plan.1",
+        nodes=(node,),
+        integration_regression_policy=regression_policy(command),
+    )
 
     assert DevelopmentPlanValidator().validate(candidate).plan == candidate
     launcher.unlink()
@@ -402,6 +430,7 @@ def test_public_graph_builder_rejects_escaped_or_non_normalized_pytest_launchers
                 output=GitOutputContract(branch="graph/unsafe-launcher/backend"),
             ),
         ),
+        integration_regression_policy=regression_policy(command),
     )
     tool = GitWorkspaceTool(
         worktree_root=tmp_path / "worktrees",
@@ -568,6 +597,148 @@ async def test_reverse_declared_dependencies_merge_in_topological_order(
         if item["branch_id"] == "frontend" and item["attempt"] == 2
     )
     assert commits == [backend_commit, frontend_commit]
+
+
+@pytest.mark.asyncio
+async def test_sequential_same_file_dependency_uses_approved_commit_as_immutable_retry_baseline(
+    tmp_path: Path, repository: tuple[Path, str]
+) -> None:
+    repo, _ = repository
+    shared = repo / "src" / "shared.txt"
+    shared.write_text("base\n")
+    test_file = repo / "tests" / "test_shared_sequence.py"
+    test_file.write_text("from pathlib import Path\ndef test_shared(): assert Path('src/shared.txt').read_text().startswith('backend')\n")
+    git("add", "src/shared.txt", "tests/test_shared_sequence.py", cwd=repo)
+    git("commit", "-m", "shared base", cwd=repo)
+    base_sha = git("rev-parse", "HEAD", cwd=repo)
+    command = ("python", "-m", "pytest", "tests/test_shared_sequence.py", "-q")
+    plan = DevelopmentPlan(
+        plan_id="sequential-shared.1",
+        nodes=tuple(
+            DevelopmentNodeSpec(
+                node_id=branch,
+                repository_root=repo,
+                base_commit=base_sha,
+                depends_on=("backend",) if branch == "frontend" else (),
+                ownership=FileOwnership(writable_paths=("src/shared.txt",)),
+                command_policy=CommandPolicy(allowed_commands=(command,), tests=(command,)),
+                output=GitOutputContract(branch=f"graph/sequential-shared/{branch}"),
+            )
+            for branch in ("backend", "frontend")
+        ),
+        integration_regression_policy=regression_policy(command),
+    )
+
+    class SequentialHarness(ApprovalHarness):
+        def __init__(self) -> None:
+            super().__init__()
+            self.frontend_baselines: list[str] = []
+
+        async def execute(self, stage: str, branch: str, attempt: int, state):
+            if stage == "worker":
+                target = Path(str(state["workspace_path"])) / "src/shared.txt"
+                if branch == "backend":
+                    target.write_text("backend\n")
+                else:
+                    assert target.read_text() == "backend\n"
+                    self.frontend_baselines.append(str(state["dependency_baseline_sha"]))
+                    target.write_text(f"backend\nfrontend attempt {attempt}\n")
+                return f"write {branch}"
+            if stage == "local_verifier" and branch == "frontend" and attempt == 1:
+                return CodeReviewDecision(
+                    reviewed_branch_id=branch,
+                    reviewed_attempt=attempt,
+                    decision="rejected",
+                    findings=("retry",),
+                    rework_instructions="retry",
+                )
+            return await super().execute(stage, branch, attempt, state)
+
+    harness = SequentialHarness()
+    tool = GitWorkspaceTool(
+        worktree_root=tmp_path / "worktrees",
+        ledger=EffectLedger(tmp_path / "effects.sqlite"),
+    )
+    graph = build_development_graph(
+        open_graph_checkpointer(tmp_path / "development.sqlite"), plan, harness, tool
+    )
+    config = graph_config("sequential-shared-run", 1)
+    reset = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        initial_development_state(
+            plan, graph_run_id="sequential-shared-run", generation=1, git_workspace=tool
+        ),
+        config,
+    )
+    backend_sha = reset["branch_outcomes"]["backend"]["result"]["commit_sha"]
+    assert reset["__interrupt__"][0].value["baseline_sha"] == backend_sha
+    integrated = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        Command(resume={"decision": "approved"}),
+        config,
+    )
+    frontend_sha = integrated["branch_outcomes"]["frontend"]["result"]["commit_sha"]
+    assert harness.frontend_baselines == [backend_sha, backend_sha]
+    assert git("rev-parse", f"{frontend_sha}^", cwd=repo) == backend_sha
+
+
+@pytest.mark.asyncio
+async def test_multi_dependency_worker_uses_ledger_managed_integration_baseline(
+    tmp_path: Path, repository: tuple[Path, str]
+) -> None:
+    repo, base_sha = repository
+    plan = development_plan_fixture(
+        repo,
+        base_sha,
+        branches=("backend", "frontend", "tests"),
+        dependencies={"tests": ("backend", "frontend")},
+        run_name="dependency-integration",
+        plan_id="dependency-integration.1",
+    )
+
+    class DependencyHarness(ApprovalHarness):
+        async def execute(self, stage: str, branch: str, attempt: int, state):
+            if stage == "worker" and branch == "tests":
+                workspace = Path(str(state["workspace_path"]))
+                assert (workspace / "src/backend.txt").exists()
+                assert (workspace / "src/frontend.txt").exists()
+            return await super().execute(stage, branch, attempt, state)
+
+    tool = GitWorkspaceTool(
+        worktree_root=tmp_path / "worktrees",
+        ledger=EffectLedger(tmp_path / "effects.sqlite"),
+    )
+    graph = build_development_graph(
+        open_graph_checkpointer(tmp_path / "development.sqlite"), plan, DependencyHarness(), tool
+    )
+    config = graph_config("dependency-integration-run", 1)
+    paused = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        initial_development_state(
+            plan, graph_run_id="dependency-integration-run", generation=1, git_workspace=tool
+        ),
+        config,
+    )
+    outcome = paused["branch_outcomes"]["tests"]["result"]
+    baseline_sha = outcome["dependency_baseline_sha"]
+    dependency_commits = [
+        paused["branch_outcomes"][name]["result"]["commit_sha"]
+        for name in ("backend", "frontend")
+    ]
+    assert git("rev-parse", f"{outcome['commit_sha']}^", cwd=repo) == baseline_sha
+    assert all(
+        subprocess.run(
+            ("git", "merge-base", "--is-ancestor", commit, baseline_sha),
+            cwd=repo,
+            check=False,
+        ).returncode == 0
+        for commit in dependency_commits
+    )
+    effect = tool.ledger.recover("dependency-integration-run:tests:dependency-baseline")
+    assert effect.result_ref == baseline_sha
 
 
 @pytest.mark.asyncio
@@ -767,6 +938,7 @@ async def test_real_merge_conflict_interrupts_arbitration_with_paths_and_parent_
                 output=GitOutputContract(branch="graph/conflict/frontend"),
             ),
         ),
+        integration_regression_policy=regression_policy(command),
     )
 
     class ConflictHarness(ApprovalHarness):
@@ -782,6 +954,12 @@ async def test_real_merge_conflict_interrupts_arbitration_with_paths_and_parent_
         worktree_root=tmp_path / "worktrees",
         ledger=EffectLedger(tmp_path / "effects.sqlite"),
     )
+    def injected_conflict(**_kwargs):
+        raise IntegrationConflict(
+            paths=("src/shared.txt",),
+            parent_graph=(base_sha, "f" * 40),
+        )
+    tool.merge_to_integration = injected_conflict  # type: ignore[method-assign]
     graph = build_development_graph(
         open_graph_checkpointer(tmp_path / "development.sqlite"), plan, ConflictHarness(), tool
     )
@@ -972,3 +1150,93 @@ async def test_global_verifier_rework_merge_requires_a_fresh_integration_approva
     )
     assert release["status"] == "awaiting_release_approval"
     assert release["merge_attempt"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("playwright_exit", "expected_status"), ((0, "awaiting_release_approval"), (1, "awaiting_replan")))
+async def test_global_verifier_runs_plan_approved_backend_and_playwright_regressions_before_release(
+    tmp_path: Path,
+    repository: tuple[Path, str],
+    monkeypatch: pytest.MonkeyPatch,
+    playwright_exit: int,
+    expected_status: str,
+) -> None:
+    repo, base_sha = repository
+    node_command = ("python", "-m", "pytest", "tests/test_backend.py", "-q")
+    backend_command = ("python", "-m", "pytest", "tests/unit", "-q")
+    playwright_command = ("playwright", "test", "--reporter=line")
+    plan = DevelopmentPlan(
+        plan_id="regression-gate.1",
+        nodes=(
+            DevelopmentNodeSpec(
+                node_id="backend",
+                repository_root=repo,
+                base_commit=base_sha,
+                ownership=FileOwnership(writable_paths=("src/backend.txt",)),
+                command_policy=CommandPolicy(
+                    allowed_commands=(node_command,), tests=(node_command,)
+                ),
+                output=GitOutputContract(branch="graph/regression-gate/backend"),
+            ),
+        ),
+        integration_regression_policy=IntegrationRegressionPolicy(
+            backend=CommandPolicy(
+                allowed_commands=(backend_command,), tests=(backend_command,)
+            ),
+            electron_playwright=CommandPolicy(
+                allowed_commands=(playwright_command,), tests=(playwright_command,)
+            ),
+        ),
+    )
+    observed: list[tuple[str, ...]] = []
+
+    def fake_run(command, **kwargs):
+        argv = tuple(command)
+        observed.append(argv)
+        exit_code = playwright_exit if argv == playwright_command else 0
+        return subprocess.CompletedProcess(command, exit_code, "suite output", "")
+
+    monkeypatch.setattr(
+        "workbench.orchestration.development_graph.subprocess.run", fake_run
+    )
+    tool = GitWorkspaceTool(
+        worktree_root=tmp_path / "worktrees",
+        ledger=EffectLedger(tmp_path / "effects.sqlite"),
+    )
+    graph = build_development_graph(
+        open_graph_checkpointer(tmp_path / "development.sqlite"), plan, ApprovalHarness(), tool
+    )
+    config = graph_config(f"regression-gate-{playwright_exit}", 1)
+    await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        initial_development_state(
+            plan,
+            graph_run_id=f"regression-gate-{playwright_exit}",
+            generation=1,
+            git_workspace=tool,
+        ),
+        config,
+    )
+    gated = await asyncio.to_thread(
+        invoke_development_to_boundary,
+        graph,
+        Command(resume={"decision": "approved"}),
+        config,
+    )
+
+    assert backend_command in observed
+    assert playwright_command in observed
+    assert gated["status"] == expected_status
+    assert gated["regression"]["integration_sha"] == gated["merge_evidence"]["integration_sha"]
+    assert gated["regression"]["summary"] == {
+        "backend": "passed",
+        "electron_playwright": "passed" if playwright_exit == 0 else "failed",
+    }
+    assert set(gated["regression"]["suite_evidence"]) == {
+        "backend",
+        "electron_playwright",
+    }
+    if playwright_exit:
+        assert gated["regression"]["suite_evidence"]["electron_playwright"]
+        assert gated["__interrupt__"][0].value["kind"] == "replan"
