@@ -651,6 +651,30 @@ def _write_result(path: Path, result: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _write_results_fail_closed(
+    paths: tuple[Path, ...], result: dict[str, Any]
+) -> None:
+    """Try every output independently and expose only failure classifications."""
+    written: list[Path] = []
+    failures: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            _write_result(path, result)
+            written.append(path)
+        except Exception as error:
+            failures.append({"error_kind": type(error).__name__})
+    if not failures:
+        return
+    result["output_write_failures"] = failures
+    # A failure discovered after an earlier successful write must also be
+    # reflected in every result that was already made safe.
+    for path in written:
+        try:
+            _write_result(path, result)
+        except Exception:
+            pass
+
+
 def _safe_output_candidates(arguments: list[str]) -> tuple[Path, ...]:
     """Collect complete --output values without trusting argparse."""
     values: list[str] = []
@@ -685,7 +709,7 @@ def _safe_explicit_output(arguments: list[str]) -> Path | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev=False)
     parser.add_argument(
         "--output", type=Path, default=Path(".runtime/development-graph-results.json")
     )
@@ -718,8 +742,7 @@ def main(argv: list[str] | None = None) -> int:
         result = result or {"completed_stages": []}
         result.update({"decision": "BLOCKED", "error_kind": type(error).__name__})
         write_outputs = output_candidates or (output,)
-    for result_output in write_outputs:
-        _write_result(result_output, result)
+    _write_results_fail_closed(write_outputs, result)
     print(result["decision"])
     return 0 if result["decision"] == "GO_RELEASE_APPROVAL" else 1
 

@@ -100,6 +100,74 @@ def test_missing_output_without_safe_candidate_replaces_default_stale_go(
     }
 
 
+def test_unwritable_first_output_does_not_leave_later_stale_go(
+    tmp_path: Path,
+) -> None:
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("ordinary file\n", encoding="utf-8")
+    unwritable = blocked_parent / "result.json"
+    writable = tmp_path / "later.json"
+    writable.write_text('{"decision": "GO_RELEASE_APPROVAL"}\n', encoding="utf-8")
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            str(script),
+            "--output",
+            str(unwritable),
+            "--output",
+            str(writable),
+        ),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout.strip() == "BLOCKED"
+    assert completed.stderr == ""
+    result = json.loads(writable.read_text(encoding="utf-8"))
+    assert result == {
+        "completed_stages": [],
+        "decision": "BLOCKED",
+        "error_kind": "ValueError",
+        "output_write_failures": [{"error_kind": "FileExistsError"}],
+    }
+    assert str(unwritable) not in json.dumps(result, sort_keys=True)
+
+
+def test_abbreviated_output_is_rejected_without_touching_its_value(
+    tmp_path: Path,
+) -> None:
+    abbreviated = tmp_path / "abbreviated.json"
+    abbreviated.write_text('{"decision": "GO_RELEASE_APPROVAL"}\n', encoding="utf-8")
+    default = tmp_path / ".runtime/development-graph-results.json"
+    default.parent.mkdir()
+    default.write_text('{"decision": "GO_RELEASE_APPROVAL"}\n', encoding="utf-8")
+    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
+
+    completed = subprocess.run(
+        (sys.executable, str(script), "--out", str(abbreviated)),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert completed.stdout.strip() == "BLOCKED"
+    assert json.loads(default.read_text(encoding="utf-8")) == {
+        "completed_stages": [],
+        "decision": "BLOCKED",
+        "error_kind": "SystemExit",
+    }
+    assert json.loads(abbreviated.read_text(encoding="utf-8")) == {
+        "decision": "GO_RELEASE_APPROVAL"
+    }
+
+
 def test_nested_backend_command_ignores_only_this_gate_file() -> None:
     script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
     source = script.read_text(encoding="utf-8")
