@@ -273,6 +273,8 @@ class DurableResearchProcessor:
         graph_run_id: str,
         *,
         resume_response: dict[str, object] | None = None,
+        resume_interrupt_id: str | None = None,
+        resume_interrupt_digest: str | None = None,
     ) -> ResearchProcessResult:
         run = self.control.get_run(graph_run_id)
         plan = self.plans.get(run.plan_id, run.plan_version)
@@ -311,6 +313,17 @@ class DurableResearchProcessor:
                 value = None
             elif values.get("status") == "needs_human":
                 if not resume_response or resume_response.get("decision") != "approved":
+                    return self._result(plan, values)
+                current_id, _, current_digest, _ = self._interrupt_identity(
+                    graph_run_id, values
+                )
+                if (
+                    resume_interrupt_id != current_id
+                    or resume_interrupt_digest != current_digest
+                ):
+                    # The old response was already committed to the graph before
+                    # the worker could project its result into the job row. Never
+                    # let that approval resume the next checkpoint interrupt.
                     return self._result(plan, values)
                 value = Command(resume=resume_response)
             elif values.get("status") == "awaiting_approval":

@@ -26,6 +26,8 @@ class ResearchJob:
     attempt: int
     last_error_code: str | None
     resume_response: dict[str, object] | None
+    resume_interrupt_id: str | None
+    resume_interrupt_digest: str | None
     next_attempt_at: float
     interrupt_id: str | None
     interrupt_kind: str | None
@@ -41,6 +43,25 @@ class ResearchJobRepository:
 
     @staticmethod
     def _job(row) -> ResearchJob:
+        resume_response = None
+        resume_interrupt_id = None
+        resume_interrupt_digest = None
+        if row["resume_json"]:
+            persisted_resume = json.loads(row["resume_json"])
+            if (
+                isinstance(persisted_resume, dict)
+                and set(persisted_resume)
+                == {"response", "interrupt_id", "interrupt_digest"}
+                and isinstance(persisted_resume.get("response"), dict)
+            ):
+                resume_response = persisted_resume["response"]
+                resume_interrupt_id = str(persisted_resume["interrupt_id"])
+                resume_interrupt_digest = str(persisted_resume["interrupt_digest"])
+            elif isinstance(persisted_resume, dict):
+                # Legacy rows have no safe interrupt identity. Preserve the
+                # response for audit/retry handling, but the processor will not
+                # replay it across a checkpoint boundary.
+                resume_response = persisted_resume
         return ResearchJob(
             graph_run_id=str(row["graph_run_id"]),
             session_id=str(row["session_id"]),
@@ -49,9 +70,9 @@ class ResearchJobRepository:
             lease_expires_at=float(row["lease_expires_at"]),
             attempt=int(row["attempt"]),
             last_error_code=row["last_error_code"],
-            resume_response=(
-                json.loads(row["resume_json"]) if row["resume_json"] else None
-            ),
+            resume_response=resume_response,
+            resume_interrupt_id=resume_interrupt_id,
+            resume_interrupt_digest=resume_interrupt_digest,
             next_attempt_at=float(row["next_attempt_at"]),
             interrupt_id=row["interrupt_id"],
             interrupt_kind=row["interrupt_kind"],
@@ -247,7 +268,6 @@ class ResearchJobRepository:
         interrupt_id: str,
         actor_id: str,
     ) -> ResearchJob:
-        encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -260,6 +280,9 @@ class ResearchJobRepository:
             if row["interrupt_id"] != interrupt_id:
                 connection.rollback()
                 raise ValueError("research interrupt identity does not match")
+            if not row["interrupt_digest"]:
+                connection.rollback()
+                raise ValueError("research interrupt digest is required")
             if row["interrupt_kind"] == "replan":
                 connection.rollback()
                 raise ValueError("replan interrupt requires a new plan version")
@@ -279,6 +302,15 @@ class ResearchJobRepository:
                 if arbitration_decision == "insufficient_evidence":
                     connection.rollback()
                     raise ValueError("insufficient evidence requires replan")
+            encoded = json.dumps(
+                {
+                    "response": response,
+                    "interrupt_id": interrupt_id,
+                    "interrupt_digest": row["interrupt_digest"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             if row["status"] == "needs_human":
                 connection.execute(
                     """UPDATE research_graph_jobs

@@ -133,7 +133,14 @@ async def test_heartbeat_loss_cancels_processor_before_retry(tmp_path: Path) -> 
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
 
-        async def process(self, graph_run_id: str, *, resume_response=None):
+        async def process(
+            self,
+            graph_run_id: str,
+            *,
+            resume_response=None,
+            resume_interrupt_id=None,
+            resume_interrupt_digest=None,
+        ):
             self.started.set()
             try:
                 await asyncio.Event().wait()

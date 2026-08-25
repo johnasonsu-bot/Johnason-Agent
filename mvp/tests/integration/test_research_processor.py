@@ -5,12 +5,14 @@ import json
 from pathlib import Path
 import re
 import time
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from workbench.adapters.hermes.runner import AgentStepResult
 from workbench.api.app import AppSettings, create_app
+from workbench.conversations.repository import ConversationRepository
 from workbench.orchestration.contracts import GraphRunRef
 from workbench.orchestration.control_store import GraphControlStore
 from workbench.orchestration.plan_service import PlanService
@@ -120,6 +122,137 @@ class StructuredResearchRunner:
             session_id=command.session_id,
             run_id=command.run_id,
         )
+
+
+@pytest.mark.asyncio
+async def test_stale_approved_resume_cannot_cross_a_new_same_shape_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "workbench.sqlite"
+    configure(database)
+    ConversationRepository(database).create_session("s1")
+    plan = PlannerCompiler().compile("形成竞争分析", catalog(), resources())
+    plans = PlanService(database)
+    plans.persist(plan)
+    plans.approve(plan.plan_id, 1, actor_id="user")
+    run = GraphRunRef(
+        graph_run_id="research-run.consecutive-human",
+        plan_id=plan.plan_id,
+        plan_version=1,
+        generation=1,
+        thread_id="research-thread.consecutive-human",
+    )
+    GraphControlStore(database).create_run(run)
+    jobs = ResearchJobRepository(database)
+    jobs.admit(run.graph_run_id, "s1")
+    first_state = {
+        "graph_run_id": run.graph_run_id,
+        "status": "needs_human",
+        "pending_interrupt": {
+            "branch_id": "research",
+            "attempt": 1,
+            "decision": "needs_human",
+        },
+    }
+    second_state = {
+        "graph_run_id": run.graph_run_id,
+        "status": "needs_human",
+        "pending_interrupt": {
+            "branch_id": "research",
+            "attempt": 2,
+            "decision": "needs_human",
+        },
+    }
+
+    class ConsecutiveInterruptGraph:
+        def __init__(self) -> None:
+            self.states = [
+                first_state,
+                second_state,
+                {"graph_run_id": run.graph_run_id, "status": "completed"},
+            ]
+            self.index = 0
+
+        def get_state(self, config):
+            return SimpleNamespace(values=self.states[self.index])
+
+        def invoke(self, value, config):
+            self.index += 1
+            return self.states[self.index]
+
+    graph = ConsecutiveInterruptGraph()
+    monkeypatch.setattr(
+        "workbench.orchestration.research_processor.build_research_graph",
+        lambda *args, **kwargs: graph,
+    )
+    runner = StructuredResearchRunner()
+    processor = DurableResearchProcessor(database=database, runner=runner)
+
+    first_claim = jobs.claim_next(owner_id="worker-1", lease_seconds=10)
+    assert first_claim is not None
+    first_interrupt = await processor.process(run.graph_run_id)
+    assert first_interrupt.status == "needs_human"
+    jobs.transition(
+        run.graph_run_id,
+        owner_id="worker-1",
+        attempt=first_claim.attempt,
+        status="needs_human",
+        interrupt_id=first_interrupt.interrupt_id,
+        interrupt_kind=first_interrupt.interrupt_kind,
+        interrupt_digest=first_interrupt.interrupt_digest,
+        interrupt_payload=first_interrupt.interrupt_payload,
+    )
+    resumed = jobs.request_resume(
+        run.graph_run_id,
+        "s1",
+        {"decision": "approved"},
+        interrupt_id=str(first_interrupt.interrupt_id),
+        actor_id="user",
+    )
+    assert resumed.resume_interrupt_id == first_interrupt.interrupt_id
+    assert resumed.resume_interrupt_digest == first_interrupt.interrupt_digest
+
+    second_claim = jobs.claim_next(owner_id="worker-1", lease_seconds=10)
+    assert second_claim is not None
+    second_interrupt = await processor.process(
+        run.graph_run_id,
+        resume_response=second_claim.resume_response,
+        resume_interrupt_id=second_claim.resume_interrupt_id,
+        resume_interrupt_digest=second_claim.resume_interrupt_digest,
+    )
+    assert second_interrupt.status == "needs_human"
+    assert second_interrupt.interrupt_id != first_interrupt.interrupt_id
+
+    # Simulate a process crash after processor.result() and before jobs.transition().
+    assert jobs.recover_owned("worker-1") == 1
+    replay_claim = jobs.claim_next(owner_id="worker-2", lease_seconds=10)
+    assert replay_claim is not None
+    replay = await processor.process(
+        run.graph_run_id,
+        resume_response=replay_claim.resume_response,
+        resume_interrupt_id=replay_claim.resume_interrupt_id,
+        resume_interrupt_digest=replay_claim.resume_interrupt_digest,
+    )
+    jobs.transition(
+        run.graph_run_id,
+        owner_id="worker-2",
+        attempt=replay_claim.attempt,
+        status=replay.status,
+        interrupt_id=replay.interrupt_id,
+        interrupt_kind=replay.interrupt_kind,
+        interrupt_digest=replay.interrupt_digest,
+        interrupt_payload=replay.interrupt_payload,
+    )
+    await processor.aclose()
+
+    assert replay.status == "needs_human"
+    assert replay.interrupt_id == second_interrupt.interrupt_id
+    assert graph.index == 1
+    projected = jobs.list_for_session("s1")[0]
+    assert projected.interrupt_id == second_interrupt.interrupt_id
+    assert projected.resume_response is None
+    assert projected.resume_interrupt_id is None
 
 
 @pytest.mark.asyncio

@@ -73,7 +73,10 @@ class ResearchTaskWorker:
             )
             processor = asyncio.create_task(
                 self.processor.process(
-                    job.graph_run_id, resume_response=job.resume_response
+                    job.graph_run_id,
+                    resume_response=job.resume_response,
+                    resume_interrupt_id=job.resume_interrupt_id,
+                    resume_interrupt_digest=job.resume_interrupt_digest,
                 ),
                 name=f"research-processor:{job.graph_run_id}",
             )
