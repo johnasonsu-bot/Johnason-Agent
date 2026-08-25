@@ -51,6 +51,52 @@ from workbench.orchestration.sequential_graph import (
 )
 
 
+_ExecutionRecord = tuple[str, int, str, dict[str, Any]]
+
+
+def _selected_worker_attempts(
+    nodes: dict[str, SequentialNodeSpec],
+    records: list[_ExecutionRecord],
+    *,
+    target: SequentialNodeSpec | None = None,
+) -> dict[str, int]:
+    """Select the only worker attempt safe to publish to a consumer."""
+    latest_attempts: dict[str, int] = {}
+    reviewers: dict[str, set[str]] = {}
+    approved_attempts: dict[str, int] = {}
+
+    for node in nodes.values():
+        if node.review_target_id is not None:
+            reviewers.setdefault(node.review_target_id, set()).add(node.node_id)
+
+    for node_id, attempt, kind, value in records:
+        if kind == "worker":
+            latest_attempts[node_id] = max(latest_attempts.get(node_id, 0), attempt)
+            continue
+        if kind != "review":
+            continue
+        decision = ReviewDecision.model_validate(value)
+        valid_reviewers = reviewers.get(decision.reviewed_node_id, set())
+        if decision.decision == "approved" and node_id in valid_reviewers:
+            approved_attempts[decision.reviewed_node_id] = max(
+                approved_attempts.get(decision.reviewed_node_id, 0),
+                decision.reviewed_attempt,
+            )
+
+    selected: dict[str, int] = {}
+    for node_id, attempt in latest_attempts.items():
+        assigned_reviewers = reviewers.get(node_id, set())
+        if not assigned_reviewers:
+            selected[node_id] = attempt
+        elif target is not None and target.node_id in assigned_reviewers:
+            # A reviewer must see the current attempt in order to decide whether
+            # it becomes the approved attempt available to later nodes.
+            selected[node_id] = attempt
+        elif node_id in approved_attempts:
+            selected[node_id] = approved_attempts[node_id]
+    return selected
+
+
 def _summary(value: str, fallback: str) -> str:
     normalized = " ".join(value.split())
     return (normalized or fallback)[:280]
@@ -177,7 +223,7 @@ class _DurableExecutionPort:
         )
         return result
 
-    def _records(self) -> list[tuple[str, int, str, dict[str, Any]]]:
+    def _records(self) -> list[_ExecutionRecord]:
         with self.conversations.store.connect() as connection:
             rows = connection.execute(
                 """SELECT node_id, attempt, result_kind, result_json
@@ -198,9 +244,18 @@ class _DurableExecutionPort:
     def _incoming(self, target: SequentialNodeSpec) -> tuple[list[Handoff], list[str]]:
         handoffs: list[Handoff] = []
         content: list[str] = []
-        for node_id, attempt, kind, value in self._records():
+        records = self._records()
+        selected_attempts = _selected_worker_attempts(
+            self.nodes, records, target=target
+        )
+        for node_id, attempt, kind, value in records:
             source = self.nodes.get(node_id)
-            if kind != "worker" or source is None or source.ordinal >= target.ordinal:
+            if (
+                kind != "worker"
+                or source is None
+                or source.ordinal >= target.ordinal
+                or selected_attempts.get(node_id) != attempt
+            ):
                 continue
             result = WorkerResult.model_validate(value)
             handoffs.append(
@@ -326,6 +381,8 @@ class DurableSequentialProcessor:
                 self._draft_for_run(graph_run_id)
             ).nodes
         }
+        records = self._records_for_run(graph_run_id)
+        selected_attempts = _selected_worker_attempts(nodes, records)
         for node_id, final_attempt in after_attempts.items():
             for attempt in range(1, int(final_attempt) + 1):
                 loaded = self.conversations.load_sequential_result(
@@ -335,6 +392,8 @@ class DurableSequentialProcessor:
                     continue
                 kind, value = loaded
                 if kind == "worker":
+                    if selected_attempts.get(node_id) != attempt:
+                        continue
                     worker = WorkerResult.model_validate(value)
                     events.append(
                         SequentialProcessEvent(
@@ -413,6 +472,24 @@ class DurableSequentialProcessor:
                 else None
             ),
         )
+
+    def _records_for_run(self, graph_run_id: str) -> list[_ExecutionRecord]:
+        with self.conversations.store.connect() as connection:
+            rows = connection.execute(
+                """SELECT node_id, attempt, result_kind, result_json
+                FROM sequential_execution_records WHERE graph_run_id = ?
+                ORDER BY created_at, node_id, attempt""",
+                (graph_run_id,),
+            ).fetchall()
+        return [
+            (
+                str(row["node_id"]),
+                int(row["attempt"]),
+                str(row["result_kind"]),
+                json.loads(row["result_json"]),
+            )
+            for row in rows
+        ]
 
     def _draft_for_run(self, graph_run_id: str) -> dict[str, Any]:
         with self.conversations.store.connect() as connection:

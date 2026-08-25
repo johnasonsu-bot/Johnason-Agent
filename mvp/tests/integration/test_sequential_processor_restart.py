@@ -30,6 +30,7 @@ from tests.unit.api.test_sequential_orchestration import (
 class RestartingSequentialRunner:
     def __init__(self) -> None:
         self.calls: dict[str, int] = {}
+        self.prompts: dict[str, list[str]] = {}
         self.crash_architect_once = True
 
     async def execute_step(self, run_id: str, step_id: str) -> AgentStepResult:
@@ -38,13 +39,18 @@ class RestartingSequentialRunner:
     async def run_turn(self, command):
         agent_id = command.session_id.rsplit(":", 1)[-1]
         self.calls[agent_id] = self.calls.get(agent_id, 0) + 1
+        self.prompts.setdefault(agent_id, []).append(command.prompt)
         attempt = int(command.command_id.rsplit(":", 1)[-1])
         if agent_id == "architect" and self.crash_architect_once:
             self.crash_architect_once = False
             raise RuntimeError("simulated process crash")
 
         if agent_id == "product-manager":
-            output = "短篇故事" if attempt == 1 else "星港的修理师终于让沉睡的飞船重新点亮。" * 12
+            output = (
+                "REJECTED_DRAFT_UNIQUE_MARKER 短篇故事"
+                if attempt == 1
+                else "APPROVED_REVISION_UNIQUE_MARKER 星港的修理师终于让沉睡的飞船重新点亮。" * 12
+            )
         elif agent_id == "architect":
             output = (
                 "<html><body>静态页面</body></html>"
@@ -130,10 +136,35 @@ async def test_restart_after_supervisor_approval_resumes_without_repeating_upstr
     assert runner.calls["supervisor"] == 2
     assert runner.calls["architect"] == 3
     assert runner.calls["verifier"] == 2
+    assert runner.prompts["architect"]
+    assert all(
+        "REJECTED_DRAFT_UNIQUE_MARKER" not in prompt
+        for prompt in runner.prompts["architect"]
+    )
+    assert all(
+        "APPROVED_REVISION_UNIQUE_MARKER" in prompt
+        for prompt in runner.prompts["architect"]
+    )
+    assert "REJECTED_DRAFT_UNIQUE_MARKER" in runner.prompts["supervisor"][0]
+    assert "REJECTED_DRAFT_UNIQUE_MARKER" not in runner.prompts["supervisor"][1]
+    assert "APPROVED_REVISION_UNIQUE_MARKER" in runner.prompts["supervisor"][1]
+    writer_node_id = orchestration["draft"]["nodes"][0]["node_id"]
+    writer_handoffs = [
+        event
+        for event in result.events
+        if event.event_type == "orchestration.handoff.published"
+        and event.payload.get("source_node_id") == writer_node_id
+    ]
+    assert [event.payload["source_attempt"] for event in writer_handoffs] == [2]
+    assert [
+        event.payload["decision"]
+        for event in result.events
+        if event.event_type == "orchestration.review.decided"
+    ] == ["rejected", "approved", "rejected", "approved"]
     assert any(
         event.event_type == "orchestration.handoff.published"
         and event.payload.get("source_node_id")
-        == orchestration["draft"]["nodes"][0]["node_id"]
+        == writer_node_id
         for event in result.events
     )
     assert any(
@@ -149,6 +180,13 @@ async def test_restart_after_supervisor_approval_resumes_without_repeating_upstr
         and event.payload.get("media_type") == "text/html"
     ]
     assert len(html_events) == 1
+    artifact_events = [
+        event
+        for event in result.events
+        if event.event_type == "orchestration.artifact.published"
+    ]
+    assert len(artifact_events) == 2
+    assert all(event.payload["attempt"] == 2 for event in artifact_events)
 
 
 def test_exact_multi_agent_api_scenario_completes_rework_and_publishes_html(
