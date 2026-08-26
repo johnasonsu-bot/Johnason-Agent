@@ -1,7 +1,8 @@
 # Engine Host v2 合同验证报告
 
-- 日期：2026-08-26
-- Source revision under test：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
+- 日期：2026-08-26；remediation gate 于 2026-08-27 完成
+- Remediation source revision under test：`5ca52d2db3256f94cabfaddc69377304970effcf`
+- 历史 Source C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
 - 代码提交 A：`cd95147db24fb1547afd63a3374a1e3ebef868a0`
 - 终态封口修复 A2：`652954f5740b68183c97603174c4b660956fff65`
 - malformed seal 测试提交 C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
@@ -13,19 +14,109 @@
 
 ## 结论
 
-九场景合同、Task 4、Host 专项、mapper/AG-UI、终态封口稳定性、malformed ack
-矩阵及静态检查均在 C 上通过；但 C 上没有获得完整必需后端回归 `pytest -q`
-的 PASS 结果。
-因此不能发布 GO，也不把实施前 development graph 观测描述为本次已证明的
-baseline failure。
+remediation source 上 Host v2 专项与前端门禁通过；完整 backend、全范围 diff
+check 与逐命中凭证扫描失败。完整 backend 的首个失败已按 systematic-debugging
+Phase 1/2 复现并定位。因此不能发布 GO。
 
 ```text
 Decision: BLOCKED
 Real runtime status: NOT_YET_EVALUATED
 ```
 
-唯一保留的发布阻塞判据：完整必需后端回归未获得 PASS。合同 Fake 的通过也
-不等于真实 Python Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入。
+发布阻塞判据共有三项：完整必需后端回归 exit 1、全范围 diff check exit 2、
+凭证扫描 exit 1。合同 Fake 的通过也不等于真实 Python Codex-Compatible、
+Goose Query 或 DSH Plugin Runtime 已接入。
+
+## Remediation gate：`5ca52d2db3256f94cabfaddc69377304970effcf`
+
+本节是当前交付判定；下方 Source C 内容保留为历史证据。所有必需命令开始与
+结束时 HEAD 均为 `5ca52d2db3256f94cabfaddc69377304970effcf`，工作树在写报告前
+保持 clean。起始 BASE 亦为该 SHA。
+
+### 1. Host v2 专项后端回归
+
+```bash
+cd mvp && /usr/bin/python3 -I -c 'import subprocess,sys; result=subprocess.run(sys.argv[1:],timeout=300); raise SystemExit(result.returncode)' env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q tests/unit/runtime/engine_host tests/unit/agui/test_mapper.py tests/integration/test_agui_resume.py tests/integration/test_engine_host_lifecycle.py tests/integration/test_engine_host_run.py tests/integration/test_engine_host_v2_query.py tests/acceptance/test_engine_host_contract.py tests/acceptance/test_engine_host_v2_conformance.py tests/acceptance/test_host_v2_report_validation.py
+```
+
+结果：wrapper exit `0`；`1563 passed, 0 failed, 0 skipped`，1 条既有
+Starlette 弃用警告，pytest 34.41 秒。source revision 起止均为 `5ca52d2`。
+
+### 2. 完整 backend 与首个失败定位
+
+```bash
+cd mvp && /usr/bin/python3 -I -c 'import subprocess,sys; result=subprocess.run(sys.argv[1:],timeout=1200); raise SystemExit(result.returncode)' env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q -x
+```
+
+结果：wrapper exit `1`；`1 failed, 14 passed, 2 skipped`，1 条既有警告，
+pytest 258.08 秒。source revision 起止均为 `5ca52d2`，未触发 1200 秒 timeout。
+首个完整 traceback 为
+`tests/acceptance/test_development_graph_blueprint.py::test_three_workers_merge_to_temporary_branch_and_stop`：
+`run_development_graph_acceptance()` 经 `_exercise_main_graph()` 到
+`scripts/run_development_graph_acceptance.py:469`，因 release 状态不等于
+`awaiting_release_approval` 抛出
+`AssertionError: global regression did not stop for release approval`。
+
+systematic-debugging Phase 1/2 的只读证据如下：
+
+- 失败 checkpoint 的最终 `status=awaiting_replan`；regression summary 为
+  `backend=failed`、`electron_playwright=passed`。因此外层断言只是症状，失败组件
+  是 development graph integration worktree 内的 backend regression。
+- 在保留的 integration worktree 上重跑相同 backend policy 命令，exit `1`，
+  `1 failed, 2201 passed, 6 skipped`，1 条既有警告，169.27 秒。具体失败为
+  `tests/unit/api/test_development_graph.py::test_development_projections_reject_absolute_windows_and_traversal_values`。
+- 在主工作树单独复现该测试，exit `1`，`1 failed`，0.05 秒。四个样例逐项
+  只读探测显示 case 1、2、4 正确拒绝，只有 case 3 被 `is_local_path()` 判为
+  非本地路径并被 AG-UI 投射。
+- 根因：提交 `67124007fe064d7ba3be904a722c428740b90b3d` 将 development
+  payload 的旧 `_UNSAFE_PATH` 检查替换为共享 `is_local_path()`。共享 UNC 模式
+  能识别 host 后单分隔符的 working example，但不能识别该既有测试的重复反斜杠
+  分隔形态；旧检查会拒绝任意反斜杠。`1d1f4e6` 仅补齐重复正斜杠开头，不覆盖
+  该差异。Task 4 按职责未修改生产代码或测试。
+
+### 3. 前端 build 与 Playwright
+
+```bash
+cd mvp/canvas-spike && npm run build && npx playwright test
+```
+
+结果：联合命令 exit `0`；Vite build exit `0`，`45 modules transformed`；
+Playwright `38 passed`，1.1 分钟。source revision 起止均为 `5ca52d2`。
+
+### 4. Git diff check 与逐命中凭证扫描
+
+```bash
+git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..HEAD
+```
+
+结果：exit `2`；
+`docs/superpowers/plans/2026-08-26-host-v2-blocker-remediation.md:198`
+存在 new blank line at EOF。source revision 起止均为 `5ca52d2`。Task 4 不拥有该
+文件，未修改。
+
+```bash
+BASE_REV=d894c81e0af03b8f74cf415bc0310c71459a3d67 HEAD_REV=$(git rev-parse HEAD) /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+结果：exit `1`；`scanned_blobs=37 fixture_allowances=0 findings=7`。source revision
+起止均为 `5ca52d2`。扫描器未输出路径或匹配值。额外只读、只输出计数的逐文件
+分布确认：integration query 测试 1 项、contracts 单元测试 4 项、registry 单元
+测试 2 项；七项所在行及相邻行均没有合规 fixture marker，故 allowance 均为 0。
+报告未记录任何匹配值，Task 4 未修改这些测试。
+
+### 5. 当前交付判定
+
+```text
+Decision: BLOCKED
+Source revision: 5ca52d2db3256f94cabfaddc69377304970effcf
+Report commit: documentation-only commit；SHA 在 Task 4 交付记录和最终回复中给出
+Real runtime status: NOT_YET_EVALUATED
+```
+
+未决问题：修复并重新验证重复反斜杠 UNC 路径拒绝；移除计划文件 EOF 空行；
+为七个 test-only credential-shaped fixture 添加逐匹配、合规 marker 或改用不命中
+形态；随后从同一新 source revision 重跑五条必需门禁。任何一项非零前均不得写
+`GO_HOST_V2_CONTRACT`。
 
 ## RED / GREEN
 
