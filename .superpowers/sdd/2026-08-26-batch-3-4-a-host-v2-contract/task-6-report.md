@@ -19,6 +19,10 @@
 - Fix3 将 Secret scan 的 changed-file 枚举改为独立 checked subprocess；Git
   枚举失败立即非零退出且不输出成功计数，路径限制为仓库内 tracked changed
   files，bytes regex 不跳过二进制内容。
+- Fix4 将 Secret scan 改为只读取 Source C/BASE 的 Git blob：checked NUL 枚举
+  后始终以 path bytes + strict UTF-8 校验处理，不访问、resolve 或跟随工作树；
+  删除项读 BASE blob，其他项读 C blob，非 blob/读取/timeout/decode 错误均
+  fail closed 且不泄漏 path、Git stderr、traceback 或成功计数。
 
 ## Task 5 承重 P0
 
@@ -37,8 +41,12 @@
 - terminal immediate-extra 独立进程重复：`passes=50 failures=0`；
 - frontend build：exit 0；既有完整 Playwright 证据：`38 passed`；
 - compileall、`git diff --check`、高置信 Secret scan：通过。
-- Secret scan 三态：合法范围 `8/0/0` exit 0、合法空范围 `0/0/0` exit 0、
-  invalid revision 仅输出安全错误类别并 exit 2。
+- Git-object Secret scan 十态：合法范围 `8/0/0` exit 0、合法空范围 `0/0/0`
+  exit 0、invalid revision 安全 exit 2、symlink token blob `2/1/0` exit 1、
+  symlink loop `1/0/0` exit 0、gitlink/blob 读取失败安全 exit 3；错误态均无
+  path、Git stderr、traceback 或成功计数；删除含合成 token 的 BASE blob 得到
+  `1/1/0` exit 1，删除且 BASE/HEAD 均无 blob 时安全 exit 3；合法格式但不存在
+  的 revision 枚举安全 exit 2，非 UTF-8 Git path decode 安全 exit 3。
 
 Source revision C 上未取得完整必需后端 `pytest -q` 的 PASS、exit code 与最终
 计数；不把实施前 development graph 观测写成本次已证明的 baseline failure。
@@ -51,7 +59,7 @@ Real runtime status: NOT_YET_EVALUATED
 ```
 
 Source revision under test：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`。
-Fix2 代码/测试提交 C 的历史包含 A/A2/B；D 与本次 documentation-only E
+Fix2 代码/测试提交 C 的历史包含 A/A2/B；D/E 与本次 documentation-only F
 均为 C 的可达 descendants，不 amend 任何既有提交。
 
 阻塞与完整命令、版本、HEAD、Fake revision、v1 兼容、Secret scan 和残余风险
