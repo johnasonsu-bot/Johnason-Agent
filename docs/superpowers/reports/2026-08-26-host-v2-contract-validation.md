@@ -50,7 +50,7 @@ cd mvp && /usr/bin/python3 -I -c 'import subprocess,sys; result=subprocess.run(s
 
 结果：wrapper exit `1`；`1 failed, 14 passed, 2 skipped`，1 条既有警告，
 pytest 258.08 秒。source revision 起止均为 `5ca52d2`，未触发 1200 秒 timeout。
-首个完整 traceback 为
+首个 traceback 摘要为
 `tests/acceptance/test_development_graph_blueprint.py::test_three_workers_merge_to_temporary_branch_and_stop`：
 `run_development_graph_acceptance()` 经 `_exercise_main_graph()` 到
 `scripts/run_development_graph_acceptance.py:469`，因 release 状态不等于
@@ -118,6 +118,187 @@ Real runtime status: NOT_YET_EVALUATED
 为七个 test-only credential-shaped fixture 添加逐匹配、合规 marker 或改用不命中
 形态；随后从同一新 source revision 重跑五条必需门禁。任何一项非零前均不得写
 `GO_HOST_V2_CONTRACT`。
+
+## Fix review round 1：完整 traceback 与诊断命令凭证
+
+### 原始完整 backend gate 的首个 pytest traceback
+
+下列内容从 source `5ca52d2db3256f94cabfaddc69377304970effcf` 的原始
+`pytest -q -x` 输出恢复。已对整段做 credential-shape 检查，未发现凭证匹配值。
+仅把两处本机绝对路径规范化为 `<pytest-temp>` 与 `<repo>`；pytest frame、源码行、
+异常原文和计数均未删减或改写。
+
+```text
+.....ss.........F
+=================================== FAILURES ===================================
+____________ test_three_workers_merge_to_temporary_branch_and_stop _____________
+
+tmp_path = PosixPath('<pytest-temp>/test_three_workers_merge_to_te0')
+
+    @pytest.mark.asyncio
+    async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) -> None:
+>       result = await run_development_graph_acceptance(tmp_path)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/acceptance/test_development_graph_blueprint.py:184:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+scripts/run_development_graph_acceptance.py:545: in run_development_graph_acceptance
+    release, plan, tool, run_id = await _exercise_main_graph(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    async def _exercise_main_graph(
+        *, repository: Path, base_sha: str, runtime_dir: Path, calls: DurableCalls, inject: str | None
+    ) -> tuple[dict[str, object], DevelopmentPlan, GitWorkspaceTool, str]:
+        run_id = "development-acceptance"
+        plan = DevelopmentPlan(
+            plan_id=run_id,
+            nodes=(
+                _node(
+                    repository,
+                    base_sha,
+                    node_id="backend",
+                    writable_paths=("mvp/acceptance_fixture/backend.py",),
+                    test_path="mvp/acceptance_fixture/tests/test_backend_slice.py",
+                    branch=f"graph/{run_id}/backend",
+                ),
+                _node(
+                    repository,
+                    base_sha,
+                    node_id="frontend",
+                    writable_paths=("mvp/acceptance_fixture/frontend.ts",),
+                    test_path="mvp/acceptance_fixture/tests/test_frontend_slice.py",
+                    branch=f"graph/{run_id}/frontend",
+                    depends_on=("backend",),
+                ),
+                _node(
+                    repository,
+                    base_sha,
+                    node_id="tests",
+                    writable_paths=("mvp/acceptance_fixture/tests/test_contract_slice.py",),
+                    test_path="mvp/acceptance_fixture/tests/test_contract_slice.py",
+                    branch=f"graph/{run_id}/tests",
+                    depends_on=("frontend",),
+                ),
+            ),
+            integration_regression_policy=_integration_regression_policy(inject),
+        )
+        tool = GitWorkspaceTool(
+            worktree_root=runtime_dir / "main-worktrees",
+            ledger=EffectLedger(runtime_dir / "main-effects.sqlite"),
+        )
+        checkpoint = runtime_dir / "main-checkpoints.sqlite"
+        config = graph_config(run_id, 1)
+        first_graph = build_development_graph(
+            open_graph_checkpointer(checkpoint), plan, FixturePort(calls, scenario="main"), tool
+        )
+        try:
+            await _to_boundary(
+                first_graph,
+                initial_development_state(
+                    plan, graph_run_id=run_id, generation=1, git_workspace=tool
+                ),
+                config,
+            )
+        except RuntimeError as error:
+            if str(error) != "simulated restart after one branch approval":
+                raise
+        else:
+            raise AssertionError("restart boundary was not exercised")
+        snapshot = first_graph.get_state(config)
+        outcomes = snapshot.values.get("branch_outcomes", {})
+        if not isinstance(outcomes, dict) or outcomes.get("backend", {}).get("decision") != "approved":
+            raise AssertionError("backend approval was not checkpointed before restart")
+
+        restarted = build_development_graph(
+            open_graph_checkpointer(checkpoint), plan, FixturePort(calls, scenario="main"), tool
+        )
+        reset = await _to_boundary(restarted, None, config)
+        if reset.get("status") != "awaiting_attempt_reset_approval":
+            raise AssertionError("frontend rejection did not require reset approval")
+        integration = await _to_boundary(
+            restarted, Command(resume={"decision": "approved"}), config
+        )
+        if integration.get("status") != "awaiting_integration_approval":
+            raise AssertionError("approved retries did not reach integration approval")
+        release = await _to_boundary(
+            restarted, Command(resume={"decision": "approved"}), config
+        )
+        expected_status = "awaiting_replan" if inject in {"backend", "electron"} else "awaiting_release_approval"
+        if release.get("status") != expected_status:
+>           raise AssertionError("global regression did not stop for release approval")
+E           AssertionError: global regression did not stop for release approval
+
+scripts/run_development_graph_acceptance.py:469: AssertionError
+=============================== warnings summary ===============================
+<repo>/mvp/.venv/lib/python3.13/site-packages/fastapi/testclient.py:1
+  <repo>/mvp/.venv/lib/python3.13/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/acceptance/test_development_graph_blueprint.py::test_three_workers_merge_to_temporary_branch_and_stop
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 14 passed, 2 skipped, 1 warning in 258.08s (0:04:18)
+```
+
+### 根因阶段附加执行表
+
+命令中的 `<repo>` 和 `<fixture-integration>` 仅替代执行时的本机绝对路径；其余 argv
+保持原样。cwd 均以对应 Git repository 根目录为基准描述。
+
+| ID | cwd | 实际 source SHA | exit | count / 结果 |
+|---|---|---|---:|---|
+| D1 integration backend policy 重跑 | disposable fixture integration worktree 的 `mvp/` | fixture candidate `ea6f91ce226e06a5aaa93f87f7541c53b45b4e91`；其 source base 为 `5ca52d2` | 1 | `1 failed, 2201 passed, 6 skipped, 1 warning in 169.27s` |
+| D2 主工作树具体单测 | `mvp/` | `5ca52d2db3256f94cabfaddc69377304970effcf` | 1 | `1 failed in 0.05s` |
+| D3 fix round 当前 worktree focused traceback | `mvp/` | `23cd299c74acea4a123c4dd0fa76908e816fee30`（相对 `5ca52d2` 仅新增报告 commits） | 1 | `1 failed in 0.05s`；frame/异常与 D2 一致，fresh event ID 不同 |
+| D4 四样例 probe | `mvp/` | `5ca52d2db3256f94cabfaddc69377304970effcf` | 0 | case 1/2/4：`local_path=True, projected=False`；case 3：`local_path=False, projected=True` |
+
+精确命令：
+
+```bash
+# D1；原绝对 executable 路径仅规范化为 <repo>
+<repo>/mvp/.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q --ignore=tests/acceptance/test_development_graph_blueprint.py
+
+# D2
+cd mvp && env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q tests/unit/api/test_development_graph.py::test_development_projections_reject_absolute_windows_and_traversal_values
+
+# D3
+cd mvp && /usr/bin/python3 -I -c 'import subprocess,sys; result=subprocess.run(sys.argv[1:],timeout=120); raise SystemExit(result.returncode)' env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q -p no:cacheprovider --tb=long tests/unit/api/test_development_graph.py::test_development_projections_reject_absolute_windows_and_traversal_values
+
+# D4
+cd mvp && env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python - <<'PY'
+from workbench.runtime.engine_host.v2.mapper import is_local_path
+from workbench.agui.mapper import map_domain_event
+from workbench.protocol.events import DomainEvent
+values=("/private/worktree", r"C:\\agent\\worktree", r"\\server\\share\\worktree", "src/../../secret")
+for index,value in enumerate(values,1):
+    event=DomainEvent.new("development.branch.progress","test",{"graph_run_id":"development-run.1","branch_id":"backend","attempt":1,"worktree_display_name":value,"worker_branch":"graph/development-run.1/backend","base_sha":"a"*40,"commit_sha":"b"*40,"owned_path_summary":["src/backend.py"],"test_label":"tests","test_result":"passed"},run_id="session-1")
+    print(f"case={index} local_path={is_local_path(value)} projected={bool(map_domain_event(event))}")
+PY
+```
+
+### 静态门禁：动态 HEAD 与固定 source reproduction
+
+原始动态命令保留不变，并明确固定 reproduction，避免报告 commits 扩大 HEAD 范围：
+
+```bash
+# 原始动态命令；实际执行时 HEAD=5ca52d2db3256f94cabfaddc69377304970effcf
+git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..HEAD
+
+# 固定 reproduction；fix round 1 再次执行，exit 2，同一 EOF 空行
+git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..5ca52d2db3256f94cabfaddc69377304970effcf
+
+# 原始动态命令；实际执行时 HEAD=5ca52d2db3256f94cabfaddc69377304970effcf
+BASE_REV=d894c81e0af03b8f74cf415bc0310c71459a3d67 HEAD_REV=$(git rev-parse HEAD) /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+
+# 固定 reproduction；fix round 1 再次执行，exit 1
+BASE_REV=d894c81e0af03b8f74cf415bc0310c71459a3d67 HEAD_REV=5ca52d2db3256f94cabfaddc69377304970effcf /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+固定 diff 输出仍为计划文件 line 198 的 EOF 空行；固定 scan 输出仍为
+`scanned_blobs=37 fixture_allowances=0 findings=7`。两次 fix-round reproduction 的
+执行 cwd 均为 repository root，执行时当前 commit 为 `23cd299c74acea4a123c4dd0fa76908e816fee30`，
+但被检查的 source range 固定止于 `5ca52d2`。
 
 ## RED / GREEN
 
