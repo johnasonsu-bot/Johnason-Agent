@@ -574,6 +574,42 @@ def test_runtime_public_values_reject_digests_paths_and_internal_proofs(
 
 
 @pytest.mark.parametrize(
+    "local_path",
+    [
+        "path=/private/state",
+        r"path=C:\private\state.json",
+        r"artifact=\\host\share\state.json",
+        "artifact:C:/private/state",
+        'artifact: "/private/state"',
+        "artifact=(C:/private/state)",
+        "../state.json",
+    ],
+)
+def test_runtime_public_boundary_rejects_local_paths_at_label_and_punctuation_boundaries(
+    local_path: str,
+) -> None:
+    """Catches local paths hidden after assignments, punctuation, or labels."""
+    with pytest.raises(ValueError):
+        mapper_module.validate_public_text(local_path, maximum=4096)
+    with pytest.raises(ValueError):
+        map_runtime_event(runtime_event("assistant.delta", payload={"text": local_path}))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/private/state",
+        "http://127.0.0.1:46121/api/v1",
+    ],
+)
+def test_runtime_public_boundary_allows_http_urls_with_path_segments(url: str) -> None:
+    """Catches path hardening accidentally rejecting legitimate public URLs."""
+    assert mapper_module.validate_public_text(url, maximum=4096) == url
+    mapped = map_runtime_event(runtime_event("assistant.delta", payload={"text": url}))
+    assert mapped[0].payload["content"] == url
+
+
+@pytest.mark.parametrize(
     ("runtime_code", "public_code"),
     [
         ("runtime_error", "runtime_error"),

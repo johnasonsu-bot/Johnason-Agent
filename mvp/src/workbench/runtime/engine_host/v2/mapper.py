@@ -42,11 +42,12 @@ _DIGEST_VALUE = re.compile(
     r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{40})(?![0-9a-f])",
     re.IGNORECASE,
 )
-_UNSAFE_PATH = re.compile(
-    r"(?:^|[\\/])\.\.(?:[\\/]|$)|"
-    r"(?:^|\s)/[^\s]{1,}|"
-    r"(?:^|\s)[A-Za-z]:[\\/][^\s]*|"
-    r"(?:^|\s)\\\\[^\s\\]+\\[^\s\\]+"
+_HTTP_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_LOCAL_PATH = re.compile(
+    r"(?<![A-Za-z0-9_./\\-])/(?!/)[^\s]*|"
+    r"(?<![A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s]*|"
+    r"(?<![A-Za-z0-9_./\\-])\\\\[^\s\\/]+[\\/][^\s\\/]+|"
+    r"(?<![A-Za-z0-9_.-])\.\.(?:[\\/]|$)"
 )
 _TRACEBACK = re.compile(r"\btraceback\s*\(", re.IGNORECASE)
 _SENSITIVE_ROOTS = (
@@ -138,7 +139,7 @@ def is_opaque_identifier(value: Any) -> bool:
         not isinstance(value, str)
         or not _IDENTIFIER.fullmatch(value)
         or _DIGEST_VALUE.fullmatch(value)
-        or _UNSAFE_PATH.search(value)
+        or is_local_path(value)
     ):
         return False
     words = _normalized_words(value)
@@ -164,7 +165,7 @@ def validate_public_text(value: Any, *, maximum: int) -> str:
         or _contains_private_public_label(value)
         or _contains_credential_value(value)
         or _DIGEST_VALUE.search(value)
-        or _UNSAFE_PATH.search(value)
+        or is_local_path(value)
         or _TRACEBACK.search(value)
     ):
         raise ValueError("value must be bounded public text")
@@ -177,6 +178,17 @@ def _normalized_words(value: str) -> tuple[str, ...]:
         word
         for match in _WORD.finditer(value)
         for word in _normalized_token_words(match.group(0))
+    )
+
+
+def is_local_path(value: Any) -> bool:
+    """Return whether text contains a local path outside an HTTP(S) URL."""
+    if not isinstance(value, str):
+        return False
+    url_spans = tuple(match.span() for match in _HTTP_URL.finditer(value))
+    return any(
+        not any(start <= match.start() < end for start, end in url_spans)
+        for match in _LOCAL_PATH.finditer(value)
     )
 
 
@@ -356,7 +368,7 @@ def _reject_sensitive_payload(value: Any) -> None:
     elif isinstance(value, str) and (
         _contains_credential_value(value)
         or _DIGEST_VALUE.search(value)
-        or _UNSAFE_PATH.search(value)
+        or is_local_path(value)
         or _contains_any_phrase(_normalized_words(value), _INTERNAL_PROOF_PHRASES)
     ):
         raise ValueError("runtime event payload contains a sensitive value")

@@ -319,6 +319,74 @@ def test_v2_second_boundary_filters_every_private_public_text_variant(unsafe_tex
 
 
 @pytest.mark.parametrize(
+    "local_path",
+    [
+        "path=/private/state",
+        r"path=C:\private\state.json",
+        r"artifact=\\host\share\state.json",
+        "artifact:C:/private/state",
+        'artifact: "/private/state"',
+        "artifact=(C:/private/state)",
+        "../state.json",
+    ],
+)
+def test_v2_development_boundary_rejects_local_paths_at_label_and_punctuation_boundaries(
+    local_path: str,
+) -> None:
+    """Catches persisted development payloads exposing local paths through AG-UI."""
+    event = DomainEvent.new(
+        "development.plan.approved",
+        "development-graph-worker",
+        {
+            "plan_id": "plan-1",
+            "graph_run_id": "graph-1",
+            "status": "approved",
+            "diagnostic": {"path": local_path},
+            "term_id": "term-1",
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+
+    assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/private/state",
+        "http://127.0.0.1:46121/api/v1",
+    ],
+)
+def test_v2_development_boundary_allows_http_urls_with_path_segments(url: str) -> None:
+    """Catches local-path filtering accidentally dropping legitimate public URLs."""
+    event = DomainEvent.new(
+        "development.plan.approved",
+        "development-graph-worker",
+        {
+            "plan_id": "plan-1",
+            "graph_run_id": "graph-1",
+            "status": "approved",
+            "diagnostic": {"url": url},
+            "term_id": "term-1",
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+
+    mapped = map_domain_event(event)
+    assert mapped[0]["value"] == {
+        "plan_id": "plan-1",
+        "graph_run_id": "graph-1",
+        "status": "approved",
+    }
+
+
+@pytest.mark.parametrize(
     ("event_id", "run_id", "term_id", "step_id", "correlation_id", "sequence", "cursor"),
     [
         ("sk-abcdefghijklmnop", "run-1", "term-1", "step-1", None, 1, 1),

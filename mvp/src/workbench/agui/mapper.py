@@ -11,13 +11,13 @@ from workbench.orchestration.contracts import OpaqueIdentifier, PublicSummary
 from workbench.runtime.engine_host.v2.mapper import (
     canonical_public_error_code,
     is_opaque_identifier,
+    is_local_path,
     is_public_text,
 )
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _SECRET_OR_CREDENTIAL = re.compile(r"(?:\b(?:token|secret|credential|password)\b|api[_ -]?(?:key|token)|authorization|bearer\s+|github_pat_|gh[pousr]_|sk-|AKIA)", re.IGNORECASE)
-_UNSAFE_PATH = re.compile(r"(?:^/|^[A-Za-z]:[\\/]|(?:^|[\\/])\.\.(?:[\\/]|$)|\\)")
 
 
 def _sha(value: str) -> str:
@@ -519,7 +519,7 @@ def _unsafe_development_payload(value: Any) -> bool:
     if isinstance(value, (tuple, list)):
         return any(_unsafe_development_payload(item) for item in value)
     if isinstance(value, str):
-        return bool(_SECRET_OR_CREDENTIAL.search(value) or _UNSAFE_PATH.search(value))
+        return bool(_SECRET_OR_CREDENTIAL.search(value) or is_local_path(value))
     return False
 
 
