@@ -1,5 +1,6 @@
 """Pure projection from domain events to AG-UI wire events."""
 
+from datetime import datetime
 import re
 from typing import Annotated, Any, Literal
 
@@ -177,11 +178,22 @@ _V2_CUSTOM_TYPES = {
     "runtime.error",
 }
 
+_V2_EVENT_TYPES = _V2_CUSTOM_TYPES | {
+    "agent.message.delta",
+    "agent.message.completed",
+    "agent.tool.started",
+    "agent.tool.completed",
+    "runtime.reasoning.observed",
+    "runtime.extension.observed",
+}
+
 
 def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
     event_type = getattr(event, "event_type", None)
     source = getattr(event, "source", None)
     if not isinstance(event_type, str) or not isinstance(source, str):
+        return []
+    if source == "engine_host.v2" and event_type not in _V2_EVENT_TYPES:
         return []
     agui_type = _SIMPLE_TYPES.get(event_type)
     if agui_type is None and event_type not in _CUSTOM_TYPES:
@@ -524,6 +536,9 @@ def _valid_v2_identity(event: DomainEvent, payload: dict[str, Any]) -> bool:
         and isinstance(event.sequence, int)
         and event.sequence > 0
         and event.sequence == cursor
+        and isinstance(event.occurred_at, datetime)
+        and event.occurred_at.tzinfo is not None
+        and event.occurred_at.utcoffset() is not None
     )
 
 
@@ -645,7 +660,9 @@ def _add_v2_tool_fields(result: dict[str, Any], payload: dict[str, Any]) -> bool
         result["toolCallName"] = tool_name
     for source, target, maximum in (("summary", "summary", 280), ("artifact_ref", "artifactRef", 128)):
         value = payload.get(source)
-        if _v2_public_text({source: value}, source, maximum) is not None:
+        if source == "artifact_ref" and is_opaque_identifier(value):
+            result[target] = value
+        elif source != "artifact_ref" and _v2_public_text({source: value}, source, maximum) is not None:
             result[target] = value
         elif source in payload:
             return False

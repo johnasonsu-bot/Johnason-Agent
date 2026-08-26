@@ -27,16 +27,25 @@ _SENSITIVE_VALUE = re.compile(
 )
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _PRIVATE_TEXT = re.compile(
-    r"(?:\b(?:reasoning|chain[ _-]?of[ _-]?thought|private[ _-]?(?:prompt|"
-    r"history|reasoning)|provider[ _-]?(?:ref|reference)|workspace(?:[ _-]?path)?|"
-    r"(?:manifest|config)[ _-]?(?:digest|ref)|digest)\s*[:=]|"
+    r"(?:\b(?:reasoning(?:[ _-]?(?:content|id))?|reasoningContent|"
+    r"chain[ _-]?of[ _-]?thought|private[ _-]?(?:prompt|history|reasoning)|"
+    r"provider(?:[ _-]?(?:ref|reference|id))?|providerRef|"
+    r"workspace(?:[ _-]?(?:path|id))?|workspacePath|"
+    r"manifest(?:[ _-]?(?:digest|id))?|manifestDigest|digest|"
+    r"vault(?:[ _-]?id)?|vaultId|secret(?:[ _-]?(?:token|id))?|secretToken|"
+    r"credential(?:[ _-]?(?:id|token))?|credentialId)\s*[:=]|"
     r"\b(?:exception|error)\s*[:=]|\btraceback\s*\(|"
     r"\bstack(?:[ _-]?trace)?\s*[:=])",
     re.IGNORECASE,
 )
 _SECRET_IDENTIFIER = re.compile(
-    r"(?:^sk-[A-Za-z0-9_-]{8,}|\bbearer\b|api[_ -]?(?:key|token)|"
-    r"access[_ -]?(?:key|token)|authorization|credential|password|secret|token)",
+    r"(?:^sk-[A-Za-z0-9_-]{8,}|^bearer(?:[-_:]|$)|"
+    r"^(?:provider(?:[_:-]?(?:ref|reference|id)|Ref)|"
+    r"workspace(?:[_:-]?(?:path|id)|Path)|"
+    r"manifest(?:[_:-]?(?:digest|id)|Digest)|digest(?:[-_:]|$)|"
+    r"reasoning(?:[_:-]?(?:content|id)|Content)|vault(?:[_:-]?id|Id)|"
+    r"secret(?:[_:-]?(?:token|id)|Token)|credential(?:[_:-]?(?:id|token)|Id))|"
+    r"api[_ -]?(?:key|token)|access[_ -]?(?:key|token)|authorization|password)",
     re.IGNORECASE,
 )
 _STATUSES = frozenset({"queued", "running", "paused", "completed", "failed", "cancelled"})

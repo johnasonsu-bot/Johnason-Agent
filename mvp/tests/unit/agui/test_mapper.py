@@ -280,3 +280,87 @@ def test_v2_agui_malformed_custom_status_returns_empty_instead_of_type_error() -
         run_id="run-1", step_id="step-1", sequence=1,
     )
     assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("run.failed", {"message": "raw error"}),
+        ("agent.tool.arguments.delta", {"tool_call_id": "call-1", "delta": "raw args"}),
+        ("run.state.snapshot", {"snapshot": {"workspace_path": "/private"}}),
+        ("run.state.delta", {"delta": [{"op": "replace"}]}),
+    ],
+)
+def test_v2_never_falls_back_to_v1_raw_event_branches(
+    event_type: str, payload: dict[str, object]
+) -> None:
+    """Catches forged v2 events reaching V1's raw message, args, or state paths."""
+    event = DomainEvent.new(
+        event_type, "engine_host.v2",
+        {**payload, "term_id": "term-1", "cursor": 1},
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []
+
+
+def test_v1_raw_event_mapping_remains_available() -> None:
+    """Catches V2 top-level isolation accidentally changing established V1 behavior."""
+    event = DomainEvent.new(
+        "run.state.snapshot", "legacy",
+        {"snapshot": {"legacy": "state"}},
+        run_id="run-1", sequence=1,
+    )
+    assert map_domain_event(event)[0]["snapshot"] == {"legacy": "state"}
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "providerRef=internal", "workspace_path: /private", "manifest-digest=abc",
+        "reasoningContent: private", "vault-id=hidden", "secretToken: x",
+        "credentialId=private",
+    ],
+)
+def test_v2_shared_public_text_validator_catches_identifier_style_private_labels(unsafe_text: str) -> None:
+    """Catches camel/snake/kebab private labels bypassing text redaction."""
+    event = DomainEvent.new(
+        "agent.message.delta", "engine_host.v2",
+        {"content": unsafe_text, "term_id": "term-1", "cursor": 1},
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"occurred_at": datetime.now()},
+        {"occurred_at": []},
+        {"event_id": []},
+        {"run_id": {}},
+        {"step_id": True},
+        {"sequence": []},
+    ],
+)
+def test_v2_model_construct_identity_and_time_anomalies_fail_closed(update: dict[str, object]) -> None:
+    """Catches model_construct values raising during V2 SSE projection."""
+    values: dict[str, object] = {
+        "event_id": "event-1", "event_type": "agent.message.delta", "source": "engine_host.v2",
+        "occurred_at": datetime.now(timezone.utc), "payload": {"content": "hello", "term_id": "term-1", "cursor": 1},
+        "run_id": "run-1", "step_id": "step-1", "sequence": 1, "correlation_id": None,
+    }
+    values.update(update)
+    assert map_domain_event(DomainEvent.model_construct(**values)) == []
+
+
+def test_v2_tool_artifact_ref_is_an_opaque_identifier_not_public_text() -> None:
+    """Catches a display string being accepted as an artifact reference."""
+    event = DomainEvent.new(
+        "agent.tool.completed", "engine_host.v2",
+        {
+            "tool_id": "search", "tool_call_id": "call-1", "read_only": True,
+            "artifact_ref": "human readable artifact", "term_id": "term-1", "cursor": 1,
+        },
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []
