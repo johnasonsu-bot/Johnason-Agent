@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 17
+PHASE1_SCHEMA_VERSION = 18
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -90,6 +90,26 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS projection_cursors (
             projection_name TEXT PRIMARY KEY,
             sequence INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_v2_registrations (
+            runtime_id TEXT PRIMARY KEY,
+            build_id TEXT NOT NULL,
+            protocol_version TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_v2_command_pins (
+            command_id TEXT PRIMARY KEY,
+            identity_digest TEXT NOT NULL,
+            identity_json TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            runtime_build_id TEXT NOT NULL,
+            latest_attempt INTEGER NOT NULL,
+            host_generation TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS lifecycle_command_results (
             command_id TEXT PRIMARY KEY,
