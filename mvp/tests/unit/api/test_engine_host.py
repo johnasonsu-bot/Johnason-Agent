@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -202,4 +203,51 @@ def test_v2_engine_host_diagnostic_exposes_only_safe_runtime_summary(
     }
     assert "argv" not in response.text
     assert "environment" not in response.text
+    assert "digest" not in response.text
+
+
+def test_v2_engine_host_diagnostic_reports_reopened_runtime_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Catches a status endpoint failing after a normal registry process restart."""
+    database = tmp_path / "api.sqlite"
+    RuntimeRegistryV2(RuntimeV2Repository(database)).register(
+        runtime_capabilities("fake-v2", build_id="fake:test", query=True)
+    )
+    app = FastAPI()
+    app.include_router(
+        engine_host_v2_router(
+            RuntimeRegistryV2(RuntimeV2Repository(database)), enabled=True
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    assert response.json()["v2"]["runtimes"][0]["state"] == "unavailable"
+
+
+def test_v2_engine_host_diagnostic_hides_corrupt_registration_details(
+    tmp_path: Path,
+) -> None:
+    """Catches database-integrity exceptions leaking through the read-only API."""
+    database = tmp_path / "api.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("fake-v2", build_id="fake:test", query=True))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE runtime_v2_registrations SET capability_digest = ?",
+            ("0" * 64,),
+        )
+    app = FastAPI()
+    app.include_router(engine_host_v2_router(registry, enabled=True))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "v2": {"enabled": True, "protocol": "2.0", "runtimes": []}
+    }
     assert "digest" not in response.text

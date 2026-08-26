@@ -87,7 +87,7 @@ class RuntimeSelectionV2:
 @dataclass(frozen=True)
 class _Registration:
     capabilities: RuntimeCapabilitiesV2
-    state: Literal["ready", "disabled"]
+    state: Literal["ready", "disabled", "unavailable"]
 
 
 class RuntimeRegistryV2:
@@ -172,31 +172,8 @@ class RuntimeRegistryV2:
         """Pick the preferred eligible runtime, otherwise stable lexical fallback."""
         if not isinstance(requirements, RuntimeRequirementsV2):
             raise TypeError("requirements must be a RuntimeRequirementsV2")
-        with self._lock:
-            candidates = [
-                registration
-                for registration in self._registrations()
-                if registration.state == "ready"
-                and registration.capabilities.protocol_version == "2.0"
-                and _meets_requirements(registration.capabilities, requirements)
-            ]
-            if not candidates:
-                raise NoConformantRuntime("no conformant runtime is available")
-            candidates.sort(key=lambda item: item.capabilities.runtime_id)
-            preferred = requirements.preferred_runtime_id
-            if preferred is not None:
-                matching = next(
-                    (
-                        item
-                        for item in candidates
-                        if item.capabilities.runtime_id == preferred
-                    ),
-                    None,
-                )
-                if matching is not None:
-                    return _selection(matching.capabilities, matching.state)
-            chosen = candidates[0]
-            return _selection(chosen.capabilities, chosen.state)
+        with self._lock, self.repository.store.connect() as connection:
+            return self._select_in_connection(requirements, connection)
 
     def select_and_pin(
         self, envelope: RunEnvelopeV2, requirements: RuntimeRequirementsV2
@@ -205,19 +182,15 @@ class RuntimeRegistryV2:
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
         with self._lock:
-            existing = self.repository.get_pin(envelope.command_id)
-            if existing is not None:
-                self.repository.pin_command(envelope)
-                return self.resume(existing.command_id)
-            chosen = self.select(requirements)
-            if (
-                chosen.runtime_id != envelope.runtime.runtime_id
-                or chosen.build_id != envelope.runtime.build_id
-            ):
-                raise NoConformantRuntime(
-                    "envelope runtime must match the selected runtime before admission"
-                )
-            self.repository.pin_command(envelope)
+            admitted = self.repository.admit_command(
+                envelope,
+                lambda connection: self._select_for_admission(
+                    envelope, requirements, connection
+                ),
+            )
+            if admitted.selection is None:
+                return self._selection_for_pin(admitted.pin.command_id)
+            chosen = admitted.selection
             return RuntimeSelectionV2(
                 runtime_id=chosen.runtime_id,
                 build_id=chosen.build_id,
@@ -227,27 +200,21 @@ class RuntimeRegistryV2:
             )
 
     def resume(self, command_id: str) -> RuntimeSelectionV2:
-        """Resolve an accepted command only to its original runtime/build pair."""
+        """Resolve an accepted command only to its durable runtime/build pair."""
+        return self._selection_for_pin(command_id)
+
+    def _selection_for_pin(self, command_id: str) -> RuntimeSelectionV2:
+        """Resume from the command pin, never from a later live registration choice."""
         pin = self.repository.get_pin(command_id)
         if pin is None:
             raise NoConformantRuntime("command has no durable runtime selection")
-        with self._lock:
-            registrations = {
-                registration.capabilities.runtime_id: registration
-                for registration in self._registrations()
-            }
-            registration = registrations.get(pin.runtime_id)
-            if registration is None or registration.capabilities.build_id != pin.runtime_build_id:
-                raise RuntimeRegistryIntegrityError(
-                    "pinned runtime registration is unavailable or changed"
-                )
-            return RuntimeSelectionV2(
-                runtime_id=registration.capabilities.runtime_id,
-                build_id=registration.capabilities.build_id,
-                state=registration.state,
-                capabilities=_enabled_capabilities(registration.capabilities),
-                command_id=pin.command_id,
-            )
+        return RuntimeSelectionV2(
+            runtime_id=pin.runtime_id,
+            build_id=pin.runtime_build_id,
+            state="pinned",
+            capabilities=(),
+            command_id=pin.command_id,
+        )
 
     def snapshot(self) -> tuple[RuntimeSelectionV2, ...]:
         """Return a deterministic public summary that excludes all process configuration."""
@@ -260,8 +227,58 @@ class RuntimeRegistryV2:
                 )
             )
 
-    def _registrations(self) -> tuple[_Registration, ...]:
-        with self.repository.store.connect() as connection:
+    def _select_in_connection(
+        self, requirements: RuntimeRequirementsV2, connection: sqlite3.Connection
+    ) -> RuntimeSelectionV2:
+        """Select using the caller's connection so admission cannot observe a stale row."""
+        candidates = [
+            registration
+            for registration in self._registrations(connection)
+            if registration.state == "ready"
+            and registration.capabilities.protocol_version == "2.0"
+            and _meets_requirements(registration.capabilities, requirements)
+        ]
+        if not candidates:
+            raise NoConformantRuntime("no conformant runtime is available")
+        candidates.sort(key=lambda item: item.capabilities.runtime_id)
+        preferred = requirements.preferred_runtime_id
+        if preferred is not None:
+            matching = next(
+                (
+                    item
+                    for item in candidates
+                    if item.capabilities.runtime_id == preferred
+                ),
+                None,
+            )
+            if matching is not None:
+                return _selection(matching.capabilities, matching.state)
+        chosen = candidates[0]
+        return _selection(chosen.capabilities, chosen.state)
+
+    def _select_for_admission(
+        self,
+        envelope: RunEnvelopeV2,
+        requirements: RuntimeRequirementsV2,
+        connection: sqlite3.Connection,
+    ) -> RuntimeSelectionV2:
+        chosen = self._select_in_connection(requirements, connection)
+        if (
+            chosen.runtime_id != envelope.runtime.runtime_id
+            or chosen.build_id != envelope.runtime.build_id
+        ):
+            raise NoConformantRuntime(
+                "envelope runtime must match the selected runtime before admission"
+            )
+        return chosen
+
+    def _registrations(
+        self, connection: sqlite3.Connection | None = None
+    ) -> tuple[_Registration, ...]:
+        if connection is None:
+            with self.repository.store.connect() as connection:
+                return self._registrations(connection)
+        else:
             rows = connection.execute(
                 "SELECT * FROM runtime_v2_registrations ORDER BY runtime_id"
             ).fetchall()
@@ -291,6 +308,8 @@ class RuntimeRegistryV2:
             ):
                 raise ValueError("registration snapshot does not match persisted metadata")
             advertised = self._advertised.get(runtime_id)
+            if advertised is None:
+                return _Registration(capabilities=capabilities, state="unavailable")
             if advertised != capabilities:
                 raise ValueError("registration snapshot does not match current capabilities")
             return _Registration(capabilities=capabilities, state=status)  # type: ignore[arg-type]

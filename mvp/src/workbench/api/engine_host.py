@@ -8,7 +8,10 @@ from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
 
 from workbench.runtime.engine_host.contracts import HostCapabilities, HostStatus
-from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.engine_host.v2.registry import (
+    RuntimeRegistryIntegrityError,
+    RuntimeRegistryV2,
+)
 
 
 class EngineHostStatusSource(Protocol):
@@ -66,7 +69,7 @@ class EngineHostV2RuntimeDiagnostic(BaseModel):
 
     runtime_id: str
     build_id: str
-    state: Literal["ready", "disabled"]
+    state: Literal["ready", "disabled", "unavailable"]
     capabilities: tuple[str, ...]
 
 
@@ -93,7 +96,13 @@ def engine_host_v2_router(registry: RuntimeRegistryV2 | None, *, enabled: bool) 
 
     @router.get("", response_model=EngineHostDiagnosticV2Envelope)
     def status() -> EngineHostDiagnosticV2Envelope:
-        snapshots = () if registry is None else registry.snapshot()
+        try:
+            snapshots = () if registry is None else registry.snapshot()
+        except RuntimeRegistryIntegrityError:
+            # Diagnostics are not an integrity oracle.  A corrupt row must never
+            # disclose its raw registration fields or turn a local read endpoint
+            # into an exception surface.
+            snapshots = ()
         return EngineHostDiagnosticV2Envelope(
             v2=EngineHostV2Diagnostic(
                 enabled=enabled,

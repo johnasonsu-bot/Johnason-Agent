@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 from pathlib import Path
 import re
 import sqlite3
 import time
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2
 from workbench.runtime.engine_host.v2.identity import (
@@ -20,6 +21,7 @@ from workbench.workflow.store import WorkflowStore
 
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_Selection = TypeVar("_Selection")
 
 
 class CommandIdentityConflict(RuntimeError):
@@ -46,6 +48,15 @@ class CommandPinV2:
     updated_at: float
 
 
+@dataclass(frozen=True)
+class AtomicCommandAdmissionV2(Generic[_Selection]):
+    """A command pin and any new-command selection produced under one write lock."""
+
+    pin: CommandPinV2
+    selection: _Selection | None
+    existing: bool
+
+
 class RuntimeV2Repository:
     """The only durable admission source for Engine Host v2 runtime requests."""
 
@@ -63,81 +74,112 @@ class RuntimeV2Repository:
     def pin_command(self, envelope: RunEnvelopeV2) -> CommandPinV2:
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
-        identity = canonical_envelope_identity(envelope)
-        now = time.time()
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(
-                    "SELECT * FROM runtime_v2_command_pins WHERE command_id = ?",
-                    (envelope.command_id,),
-                ).fetchone()
-                if row is None:
-                    connection.execute(
-                        """
-                        INSERT INTO runtime_v2_command_pins(
-                            command_id, identity_digest, identity_json, runtime_id,
-                            runtime_build_id, latest_attempt, host_generation,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            envelope.command_id,
-                            identity.identity_digest,
-                            identity.canonical_json,
-                            envelope.runtime.runtime_id,
-                            envelope.runtime.build_id,
-                            envelope.attempt,
-                            envelope.runtime.host_generation,
-                            now,
-                            now,
-                        ),
-                    )
-                    pin = CommandPinV2(
-                        command_id=envelope.command_id,
-                        identity_digest=identity.identity_digest,
-                        runtime_id=envelope.runtime.runtime_id,
-                        runtime_build_id=envelope.runtime.build_id,
-                        latest_attempt=envelope.attempt,
-                        host_generation=envelope.runtime.host_generation,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                else:
-                    pin = self._validated_pin(row)
-                    if pin.identity_digest != identity.identity_digest:
-                        raise CommandIdentityConflict(envelope.command_id)
-                    if envelope.attempt < pin.latest_attempt:
-                        raise CommandAttemptRegression(envelope.command_id)
-                    if envelope.attempt > pin.latest_attempt:
-                        connection.execute(
-                            """
-                            UPDATE runtime_v2_command_pins
-                            SET latest_attempt = ?, host_generation = ?, updated_at = ?
-                            WHERE command_id = ?
-                            """,
-                            (
-                                envelope.attempt,
-                                envelope.runtime.host_generation,
-                                now,
-                                envelope.command_id,
-                            ),
-                        )
-                        pin = CommandPinV2(
-                            command_id=pin.command_id,
-                            identity_digest=pin.identity_digest,
-                            runtime_id=pin.runtime_id,
-                            runtime_build_id=pin.runtime_build_id,
-                            latest_attempt=envelope.attempt,
-                            host_generation=envelope.runtime.host_generation,
-                            created_at=pin.created_at,
-                            updated_at=now,
-                        )
+                pin = self._pin_command_in_transaction(connection, envelope)
                 connection.commit()
                 return pin
             except Exception:
                 connection.rollback()
                 raise
+
+    def admit_command(
+        self,
+        envelope: RunEnvelopeV2,
+        select: Callable[[sqlite3.Connection], _Selection],
+    ) -> AtomicCommandAdmissionV2[_Selection]:
+        """Select and pin a new command while holding one SQLite write transaction."""
+        if not isinstance(envelope, RunEnvelopeV2):
+            raise TypeError("envelope must be a RunEnvelopeV2")
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT * FROM runtime_v2_command_pins WHERE command_id = ?",
+                    (envelope.command_id,),
+                ).fetchone()
+                selection = None if existing is not None else select(connection)
+                pin = self._pin_command_in_transaction(connection, envelope)
+                connection.commit()
+                return AtomicCommandAdmissionV2(
+                    pin=pin, selection=selection, existing=existing is not None
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+    def _pin_command_in_transaction(
+        self, connection: sqlite3.Connection, envelope: RunEnvelopeV2
+    ) -> CommandPinV2:
+        """Apply command pin identity rules without opening or committing a transaction."""
+        identity = canonical_envelope_identity(envelope)
+        now = time.time()
+        row = connection.execute(
+            "SELECT * FROM runtime_v2_command_pins WHERE command_id = ?",
+            (envelope.command_id,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO runtime_v2_command_pins(
+                    command_id, identity_digest, identity_json, runtime_id,
+                    runtime_build_id, latest_attempt, host_generation,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    envelope.command_id,
+                    identity.identity_digest,
+                    identity.canonical_json,
+                    envelope.runtime.runtime_id,
+                    envelope.runtime.build_id,
+                    envelope.attempt,
+                    envelope.runtime.host_generation,
+                    now,
+                    now,
+                ),
+            )
+            return CommandPinV2(
+                command_id=envelope.command_id,
+                identity_digest=identity.identity_digest,
+                runtime_id=envelope.runtime.runtime_id,
+                runtime_build_id=envelope.runtime.build_id,
+                latest_attempt=envelope.attempt,
+                host_generation=envelope.runtime.host_generation,
+                created_at=now,
+                updated_at=now,
+            )
+        pin = self._validated_pin(row)
+        if pin.identity_digest != identity.identity_digest:
+            raise CommandIdentityConflict(envelope.command_id)
+        if envelope.attempt < pin.latest_attempt:
+            raise CommandAttemptRegression(envelope.command_id)
+        if envelope.attempt == pin.latest_attempt:
+            return pin
+        connection.execute(
+            """
+            UPDATE runtime_v2_command_pins
+            SET latest_attempt = ?, host_generation = ?, updated_at = ?
+            WHERE command_id = ?
+            """,
+            (
+                envelope.attempt,
+                envelope.runtime.host_generation,
+                now,
+                envelope.command_id,
+            ),
+        )
+        return CommandPinV2(
+            command_id=pin.command_id,
+            identity_digest=pin.identity_digest,
+            runtime_id=pin.runtime_id,
+            runtime_build_id=pin.runtime_build_id,
+            latest_attempt=envelope.attempt,
+            host_generation=envelope.runtime.host_generation,
+            created_at=pin.created_at,
+            updated_at=now,
+        )
 
     def get_pin(self, command_id: str) -> CommandPinV2 | None:
         if not isinstance(command_id, str) or not command_id:

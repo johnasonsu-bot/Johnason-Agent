@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,89 @@ def test_v2_runtime_settings_are_parsed_from_structured_json_environment(
 
     assert settings.engine_host_v2_enabled is True
     assert settings.engine_host_v2_runtimes[0].argv == ("fake-v2", "--stdio")
+
+
+def test_atomic_admission_blocks_cross_registry_disable_until_command_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches disable committing in the former select-to-pin admission gap."""
+    database = tmp_path / "state.sqlite"
+    first = RuntimeRegistryV2(RuntimeV2Repository(database))
+    second = RuntimeRegistryV2(RuntimeV2Repository(database))
+    capabilities = runtime_capabilities("goose", query=True)
+    first.register(capabilities)
+    second.register(capabilities)
+    selected = threading.Event()
+    release_pin = threading.Event()
+    disable_finished = threading.Event()
+    outcomes: dict[str, object] = {}
+    original = first._select_in_connection
+
+    def pause_after_selection(requirements, connection):
+        outcome = original(requirements, connection)
+        selected.set()
+        assert release_pin.wait(timeout=2)
+        return outcome
+
+    monkeypatch.setattr(first, "_select_in_connection", pause_after_selection)
+
+    def admit() -> None:
+        outcomes["selection"] = first.select_and_pin(
+            run_envelope(runtime_id="goose", command_id="command-atomic"),
+            RuntimeRequirementsV2(query=True),
+        )
+
+    def disable() -> None:
+        outcomes["disabled"] = second.disable("goose")
+        disable_finished.set()
+
+    admission = threading.Thread(target=admit)
+    admission.start()
+    assert selected.wait(timeout=2)
+    disabler = threading.Thread(target=disable)
+    disabler.start()
+    assert not disable_finished.wait(timeout=0.1)
+    release_pin.set()
+    admission.join(timeout=2)
+    disabler.join(timeout=2)
+
+    assert not admission.is_alive()
+    assert not disabler.is_alive()
+    assert first.repository.get_pin("command-atomic") is not None
+    assert first.resume("command-atomic").runtime_id == "goose"
+
+
+def test_reopened_registry_marks_unadvertised_runtime_unavailable_not_corrupt(
+    tmp_path: Path,
+) -> None:
+    """Catches a normal process restart turning durable history into an integrity error."""
+    database = tmp_path / "state.sqlite"
+    RuntimeRegistryV2(RuntimeV2Repository(database)).register(
+        runtime_capabilities("goose", query=True)
+    )
+    reopened = RuntimeRegistryV2(RuntimeV2Repository(database))
+
+    snapshot = reopened.snapshot()
+
+    assert snapshot[0].runtime_id == "goose"
+    assert snapshot[0].state == "unavailable"
+    with pytest.raises(NoConformantRuntime):
+        reopened.select(RuntimeRequirementsV2(query=True))
+
+
+def test_reopened_registry_resumes_durable_pin_without_live_advertisement(
+    tmp_path: Path,
+) -> None:
+    """Catches resume consulting the new process's live selection instead of its pin."""
+    database = tmp_path / "state.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("goose", query=True))
+    registry.select_and_pin(
+        run_envelope(runtime_id="goose", command_id="command-reopen"),
+        RuntimeRequirementsV2(query=True),
+    )
+
+    resumed = RuntimeRegistryV2(RuntimeV2Repository(database)).resume("command-reopen")
+
+    assert resumed.runtime_id == "goose"
+    assert resumed.build_id == "goose:test"
