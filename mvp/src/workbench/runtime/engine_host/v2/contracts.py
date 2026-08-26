@@ -52,8 +52,12 @@ def _is_sensitive_key(key: str) -> bool:
         "accesskey",
         "accesstoken",
         "apitoken",
+        "authtoken",
+        "bearertoken",
+        "clientsecret",
         "privatekey",
         "privateprompt",
+        "secretkey",
     }
     if any(part in sensitive_pairs for part in parts):
         return True

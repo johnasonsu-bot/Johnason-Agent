@@ -308,6 +308,44 @@ def test_tool_schema_recursively_rejects_undelimited_access_token() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "field", ["clientsecret", "secretkey", "authtoken", "bearertoken"]
+)
+@pytest.mark.parametrize("boundary", ["event", "query", "schema"])
+def test_recursive_boundaries_reject_common_undelimited_credential_keys(
+    boundary: str, field: str
+) -> None:
+    """Catches common compound credential keys evading normalized matching."""
+    with pytest.raises(ValidationError, match="sensitive"):
+        if boundary == "event":
+            runtime_event(
+                "assistant.delta", payload={"safe": {field: "redacted"}}
+            )
+        elif boundary == "query":
+            QueryCommandV2(
+                type="query.status",
+                command_id="command-1",
+                payload={"safe": {field: "redacted"}},
+            )
+        else:
+            run_envelope(
+                overrides={
+                    "tool_manifest": (
+                        {
+                            "tool_id": "tool-1",
+                            "schema": {
+                                "properties": {field: {"type": "string"}}
+                            },
+                            "version": "1",
+                            "read_only": True,
+                            "timeout_ms": 1,
+                            "idempotency": "idempotent",
+                        },
+                    )
+                }
+            )
+
+
 def test_query_payload_allows_safe_camel_case_token_count() -> None:
     """Catches the secret matcher rejecting a query's safe camel-case metric."""
     command = QueryCommandV2(
