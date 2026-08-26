@@ -31,3 +31,11 @@
 - False positives: `secretary`、`token_count`/`tokenCount`/`token-count`、workspace/provider 普通业务句子，以及 `manifestation`/`vaulted` 等合法邻近词均通过；`token=`、`token-ref-*`、`vault-private`、`reasoningRef`、`chainOfThoughtReference`、`privatePromptRef`、`history_reference` 均 fail closed。
 - Boundaries: AG-UI 继续直接复用 runtime mapper 的共享 validator，无需额外适配；runtime identity/summary、persisted identity/summary 与 runtime/persisted `artifact_ref` 使用同一规范化语义。
 - Verification: Task 5、AG-UI、resume、Task 4 与 V1/Host 回归共 1188 项通过；独立恶意 probe 覆盖 17 个危险文本、8 个危险 ID 和 11 个安全邻近项；`compileall`、`git diff --check` 均通过。仅有既存 Starlette TestClient 弃用警告。
+
+## Fix 5
+
+- RED: 新增精确 compact credential 表驱动测试，覆盖 `APIKEY`/`apikey`、`ACCESSTOKEN`/`accesstoken`、`PRIVATEKEY`/`privatekey`、`GITHUBPAT`/`githubpat`，以及 apiKey、api_token、accessToken、privateKey、clientSecret、secretKey、authToken、bearerToken、githubPat 的 camel/separator 形式；旧实现出现 100 项预期失败，分别证明 runtime public text、runtime identity/`artifact_ref`、persisted public text/identity/`artifact_ref` 可被穿透。另有 33 assignments fail-closed 与 normalization 调用计数红测，证明增长前缀被重复解析。
+- GREEN: tokenizer 先对完整 token 规范为 lowercase，仅命中显式 `_CANONICAL_COMPACT_LABELS` 时展开；未进行任意词典分词。credential roots 同步加入 client-secret、secret-key、auth-token、bearer-token、github-pat，三层边界复用同一语义。
+- Complexity: `_contains_sensitive_assignment` 改为一次 `_LABEL_TOKEN.finditer` 线性扫描，只保留最长 3 个 label words；公开文本最多允许 32 个 `:`/`=`，第 33 个立即 fail closed。所有正则均为固定 lookaround、字符类或无嵌套量词分支；最大长度 alternating camel 输入用于验证 tokenizer 不存在重复前缀扫描或回溯放大。
+- False positives: `apikeyboard`、`apitokens`、`accesskeys`、`accesstokens`、`privatekeynote`、`clientsecrets`、`secretkeys`、`authtokens`、`bearertokens`、`githubpattern` 等非精确邻近词继续通过 runtime 与 persisted 校验。
+- Verification: 两份 Task 5 mapper 测试共 1042 项通过；Task 5、AG-UI、resume、Task 4 query/lifecycle/run 与 V1/Host 回归共 1268 项通过。独立组合 probe 覆盖 40 个 credential 风格、5 个安全邻近项，并对 4096 字符/32 assignments 输入执行 1000 次（0.7604 秒）；`compileall`、`git diff --check` 均通过。仅有既存 Starlette TestClient 弃用警告。

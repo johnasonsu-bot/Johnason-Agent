@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import re
@@ -16,7 +17,22 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CAMEL_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
 _CAMEL_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _WORD = re.compile(r"[A-Za-z0-9]+")
-_ASSIGNMENT = re.compile(r"[:=]")
+_LABEL_TOKEN = re.compile(r"[A-Za-z0-9]+|[:=]")
+_CANONICAL_COMPACT_LABELS = {
+    "apikey": ("api", "key"),
+    "apitoken": ("api", "token"),
+    "accesskey": ("access", "key"),
+    "accesstoken": ("access", "token"),
+    "privatekey": ("private", "key"),
+    "clientsecret": ("client", "secret"),
+    "secretkey": ("secret", "key"),
+    "authtoken": ("auth", "token"),
+    "bearertoken": ("bearer", "token"),
+    "githubpat": ("github", "pat"),
+    "chainofthought": ("chain", "of", "thought"),
+    "privateprompt": ("private", "prompt"),
+    "privatehistory": ("private", "history"),
+}
 _CREDENTIAL_VALUE = re.compile(
     r"(?:github_pat_|gh[pousr]_|sk-|AKIA)[A-Za-z0-9_-]+|"
     r"\bbearer(?:\s+|\s*[:=]\s*)[A-Za-z0-9._~+/=-]{8,}",
@@ -44,6 +60,11 @@ _SENSITIVE_ROOTS = (
     ("bearer",),
     ("access", "token"),
     ("api", "token"),
+    ("client", "secret"),
+    ("secret", "key"),
+    ("auth", "token"),
+    ("bearer", "token"),
+    ("github", "pat"),
     ("authorization",),
     ("password",),
     ("passwd",),
@@ -55,6 +76,9 @@ _DIAGNOSTIC_LABELS = (
     ("stack", "trace"),
     ("traceback",),
 )
+_ASSIGNMENT_LABELS = (*_SENSITIVE_ROOTS, *_DIAGNOSTIC_LABELS, ("token",))
+_MAX_ASSIGNMENT_LABEL_WORDS = max(len(label) for label in _ASSIGNMENT_LABELS)
+_MAX_PUBLIC_TEXT_ASSIGNMENTS = 32
 _SENSITIVE_METADATA_SUFFIXES = frozenset(
     {
         "content",
@@ -111,9 +135,22 @@ def validate_public_text(value: Any, *, maximum: int) -> str:
 
 def _normalized_words(value: str) -> tuple[str, ...]:
     """Split identifier styles into one lowercase semantic representation."""
+    return tuple(
+        word
+        for match in _WORD.finditer(value)
+        for word in _normalized_token_words(match.group(0))
+    )
+
+
+def _normalized_token_words(value: str) -> tuple[str, ...]:
     separated = _CAMEL_ACRONYM_BOUNDARY.sub(" ", value)
     separated = _CAMEL_WORD_BOUNDARY.sub(" ", separated)
-    return tuple(match.group(0).lower() for match in _WORD.finditer(separated))
+    normalized = tuple(part.lower() for part in separated.split())
+    return tuple(
+        expanded
+        for word in normalized
+        for expanded in _CANONICAL_COMPACT_LABELS.get(word, (word,))
+    )
 
 
 def _contains_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
@@ -152,13 +189,24 @@ def _ends_with_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
 
 
 def _contains_sensitive_assignment(value: str) -> bool:
-    assignment_labels = (*_SENSITIVE_ROOTS, *_DIAGNOSTIC_LABELS, ("token",))
-    for assignment in _ASSIGNMENT.finditer(value):
-        label_words = _normalized_words(value[: assignment.start()])
-        if _is_safe_token_counter(label_words):
-            continue
-        if any(_ends_with_phrase(label_words, label) for label in assignment_labels):
-            return True
+    trailing_words: deque[str] = deque(maxlen=_MAX_ASSIGNMENT_LABEL_WORDS)
+    assignment_count = 0
+    for match in _LABEL_TOKEN.finditer(value):
+        token = match.group(0)
+        if token == ":" or token == "=":
+            assignment_count += 1
+            if assignment_count > _MAX_PUBLIC_TEXT_ASSIGNMENTS:
+                return True
+            label_words = tuple(trailing_words)
+            if _is_safe_token_counter(label_words):
+                continue
+            if any(
+                _ends_with_phrase(label_words, label)
+                for label in _ASSIGNMENT_LABELS
+            ):
+                return True
+        else:
+            trailing_words.extend(_normalized_token_words(token))
     return False
 
 

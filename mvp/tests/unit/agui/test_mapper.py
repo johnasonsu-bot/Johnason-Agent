@@ -30,6 +30,18 @@ _SENSITIVE_METADATA_SUFFIXES = (
 )
 _LABEL_STYLES = ("snake", "kebab", "dot", "space", "colon", "equals", "camel", "pascal")
 _IDENTIFIER_STYLES = ("snake", "kebab", "dot", "colon", "camel", "pascal")
+_COMPACT_CREDENTIAL_LABELS = (
+    (("api", "key"), "apikey"),
+    (("api", "token"), "apitoken"),
+    (("access", "key"), "accesskey"),
+    (("access", "token"), "accesstoken"),
+    (("private", "key"), "privatekey"),
+    (("client", "secret"), "clientsecret"),
+    (("secret", "key"), "secretkey"),
+    (("auth", "token"), "authtoken"),
+    (("bearer", "token"), "bearertoken"),
+    (("github", "pat"), "githubpat"),
+)
 
 
 def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> str:
@@ -42,6 +54,16 @@ def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> s
         "snake": "_", "kebab": "-", "dot": ".", "space": " ", "colon": ":", "equals": "="
     }[style]
     return separator.join(parts)
+
+
+def _credential_styles(parts: tuple[str, ...], compact: str) -> tuple[str, ...]:
+    return (
+        compact.upper(),
+        compact,
+        parts[0] + "".join(part.title() for part in parts[1:]),
+        "_".join(parts),
+        "-".join(parts),
+    )
 
 
 @pytest.mark.parametrize(
@@ -527,3 +549,84 @@ def test_v2_forged_public_text_allows_safe_counters_and_business_neighbors(
         sequence=1,
     )
     assert map_domain_event(event)[0]["delta"] == safe_text
+
+
+@pytest.mark.parametrize(
+    "credential_label",
+    [
+        style
+        for parts, compact in _COMPACT_CREDENTIAL_LABELS
+        for style in _credential_styles(parts, compact)
+    ],
+)
+def test_v2_persisted_public_text_rejects_compact_credential_labels(
+    credential_label: str,
+) -> None:
+    """Catches compact credentials bypassing the persisted public-text boundary."""
+    event = DomainEvent.new(
+        "agent.message.delta",
+        "engine_host.v2",
+        {
+            "content": f"{credential_label}=hidden",
+            "term_id": "term-1",
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+    assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    "credential_label",
+    [
+        style
+        for parts, compact in _COMPACT_CREDENTIAL_LABELS
+        for style in _credential_styles(parts, compact)
+    ],
+)
+def test_v2_persisted_identity_and_artifact_ref_reject_compact_credentials(
+    credential_label: str,
+) -> None:
+    """Catches compact credentials in persisted identity or artifact references."""
+    unsafe_identifier = f"{credential_label}-1"
+    event = DomainEvent.new(
+        "agent.tool.completed",
+        "engine_host.v2",
+        {
+            "tool_id": "search",
+            "tool_call_id": "call-1",
+            "read_only": True,
+            "artifact_ref": unsafe_identifier,
+            "term_id": unsafe_identifier,
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+    assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    "safe_neighbor",
+    ["apikeyboard", "accesstokens", "privatekeynote", "clientsecrets", "githubpattern"],
+)
+def test_v2_compact_label_expansion_allows_exact_persisted_neighbors(
+    safe_neighbor: str,
+) -> None:
+    """Catches compact matching overreach at the persisted boundary."""
+    event = DomainEvent.new(
+        "agent.message.delta",
+        "engine_host.v2",
+        {
+            "content": f"{safe_neighbor}=3",
+            "term_id": f"{safe_neighbor}-1",
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+    assert map_domain_event(event)[0]["delta"] == f"{safe_neighbor}=3"

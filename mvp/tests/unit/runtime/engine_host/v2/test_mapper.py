@@ -1,9 +1,11 @@
 from types import SimpleNamespace
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 
 from tests.fixtures.host_v2 import runtime_event
+from workbench.runtime.engine_host.v2 import mapper as mapper_module
 from workbench.runtime.engine_host.v2.mapper import map_runtime_event
 from workbench.runtime.engine_host.v2.contracts import RuntimeEventV2
 from workbench.agui.mapper import map_domain_event
@@ -35,6 +37,18 @@ _SENSITIVE_METADATA_SUFFIXES = (
 )
 _LABEL_STYLES = ("snake", "kebab", "dot", "space", "colon", "equals", "camel", "pascal")
 _IDENTIFIER_STYLES = ("snake", "kebab", "dot", "colon", "camel", "pascal")
+_COMPACT_CREDENTIAL_LABELS = (
+    (("api", "key"), "apikey"),
+    (("api", "token"), "apitoken"),
+    (("access", "key"), "accesskey"),
+    (("access", "token"), "accesstoken"),
+    (("private", "key"), "privatekey"),
+    (("client", "secret"), "clientsecret"),
+    (("secret", "key"), "secretkey"),
+    (("auth", "token"), "authtoken"),
+    (("bearer", "token"), "bearertoken"),
+    (("github", "pat"), "githubpat"),
+)
 
 
 def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> str:
@@ -47,6 +61,16 @@ def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> s
         "snake": "_", "kebab": "-", "dot": ".", "space": " ", "colon": ":", "equals": "="
     }[style]
     return separator.join(parts)
+
+
+def _credential_styles(parts: tuple[str, ...], compact: str) -> tuple[str, ...]:
+    return (
+        compact.upper(),
+        compact,
+        parts[0] + "".join(part.title() for part in parts[1:]),
+        "_".join(parts),
+        "-".join(parts),
+    )
 
 
 @pytest.mark.parametrize(
@@ -399,6 +423,129 @@ def test_runtime_opaque_ids_allow_safe_counters_and_lexical_neighbors(
         runtime_event("artifact.proposed", payload={"artifact_id": safe_identifier})
     )
     assert mapped[0].payload["artifact_id"] == safe_identifier
+
+
+@pytest.mark.parametrize(
+    "credential_label",
+    [
+        style
+        for parts, compact in _COMPACT_CREDENTIAL_LABELS
+        for style in _credential_styles(parts, compact)
+    ],
+)
+def test_runtime_public_text_rejects_compact_credential_labels(
+    credential_label: str,
+) -> None:
+    """Catches compact credential acronyms bypassing runtime public text."""
+    with pytest.raises(ValueError):
+        map_runtime_event(
+            runtime_event(
+                "assistant.delta", payload={"text": f"{credential_label}=hidden"}
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "credential_label",
+    [
+        style
+        for parts, compact in _COMPACT_CREDENTIAL_LABELS
+        for style in _credential_styles(parts, compact)
+    ],
+)
+def test_runtime_identity_and_artifact_ref_reject_compact_credential_labels(
+    credential_label: str,
+) -> None:
+    """Catches compact credentials crossing runtime identity or artifact refs."""
+    unsafe_identifier = f"{credential_label}-1"
+    forged_identity = SimpleNamespace(
+        event_id="event-1",
+        run_id=unsafe_identifier,
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.delta",
+        payload={"text": "hello"},
+        required=False,
+    )
+    with pytest.raises(ValueError, match="identity"):
+        map_runtime_event(forged_identity)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        map_runtime_event(
+            runtime_event(
+                "tool.call",
+                payload={
+                    "tool_id": "search",
+                    "tool_call_id": "call-1",
+                    "read_only": True,
+                    "artifact_ref": unsafe_identifier,
+                },
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "safe_neighbor",
+    [
+        "apikeyboard",
+        "apitokens",
+        "accesskeys",
+        "accesstokens",
+        "privatekeynote",
+        "clientsecrets",
+        "secretkeys",
+        "authtokens",
+        "bearertokens",
+        "githubpattern",
+    ],
+)
+def test_runtime_compact_label_expansion_allows_exact_lexical_neighbors(
+    safe_neighbor: str,
+) -> None:
+    """Catches exact compact-label expansion becoming arbitrary word splitting."""
+    text = f"{safe_neighbor}=3"
+    mapped_text = map_runtime_event(
+        runtime_event("assistant.delta", payload={"text": text})
+    )
+    mapped_identifier = map_runtime_event(
+        runtime_event(
+            "artifact.proposed", payload={"artifact_id": f"{safe_neighbor}-1"}
+        )
+    )
+    assert mapped_text[0].payload["content"] == text
+    assert mapped_identifier[0].payload["artifact_id"] == f"{safe_neighbor}-1"
+
+
+def test_public_text_fails_closed_above_the_assignment_limit() -> None:
+    """Catches unbounded assignment work being accepted at the public boundary."""
+    with pytest.raises(ValueError):
+        mapper_module.validate_public_text("note=" * 33, maximum=4096)
+
+
+def test_maximum_public_text_uses_one_full_normalization_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches assignment scanning that repeatedly tokenizes growing prefixes."""
+    original = mapper_module._normalized_words
+    normalization_calls = 0
+
+    def counted_normalization(value: str) -> tuple[str, ...]:
+        nonlocal normalization_calls
+        normalization_calls += 1
+        return original(value)
+
+    monkeypatch.setattr(mapper_module, "_normalized_words", counted_normalization)
+    prefix = "note=" * 32
+    remaining = 4096 - len(prefix)
+    maximum_text = prefix + ("aA" * ((remaining + 1) // 2))[:remaining]
+
+    started = perf_counter()
+    result = mapper_module.validate_public_text(maximum_text, maximum=4096)
+    elapsed = perf_counter() - started
+
+    assert result == maximum_text
+    assert normalization_calls == 1
+    assert elapsed < 0.25
 
 
 @pytest.mark.asyncio
