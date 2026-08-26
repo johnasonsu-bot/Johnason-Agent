@@ -187,9 +187,9 @@ changed-file 枚举命令：
 结果为 8 个文件：Task report、公共验证报告、v2 client、acceptance conformance、
 conformance helper、Fake Host、Host factory fixture、v2 query integration test。
 
-Secret scan 已提取为仓库内受测试的 Git-object CLI。cwd 可以是任意可读取目标
-Git 仓库的位置；revision 仅通过 `BASE_REV` / `HEAD_REV` 环境参数传入，且必须为
-40 位十六进制 commit id，因此不能注入 Git option。执行命令为：
+Secret scan 已提取为仓库内受测试的 Git-object CLI。以下命令必须从仓库根目录
+运行；revision 仅通过 `BASE_REV` / `HEAD_REV` 环境参数传入，且必须为 40 位
+十六进制 commit id，因此不能注入 Git option。执行命令为：
 
 ```bash
 BASE_REV=<40-hex-base> HEAD_REV=<40-hex-head> \
@@ -201,10 +201,12 @@ BASE_REV=<40-hex-base> HEAD_REV=<40-hex-head> \
 它只用 `git cat-file blob REV:path` 读取 Git 对象，绝不访问、resolve 或跟随工作树；
 非 blob、对象读取失败、超时、路径解码/校验失败与 Git 枚举失败均 fail closed。
 
-每一个 credential-shaped match 都独立判断：仅当 path 位于 `mvp/tests/`，且该
-match 前后有限字节窗口同时包含拒绝/不安全/敏感的测试语义和
-credential/secret/token/private 语义时，才计作 fixture allowance。一个文件内的
-远端无关命中不会因同文件的 reject 标记被整体放行。成功 stdout 仅包含
+每一个 credential-shaped match 都独立判断：仅当 path 位于 `mvp/tests/`，且其
+所在行或紧邻行有带明确边界的 `credential-fixture:` reject/unsafe/sensitive 标记、
+并且该行只有该一个 match 时，才计作 fixture allowance。标记检查前会掩码所有
+credential spans，且不会跨相邻 match 共享上下文；因此 credential 值自身的词和
+同文件的其他 match 都不能获得放行。总时限使用跨平台的 monotonic deadline，Git
+子进程接收剩余 timeout，大 blob 扫描也按块检查 deadline。成功 stdout 仅包含
 `scanned_blobs`、`fixture_allowances` 与 `findings` 三个计数；错误 stdout 为空，
 stderr 只包含固定错误类别，从不回显 path、匹配值、Git stderr 或 traceback。
 
