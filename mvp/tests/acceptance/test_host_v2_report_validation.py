@@ -245,6 +245,47 @@ def test_one_fixture_marker_does_not_allow_an_adjacent_second_match() -> None:
         directory.cleanup()
 
 
+def test_cross_chunk_credential_shape_is_one_ordinary_finding() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_token(body="c" * 100)
+        path = "mvp/src/cross_chunk.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_bytes((b"x" * 65500) + token.encode("ascii") + b"\n")
+        head = _commit(repo, "add cross chunk finding")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=0 findings=1\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
+    finally:
+        directory.cleanup()
+
+
+def test_cross_chunk_credential_shape_has_one_explicit_fixture_allowance() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_token(body="d" * 100)
+        path = "mvp/tests/test_cross_chunk_fixture.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        marker = b"# credential-fixture: reject unsafe allowed = '"
+        target.write_bytes(
+            (b"x" * (65500 - len(marker))) + marker + token.encode("ascii") + b"'\n"
+        )
+        head = _commit(repo, "add cross chunk fixture")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 0
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=1 findings=0\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
+    finally:
+        directory.cleanup()
+
+
 def test_deleted_blob_is_scanned_from_base_revision() -> None:
     directory, repo, initial = _repository_with_base()
     try:

@@ -14,6 +14,12 @@ OVERALL_TIMEOUT_SECONDS = 30
 SUBPROCESS_TIMEOUT_SECONDS = 10
 SCAN_CHUNK_BYTES = 64 * 1024
 SCAN_OVERLAP_BYTES = 64
+ALPHANUMERIC_HYPHEN_UNDERSCORE = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+ALPHANUMERIC_DOT_HYPHEN_UNDERSCORE = (
+    ALPHANUMERIC_HYPHEN_UNDERSCORE | frozenset(b".")
+)
 SECRET_SHAPES = re.compile(
     rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
     rb"AKIA[0-9A-Z]{16}|(?i:bearer)[\t\r\n ]+[A-Za-z0-9._-]{20,})"
@@ -107,18 +113,53 @@ def enumerate_paths(
     )
 
 
+def match_continuation_bytes(blob: bytes, start: int) -> frozenset[int] | None:
+    """Return the unbounded token alphabet for a matched secret shape."""
+    if blob.startswith(b"sk-", start) or blob.startswith(b"gh", start):
+        return ALPHANUMERIC_HYPHEN_UNDERSCORE
+    if blob[start : start + 6].lower() == b"bearer":
+        return ALPHANUMERIC_DOT_HYPHEN_UNDERSCORE
+    return None
+
+
+def extend_unterminated_match(
+    blob: bytes, start: int, end: int, deadline: float
+) -> int:
+    """Continue a chunk-edge match until its token terminator or EOF."""
+    continuation_bytes = match_continuation_bytes(blob, start)
+    if continuation_bytes is None:
+        return end
+    cursor = end
+    while cursor < len(blob):
+        check_deadline(deadline)
+        block_end = min(cursor + SCAN_CHUNK_BYTES, len(blob))
+        while cursor < block_end and blob[cursor] in continuation_bytes:
+            cursor += 1
+        if cursor < block_end:
+            return cursor
+    return cursor
+
+
 def find_secret_spans(blob: bytes, deadline: float) -> list[tuple[int, int]]:
     """Scan bounded chunks so a large blob cannot bypass the total deadline check."""
-    spans: set[tuple[int, int]] = set()
+    spans: list[tuple[int, int]] = []
+    covered_until = 0
     step = SCAN_CHUNK_BYTES - SCAN_OVERLAP_BYTES
     for offset in range(0, len(blob), step):
         check_deadline(deadline)
         chunk = blob[offset : offset + SCAN_CHUNK_BYTES]
         for match in SECRET_SHAPES.finditer(chunk):
             check_deadline(deadline)
-            spans.add((offset + match.start(), offset + match.end()))
+            start = offset + match.start()
+            if start < covered_until:
+                continue
+            end = offset + match.end()
+            if end == offset + len(chunk) and end < len(blob):
+                end = extend_unterminated_match(blob, start, end, deadline)
+            spans.append((start, end))
+            covered_until = end
         check_deadline(deadline)
-    return sorted(spans)
+    return spans
 
 
 def line_bounds(blob: bytes, position: int) -> tuple[int, int]:
