@@ -189,6 +189,10 @@ Engine Host v2 默认关闭，且与现有 v1 路由并存。当前可重复执�
 控制面合同通过；门禁使用 `contract_fake` / `fake-v2` 测试进程，不代表任何
 真实 Runtime 已接入，也不会改变 v2 关闭时继续使用现有 Python/v1 路径的行为。
 
+该专项当前只属于通过的定向子集。完整后端尚未全绿，所以正式判定仍为
+`Decision: BLOCKED`；不得以 conformance、Host 专项或旧前端结果替代同一 Source
+revision 上的完整后端、build 与 Playwright 门禁。
+
 后续真实 Runtime 必须分别通过独立门禁，不能复用本合同门禁的 GO 结论：
 
 - Python Codex-Compatible Runtime 接入门禁；

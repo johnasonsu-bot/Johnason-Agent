@@ -70,26 +70,25 @@ Real runtime status: NOT_YET_EVALUATED
   不包含 PID marker、PID 值或临时路径。
 - context 外确认 returncode、process-tree cleanup、reader tasks 完成，SQLite
   与实例目录均已删除；factory root 在正常和异常退出均删除。
-- context/manifest/workspace 由 Host 解析并输出不可逆 digest、计数和允许的
-  policy 结果，不回显 protected id、summary ref、tool id、secret 或路径；错误
-  语义保留精确异常。
-- checkpoint 来源实例 A 先查询并取得真实 ref/digest/cursor，关闭并确认清理；
-  新实例 B 使用原值恢复，校验新进程/identity/cursor/terminal/public payload，
-  并覆盖错误 digest 分支。
+- 最终修复后的 context/manifest/workspace 由 Host 实际评估，只公开安全计数、
+  policy 和 allow/deny/expiry 结果，不回显 protected id、summary ref、tool id、
+  secret、路径或内部 proof。
+- checkpoint 来源实例 A 将 opaque state 持久化后关闭并确认清理；新实例 B 从
+  该状态恢复并校验新进程、identity、cursor、terminal 与安全 public result。
+  checkpoint 完整性材料只留在私有 Host 协议，不进入公共 Event。
 
 ## C 上的可复现命令
 
-所有后端命令 cwd 均为
-`/Users/sushi/Downloads/Johnason-Agent/.worktrees/batch-3-4-a-host-v2/mvp`，
-环境均为 `PYTHONPATH="$PWD/src:$PWD"`。macOS 没有 `timeout`，因此用系统
+所有后端命令均从仓库的 `mvp/` 目录执行，环境为
+`PYTHONPATH="$PWD/src:$PWD"`。macOS 没有 `timeout`，因此用系统
 Python 的 `subprocess.run(timeout=...)` 提供真实命令级上限；以下命令均在
 上限内 exit 0。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
   env PYTHONPATH="$PWD/src:$PWD" \
-  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+  .venv/bin/python -m pytest -q \
   tests/acceptance/test_engine_host_v2_conformance.py
 ```
 
@@ -97,20 +96,20 @@ Python 的 `subprocess.run(timeout=...)` 提供真实命令级上限；以下命
 pytest 3.14 秒，wrapper exit 0。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
   env PYTHONPATH="$PWD/src:$PWD" \
-  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+  .venv/bin/python -m pytest -q \
   tests/integration/test_engine_host_v2_query.py::test_terminal_seal_malformed_ack_fails_closed
 ```
 
 结果：`7 passed, 0 failed, 0 skipped`，pytest 0.32 秒，wrapper exit 0。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
   env PYTHONPATH="$PWD/src:$PWD" \
-  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+  .venv/bin/python -m pytest -q \
   tests/integration/test_engine_host_v2_query.py \
   tests/integration/test_engine_host_lifecycle.py \
   tests/integration/test_engine_host_run.py
@@ -119,10 +118,10 @@ pytest 3.14 秒，wrapper exit 0。
 结果：`148 passed, 0 failed, 0 skipped`，pytest 13.55 秒，wrapper exit 0。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
   env PYTHONPATH="$PWD/src:$PWD" \
-  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+  .venv/bin/python -m pytest -q \
   tests/unit/runtime/engine_host/v2/test_mapper.py \
   tests/unit/agui/test_mapper.py \
   tests/integration/test_engine_host_v2_query.py
@@ -131,10 +130,10 @@ pytest 3.14 秒，wrapper exit 0。
 结果：`1144 passed, 0 failed, 0 skipped`，pytest 6.29 秒，wrapper exit 0。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
   env PYTHONPATH="$PWD/src:$PWD" \
-  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+  .venv/bin/python -m pytest -q \
   tests/unit/runtime/engine_host \
   tests/integration/test_engine_host_lifecycle.py \
   tests/integration/test_engine_host_run.py \
@@ -147,11 +146,11 @@ pytest 3.14 秒，wrapper exit 0。
 pytest 19.89 秒，wrapper exit 0。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
   bash -c 'passes=0; failures=0; for run in $(seq 1 50); do \
     if env PYTHONPATH="$PWD/src:$PWD" \
-      /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+      .venv/bin/python -m pytest -q \
       tests/integration/test_engine_host_v2_query.py::test_terminal_seals_the_stream_and_rejects_every_later_event \
       >/dev/null 2>&1; then passes=$((passes + 1)); \
     else failures=$((failures + 1)); fi; done; \
@@ -163,13 +162,12 @@ pytest 19.89 秒，wrapper exit 0。
 
 ## Fix1 + Fix2 全范围 diff 与 Secret scan
 
-以下命令 cwd 为
-`/Users/sushi/Downloads/Johnason-Agent/.worktrees/batch-3-4-a-host-v2`。
+以下命令从仓库根目录执行。
 diff 范围从原 Task 6 提交 `dd8ac2033a214fdd1af340f75d03b49b394d1b85`
 到 Source C，覆盖全部 Fix1 + Fix2 代码、测试和既有报告。
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=30); raise SystemExit(result.returncode)' \
   git diff --check \
   dd8ac2033a214fdd1af340f75d03b49b394d1b85..c803de37c6328330fda214ab0b4d9ecffdcd9ab9
@@ -180,7 +178,7 @@ diff 范围从原 Task 6 提交 `dd8ac2033a214fdd1af340f75d03b49b394d1b85`
 changed-file 枚举命令：
 
 ```bash
-/usr/bin/python3 -c \
+/usr/bin/python3 -I -c \
   'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=30); raise SystemExit(result.returncode)' \
   git diff --name-only --diff-filter=ACMR \
   dd8ac2033a214fdd1af340f75d03b49b394d1b85..c803de37c6328330fda214ab0b4d9ecffdcd9ab9
@@ -210,7 +208,7 @@ enumeration、blob、timeout、path decode/validation 任一失败时，只输�
 ```bash
 BASE_REV=dd8ac2033a214fdd1af340f75d03b49b394d1b85 \
 HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9 \
-/usr/bin/python3 - <<'PY'
+/usr/bin/python3 -I - <<'PY'
 import os
 import re
 import signal
@@ -362,7 +360,7 @@ PY
 
 ```bash
 cd mvp
-PYTHONPATH="$PWD/src:$PWD" /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python \
+PYTHONPATH="$PWD/src:$PWD" .venv/bin/python \
   -m pytest -q
 ```
 
@@ -382,7 +380,7 @@ Vite `45 modules transformed`；Playwright `38 passed`。另一次 A2 fresh Play
 - Fake 边界：仅声明 `contract_fake` / `fake-v2`，不冒充 Python、Goose、DSH；
   公共导出仍仅为现有 v1 名称加 `v2` namespace。
 - compile：cwd `mvp`，使用同一 120 秒 Python wrapper 执行
-  `env PYTHONPATH="$PWD/src:$PWD" /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m compileall -q src tests`，
+  `env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m compileall -q src tests`，
   wrapper exit 0。
 - 全范围 diff、changed-file 枚举和 Secret scan 使用上一节的完整命令；范围为
   `dd8ac2033a214fdd1af340f75d03b49b394d1b85..c803de37c6328330fda214ab0b4d9ecffdcd9ab9`，

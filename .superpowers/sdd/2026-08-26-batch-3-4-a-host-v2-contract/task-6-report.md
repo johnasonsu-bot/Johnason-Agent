@@ -7,8 +7,9 @@
 - Fake Host 固定标识为 `contract_fake` / `fake-v2`，revision 为
   `fake-host-v2/r2`，不冒充任何真实 Runtime。
 - 新增 v1/v2 并存、v2 默认关闭、稳定导出与 README 边界说明。
-- Fix1 去除自证：Host 实际解析 context budget、manifest/workspace grant，并只
-  回传安全 digest/计数/policy；checkpoint 使用跨实例真实 ref/digest/cursor。
+- 最终修复去除自证：Host 实际评估 context budget、manifest/workspace grant，
+  公共 Event 只回传安全计数、policy 与 result；checkpoint 使用跨进程持久化的
+  opaque state，完整性材料不进入公共 Event。
 - Factory 暴露安全 generation/nonce/process marker，九场景每次使用独立
   Client/进程/repository/registry/SQLite/cursor，并在正常/异常退出清理临时目录。
 - 修复 terminal 后 Event 的竞态：有序 `query.status` seal ack 在 terminal 对

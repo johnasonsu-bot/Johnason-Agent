@@ -122,6 +122,18 @@ Focused orchestration/runtime/restart/acceptance: 108 passed
 Complete backend: 568 passed, 6 skipped
 ```
 
+Batch 3.4-A 的 Engine Host v2 定向合同子集已通过，但这不是正式 GO。当前完整
+后端门仍未取得全绿结果，因此判定保持：
+
+```text
+Decision: BLOCKED
+Real runtime status: NOT_YET_EVALUATED
+```
+
+只有同一可达 Source revision 上的完整后端、前端 build、Playwright、v1/v2
+兼容与安全扫描全部通过，才能发布 `GO_HOST_V2_CONTRACT`；Fake/专项结果不能替代
+完整门禁。
+
 复现核心门：
 
 ```bash
