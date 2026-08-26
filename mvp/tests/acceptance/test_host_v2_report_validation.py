@@ -21,6 +21,11 @@ def _synthetic_token(*, body: str | None = None) -> str:
     return "s" + "k" + "-" + (body if body is not None else "a" * 24)
 
 
+def _synthetic_github_token(*, body: str) -> str:
+    """Build a test-only GitHub-shaped value without storing one in source."""
+    return "g" + "h" + "p" + "_" + body
+
+
 def _git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],
@@ -284,6 +289,64 @@ def test_cross_chunk_credential_shape_has_one_explicit_fixture_allowance() -> No
         _assert_private_output(result, path=path, token=token)
     finally:
         directory.cleanup()
+
+
+def test_cross_chunk_github_fixture_does_not_consume_adjacent_sk_shape() -> None:
+    for separator in ("-", "_"):
+        directory, repo, base = _repository_with_base()
+        try:
+            github_token = _synthetic_github_token(body="e" * 100)
+            sk_token = _synthetic_token(body="f" * 24)
+            path = f"mvp/tests/test_github_{ord(separator)}.py"
+            target = repo / path
+            target.parent.mkdir(parents=True)
+            marker = b"# credential-fixture: reject unsafe allowed = '"
+            target.write_bytes(
+                (b"x" * (65500 - len(marker)))
+                + marker
+                + github_token.encode("ascii")
+                + separator.encode("ascii")
+                + sk_token.encode("ascii")
+                + b"'\n"
+            )
+            head = _commit(repo, f"add github boundary {ord(separator)}")
+            result = _scan(repo, base, head)
+
+            assert result.returncode == 1
+            assert result.stdout == "scanned_blobs=1 fixture_allowances=1 findings=1\n"
+            assert result.stderr == ""
+            _assert_private_output(result, path=path, token=github_token)
+            _assert_private_output(result, path=path, token=sk_token)
+        finally:
+            directory.cleanup()
+
+
+def test_cross_chunk_github_and_adjacent_sk_shapes_are_two_ordinary_findings() -> None:
+    for separator in ("-", "_"):
+        directory, repo, base = _repository_with_base()
+        try:
+            github_token = _synthetic_github_token(body="g" * 100)
+            sk_token = _synthetic_token(body="h" * 24)
+            path = f"mvp/src/github_{ord(separator)}.py"
+            target = repo / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(
+                (b"x" * 65500)
+                + github_token.encode("ascii")
+                + separator.encode("ascii")
+                + sk_token.encode("ascii")
+                + b"\n"
+            )
+            head = _commit(repo, f"add ordinary github boundary {ord(separator)}")
+            result = _scan(repo, base, head)
+
+            assert result.returncode == 1
+            assert result.stdout == "scanned_blobs=1 fixture_allowances=0 findings=2\n"
+            assert result.stderr == ""
+            _assert_private_output(result, path=path, token=github_token)
+            _assert_private_output(result, path=path, token=sk_token)
+        finally:
+            directory.cleanup()
 
 
 def test_deleted_blob_is_scanned_from_base_revision() -> None:

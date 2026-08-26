@@ -17,6 +17,9 @@ SCAN_OVERLAP_BYTES = 64
 ALPHANUMERIC_HYPHEN_UNDERSCORE = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 )
+ALPHANUMERIC = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+)
 ALPHANUMERIC_DOT_HYPHEN_UNDERSCORE = (
     ALPHANUMERIC_HYPHEN_UNDERSCORE | frozenset(b".")
 )
@@ -115,8 +118,10 @@ def enumerate_paths(
 
 def match_continuation_bytes(blob: bytes, start: int) -> frozenset[int] | None:
     """Return the unbounded token alphabet for a matched secret shape."""
-    if blob.startswith(b"sk-", start) or blob.startswith(b"gh", start):
+    if blob.startswith(b"sk-", start):
         return ALPHANUMERIC_HYPHEN_UNDERSCORE
+    if blob.startswith(b"gh", start):
+        return ALPHANUMERIC
     if blob[start : start + 6].lower() == b"bearer":
         return ALPHANUMERIC_DOT_HYPHEN_UNDERSCORE
     return None
@@ -198,6 +203,26 @@ def is_unique_match_on_line(
     ] == [candidate]
 
 
+def marker_binds_first_same_line_match(
+    masked: bytes,
+    line_start: int,
+    line_end: int,
+    candidate: tuple[int, int],
+    spans: list[tuple[int, int]],
+) -> bool:
+    """A same-line marker binds only the first span after that marker."""
+    for marker in FIXTURE_MARKER.finditer(masked):
+        marker_end = line_start + marker.end()
+        following_spans = [
+            span
+            for span in spans
+            if marker_end <= span[0] < line_end and span[1] > line_start
+        ]
+        if following_spans and following_spans[0] == candidate:
+            return True
+    return False
+
+
 def marker_binds_adjacent_unique_match(
     blob: bytes,
     marker_start: int,
@@ -236,10 +261,13 @@ def is_allowed_fixture_match(
     if not path.startswith(b"mvp/tests/"):
         return False
     line_start, line_end = line_bounds(blob, candidate[0])
+    masked = masked_line(blob, line_start, line_end, spans)
+    if line_has_fixture_marker(masked) and marker_binds_first_same_line_match(
+        masked, line_start, line_end, candidate, spans
+    ):
+        return True
     if not is_unique_match_on_line(spans, line_start, line_end, candidate):
         return False
-    if line_has_fixture_marker(masked_line(blob, line_start, line_end, spans)):
-        return True
     if line_start:
         marker_start, marker_end = line_bounds(blob, line_start - 1)
         if line_has_fixture_marker(masked_line(blob, marker_start, marker_end, spans)) and marker_binds_adjacent_unique_match(

@@ -202,10 +202,10 @@ BASE_REV=<40-hex-base> HEAD_REV=<40-hex-head> \
 非 blob、对象读取失败、超时、路径解码/校验失败与 Git 枚举失败均 fail closed。
 
 每一个 credential-shaped match 都独立判断：仅当 path 位于 `mvp/tests/`，且其
-所在行或紧邻行有带明确边界的 `credential-fixture:` reject/unsafe/sensitive 标记、
-并且该行只有该一个 match 时，才计作 fixture allowance。标记检查前会掩码所有
-credential spans，且不会跨相邻 match 共享上下文；因此 credential 值自身的词和
-同文件的其他 match 都不能获得放行。总时限使用跨平台的 monotonic deadline，Git
+所在行有带明确边界的 `credential-fixture:` reject/unsafe/sensitive 标记时，只绑定
+该 marker 后的首个 match；独立的紧邻 marker 行只能绑定其唯一相邻 match，才计作
+fixture allowance。标记检查前会掩码所有 credential spans，且不会跨相邻 match
+共享上下文；因此 credential 值自身的词和同文件的其他 match 都不能获得放行。总时限使用跨平台的 monotonic deadline，Git
 子进程接收剩余 timeout，大 blob 扫描也按块检查 deadline。成功 stdout 仅包含
 `scanned_blobs`、`fixture_allowances` 与 `findings` 三个计数；错误 stdout 为空，
 stderr 只包含固定错误类别，从不回显 path、匹配值、Git stderr 或 traceback。
