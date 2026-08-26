@@ -109,7 +109,8 @@ BASE_REV=d894c81e0af03b8f74cf415bc0310c71459a3d67 HEAD_REV=$(git rev-parse HEAD)
 ```text
 Decision: BLOCKED
 Source revision: 5ca52d2db3256f94cabfaddc69377304970effcf
-Report commit: documentation-only commit；SHA 在 Task 4 交付记录和最终回复中给出
+Initial gate evidence commit: 510f56740a614d492103e95f1c3fe782fdb4cf80
+Final annotation commit: 在最终回复中给出
 Real runtime status: NOT_YET_EVALUATED
 ```
 

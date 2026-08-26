@@ -4,7 +4,8 @@
 - 起始 BASE：`5ca52d2db3256f94cabfaddc69377304970effcf`
 - Source revision under test：`5ca52d2db3256f94cabfaddc69377304970effcf`
 - 结束 source revision：`5ca52d2db3256f94cabfaddc69377304970effcf`
-- Report commit SHA：documentation-only commit；提交后在本报告交付记录与最终回复给出
+- Initial gate evidence commit SHA：`510f56740a614d492103e95f1c3fe782fdb4cf80`
+- Final annotation commit SHA：在最终回复中给出
 - 最终判定：`BLOCKED`
 
 ## 门禁结果
