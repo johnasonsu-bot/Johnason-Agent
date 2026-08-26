@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    StrictBool,
     StrictInt,
     field_serializer,
     field_validator,
@@ -50,12 +51,19 @@ def _is_sensitive_key(key: str) -> bool:
         "apikey",
         "accesskey",
         "accesstoken",
+        "apitoken",
         "privatekey",
         "privateprompt",
     }
-    return any(part in sensitive_names for part in parts) or any(
+    if any(
         f"{first}{second}" in sensitive_pairs
         for first, second in zip(parts, parts[1:], strict=False)
+    ):
+        return True
+    return any(
+        part in sensitive_names
+        and not (part == "token" and parts[index : index + 2] == ("token", "count"))
+        for index, part in enumerate(parts)
     )
 
 
@@ -155,7 +163,7 @@ class ToolManifestEntryV2(FrozenModel):
     tool_id: OpaqueIdentifier
     schema: Mapping[str, JsonValue]
     version: OpaqueIdentifier
-    read_only: bool
+    read_only: StrictBool
     timeout_ms: StrictInt = Field(gt=0)
     idempotency: Literal["idempotent", "non_idempotent"]
 
@@ -211,15 +219,15 @@ class RuntimeCapabilitiesV2(FrozenModel):
     """Capabilities advertised by a runtime before it can receive a v2 query."""
 
     runtime_id: OpaqueIdentifier
-    model: bool = False
-    tools: bool = False
-    skills: bool = False
-    plugins: bool = False
-    workspace: bool = False
-    interventions: bool = False
-    pause_resume: bool = False
-    compaction: bool = False
-    checkpoints: bool = False
+    model: StrictBool = False
+    tools: StrictBool = False
+    skills: StrictBool = False
+    plugins: StrictBool = False
+    workspace: StrictBool = False
+    interventions: StrictBool = False
+    pause_resume: StrictBool = False
+    compaction: StrictBool = False
+    checkpoints: StrictBool = False
 
 
 QueryCommandTypeV2 = Literal[
@@ -286,7 +294,7 @@ class RuntimeEventV2(FrozenModel):
     cursor: StrictInt = Field(gt=0)
     type: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
-    required: bool = False
+    required: StrictBool = False
 
     @field_validator("payload", mode="before")
     @classmethod

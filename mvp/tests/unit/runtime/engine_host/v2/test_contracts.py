@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from tests.fixtures.host_v2 import run_envelope, runtime_event
+from tests.fixtures.host_v2 import run_envelope, runtime_capabilities, runtime_event
 from workbench.runtime.engine_host import v2
 from workbench.runtime.engine_host.v2.contracts import (
     CheckpointHintV2,
@@ -226,6 +226,7 @@ def test_event_and_checkpoint_cursors_reject_non_integer_wire_values(
     [
         "api_key",
         "accessKey",
+        "access_token",
         "x_access_key",
         "token",
         "password",
@@ -253,6 +254,75 @@ def test_extensions_allow_non_sensitive_business_content() -> None:
     envelope = RunEnvelopeV2.model_validate(value)
 
     assert envelope.extensions["secretary"] == "Alice"
+
+
+def test_runtime_event_payload_allows_safe_token_count() -> None:
+    """Catches the secret matcher rejecting an event's safe token metric."""
+    event = runtime_event("assistant.delta", payload={"token_count": 3})
+
+    assert event.payload["token_count"] == 3
+
+
+def test_query_payload_allows_safe_camel_case_token_count() -> None:
+    """Catches the secret matcher rejecting a query's safe camel-case metric."""
+    command = QueryCommandV2(
+        type="query.status", command_id="command-1", payload={"tokenCount": 3}
+    )
+
+    assert command.payload["tokenCount"] == 3
+
+
+def test_tool_schema_allows_safe_separator_token_count() -> None:
+    """Catches the secret matcher rejecting a JSON Schema token-count property."""
+    envelope = run_envelope(
+        overrides={
+            "tool_manifest": (
+                {
+                    "tool_id": "tool-1",
+                    "schema": {"properties": {"token-count": {"type": "integer"}}},
+                    "version": "1",
+                    "read_only": True,
+                    "timeout_ms": 1,
+                    "idempotency": "idempotent",
+                },
+            )
+        }
+    )
+
+    assert envelope.tool_manifest[0].schema["properties"]["token-count"] == {
+        "type": "integer"
+    }
+
+
+@pytest.mark.parametrize("wire_value", [1, 0, "true", "false"])
+def test_tool_and_capability_flags_reject_non_boolean_wire_values(
+    wire_value: object,
+) -> None:
+    """Catches permissive coercion of runtime capability and tool access flags."""
+    value = run_envelope().model_dump(mode="json")
+    _set_path(value, "tool_manifest.0.read_only", wire_value)
+
+    with pytest.raises(ValidationError):
+        RunEnvelopeV2.model_validate(value)
+    with pytest.raises(ValidationError):
+        runtime_capabilities("fake-v2", tools=wire_value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("wire_value", [1, 0, "true", "false"])
+def test_runtime_event_required_rejects_non_boolean_wire_values(
+    wire_value: object,
+) -> None:
+    """Catches an unknown event being silently downgraded by boolean coercion."""
+    with pytest.raises(ValidationError):
+        RuntimeEventV2(
+            event_id="event-1",
+            run_id="run-1",
+            term_id="term-1",
+            step_id="step-1",
+            cursor=1,
+            type="vendor.mutating-event",
+            required=wire_value,  # type: ignore[arg-type]
+        )
 
 
 def test_v2_package_exports_only_task_one_contracts() -> None:
