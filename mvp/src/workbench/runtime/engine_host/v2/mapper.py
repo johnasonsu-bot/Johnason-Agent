@@ -44,7 +44,7 @@ _DIGEST_VALUE = re.compile(
 )
 _HTTP_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _LOCAL_PATH = re.compile(
-    r"(?<![A-Za-z0-9_./\\-])/(?!/)[^\s]*|"
+    r"(?<![A-Za-z0-9_./\\-])/[^\s]*|"
     r"(?<![A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s]*|"
     r"(?<![A-Za-z0-9_./\\-])\\\\[^\s\\/]+[\\/][^\s\\/]+|"
     r"(?<![A-Za-z0-9_.-])\.\.(?:[\\/]|$)"

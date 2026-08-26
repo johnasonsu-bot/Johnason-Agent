@@ -582,6 +582,8 @@ def test_runtime_public_values_reject_digests_paths_and_internal_proofs(
         "artifact:C:/private/state",
         'artifact: "/private/state"',
         "artifact=(C:/private/state)",
+        "//private/state",
+        "///private/state",
         "../state.json",
     ],
 )
