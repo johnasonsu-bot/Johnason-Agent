@@ -1,3 +1,250 @@
+# Batch 3.4 多运行时联合架构设计
+
+**日期：** 2026-08-26
+**状态：** 设计已批准，等待编写实施计划
+**最终门禁：** `GO_RUNTIME_FEDERATION`
+
+> 本文以中文规格为准。协议字段、事件名、门禁码和源码 revision 保留英文，以避免实现歧义。原始英文批准稿保留在附录 A，仅用于对照。
+
+## 1. 目标
+
+在同一套 Host v2 协议后接入三种可替换的 Agent 运行时，同时继续由现有 Python/LangGraph 控制面担任产品唯一事实源：
+
+1. Python 运行时对齐 Codex 式 Term/Step 步进隔离；
+2. Goose 运行时对齐 Claude 式统一 Query 与动态交互；
+3. DeepSeek Harness 运行时对齐事件驱动与插件化执行。
+
+本批次不替换控制面，不允许 Runtime 建立第二套会话事实源，也不允许 Runtime 持有 Plan、Todo、Artifact、审批或执行图的最终状态。
+
+## 2. 固定源码输入
+
+| 源码 | 用途 | 固定版本 | 接入方式 |
+|---|---|---|---|
+| `git@github.com:johnasonsu-bot/openai-agents-python.git` | Python SDK 基础构件 | `e773b15488c491d907d42756d91e470f280a3d7e` | Git revision 依赖并写入 Python 锁文件 |
+| `git@github.com:johnasonsu-bot/goose.git` | Rust Query 运行时 | `d9d08f0e051531e921f561fcb77aa0ed589e9de9` | Git Submodule 和可复现 sidecar 构建 |
+| `git@github.com:johnasonsu-bot/claude-quickstarts.git` | 交互行为和验收参考 | `3313e9716fb5b977248bcd06cb0cc86a8c547b9b` | 仅文档引用，不进入生产依赖 |
+| `https://github.com/deepseek-ai/deepseek-harness.git` | 插件运行时 | tag `dsh-v0.1.1-rc.2`，commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e` | Git Submodule 和可复现 sidecar 构建 |
+
+CI 必须校验 revision、许可证、锁文件和构建产物 digest。构建不得隐式跟随上游默认分支。
+
+`openai-agents-python` 是 Agents SDK，不是 Codex CLI 运行时。它提供 Runner、RunContext、Tool、Handoff、Guardrail、Tracing 和 Session 等可复用接口；Term 身份、Step 隔离、权限冻结、Workspace Grant、PTY 隔离、SQLite 投影及恢复语义仍由本项目实现。
+
+## 3. 所有权边界
+
+### 3.1 控制面继续拥有
+
+- Conversation、Session 及全部 durable identity；
+- Execution Graph、Plan、Todo 和声明式进度状态；
+- Agent 私有上下文、Project 共享上下文和结构化 Handoff；
+- SQLite Checkpoint、Domain Event、公开投影和恢复决策；
+- Provider Profile、Vault 和凭据生命周期；
+- Tool/Skill Manifest、Permission Policy 和 Workspace Grant；
+- Supervisor、Verifier、人工介入和自动返工；
+- Artifact 元数据、版本、发布和预览状态；
+- Runtime 选择、版本固定、健康检查、故障隔离和回滚。
+
+### 3.2 Runtime 只负责
+
+- 执行一个冻结的 Term 或 Step；
+- 调用选定模型以及获准的 Tool/Skill；
+- 发送规范化 Host Event；
+- 返回 Step 结果、Checkpoint hint 和 Artifact proposal。
+
+Runtime 不得直接修改控制面数据库、保留 Vault 明文凭据、替代控制面 Session/Event/Plan/Todo/Artifact 状态、决定跨节点调度或把已接受的 command 静默切换到另一个 Runtime。
+
+## 4. 总体架构
+
+```text
+Electron / Web UX
+        │
+FastAPI / AG-UI / SSE
+        │
+Python/LangGraph Control Plane（唯一事实源）
+├── Conversation / Session
+├── Execution Graph / Plan / Todo 投影
+├── SQLite Checkpoint / Event Store
+├── Vault / Provider Profile
+├── Approval / Intervention
+├── Artifact / Workspace 元数据
+└── Runtime Registry + Router
+        │
+        ├── Python Runtime Adapter（进程内）
+        ├── Goose Host Adapter（Rust sidecar）
+        └── DeepSeek Harness Host Adapter（Node/TypeScript sidecar）
+```
+
+Python 在进程内实现 Host v2 的逻辑合同；Goose 和 DeepSeek Harness 通过受监管的 NDJSON sidecar 实现相同合同。三个 Runtime 执行同一套与语言无关的 Conformance Suite。
+
+## 5. Host v2 统一协议
+
+### 5.1 冻结的 `RunEnvelope`
+
+每个 durable command 必须冻结：协议版本；Runtime ID/build/config digest/Host generation；Session、Run、Term、Step、command 和 attempt 身份；Agent ID/角色；Provider reference、模型和参数 digest；消息快照和 Context digest/version；Tool、Skill、Plugin、PromptSection Manifest digest；Permission Policy；Workspace Grant；Checkpoint cursor；deadline 和 trace context。
+
+同一 `command_id` 只能改变 attempt、临时 backoff 和 Host generation。模型、上下文、权限、Workspace、Manifest、Runtime build 或请求 digest 改变时必须创建新 command。Repository 必须拒绝同一 command ID 对应不同请求身份。
+
+### 5.2 统一内部消息
+
+Host v2 采用可扩展 discriminated union：
+
+- `user.message`；
+- `assistant.delta`、`assistant.message` 和 `reasoning.delta`；
+- `tool.call` 和 `tool.result`；
+- `plan.snapshot`、`plan.delta`、`todo.snapshot` 和 `todo.delta`；
+- `intervention.requested` 和 `intervention.applied`；
+- `artifact.proposed`、`runtime.status` 和 `error`。
+
+控制面将这些消息转换为 Domain Event 和 AG-UI/SSE。Runtime 不生成前端专用记录。未知 required 消息属于协议错误；optional 扩展消息只能用于诊断，除非存在注册过的 Projector。
+
+### 5.3 Query 命令与 Context Budget
+
+命令族为 `query.start`、`query.intervene`、`query.pause`、`query.resume`、`query.cancel`、`query.compact`、`query.status`、`checkpoint.get` 和 `runtime.capabilities`。
+
+一个 Query 包含一个或多个 Term，一个 Term 包含有序 Step。Intervention 在安全边界生效，并携带 Context version 的 compare-and-swap 值。
+
+控制面下发最大输入 token、预留输出 token、不可裁剪消息和 PromptSection、compaction policy 以及 summary reference。Runtime 报告裁剪前后 token、保留/摘要/删除范围、算法版本、摘要引用和最终 Context digest。Tool call/result 必须成组处理；活动目标、Plan/Todo、未解决审核意见和未应用介入不得裁剪。
+
+### 5.4 Manifest、Tool 生命周期与 Workspace
+
+Host v2 取消 v1 的空 Manifest 限制：
+
+- Tool Manifest：schema、版本、读写属性、超时、幂等策略；
+- Skill Pin：ID、版本、digest、PromptSection 贡献；
+- Plugin Pin：package ID、版本、revision、digest、能力贡献和稳定顺序；
+- Workspace Grant：可读/可写路径、命令策略、网络策略和有效期；
+- Permission Policy：`allow`、`deny`、`ask` 和 Supervisor approval。
+
+统一 Tool 生命周期为 `Pre → Execute → Post → Commit/Reject`。写入型 Tool 必须预留 Effect identity；未知写入结果进入 `reconciliation_required`，不得盲目重放。
+
+### 5.5 Checkpoint、兼容和路由
+
+Runtime Checkpoint 是恢复证据，不是产品事实源。Runtime 返回 hint 和 cursor；控制面追加事件、保存 cursor/Step 投影，并决定 resume、retry、reconcile 或 fail。
+
+兼容期内，已固定到 Host v1 的会话继续执行 v1。新 Query 只有在 Runtime 声明兼容能力且通过 Conformance Suite 后才能使用 v2。Runtime selection 一经持久化不得静默改变；只有 Runtime 未接受请求且未产生外部 Effect 时才允许 fallback。
+
+## 6. Python/Codex 式步进隔离
+
+### 6.1 SDK 与状态边界
+
+Python Adapter 复用 `openai-agents-python` 的 Runner/RunContext、Agent/Tool/Handoff、Guardrail、Tracing 和 Session 接口。SDK Session 只读取控制面冻结快照，不能成为第二套 Session Store。现有 Provider Gateway、Vault、Conversation Repository、LangGraph、Event Store、Checkpoint、Effect Ledger、Supervisor/Verifier、AG-UI 和 Git Workspace 继续作为权威实现。
+
+### 6.2 Term 与 `StepContext`
+
+Term 保存不可变 `RunEnvelope`、有序 Step、Work State reference、Context snapshot reference 和终态/Checkpoint。`StepContext` 只包含 Term/Step/attempt 身份、冻结消息、冻结 Manifest、Permission Policy、Workspace Grant、环境 allowlist、Context Budget 和 Effect scope，不得包含数据库连接、Vault Service、明文凭据或未授权路径。
+
+状态分为公开 Conversation Context、版本化 Project Context 和 Term 本地 Work State。Term 文件位于 `.runtime/terms/<term_id>/{work,outputs,logs}`；SQLite 只保存规范化状态、digest 和引用。
+
+### 6.3 权限与 PTY
+
+Python Runtime 必须消费冻结消息快照，不得重读变化后的 Session。Tool/Skill allowlist、Permission Policy、Workspace Grant、Context digest 和 Runtime build 进入 durable identity。
+
+Tool Router 默认 fail-closed，并执行 Schema 校验、Manifest 查找、权限决策、Workspace/网络/命令校验、可选审批、Effect 预留、执行、脱敏和 Effect 提交。
+
+终端 Step 在受监管子进程中执行，具有固定工作目录、环境 allowlist、命令策略、输出/时间/速率限制、取消、deadline 和进程树终止。子进程不得继承 Vault 或无关 Git 凭据。Git Worktree 只代表版本控制隔离，不宣称为 OS 沙箱。
+
+### 6.4 Python 门禁
+
+必须验证冻结身份、Agent 私有历史隔离、Workspace Grant、未授权 Tool 拒绝、PTY Secret 隔离、写入 Effect 不重复、重启从安全 Step 恢复、Event replay 与投影一致、SDK 不改变控制面事实源，以及现有 Python 回归全部通过。
+
+门禁：`GO_PYTHON_TERM_RUNTIME`。
+
+## 7. Goose/Claude 式统一 Query
+
+Rust sidecar 包含 Host v2 Transport、Goose Query Adapter、消息转换、Context Budget、Plan/Todo、Intervention Channel、Tool/Skill Bridge、Provider/Vault Bridge 和 Checkpoint Cursor Adapter。Goose 本地 Session 只能作为临时缓存。
+
+聊天、Tool、Plan、Todo 和 Intervention 必须在同一 Query 消息流中运行，并支持单/多 Agent 节点、长时间执行、pause/resume/cancel、原链 retry、多次介入、Supervisor/Verifier、崩溃恢复和 token 级流式输出。未知 Goose Event 不得静默丢弃。
+
+Context 压缩必须保留平台策略、当前目标、活动 Plan/Todo、未解决审核意见、最近完整对话和 Tool call/result 组。旧历史先摘要后删除；Artifact 正文变成引用和摘要。超过 300 条消息时必须 compact 后继续执行，不能持续 retry 同一个超大快照。
+
+原链 retry 保持所有冻结身份，只允许改变 attempt、backoff 和 Host generation。Goose 只能提出 Plan/Todo delta；控制面校验并保存 canonical state。Intervention 类型包括 `supplement`、`correct`、`constraint`、`pause`、`resume`、`skip`、`retry` 和 `cancel`，且必须绑定 Context version。
+
+Goose 不保存 API key。控制面通过受控 stdin/IPC 提供短生命周期 Provider Grant；Secret 不得进入 argv、环境快照、日志、Event 或 Checkpoint。
+
+门禁：`GO_GOOSE_QUERY_RUNTIME`。
+
+## 8. DeepSeek Harness 事件与插件运行时
+
+Node/TypeScript sidecar 包含 Host v2 Transport、固定版本 DSH Bootstrap、PromptSection Bridge、Provider Seam、Tool Waterfall、Session Event、Checkpoint、Plugin Manifest Validator 和 Vault/Workspace Adapter。只加载固定 Preset 中明确列出的 Plugin，不扫描用户目录或运行时下载依赖。
+
+PromptSection 包含 ID、namespace、priority、stable order、content/reference、visibility、mutable 和 source digest。同一 priority 按 stable order 和 section ID 排序；每个 Step 返回最终顺序和 digest。
+
+Provider Profile 和 Vault 解析结果形成短生命周期 Provider Grant，再交给 DSH `LlmAdapter`。Adapter 声明 thinking、Tool calling、图像/音频、Context window、streaming、sampling 限制和 continuation。DeepSeek reasoning continuation 保持私有。
+
+Tool 链直接映射 `tools/pre-execute → tools/execute → tools/post-execute`。Pre 校验 Schema/Pin/Permission/Workspace、审批和 Effect；Execute 负责取消、deadline、进度和输出限制；Post 负责脱敏、截断/外置、结果替换和 Effect commit/uncertain。Interceptor 按 priority 和 plugin ID 稳定排序，Plugin Chain digest 进入 command identity。
+
+DSH Session Event 是内部执行日志，映射为 Host Event 后才追加为控制面 Domain Event。控制面保存 DSH cursor 和事件 digest；cursor 回退、跳跃或内容变化属于协议错误，未知 required event 阻止恢复。Checkpoint 必须包含 Runtime、Preset、Prompt、Provider、Manifest、Context、Term/Step、Effect 和 Plan/Todo digest/version。
+
+门禁：`GO_DSH_PLUGIN_RUNTIME`。
+
+## 9. 实施顺序
+
+### Batch 3.4-A：Host v2 Contract
+
+交付 Schema、capability negotiation、Runtime Registry、durable pinning、Fake Host v2、Runtime-neutral Conformance Suite 和 Host v1 兼容。
+
+门禁：`GO_HOST_V2_CONTRACT`。
+
+### Batch 3.4-B：Python Codex-Compatible Runtime
+
+交付固定 Agents SDK、Term/StepContext、状态分层、冻结身份、fail-closed Tool Router、PTY Worker、Step Event、投影和兼容迁移。
+
+### Batch 3.4-C：Goose Query Runtime
+
+交付固定 Goose Submodule、Host v2 sidecar、Query、消息、compact、Plan/Todo、Intervention、streaming、Vault、retry 和恢复。
+
+### Batch 3.4-D：DeepSeek Harness Plugin Runtime
+
+交付固定 DSH Submodule、Host v2 sidecar、PromptSection、Provider Seam、Tool Waterfall、Session cursor、Checkpoint、固定 Preset 和诊断。
+
+真实 Runtime 接入不得早于 Host v2 门禁；后续批次只有在前一门禁已记录后才能启动。Fixture 或 Fake Binary 不能满足真实 Runtime 门禁。
+
+## 10. 故障与回滚
+
+| 边界 | 必须采取的动作 |
+|---|---|
+| Runtime 接受前 | 可以 retry 或选择符合条件的 Runtime |
+| 已接受、尚未执行 Tool | 在同一固定 Runtime 上原链 retry |
+| 已确认只读 Tool | 策略允许时重放证据 |
+| 已确认写入 Tool | 恢复 Effect，不重复执行 |
+| 写入结果未知 | `reconciliation_required` |
+| Runtime build 或 Manifest 改变 | 拒绝原 command resume |
+| Host 崩溃 | 根据 cursor、Checkpoint 和 Effect 决策 |
+| 协议违规 | 隔离该 Runtime，其他 Runtime 继续可用 |
+
+发布期间通过 feature flag 保留当前 Python 路径。回滚只能创建新 command，或发生在 Runtime 接受前；不得改写已接受 command 的 Runtime identity。
+
+## 11. 联合验收
+
+最终必须同时满足：四个子门禁；三 Runtime 独立门禁；同一 Tool/Skill/Workspace Manifest；同一 Vault Provider Profile 且 Secret 不泄漏；一致的 AG-UI 公开语义；跨 Runtime Supervisor/Verifier 和自动返工；crash/restart/duplicate command/Effect reconciliation；已有 269 项专项回归、完整后端和 Electron/Playwright 回归。
+
+真实跨模型验收场景：
+
+```text
+@产品经理（Python）写一篇 200 字中文小说
+→ @架构师（Goose）整理为动画分镜
+→ @工程师（DeepSeek Harness）生成动画 HTML Artifact
+→ @Verifier 审核
+→ 未通过时返回责任节点返工
+→ 通过后发布 HTML Artifact
+```
+
+只有三个真实 Runtime 均构建并通过验收时，最终结果才是 `GO_RUNTIME_FEDERATION`。源码缺失、仅有 Fixture 证据、凭据链失败、事件恢复不兼容或任一门禁失败时，结果必须为 `BLOCKED`。
+
+## 12. 明确不做
+
+- 不替换 Python/LangGraph 控制面；
+- 不采用 Runtime 本地 Session Store 作为产品事实源；
+- 不允许 command 被接受后静默 fallback；
+- 不增加无关 Connector、Canvas 或打包功能；
+- 不把 Git Worktree 描述为 OS 级沙箱；
+- 在 `GO_RUNTIME_FEDERATION` 和独立删除决策前，不删除当前 Python Runtime。
+
+---
+
+## 附录 A：原始英文批准稿
+
+以下英文内容仅用于逐项对照；如有表述差异，以前述中文正文为准。
+
 # Batch 3.4 Runtime Federation Design
 
 **Date:** 2026-08-26  
