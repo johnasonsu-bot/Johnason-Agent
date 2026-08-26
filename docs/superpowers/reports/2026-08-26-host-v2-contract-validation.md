@@ -1,7 +1,8 @@
 # Engine Host v2 合同验证报告
 
-- 日期：2026-08-26；remediation gate 于 2026-08-27 完成
-- Remediation source revision under test：`5ca52d2db3256f94cabfaddc69377304970effcf`
+- 日期：2026-08-26；final unified fix gate 于 2026-08-27 完成
+- Final unified source revision under test：`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`
+- 历史 remediation source：`5ca52d2db3256f94cabfaddc69377304970effcf`
 - 历史 Source C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
 - 代码提交 A：`cd95147db24fb1547afd63a3374a1e3ebef868a0`
 - 终态封口修复 A2：`652954f5740b68183c97603174c4b660956fff65`
@@ -14,18 +15,73 @@
 
 ## 结论
 
-remediation source 上 Host v2 专项与前端门禁通过；完整 backend、全范围 diff
-check 与逐命中凭证扫描失败。完整 backend 的首个失败已按 systematic-debugging
-Phase 1/2 复现并定位。因此不能发布 GO。
+final unified source 上 Host v2 专项、前端、全范围 diff check 与逐命中凭证扫描
+通过；完整 backend 被必需的 1200 秒 wrapper 超时终止，未产生 pytest 最终计数。
+因此五类门禁并非全部 exit 0，不能发布 GO。
 
 ```text
 Decision: BLOCKED
 Real runtime status: NOT_YET_EVALUATED
 ```
 
-发布阻塞判据共有三项：完整必需后端回归 exit 1、全范围 diff check exit 2、
-凭证扫描 exit 1。合同 Fake 的通过也不等于真实 Python Codex-Compatible、
-Goose Query 或 DSH Plugin Runtime 已接入。
+唯一发布阻塞判据为完整 backend gate exit 1（wrapper `TimeoutExpired`）。合同
+Fake 的通过也不等于真实 Python Codex-Compatible、Goose Query 或 DSH Plugin
+Runtime 已接入。
+
+## Final unified fix gate：`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`
+
+所有命令均由同一个最终门禁编排进程依次启动。每类门禁开始和结束时 HEAD 均为
+`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`；后续报告提交未混入 SOURCE_REV。
+
+### 1. Host v2 专项后端
+
+```bash
+cd mvp && /usr/bin/python3 -I -c 'import subprocess,sys; result=subprocess.run(sys.argv[1:],timeout=300); raise SystemExit(result.returncode)' env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q tests/unit/runtime/engine_host tests/unit/agui/test_mapper.py tests/integration/test_agui_resume.py tests/integration/test_engine_host_lifecycle.py tests/integration/test_engine_host_run.py tests/integration/test_engine_host_v2_query.py tests/acceptance/test_engine_host_contract.py tests/acceptance/test_engine_host_v2_conformance.py tests/acceptance/test_host_v2_report_validation.py
+```
+
+结果：exit `0`；`1585 passed`，1 条既有 Starlette 弃用警告，36.39 秒。
+
+### 2. 完整 backend
+
+```bash
+cd mvp && /usr/bin/python3 -I -c 'import subprocess,sys; result=subprocess.run(sys.argv[1:],timeout=1200); raise SystemExit(result.returncode)' env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q -x
+```
+
+结果：exit `1`；wrapper 在 1199.999968916 秒抛出 `subprocess.TimeoutExpired`。
+pytest 在超时前只输出通过/跳过进度点，没有测试失败 traceback，也没有最终
+passed/skipped 计数。完整脱敏 wrapper traceback 记录在 final-fix-report。
+
+### 3. 前端 build 与 Playwright
+
+```bash
+cd mvp/canvas-spike && npm run build && npx playwright test
+```
+
+结果：exit `0`；Vite `45 modules transformed`；Playwright `38 passed (1.1m)`。
+
+### 4. 全范围 diff check
+
+```bash
+git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..7712ac2254e7d106a401bac7a9dbe99b3eac7e0c
+```
+
+结果：exit `0`；无输出。
+
+### 5. Git-object credential scanner
+
+```bash
+BASE_REV=d894c81e0af03b8f74cf415bc0310c71459a3d67 HEAD_REV=7712ac2254e7d106a401bac7a9dbe99b3eac7e0c /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+结果：exit `0`；`scanned_blobs=39 fixture_allowances=0 findings=0`。
+
+```text
+Decision: BLOCKED
+GO_HOST_V2_CONTRACT: NOT_ISSUED
+Source revision: 7712ac2254e7d106a401bac7a9dbe99b3eac7e0c
+Implementation commit: 7712ac2254e7d106a401bac7a9dbe99b3eac7e0c
+Real runtime status: NOT_YET_EVALUATED
+```
 
 ## Remediation gate：`5ca52d2db3256f94cabfaddc69377304970effcf`
 
