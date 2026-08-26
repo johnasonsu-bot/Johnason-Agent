@@ -163,9 +163,14 @@ def runtime_event(
     )
 
 
-def fake_v2_command(mode: str) -> tuple[str, ...]:
+def fake_v2_command(
+    mode: str, *, checkpoint_store: Path | None = None
+) -> tuple[str, ...]:
     fixture = Path(__file__).with_name("fake_engine_host.py")
-    return (sys.executable, str(fixture), "--v2", mode)
+    command = (sys.executable, str(fixture), "--v2", mode)
+    if checkpoint_store is not None:
+        return (*command, str(checkpoint_store))
+    return command
 
 
 @dataclass(frozen=True)
@@ -230,6 +235,7 @@ class FakeHostV2Factory:
             prefix="host-v2-conformance-"
         )
         self.temporary_root = Path(self._temporary_directory.name)
+        self._checkpoint_store = self.temporary_root / "checkpoint-state.json"
 
     def cleanup(self) -> None:
         self._temporary_directory.cleanup()
@@ -246,7 +252,9 @@ class FakeHostV2Factory:
         host_generation = f"host-{uuid4().hex}"
         instance_nonce = f"instance-{uuid4().hex}"
         client = EngineHostV2Client(
-            fake_v2_command(mode), request_timeout=0.25, shutdown_timeout=0.1
+            fake_v2_command(mode, checkpoint_store=self._checkpoint_store),
+            request_timeout=0.25,
+            shutdown_timeout=0.1,
         )
         try:
             repository = RuntimeV2Repository(database)

@@ -11,7 +11,6 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from copy import deepcopy
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -274,13 +273,6 @@ def _write_envelope(runtime: HostV2Runtime) -> RunEnvelopeV2:
     return RunEnvelopeV2.model_validate(value)
 
 
-def _safe_digest(value: object) -> str:
-    canonical = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 async def _scenario_capabilities(factory, seen_clients, seen_databases) -> None:
     async with _isolated(factory, "normal", seen_clients, seen_databases) as runtime:
         capabilities = runtime.client.capabilities
@@ -416,25 +408,22 @@ async def _scenario_context_compaction(factory, seen_clients, seen_databases) ->
         events = await _collect(runtime, envelope)
         assert [event.cursor for event in events] == [1, 2, 3, 4, 5]
         assert events[-1].payload == {"status": "completed"}
-        context_proof = map_runtime_event(events[1])[0]
-        expected_digest = _safe_digest(
-            envelope.context_budget.model_dump(mode="json")
-        )
-        assert context_proof.payload == {
+        context_result = map_runtime_event(events[1])[0]
+        assert context_result.payload == {
             "term_id": "term-1",
             "cursor": 2,
-            "artifact_id": "context-proof",
+            "artifact_id": "evaluation-1",
             "summary": (
-                f"context {expected_digest} input 2048 output 256 messages 2 "
-                "sections 2 policy summarize summary present"
+                "context result accepted input 2048 output 256 usable 1792 "
+                "messages 2 sections 2 policy summarize summary present"
             ),
-            "media_type": "application/x-host-v2-context-proof",
+            "media_type": "application/json",
         }
-        public_wire = map_domain_event(context_proof)[0]
+        public_wire = map_domain_event(context_result)[0]
         assert public_wire["value"] == {
-            "artifact_id": "context-proof",
-            "summary": context_proof.payload["summary"],
-            "media_type": "application/x-host-v2-context-proof",
+            "artifact_id": "evaluation-1",
+            "summary": context_result.payload["summary"],
+            "media_type": "application/json",
         }
         serialized_events = json.dumps(
             [event.model_dump(mode="json") for event in events]
@@ -530,31 +519,42 @@ async def _scenario_manifest_workspace(factory, seen_clients, seen_databases) ->
             events = await _collect(runtime, envelope)
             assert [event.cursor for event in events] == [1, 2, 3, 4, 5]
             assert events[-1].payload == {"status": "completed"}
-            manifest_proof = map_runtime_event(events[2])[0]
-            workspace_proof = map_runtime_event(events[3])[0]
-            manifest_shape_digest = _safe_digest(
-                [item.model_dump(mode="json") for item in envelope.tool_manifest]
+            manifest_result = map_runtime_event(events[2])[0]
+            workspace_result = map_runtime_event(events[3])[0]
+            assert manifest_result.payload["summary"] == (
+                "manifest result supervisor approval required tools 2 read 1 write 1"
             )
-            workspace_digest = _safe_digest(
-                envelope.workspace_grant.model_dump(mode="json")
-            )
-            assert manifest_proof.payload["summary"] == (
-                f"manifest pin {'7' * 64} shape {manifest_shape_digest} tools 2 "
-                "read 1 write 1"
-            )
-            assert workspace_proof.payload["summary"] == (
-                f"workspace {workspace_digest} readable 2 writable 1 command "
-                "supervisor_approval network deny"
+            assert workspace_result.payload["summary"] == (
+                "workspace result denied expired yes readable 2 writable 1 "
+                "command supervisor approval required network denied"
             )
             public_values = [
-                map_domain_event(manifest_proof)[0]["value"],
-                map_domain_event(workspace_proof)[0]["value"],
+                map_domain_event(manifest_result)[0]["value"],
+                map_domain_event(workspace_result)[0]["value"],
             ]
             public_json = json.dumps(public_values, sort_keys=True)
             assert "/workspace/read" not in public_json
             assert "/workspace/write" not in public_json
             assert "tool-1" not in public_json
             assert "tool-2" not in public_json
+
+        async with _isolated(
+            factory, "contract_inputs", seen_clients, seen_databases
+        ) as runtime:
+            future_grant = runtime.envelope(
+                command_id="future-workspace-command",
+                overrides={
+                    "workspace_grant.expires_at_ms": 9_999_999_999_999,
+                    "workspace_grant.command_policy": "allow",
+                    "workspace_grant.network_policy": "deny",
+                },
+            )
+            events = await _collect(runtime, future_grant)
+            workspace_result = map_runtime_event(events[3])[0]
+            assert workspace_result.payload["summary"] == (
+                "workspace result denied expired no readable 1 writable 0 "
+                "command allowed network denied"
+            )
     finally:
         if previous is None:
             os.environ.pop("ENGINE_HOST_TEST_SECRET", None)
@@ -664,7 +664,6 @@ async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> 
         assert first.payload == {"status": "running"}
         checkpoint = await runtime.client.checkpoint("run-1")
         assert checkpoint.checkpoint_ref.startswith("checkpoint-")
-        assert _DIGEST.fullmatch(checkpoint.checkpoint_digest)
         assert checkpoint.cursor == 1
         source_marker = runtime.process_marker
         source_generation = runtime.host_generation
@@ -693,7 +692,6 @@ async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> 
         _admit(runtime, resume_envelope)
         resume_pin = runtime.repository.get_pin(resume_envelope.command_id)
         assert resume_pin is not None
-        assert _DIGEST.fullmatch(resume_pin.identity_digest)
         assert resume_pin.identity_digest != source_pin.identity_digest
         events = await _collect(runtime, resume_envelope)
         assert [event.cursor for event in events] == [2, 3, 4]
@@ -710,9 +708,9 @@ async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> 
         assert resumed.payload == {
             "term_id": "term-1",
             "cursor": 3,
-            "content": "resumed from checkpoint",
+            "content": "checkpoint state restored",
         }
-        assert map_domain_event(resumed)[0]["delta"] == "resumed from checkpoint"
+        assert map_domain_event(resumed)[0]["delta"] == "checkpoint state restored"
         assert events[-1].payload == {"status": "completed"}
 
     async with _isolated(

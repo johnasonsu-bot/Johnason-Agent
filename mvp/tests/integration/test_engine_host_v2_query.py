@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 import os
+from pathlib import Path
 import signal
 
 import pytest
@@ -59,10 +60,15 @@ async def _collect(
 
 
 async def _collect_mode(
-    mode: str, envelope: RunEnvelopeV2 | None = None
+    mode: str,
+    envelope: RunEnvelopeV2 | None = None,
+    *,
+    checkpoint_store: Path | None = None,
 ) -> list[RuntimeEventV2]:
     client = EngineHostV2Client(
-        fake_v2_command(mode), request_timeout=0.25, shutdown_timeout=0.1
+        fake_v2_command(mode, checkpoint_store=checkpoint_store),
+        request_timeout=0.25,
+        shutdown_timeout=0.1,
     )
     await asyncio.wait_for(client.start(), timeout=1.0)
     try:
@@ -148,20 +154,24 @@ async def test_duplicate_cursor_is_idempotent_only_for_same_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_resume_uses_the_source_host_identity() -> None:
-    source = EngineHostV2Client(fake_v2_command("checkpoint_source"))
+async def test_checkpoint_resume_uses_persisted_source_state(tmp_path: Path) -> None:
+    checkpoint_store = tmp_path / "checkpoint-state.json"
+    source = EngineHostV2Client(
+        fake_v2_command("checkpoint_source", checkpoint_store=checkpoint_store)
+    )
     await source.start()
     source_stream = source.run_query(run_envelope(command_id="checkpoint-command"))
     try:
         first = await asyncio.wait_for(anext(source_stream), timeout=1.0)
         checkpoint = await source.checkpoint("run-1")
         assert checkpoint.cursor == first.cursor == 1
+        assert checkpoint_store.exists()
     finally:
         await source_stream.aclose()
         await source.aclose()
 
     resume_envelope = run_envelope(
-        command_id="checkpoint-command",
+        command_id="checkpoint-resume-command",
         overrides={
             "checkpoint_cursor": checkpoint.cursor,
             "extensions": {
@@ -170,10 +180,21 @@ async def test_checkpoint_resume_uses_the_source_host_identity() -> None:
             },
         },
     )
-    events = await _collect_mode("checkpoint_resume", resume_envelope)
+    events = await _collect_mode(
+        "checkpoint_resume",
+        resume_envelope,
+        checkpoint_store=checkpoint_store,
+    )
 
     assert [event.cursor for event in events] == [2, 3, 4]
-    assert events[1].payload == {"text": "resumed from checkpoint"}
+    assert events[1].payload == {"text": "checkpoint state restored"}
+
+    with pytest.raises(RuntimeControlError, match="rejected query"):
+        await _collect_mode(
+            "checkpoint_resume",
+            resume_envelope,
+            checkpoint_store=tmp_path / "missing-checkpoint-state.json",
+        )
 
 
 @pytest.mark.asyncio
