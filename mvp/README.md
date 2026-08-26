@@ -182,6 +182,27 @@ npm start
 
 客户端“Agent 配置”页的 Engine Host 卡片为只读诊断入口。
 
+### 8.1 Engine Host v2 合同门禁
+
+Engine Host v2 默认关闭，且与现有 v1 路由并存。当前可重复执行的
+`tests/acceptance/test_engine_host_v2_conformance.py` 只证明冻结的 Host v2
+控制面合同通过；门禁使用 `contract_fake` / `fake-v2` 测试进程，不代表任何
+真实 Runtime 已接入，也不会改变 v2 关闭时继续使用现有 Python/v1 路径的行为。
+
+后续真实 Runtime 必须分别通过独立门禁，不能复用本合同门禁的 GO 结论：
+
+- Python Codex-Compatible Runtime 接入门禁；
+- Goose Query Runtime 接入门禁；
+- DSH Plugin Runtime 接入门禁。
+
+运行合同门禁：
+
+```bash
+cd mvp
+PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q \
+  tests/acceptance/test_engine_host_v2_conformance.py
+```
+
 ## 9. 构建和安装包状态
 
 只构建，不启动：

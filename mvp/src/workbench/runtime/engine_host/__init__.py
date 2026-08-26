@@ -1,5 +1,7 @@
 """Versioned contracts for the Engine Host sidecar boundary."""
 
+from . import v2
+
 from .contracts import (
     PROTOCOL_V1,
     HostCapabilities,
@@ -40,4 +42,5 @@ __all__ = [
     "HostSequenceError",
     "HostTerminalError",
     "HostUnavailable",
+    "v2",
 ]

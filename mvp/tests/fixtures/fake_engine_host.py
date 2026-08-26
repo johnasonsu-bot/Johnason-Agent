@@ -467,6 +467,33 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             )
             write_v2_terminal(first_cursor + 1)
             return False
+        if mode == "public_redaction":
+            summaries = (
+                "The chainOfThought remains internal.",
+                "The chain_of_thought remains internal.",
+                "The chain-of-thought remains internal.",
+                "The chain of thought remains internal.",
+                "The privatePrompt remains internal.",
+                "The private_prompt remains internal.",
+                "The private-prompt remains internal.",
+                "The private prompt remains internal.",
+                "The privateHistory remains internal.",
+                "The private_history remains internal.",
+                "The private-history remains internal.",
+                "The private history remains internal.",
+                "This provider offers a public service.",
+                "The workspace supports ordinary team planning.",
+            )
+            for offset, summary in enumerate(summaries, start=1):
+                write_v2(
+                    v2_event(
+                        first_cursor + offset,
+                        "artifact.proposed",
+                        {"artifact_id": f"artifact-{offset}", "summary": summary},
+                    )
+                )
+            write_v2_terminal(first_cursor + len(summaries) + 1)
+            return False
 
         write_v2(
             v2_event(first_cursor + 1, "assistant.delta", {"text": "hello"})
@@ -508,8 +535,27 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         write_v2(v2_response(command, {"accepted": True}))
         cursor = int(V2_STATE["cursor"]) + 1
         V2_STATE["cursor"] = cursor
+        command_payload = command.get("payload")
+        intervention = (
+            command_payload.get("intervention")
+            if isinstance(command_payload, dict)
+            else None
+        )
+        intervention_id = (
+            intervention.get("intervention_id")
+            if isinstance(intervention, dict)
+            else None
+        )
+        summary = intervention.get("summary") if isinstance(intervention, dict) else None
         write_v2(
-            v2_event(cursor, "intervention.applied", {"context_version": 1})
+            v2_event(
+                cursor,
+                "intervention.applied",
+                {
+                    "intervention_id": intervention_id or "intervention-1",
+                    "summary": summary or "review",
+                },
+            )
         )
         return False
     if command_type == "checkpoint.get":

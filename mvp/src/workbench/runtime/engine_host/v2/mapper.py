@@ -69,6 +69,11 @@ _SENSITIVE_ROOTS = (
     ("password",),
     ("passwd",),
 )
+_FORBIDDEN_PUBLIC_PHRASES = (
+    ("chain", "of", "thought"),
+    ("private", "prompt"),
+    ("private", "history"),
+)
 _DIAGNOSTIC_LABELS = (
     ("exception",),
     ("error",),
@@ -213,7 +218,8 @@ def _contains_sensitive_assignment(value: str) -> bool:
 def _contains_private_public_label(value: str) -> bool:
     words = _normalized_words(value)
     return (
-        _contains_sensitive_metadata_label(words)
+        _contains_any_phrase(words, _FORBIDDEN_PUBLIC_PHRASES)
+        or _contains_sensitive_metadata_label(words)
         or _contains_token_sensitive_suffix(words)
         or _contains_sensitive_assignment(value)
     )

@@ -42,6 +42,20 @@ _COMPACT_CREDENTIAL_LABELS = (
     (("bearer", "token"), "bearertoken"),
     (("github", "pat"), "githubpat"),
 )
+_PRIVATE_PUBLIC_PHRASES = (
+    "chainOfThought",
+    "chain_of_thought",
+    "chain-of-thought",
+    "chain of thought",
+    "privatePrompt",
+    "private_prompt",
+    "private-prompt",
+    "private prompt",
+    "privateHistory",
+    "private_history",
+    "private-history",
+    "private history",
+)
 
 
 def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> str:
@@ -549,6 +563,27 @@ def test_v2_forged_public_text_allows_safe_counters_and_business_neighbors(
         sequence=1,
     )
     assert map_domain_event(event)[0]["delta"] == safe_text
+
+
+@pytest.mark.parametrize("private_phrase", _PRIVATE_PUBLIC_PHRASES)
+def test_v2_persisted_summary_rejects_unambiguous_private_phrase_before_agui(
+    private_phrase: str,
+) -> None:
+    """Catches a forged persisted summary exposing private text through AG-UI."""
+    event = DomainEvent.new(
+        "artifact.proposed",
+        "engine_host.v2",
+        {
+            "artifact_id": "artifact-1",
+            "summary": f"The {private_phrase} remains internal.",
+            "term_id": "term-1",
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+    assert map_domain_event(event) == []
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,20 @@ _COMPACT_CREDENTIAL_LABELS = (
     (("bearer", "token"), "bearertoken"),
     (("github", "pat"), "githubpat"),
 )
+_PRIVATE_PUBLIC_PHRASES = (
+    "chainOfThought",
+    "chain_of_thought",
+    "chain-of-thought",
+    "chain of thought",
+    "privatePrompt",
+    "private_prompt",
+    "private-prompt",
+    "private prompt",
+    "privateHistory",
+    "private_history",
+    "private-history",
+    "private history",
+)
 
 
 def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> str:
@@ -228,6 +242,23 @@ def test_accepts_ordinary_public_text(safe_text: str) -> None:
     """Catches public-text validation becoming broad enough to reject normal output."""
     mapped = map_runtime_event(runtime_event("assistant.delta", payload={"text": safe_text}))
     assert mapped[0].payload["content"] == safe_text
+
+
+@pytest.mark.parametrize("private_phrase", _PRIVATE_PUBLIC_PHRASES)
+def test_runtime_public_summary_rejects_unambiguous_private_phrase_in_body(
+    private_phrase: str,
+) -> None:
+    """Catches an unlabelled private phrase crossing the runtime public boundary."""
+    with pytest.raises(ValueError, match="bounded public text"):
+        map_runtime_event(
+            runtime_event(
+                "artifact.proposed",
+                payload={
+                    "artifact_id": "artifact-1",
+                    "summary": f"The {private_phrase} remains internal.",
+                },
+            )
+        )
 
 
 @pytest.mark.parametrize(
