@@ -756,6 +756,36 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             )
         )
         return False
+    if command_type == "query.status":
+        if mode == "ignore_terminal_seal":
+            return False
+        payload = command.get("payload")
+        if not isinstance(payload, dict):
+            return True
+        terminal_cursor = payload.get("terminal_cursor")
+        if (
+            not isinstance(payload.get("run_id"), str)
+            or not isinstance(payload.get("term_id"), str)
+            or not isinstance(payload.get("step_id"), str)
+            or isinstance(terminal_cursor, bool)
+            or not isinstance(terminal_cursor, int)
+            or terminal_cursor <= 0
+        ):
+            return True
+        write_v2(
+            v2_response(
+                command,
+                {
+                    "state": "terminal",
+                    "run_id": payload["run_id"],
+                    "term_id": payload["term_id"],
+                    "step_id": payload["step_id"],
+                    "terminal_cursor": terminal_cursor,
+                    "sealed": True,
+                },
+            )
+        )
+        return False
     if command_type == "query.resume":
         if mode == "resume_crash":
             return True

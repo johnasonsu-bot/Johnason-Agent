@@ -385,9 +385,11 @@ class EngineHostV2Client:
                 item = await stream.queue.get()
                 if isinstance(item, Exception):
                     raise item
-                yield item
                 if item is stream.terminal:
+                    await self._confirm_terminal_seal(stream, item)
+                    yield item
                     return
+                yield item
         finally:
             admission_uncertain = (
                 not stream.accepted
@@ -858,6 +860,52 @@ class EngineHostV2Client:
             raise RuntimeUnavailableError("engine-host v2 request timed out") from error
         finally:
             self._pending.pop(resolved_command_id, None)
+
+    async def _confirm_terminal_seal(
+        self, stream: _QueryStream, terminal: RuntimeEventV2
+    ) -> None:
+        """Wait for an ordered Host acknowledgement before exposing terminal."""
+        try:
+            response = await self._request(
+                "query.status",
+                {
+                    "run_id": terminal.run_id,
+                    "term_id": terminal.term_id,
+                    "step_id": terminal.step_id,
+                    "terminal_cursor": terminal.cursor,
+                },
+            )
+        except RuntimeClientError as error:
+            failure: RuntimeClientError
+            if isinstance(error, RuntimeUnavailableError) and str(error) == (
+                "engine-host v2 request timed out"
+            ):
+                failure = RuntimeUnavailableError(
+                    "engine-host v2 terminal seal timed out"
+                )
+            else:
+                failure = error
+            self._fail_stream(stream, failure)
+            close_task = await self._ensure_close_task()
+            await asyncio.shield(close_task)
+            raise failure
+
+        expected = {
+            "state": "terminal",
+            "run_id": terminal.run_id,
+            "term_id": terminal.term_id,
+            "step_id": terminal.step_id,
+            "terminal_cursor": terminal.cursor,
+            "sealed": True,
+        }
+        if response != expected:
+            failure = RuntimeProtocolError(
+                "engine-host v2 terminal seal acknowledgement is invalid"
+            )
+            self._fail_stream(stream, failure)
+            close_task = await self._ensure_close_task()
+            await asyncio.shield(close_task)
+            raise failure
 
     async def _write(self, frame: Mapping[str, Any]) -> None:
         process = self._process

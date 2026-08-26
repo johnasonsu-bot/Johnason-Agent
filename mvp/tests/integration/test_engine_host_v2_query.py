@@ -708,6 +708,22 @@ async def test_terminal_seals_the_stream_and_rejects_every_later_event() -> None
 
 
 @pytest.mark.asyncio
+async def test_terminal_seal_barrier_timeout_fails_closed() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("ignore_terminal_seal"),
+        request_timeout=0.05,
+        shutdown_timeout=0.1,
+    )
+    await client.start()
+    try:
+        with pytest.raises(RuntimeUnavailableError, match="terminal seal timed out"):
+            await _collect(client)
+        assert client.state == "unavailable"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_query_ack_cannot_overwrite_a_terminal_from_the_same_read_batch() -> None:
     client = EngineHostV2Client(fake_v2_command("ack_terminal_same_batch"))
     await client.start()
