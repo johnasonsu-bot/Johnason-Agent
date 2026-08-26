@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from queue import Empty, Queue
+import signal
 import subprocess
 import sys
 from threading import Lock, Thread
@@ -172,14 +173,27 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         V2_STATE["cursor"] = first_cursor
         write_v2(v2_response(command, {"accepted": True}))
         running_payload: dict[str, object] = {"status": "running"}
-        if mode == "grandchild":
+        if mode in {"grandchild", "grandchild_ignore_term"}:
+            grandchild_command = "import time; time.sleep(60)"
+            grandchild_stdout: int = subprocess.DEVNULL
+            if mode == "grandchild_ignore_term":
+                grandchild_command = (
+                    "import signal,time;"
+                    "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                    "print('ready',flush=True);time.sleep(60)"
+                )
+                grandchild_stdout = subprocess.PIPE
             grandchild = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(60)"],
+                [sys.executable, "-c", grandchild_command],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
+                stdout=grandchild_stdout,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
+            if mode == "grandchild_ignore_term":
+                assert grandchild.stdout is not None
+                if grandchild.stdout.readline() != b"ready\n":
+                    return True
             V2_STATE["grandchild"] = grandchild
             running_payload["grandchild_pid"] = grandchild.pid
         write_v2(v2_event(first_cursor, "runtime.status", running_payload))
@@ -202,8 +216,10 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             "controls",
             "cancel",
             "cancel_crash",
+            "cancel_timeout_delayed_unknown_write",
             "control_cycles",
             "grandchild",
+            "grandchild_ignore_term",
             "ignore_pause",
             "missing_control_capabilities",
             "pause_terminal",
@@ -290,6 +306,35 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             if mode != "write_result_missing_status":
                 result_payload["status"] = "completed"
             write_v2(v2_event(first_cursor + 2, "tool.result", result_payload))
+            write_v2_terminal(first_cursor + 3)
+            return False
+        if mode.startswith("write_result_status_"):
+            status = mode.removeprefix("write_result_status_")
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "tool.call",
+                    {
+                        "tool_call_id": "write-status-1",
+                        "tool_id": "tool-1",
+                        "read_only": False,
+                        "effect_id": "effect-status-1",
+                    },
+                )
+            )
+            write_v2(
+                v2_event(
+                    first_cursor + 2,
+                    "tool.result",
+                    {
+                        "tool_call_id": "write-status-1",
+                        "tool_id": "tool-1",
+                        "read_only": False,
+                        "effect_id": "effect-status-1",
+                        "status": status,
+                    },
+                )
+            )
             write_v2_terminal(first_cursor + 3)
             return False
         if mode == "write_ignore_cancel":
@@ -473,6 +518,24 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
     if command_type == "query.cancel":
         if mode == "cancel_crash":
             return True
+        if mode == "cancel_timeout_delayed_unknown_write":
+            def report_unknown_write() -> None:
+                time.sleep(0.15)
+                cursor = int(V2_STATE["cursor"]) + 1
+                V2_STATE["cursor"] = cursor
+                write_v2(
+                    v2_event(
+                        cursor,
+                        "error",
+                        {
+                            "code": "unknown_write_effect",
+                            "effect_id": "late-effect-1",
+                        },
+                    )
+                )
+
+            Thread(target=report_unknown_write, daemon=True).start()
+            return False
         if mode == "write_ignore_cancel":
             return False
         V2_STATE["cancel_count"] = int(V2_STATE["cancel_count"]) + 1
@@ -493,6 +556,11 @@ def main_v2(mode: str) -> int:
         "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
     ):
         return 3
+    if mode in {
+        "cancel_timeout_delayed_unknown_write",
+        "grandchild_ignore_term",
+    }:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while raw_line := sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1):
         if len(raw_line) > MAX_FRAME_BYTES:
             return 2
@@ -504,6 +572,8 @@ def main_v2(mode: str) -> int:
             return 2
         if respond_v2(command, mode):
             return 0
+    if mode == "cancel_timeout_delayed_unknown_write":
+        time.sleep(0.3)
     return 0
 
 

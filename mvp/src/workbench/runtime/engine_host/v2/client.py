@@ -47,9 +47,7 @@ STATE_TRANSITIONS = {
     "unavailable": frozenset({"reconciliation_required"}),
     "reconciliation_required": frozenset(),
 }
-UNCERTAIN_EFFECT_STATUSES = frozenset(
-    {"unknown", "uncertain", "reconciliation_required"}
-)
+AUTHORITATIVE_WRITE_RESULT_STATUSES = frozenset({"completed", "failed"})
 
 
 class RuntimeClientError(RuntimeError):
@@ -567,7 +565,7 @@ class EngineHostV2Client:
             failure = self._classify_interruption(stream, str(error), error)
             self._fail_stream(stream, failure)
             await self._close_after_control_failure()
-            raise failure
+            raise self._effective_stream_failure(stream, failure)
         if response.get("accepted") is not True:
             raise RuntimeProtocolError("engine-host v2 did not acknowledge cancel")
         try:
@@ -579,7 +577,7 @@ class EngineHostV2Client:
             )
             self._fail_stream(stream, failure)
             await self._close_after_control_failure()
-            raise failure from error
+            raise self._effective_stream_failure(stream, failure) from error
 
     async def checkpoint(self, run_id: str | None = None) -> CheckpointHintV2:
         async with self._control_lock:
@@ -655,7 +653,7 @@ class EngineHostV2Client:
             failure = self._classify_interruption(stream, str(error), error)
             self._fail_stream(stream, failure)
             await self._close_after_control_failure()
-            raise failure
+            raise self._effective_stream_failure(stream, failure)
 
     async def _control_protocol_failure(
         self,
@@ -667,9 +665,18 @@ class EngineHostV2Client:
         failure = RuntimeProtocolError(message)
         self._fail_stream(stream, failure)
         await self._close_after_control_failure()
+        effective = self._effective_stream_failure(stream, failure)
         if cause is None:
-            raise failure
-        raise failure from cause
+            raise effective
+        raise effective from cause
+
+    @staticmethod
+    def _effective_stream_failure(
+        stream: _QueryStream, fallback: RuntimeClientError
+    ) -> RuntimeClientError:
+        if isinstance(stream.failure, RuntimeClientError):
+            return stream.failure
+        return fallback
 
     async def _close_after_control_failure(self) -> None:
         """Start closure once without waiting on a supervisor that awaits us."""
@@ -949,6 +956,16 @@ class EngineHostV2Client:
         if stream.terminal is not None:
             raise RuntimeProtocolError("engine-host v2 emitted an event after terminal")
         if stream.failure is not None:
+            if (
+                stream.accepted
+                and self._is_trusted_reconciliation_signal(stream, event)
+            ):
+                if not self._accept_cursor(stream, event):
+                    return
+                effect_failure = self._observe_effect(stream, event)
+                if isinstance(effect_failure, RuntimeReconciliationRequired):
+                    self._fail_stream(stream, effect_failure)
+                    return
             self._fail_stream(
                 stream,
                 RuntimeProtocolError(
@@ -1040,6 +1057,19 @@ class EngineHostV2Client:
             )
         return None
 
+    @staticmethod
+    def _is_trusted_reconciliation_signal(
+        stream: _QueryStream, event: RuntimeEventV2
+    ) -> bool:
+        return (
+            any(not tool.read_only for tool in stream.envelope.tool_manifest)
+            and event.type == "error"
+            and event.payload.get("code")
+            in {"unknown_write_effect", "uncertain_write_outcome"}
+            and isinstance(event.payload.get("effect_id"), str)
+            and bool(event.payload["effect_id"])
+        )
+
     def _observe_tool_call(
         self, stream: _QueryStream, event: RuntimeEventV2
     ) -> RuntimeClientError | None:
@@ -1106,8 +1136,9 @@ class EngineHostV2Client:
                 "engine-host v2 tool result does not match durable tool manifest"
             )
         status = event.payload.get("status")
-        if not observed.read_only and (
-            not isinstance(status, str) or status in UNCERTAIN_EFFECT_STATUSES
+        if (
+            not observed.read_only
+            and status not in AUTHORITATIVE_WRITE_RESULT_STATUSES
         ):
             return RuntimeReconciliationRequired(
                 "engine-host v2 write effect outcome is unknown"
@@ -1307,7 +1338,7 @@ class EngineHostV2Client:
         process_group_id: int | None,
     ) -> None:
         if os.name == "posix" and process_group_id is not None:
-            await self._terminate_posix_group(process_group_id)
+            await self._terminate_posix_group(process, process_group_id)
         elif os.name == "nt" and process.returncode is None:
             await self._terminate_windows_tree(process.pid)
         if process.returncode is not None:
@@ -1321,24 +1352,65 @@ class EngineHostV2Client:
             await asyncio.wait_for(process.wait(), timeout=self.shutdown_timeout)
         except TimeoutError:
             process.kill()
-            await process.wait()
+            try:
+                await asyncio.wait_for(
+                    process.wait(), timeout=self.shutdown_timeout
+                )
+            except TimeoutError:
+                self._report_unconfirmed_tree_cleanup()
+                return
 
-    async def _terminate_posix_group(self, process_group_id: int) -> None:
+    async def _terminate_posix_group(
+        self,
+        process: asyncio.subprocess.Process,
+        process_group_id: int,
+    ) -> None:
         try:
             os.killpg(process_group_id, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             return
+        except PermissionError:
+            self._report_unconfirmed_tree_cleanup()
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self.shutdown_timeout)
+        except TimeoutError:
+            pass
+        if not self._process_group_exists(process_group_id):
+            return
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            self._report_unconfirmed_tree_cleanup()
+            return
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self.shutdown_timeout)
+        except TimeoutError:
+            process.kill()
+            try:
+                await asyncio.wait_for(
+                    process.wait(), timeout=self.shutdown_timeout
+                )
+            except TimeoutError:
+                self._report_unconfirmed_tree_cleanup()
+                return
         deadline = asyncio.get_running_loop().time() + self.shutdown_timeout
         while self._process_group_exists(process_group_id):
             if asyncio.get_running_loop().time() >= deadline:
-                try:
-                    os.killpg(process_group_id, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                self._report_unconfirmed_tree_cleanup()
                 return
             await asyncio.sleep(0)
 
+    def _report_unconfirmed_tree_cleanup(self) -> None:
+        self._diagnostics = (
+            "engine-host v2 process tree cleanup was not confirmed"
+        )
+
     async def _terminate_windows_tree(self, process_id: int) -> None:
+        killer: asyncio.subprocess.Process | None = None
+        target_cleanup_confirmed = False
         try:
             killer = await asyncio.create_subprocess_exec(
                 "taskkill",
@@ -1350,9 +1422,36 @@ class EngineHostV2Client:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            await asyncio.wait_for(killer.wait(), timeout=self.shutdown_timeout)
+            returncode = await asyncio.wait_for(
+                killer.wait(), timeout=self.shutdown_timeout
+            )
+            target_cleanup_confirmed = returncode == 0
         except (OSError, TimeoutError):
-            pass
+            target_cleanup_confirmed = False
+        finally:
+            if killer is not None and killer.returncode is None:
+                try:
+                    killer.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        killer.wait(), timeout=self.shutdown_timeout
+                    )
+                except TimeoutError:
+                    if killer.returncode is None:
+                        try:
+                            killer.kill()
+                        except ProcessLookupError:
+                            pass
+                    try:
+                        await asyncio.wait_for(
+                            killer.wait(), timeout=self.shutdown_timeout
+                        )
+                    except TimeoutError:
+                        target_cleanup_confirmed = False
+            if not target_cleanup_confirmed:
+                self._report_unconfirmed_tree_cleanup()
 
     @staticmethod
     def _process_group_exists(process_group_id: int) -> bool:

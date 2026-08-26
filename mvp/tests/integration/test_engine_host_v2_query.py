@@ -449,6 +449,69 @@ async def test_unknown_write_effect_takes_precedence_over_cancel_timeout() -> No
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_delayed_unknown_write_promotes_a_cancel_timeout_failure() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("cancel_timeout_delayed_unknown_write"),
+        request_timeout=0.1,
+        shutdown_timeout=0.2,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(_write_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        with pytest.raises(RuntimeReconciliationRequired):
+            await asyncio.wait_for(client.cancel(), timeout=1.0)
+        assert client.state == "reconciliation_required"
+        assert isinstance(client._active.failure, RuntimeReconciliationRequired)
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delayed_unknown_write_requires_a_durable_write_pin() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("cancel_timeout_delayed_unknown_write"),
+        request_timeout=0.1,
+        shutdown_timeout=0.2,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        with pytest.raises(RuntimeProtocolError, match="after query failure"):
+            await asyncio.wait_for(client.cancel(), timeout=1.0)
+        assert client.state == "unavailable"
+        assert not isinstance(
+            client._active.failure, RuntimeReconciliationRequired
+        )
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failure_priority_can_upgrade_but_never_downgrade() -> None:
+    client = EngineHostV2Client(fake_v2_command("cancel"))
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        active = client._active
+        assert active is not None
+        client._fail_stream(active, RuntimeUnavailableError("initial failure"))
+        client._fail_stream(
+            active, RuntimeReconciliationRequired("write outcome unknown")
+        )
+        client._fail_stream(active, RuntimeProtocolError("late protocol error"))
+        assert isinstance(active.failure, RuntimeReconciliationRequired)
+        assert client.state == "reconciliation_required"
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
 @pytest.mark.parametrize(
     ("mode", "envelope"),
     [
@@ -489,6 +552,41 @@ async def test_write_tool_result_without_an_outcome_requires_reconciliation() ->
         await _collect_mode("write_result_missing_status", _write_envelope())
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        "started",
+        "pending",
+        "running",
+        "completedd",
+        "unknown",
+        "uncertain",
+        "reconciliation_required",
+    ],
+)
+@pytest.mark.asyncio
+async def test_only_authoritative_write_result_statuses_clear_the_effect(
+    status: str,
+) -> None:
+    with pytest.raises(RuntimeReconciliationRequired):
+        await _collect_mode(f"write_result_status_{status}", _write_envelope())
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+@pytest.mark.asyncio
+async def test_authoritative_terminal_write_results_clear_the_effect(
+    status: str,
+) -> None:
+    events = await _collect_mode(
+        f"write_result_status_{status}", _write_envelope()
+    )
+    assert [event.type for event in events[-2:]] == [
+        "tool.result",
+        "runtime.status",
+    ]
+    assert events[-2].payload["status"] == status
+
+
 @pytest.mark.asyncio
 async def test_terminal_seals_the_stream_and_rejects_every_later_event() -> None:
     client = EngineHostV2Client(fake_v2_command("terminal_extra"))
@@ -519,7 +617,7 @@ async def test_failure_cannot_be_downgraded_or_sealed_by_a_later_terminal() -> N
     await client.start()
     try:
         with pytest.raises(RuntimeReconciliationRequired):
-            await _collect(client)
+            await _collect(client, _write_envelope())
         assert client.state == "reconciliation_required"
         assert ("run-1", "term-1", "step-1") not in client._sealed
     finally:
@@ -635,6 +733,72 @@ async def test_aclose_reaps_the_entire_host_process_group() -> None:
         await client.aclose()
         if grandchild_pid > 0 and _pid_exists(grandchild_pid):
             os.kill(grandchild_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+@pytest.mark.asyncio
+async def test_aclose_waits_for_sigkill_process_group_disappearance() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("grandchild_ignore_term"),
+        request_timeout=0.2,
+        shutdown_timeout=0.05,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    process_group_id = client._process_group_id
+    stream = client.run_query(run_envelope())
+    grandchild_pid = -1
+    try:
+        running = await asyncio.wait_for(anext(stream), timeout=1.0)
+        grandchild_pid = int(running.payload["grandchild_pid"])
+        assert process_group_id is not None
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        assert not client._process_group_exists(process_group_id)
+        assert not _pid_exists(grandchild_pid)
+    finally:
+        await stream.aclose()
+        await client.aclose()
+        if grandchild_pid > 0 and _pid_exists(grandchild_pid):
+            os.kill(grandchild_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+@pytest.mark.asyncio
+async def test_posix_process_group_wait_remains_bounded_after_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubbornProcess:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    process = StubbornProcess()
+    monkeypatch.setattr(os, "killpg", lambda process_group_id, sig: None)
+    monkeypatch.setattr(
+        EngineHostV2Client,
+        "_process_group_exists",
+        staticmethod(lambda process_group_id: True),
+    )
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+
+    await asyncio.wait_for(
+        client._terminate_posix_group(process, 1234),  # type: ignore[arg-type]
+        timeout=0.2,
+    )
+
+    assert process.kill_calls == 1
+    assert client.diagnostics == (
+        "engine-host v2 process tree cleanup was not confirmed"
+    )
 
 
 @pytest.mark.parametrize(
@@ -818,6 +982,50 @@ async def test_aclose_cancel_crash_has_no_supervisor_dependency_cycle() -> None:
     finally:
         await stream.aclose()
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_windows_taskkill_timeout_reaps_the_helper_and_reports_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HangingTaskkill:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self._exited = asyncio.Event()
+
+        async def wait(self) -> int:
+            await self._exited.wait()
+            assert self.returncode is not None
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            self.returncode = -9
+            self._exited.set()
+
+    killer = HangingTaskkill()
+
+    async def fake_spawn(*args: object, **kwargs: object) -> HangingTaskkill:
+        return killer
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+
+    await asyncio.wait_for(client._terminate_windows_tree(1234), timeout=0.5)
+
+    assert killer.terminate_calls == 1
+    assert killer.kill_calls == 1
+    assert killer.returncode == -9
+    assert client.diagnostics == (
+        "engine-host v2 process tree cleanup was not confirmed"
+    )
 
 
 async def _consume_remaining(
