@@ -723,6 +723,49 @@ async def test_terminal_seal_barrier_timeout_fails_closed() -> None:
         await client.aclose()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "terminal_seal_wrong_state",
+        "terminal_seal_wrong_run",
+        "terminal_seal_wrong_term",
+        "terminal_seal_wrong_step",
+        "terminal_seal_wrong_cursor",
+        "terminal_seal_not_sealed",
+        "terminal_seal_wrong_type",
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_seal_malformed_ack_fails_closed(mode: str) -> None:
+    client = EngineHostV2Client(
+        fake_v2_command(mode), request_timeout=0.1, shutdown_timeout=0.1
+    )
+    await client.start()
+    try:
+        with pytest.raises(RuntimeProtocolError) as raised:
+            await asyncio.wait_for(_collect(client), timeout=1.0)
+        assert str(raised.value) == (
+            "engine-host v2 terminal seal acknowledgement is invalid"
+        )
+        assert mode not in str(raised.value)
+        public_failure = f"{raised.value}\n{client.diagnostics}"
+        assert all(
+            private_value not in public_failure
+            for private_value in (
+                "wrong-run",
+                "wrong-term",
+                "wrong-step",
+                "wrong-type",
+            )
+        )
+        assert client.state == "unavailable"
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+    assert client.returncode is not None
+    assert client.cleanup_confirmed is True
+    assert client.reader_tasks_done is True
+
+
 @pytest.mark.asyncio
 async def test_query_ack_cannot_overwrite_a_terminal_from_the_same_read_batch() -> None:
     client = EngineHostV2Client(fake_v2_command("ack_terminal_same_batch"))

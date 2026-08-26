@@ -772,19 +772,27 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             or terminal_cursor <= 0
         ):
             return True
-        write_v2(
-            v2_response(
-                command,
-                {
-                    "state": "terminal",
-                    "run_id": payload["run_id"],
-                    "term_id": payload["term_id"],
-                    "step_id": payload["step_id"],
-                    "terminal_cursor": terminal_cursor,
-                    "sealed": True,
-                },
-            )
-        )
+        acknowledgement: dict[str, object] = {
+            "state": "terminal",
+            "run_id": payload["run_id"],
+            "term_id": payload["term_id"],
+            "step_id": payload["step_id"],
+            "terminal_cursor": terminal_cursor,
+            "sealed": True,
+        }
+        malformed_updates: dict[str, dict[str, object]] = {
+            "terminal_seal_wrong_state": {"state": "running"},
+            "terminal_seal_wrong_run": {"run_id": "wrong-run"},
+            "terminal_seal_wrong_term": {"term_id": "wrong-term"},
+            "terminal_seal_wrong_step": {"step_id": "wrong-step"},
+            "terminal_seal_wrong_cursor": {
+                "terminal_cursor": terminal_cursor + 1
+            },
+            "terminal_seal_not_sealed": {"sealed": False},
+            "terminal_seal_wrong_type": {"terminal_cursor": "wrong-type"},
+        }
+        acknowledgement.update(malformed_updates.get(mode, {}))
+        write_v2(v2_response(command, acknowledgement))
         return False
     if command_type == "query.resume":
         if mode == "resume_crash":
