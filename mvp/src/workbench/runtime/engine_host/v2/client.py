@@ -354,7 +354,12 @@ class EngineHostV2Client:
             self._process_group_id = process.pid
 
     def _schedule_late_spawn_reap(self, spawn_task: asyncio.Task[Any]) -> None:
-        if self._late_spawn_reap_task is None:
+        existing = self._late_spawn_reap_task
+        if (
+            existing is None
+            or existing.done()
+            or existing is asyncio.current_task()
+        ):
             self._late_spawn_reap_task = asyncio.create_task(
                 self._reap_late_spawn(spawn_task)
             )
@@ -362,12 +367,42 @@ class EngineHostV2Client:
     async def _reap_late_spawn(self, spawn_task: asyncio.Task[Any]) -> None:
         try:
             process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError:
+            if spawn_task.done():
+                try:
+                    spawn_task.result()
+                except BaseException:
+                    self._cleanup_confirmed = True
+                    self._cleanup_error = None
+                    if self._spawn_task is spawn_task:
+                        self._spawn_task = None
+                    return
+            self._cleanup_confirmed = False
+            self._report_unconfirmed_tree_cleanup()
+            if self._cleanup_error is None:
+                self._cleanup_error = RuntimeUnavailableError(
+                    "engine-host v2 process tree cleanup was not confirmed"
+                )
+            self._schedule_late_spawn_reap(spawn_task)
+            raise
         except BaseException:
             self._cleanup_confirmed = True
             self._cleanup_error = None
+            if self._spawn_task is spawn_task:
+                self._spawn_task = None
             return
         process_group_id = process.pid if os.name == "posix" else None
-        cleanup = await self._terminate_process_tree(process, process_group_id)
+        try:
+            cleanup = await self._terminate_process_tree(process, process_group_id)
+        except asyncio.CancelledError:
+            self._cleanup_confirmed = False
+            self._report_unconfirmed_tree_cleanup()
+            if self._cleanup_error is None:
+                self._cleanup_error = RuntimeUnavailableError(
+                    "engine-host v2 process tree cleanup was not confirmed"
+                )
+            self._schedule_late_spawn_reap(spawn_task)
+            raise
         self._returncode = cleanup.returncode
         self._cleanup_confirmed = cleanup.confirmed
         if cleanup.confirmed:
@@ -1587,14 +1622,18 @@ class EngineHostV2Client:
         try:
             await asyncio.wait_for(process.wait(), timeout=self.shutdown_timeout)
         except TimeoutError:
-            process.kill()
             try:
-                await asyncio.wait_for(
-                    process.wait(), timeout=self.shutdown_timeout
-                )
-            except TimeoutError:
-                self._report_unconfirmed_tree_cleanup()
-                return False
+                process.kill()
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=self.shutdown_timeout
+                    )
+                except TimeoutError:
+                    self._report_unconfirmed_tree_cleanup()
+                    return False
         deadline = asyncio.get_running_loop().time() + self.shutdown_timeout
         while self._process_group_exists(process_group_id):
             if asyncio.get_running_loop().time() >= deadline:

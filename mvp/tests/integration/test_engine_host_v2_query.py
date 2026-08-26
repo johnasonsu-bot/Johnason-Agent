@@ -1094,6 +1094,47 @@ async def test_posix_process_group_wait_remains_bounded_after_sigkill(
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group contract")
+@pytest.mark.asyncio
+async def test_posix_process_lookup_from_fallback_kill_confirms_missing_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a vanished process escaping the SIGKILL fallback as an error."""
+    class VanishedProcess:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+            raise ProcessLookupError
+
+    process = VanishedProcess()
+    group_queries = iter((True, False))
+    monkeypatch.setattr(os, "killpg", lambda process_group_id, sig: None)
+    monkeypatch.setattr(
+        EngineHostV2Client,
+        "_process_group_exists",
+        staticmethod(lambda process_group_id: next(group_queries)),
+    )
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+
+    confirmed = await asyncio.wait_for(
+        client._terminate_posix_group(process, 1234),  # type: ignore[arg-type]
+        timeout=0.2,
+    )
+
+    assert confirmed is True
+    assert process.kill_calls == 1
+
+
 @pytest.mark.parametrize(
     ("mode", "message"),
     [
@@ -1322,6 +1363,76 @@ async def test_aclose_bounds_spawn_cancellation_and_reclaims_late_process(
     finally:
         release_spawn.set()
         await asyncio.gather(starting, closing, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_late_spawn_reaper_preserves_uncertainty_and_supervision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches reaper cancellation claiming success before spawn completes."""
+    class LateProcess:
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.exited = asyncio.Event()
+
+        def terminate(self) -> None:
+            self.returncode = -15
+            self.exited.set()
+
+    release_spawn = asyncio.Event()
+    process = LateProcess()
+
+    async def delayed_spawn() -> LateProcess:
+        await release_spawn.wait()
+        return process
+
+    async def terminate_late_process(
+        spawned_process: LateProcess, process_group_id: int | None
+    ) -> client_module._ProcessCleanupResult:
+        del process_group_id
+        spawned_process.terminate()
+        return client_module._ProcessCleanupResult(returncode=-15, confirmed=True)
+
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+    spawn_task = asyncio.create_task(delayed_spawn())
+    client._spawn_task = spawn_task
+    client._cleanup_confirmed = False
+    cleanup_error = RuntimeUnavailableError(
+        "engine-host v2 process tree cleanup was not confirmed"
+    )
+    client._cleanup_error = cleanup_error
+    client._report_unconfirmed_tree_cleanup()
+    monkeypatch.setattr(client, "_terminate_process_tree", terminate_late_process)
+    client._schedule_late_spawn_reap(spawn_task)
+    cancelled_reaper = client._late_spawn_reap_task
+    assert cancelled_reaper is not None
+    await asyncio.sleep(0)
+
+    cancelled_reaper.cancel()
+    await asyncio.gather(cancelled_reaper, return_exceptions=True)
+    try:
+        assert client.cleanup_confirmed is False
+        assert client._cleanup_error is cleanup_error
+
+        release_spawn.set()
+        await asyncio.wait_for(process.exited.wait(), timeout=0.2)
+        replacement_reaper = client._late_spawn_reap_task
+        assert replacement_reaper is not None
+        assert replacement_reaper is not cancelled_reaper
+        await asyncio.wait_for(asyncio.shield(replacement_reaper), timeout=0.2)
+    finally:
+        release_spawn.set()
+        await asyncio.gather(spawn_task, return_exceptions=True)
+        if not process.exited.is_set():
+            process.terminate()
+        replacement_reaper = client._late_spawn_reap_task
+        if replacement_reaper is not None and not replacement_reaper.done():
+            replacement_reaper.cancel()
+            await asyncio.gather(replacement_reaper, return_exceptions=True)
 
 
 @pytest.mark.asyncio
