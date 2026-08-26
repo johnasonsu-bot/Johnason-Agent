@@ -8,7 +8,11 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationErr
 
 from workbench.protocol.events import DomainEvent
 from workbench.orchestration.contracts import OpaqueIdentifier, PublicSummary
-from workbench.runtime.engine_host.v2.mapper import is_opaque_identifier, is_public_text
+from workbench.runtime.engine_host.v2.mapper import (
+    canonical_public_error_code,
+    is_opaque_identifier,
+    is_public_text,
+)
 
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -633,7 +637,11 @@ def _public_v2_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[
             else {}
         )
     if event_type == "runtime.error":
-        code = opaque("code")
+        raw_code = payload.get("code")
+        try:
+            code = canonical_public_error_code(raw_code)
+        except ValueError:
+            return {}
         public_summary = text("summary")
         return {"code": code, "summary": public_summary} if code and public_summary else {}
     return {}

@@ -357,6 +357,55 @@ def test_v2_agui_malformed_custom_status_returns_empty_instead_of_type_error() -
 
 
 @pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "a" * 64,
+        "result " + "b" * 40,
+        r"C:\private\runtime\state.json",
+        r"\\runtime-host\private-share\state.json",
+        "context proof available",
+        "application/x-host-v2-workspace-proof",
+    ],
+)
+def test_v2_agui_rejects_digests_paths_and_internal_proofs(
+    unsafe_text: str,
+) -> None:
+    """Catches forged persisted values bypassing the first public boundary."""
+    event = DomainEvent.new(
+        "agent.message.delta",
+        "engine_host.v2",
+        {"content": unsafe_text, "term_id": "term-1", "cursor": 1},
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+
+    assert map_domain_event(event) == []
+
+
+def test_v2_agui_canonicalizes_unknown_runtime_error_codes() -> None:
+    """Catches forged provider-specific error codes reaching the browser."""
+    event = DomainEvent.new(
+        "runtime.error",
+        "engine_host.v2",
+        {
+            "code": "provider_overloaded_in_region_7",
+            "summary": "request failed",
+            "term_id": "term-1",
+            "cursor": 1,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+
+    assert map_domain_event(event)[0]["value"] == {
+        "code": "runtime_error",
+        "summary": "request failed",
+    }
+
+
+@pytest.mark.parametrize(
     ("event_type", "payload"),
     [
         ("run.failed", {"message": "raw error"}),

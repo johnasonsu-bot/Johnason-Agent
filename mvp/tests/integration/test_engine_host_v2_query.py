@@ -819,6 +819,20 @@ async def test_failure_cannot_be_downgraded_or_sealed_by_a_later_terminal() -> N
 
 
 @pytest.mark.asyncio
+async def test_runtime_cannot_publish_reconciliation_as_a_terminal_status() -> None:
+    """Catches a Host bypassing the client's authoritative failure classification."""
+    client = EngineHostV2Client(fake_v2_command("runtime_reconciliation_status"))
+    await client.start()
+    try:
+        with pytest.raises(RuntimeProtocolError):
+            await _collect(client)
+        assert client.state == "unavailable"
+        assert ("run-1", "term-1", "step-1") not in client._sealed
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_delayed_event_after_delivered_terminal_quarantines_host() -> None:
     client = EngineHostV2Client(fake_v2_command("terminal_delayed_extra"))
     await client.start()

@@ -344,6 +344,9 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         if mode == "ack_terminal_same_batch":
             write_v2_terminal(first_cursor + 1)
             return False
+        if mode == "runtime_reconciliation_status":
+            write_v2_terminal(first_cursor + 1, "reconciliation_required")
+            return False
         if mode == "failure_then_terminal":
             write_v2(
                 v2_event(

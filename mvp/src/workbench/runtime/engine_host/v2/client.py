@@ -25,9 +25,7 @@ from .security import validate_runtime_argv
 
 
 MAX_FRAME_BYTES = 1_048_576
-TERMINAL_STATUSES = frozenset(
-    {"completed", "failed", "cancelled", "reconciliation_required"}
-)
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 STATE_TRANSITIONS = {
     "created": frozenset({"starting", "unavailable"}),
     "starting": frozenset({"ready", "unavailable"}),
@@ -1094,6 +1092,17 @@ class EngineHostV2Client:
             raise RuntimeProtocolError(
                 "engine-host v2 emitted an event before query acceptance"
             )
+        if (
+            event.type == "runtime.status"
+            and event.payload.get("status") == "reconciliation_required"
+        ):
+            self._fail_stream(
+                stream,
+                RuntimeProtocolError(
+                    "engine-host v2 cannot publish reconciliation as terminal status"
+                ),
+            )
+            return
         if not self._accept_cursor(stream, event):
             return
         effect_failure = self._observe_effect(stream, event)

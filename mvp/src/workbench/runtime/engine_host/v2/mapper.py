@@ -38,8 +38,15 @@ _CREDENTIAL_VALUE = re.compile(
     r"\bbearer(?:\s+|\s*[:=]\s*)[A-Za-z0-9._~+/=-]{8,}",
     re.IGNORECASE,
 )
+_DIGEST_VALUE = re.compile(
+    r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{40})(?![0-9a-f])",
+    re.IGNORECASE,
+)
 _UNSAFE_PATH = re.compile(
-    r"(?:^|[\\/])\.\.(?:[\\/]|$)|(?:^|\s)/[^\s]{1,}"
+    r"(?:^|[\\/])\.\.(?:[\\/]|$)|"
+    r"(?:^|\s)/[^\s]{1,}|"
+    r"(?:^|\s)[A-Za-z]:[\\/][^\s]*|"
+    r"(?:^|\s)\\\\[^\s\\]+\\[^\s\\]+"
 )
 _TRACEBACK = re.compile(r"\btraceback\s*\(", re.IGNORECASE)
 _SENSITIVE_ROOTS = (
@@ -74,6 +81,13 @@ _FORBIDDEN_PUBLIC_PHRASES = (
     ("private", "prompt"),
     ("private", "history"),
 )
+_INTERNAL_PROOF_PHRASES = (
+    ("context", "proof"),
+    ("manifest", "proof"),
+    ("workspace", "proof"),
+    ("capability", "proof"),
+    ("checkpoint", "proof"),
+)
 _DIAGNOSTIC_LABELS = (
     ("exception",),
     ("error",),
@@ -83,7 +97,6 @@ _DIAGNOSTIC_LABELS = (
 )
 _ASSIGNMENT_LABELS = (*_SENSITIVE_ROOTS, *_DIAGNOSTIC_LABELS, ("token",))
 _MAX_ASSIGNMENT_LABEL_WORDS = max(len(label) for label in _ASSIGNMENT_LABELS)
-_MAX_PUBLIC_TEXT_ASSIGNMENTS = 32
 _SENSITIVE_METADATA_SUFFIXES = frozenset(
     {
         "content",
@@ -104,11 +117,29 @@ _TOKEN_SENSITIVE_SUFFIXES = frozenset({"id", "ref", "reference", "key", "token",
 _STATUSES = frozenset({"queued", "running", "paused", "completed", "failed", "cancelled"})
 _TOOL_RESULT_STATUSES = frozenset({"completed", "failed"})
 _STATE_OPERATIONS = frozenset({"add", "remove", "replace", "update"})
+_PUBLIC_ERROR_CODES = frozenset(
+    {
+        "runtime_error",
+        "invalid_request",
+        "capacity_unavailable",
+        "capability_unavailable",
+        "policy_rejected",
+        "rate_limited",
+        "timeout",
+        "unavailable",
+    }
+)
+_GENERIC_PUBLIC_ERROR_CODE = "runtime_error"
 
 
 def is_opaque_identifier(value: Any) -> bool:
     """Return whether an identifier is bounded and cannot carry a secret."""
-    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or not _IDENTIFIER.fullmatch(value)
+        or _DIGEST_VALUE.fullmatch(value)
+        or _UNSAFE_PATH.search(value)
+    ):
         return False
     words = _normalized_words(value)
     if not words or _is_safe_token_counter(words):
@@ -119,6 +150,7 @@ def is_opaque_identifier(value: Any) -> bool:
         or _contains_sensitive_metadata_label(words)
         or _contains_token_sensitive_suffix(words)
         or words[0] == "digest"
+        or _contains_any_phrase(words, _INTERNAL_PROOF_PHRASES)
     )
 
 
@@ -131,6 +163,7 @@ def validate_public_text(value: Any, *, maximum: int) -> str:
         or _CONTROL.search(value)
         or _contains_private_public_label(value)
         or _contains_credential_value(value)
+        or _DIGEST_VALUE.search(value)
         or _UNSAFE_PATH.search(value)
         or _TRACEBACK.search(value)
     ):
@@ -195,13 +228,9 @@ def _ends_with_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
 
 def _contains_sensitive_assignment(value: str) -> bool:
     trailing_words: deque[str] = deque(maxlen=_MAX_ASSIGNMENT_LABEL_WORDS)
-    assignment_count = 0
     for match in _LABEL_TOKEN.finditer(value):
         token = match.group(0)
         if token == ":" or token == "=":
-            assignment_count += 1
-            if assignment_count > _MAX_PUBLIC_TEXT_ASSIGNMENTS:
-                return True
             label_words = tuple(trailing_words)
             if _is_safe_token_counter(label_words):
                 continue
@@ -219,6 +248,7 @@ def _contains_private_public_label(value: str) -> bool:
     words = _normalized_words(value)
     return (
         _contains_any_phrase(words, _FORBIDDEN_PUBLIC_PHRASES)
+        or _contains_any_phrase(words, _INTERNAL_PROOF_PHRASES)
         or _contains_sensitive_metadata_label(words)
         or _contains_token_sensitive_suffix(words)
         or _contains_sensitive_assignment(value)
@@ -324,7 +354,10 @@ def _reject_sensitive_payload(value: Any) -> None:
         for nested in value:
             _reject_sensitive_payload(nested)
     elif isinstance(value, str) and (
-        _contains_credential_value(value) or _UNSAFE_PATH.search(value)
+        _contains_credential_value(value)
+        or _DIGEST_VALUE.search(value)
+        or _UNSAFE_PATH.search(value)
+        or _contains_any_phrase(_normalized_words(value), _INTERNAL_PROOF_PHRASES)
     ):
         raise ValueError("runtime event payload contains a sensitive value")
     elif value is not None and (isinstance(value, bool) or isinstance(value, (int, float, str))):
@@ -518,9 +551,16 @@ def _project_runtime_status(payload: Mapping[str, Any]) -> tuple[str, dict[str, 
 def _project_error(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     _allow_only(payload, "code", "summary")
     return "runtime.error", {
-        "code": _identifier(payload, "code"),
+        "code": canonical_public_error_code(payload.get("code")),
         "summary": _public_text(payload, "summary", required=True, maximum=280),
     }
+
+
+def canonical_public_error_code(value: Any) -> str:
+    """Map runtime/provider codes to the closed public error vocabulary."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("runtime error code must be a non-empty string")
+    return value if value in _PUBLIC_ERROR_CODES else _GENERIC_PUBLIC_ERROR_CODE
 
 
 _PROJECTORS: dict[str, Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]] = {

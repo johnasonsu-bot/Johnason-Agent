@@ -547,10 +547,52 @@ def test_runtime_compact_label_expansion_allows_exact_lexical_neighbors(
     assert mapped_identifier[0].payload["artifact_id"] == f"{safe_neighbor}-1"
 
 
-def test_public_text_fails_closed_above_the_assignment_limit() -> None:
-    """Catches unbounded assignment work being accepted at the public boundary."""
-    with pytest.raises(ValueError):
-        mapper_module.validate_public_text("note=" * 33, maximum=4096)
+def test_public_text_allows_more_than_32_ordinary_assignments() -> None:
+    """Catches a complexity shortcut rejecting semantically safe public text."""
+    text = " ".join(f"note{index}=ready" for index in range(33))
+
+    assert mapper_module.validate_public_text(text, maximum=4096) == text
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "a" * 64,
+        "result " + "b" * 40,
+        r"C:\private\runtime\state.json",
+        r"\\runtime-host\private-share\state.json",
+        "context proof available",
+        "application/x-host-v2-workspace-proof",
+    ],
+)
+def test_runtime_public_values_reject_digests_paths_and_internal_proofs(
+    unsafe_text: str,
+) -> None:
+    """Catches internal proof material crossing the first public boundary."""
+    with pytest.raises(ValueError, match="sensitive value|public text"):
+        map_runtime_event(runtime_event("assistant.delta", payload={"text": unsafe_text}))
+
+
+@pytest.mark.parametrize(
+    ("runtime_code", "public_code"),
+    [
+        ("runtime_error", "runtime_error"),
+        ("capacity_unavailable", "capacity_unavailable"),
+        ("provider_overloaded_in_region_7", "runtime_error"),
+        ("unknown_write_effect", "runtime_error"),
+    ],
+)
+def test_runtime_error_codes_use_the_public_canonical_allowlist(
+    runtime_code: str, public_code: str
+) -> None:
+    """Catches provider-specific or reconciliation codes entering public events."""
+    mapped = map_runtime_event(
+        runtime_event(
+            "error", payload={"code": runtime_code, "summary": "request failed"}
+        )
+    )[0]
+
+    assert mapped.payload["code"] == public_code
 
 
 def test_maximum_public_text_uses_one_full_normalization_pass(
