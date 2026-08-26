@@ -5,9 +5,9 @@
 - 代码提交 A：`cd95147db24fb1547afd63a3374a1e3ebef868a0`
 - 终态封口修复 A2：`652954f5740b68183c97603174c4b660956fff65`
 - malformed seal 测试提交 C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
-- C 的历史包含 A/A2/B，均保持可达。
-- Report revision：本文件所在的 documentation-only commit D；D 是 C 的直接
-  child，最终 SHA 在交付记录中给出，未 amend 任何代码/测试提交。
+- C 的历史包含 A/A2/B，报告 D 是 C 的 child，均保持可达。
+- Report revision：本文件所在的 documentation-only commit E；E 的历史包含
+  Source C，最终 SHA 在交付记录中给出，未 amend 任何既有提交。
 - Python：`3.13.5`；Node.js：`v22.20.0`；npm：`10.9.3`
 - Fake Host revision：`fake-host-v2/r2`
 
@@ -47,6 +47,10 @@ Real runtime status: NOT_YET_EVALUATED
   cursor、`sealed=False` 和错误类型响应后，现有生产 exact-response 校验全部
   fail closed：`7 passed`；异常与 diagnostics 不回显 Host 错误 identity/type，
   wait、aclose、process cleanup 和 reader cleanup 均有界完成。生产代码无需修改。
+- Fix3 Secret scan RED：旧 shell process-substitution 命令面对 invalid revision
+  时，Git 枚举虽失败，父 shell 仍输出 `changed_files=0 matching_files=0
+  scan_errors=0` 并 exit 0。checked Python 枚举器替换后，非法 revision 在计数
+  前 exit 2，且只输出安全错误类别。
 
 ## 九场景与隔离证据
 
@@ -180,20 +184,131 @@ changed-file 枚举命令：
 结果为 8 个文件：Task report、公共验证报告、v2 client、acceptance conformance、
 conformance helper、Fake Host、Host factory fixture、v2 query integration test。
 
-Secret scan 的完整可复制命令如下。pattern 只包含 OpenAI-style、GitHub token、
-AWS access key、Bearer high-entropy token 的敏感形状，不包含真实 secret。文件名
-通过 NUL 分隔读取，可处理空列表；`rg --text` 不跳过二进制内容；`-l` 的文件名
-和任何诊断均重定向到 `/dev/null`，命令只输出安全计数。
+Secret scan 的完整可复制命令如下。cwd 为 worktree root；revision 仅通过
+`BASE_REV` / `HEAD_REV` 环境参数传入。pattern 只包含 OpenAI-style、GitHub
+token、AWS access key、Bearer high-entropy token 的敏感形状，不包含真实
+secret。整体由 `SIGALRM` 限制为 30 秒，每个 Git subprocess 限制为 10 秒。
+
+changed-file 枚举是独立的 `subprocess.run(..., check=True, stdout=PIPE,
+stderr=PIPE)`；枚举失败立即安全 exit 2，不解析路径、不扫描、不输出成功计数。
+成功后才解析 NUL 路径，拒绝绝对路径、仓库外 symlink、非现存文件，并用
+checked `git ls-files --error-unmatch` 限制为仓库内 tracked changed files。
+逐文件以 bytes regex 扫描，因此不跳过二进制；只输出文件计数，不输出路径或
+匹配值。
 
 ```bash
-/usr/bin/python3 -c \
-  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=30); raise SystemExit(result.returncode)' \
-  bash -c 'set -uo pipefail; base="$1"; revision="$2"; pattern="(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|(?i:bearer)[[:space:]]+[A-Za-z0-9._-]{20,})"; changed_files=0; matching_files=0; scan_errors=0; while IFS= read -r -d "" file; do changed_files=$((changed_files + 1)); if LC_ALL=C rg --text -l -- "$pattern" "$file" >/dev/null 2>&1; then matching_files=$((matching_files + 1)); else status=$?; if [ "$status" -gt 1 ]; then scan_errors=$((scan_errors + 1)); fi; fi; done < <(git diff --name-only --diff-filter=ACMR -z "$base..$revision"); printf "changed_files=%d matching_files=%d scan_errors=%d\n" "$changed_files" "$matching_files" "$scan_errors"; test "$matching_files" -eq 0 && test "$scan_errors" -eq 0' \
-  _ dd8ac2033a214fdd1af340f75d03b49b394d1b85 c803de37c6328330fda214ab0b4d9ecffdcd9ab9
+BASE_REV=dd8ac2033a214fdd1af340f75d03b49b394d1b85 \
+HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9 \
+/usr/bin/python3 - <<'PY'
+import os
+import re
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+OVERALL_TIMEOUT_SECONDS = 30
+SUBPROCESS_TIMEOUT_SECONDS = 10
+SECRET_SHAPES = re.compile(
+    rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    rb"AKIA[0-9A-Z]{16}|(?i:bearer)[\t\r\n ]+[A-Za-z0-9._-]{20,})"
+)
+
+def fail(category: str, code: int) -> None:
+    print(f"secret_scan_error={category}", file=sys.stderr)
+    raise SystemExit(code)
+
+def on_timeout(_signum: int, _frame: object) -> None:
+    fail("timeout", 4)
+
+signal.signal(signal.SIGALRM, on_timeout)
+signal.alarm(OVERALL_TIMEOUT_SECONDS)
+base_revision = os.environ.get("BASE_REV")
+head_revision = os.environ.get("HEAD_REV")
+if not base_revision or not head_revision:
+    fail("revision_environment_missing", 2)
+
+try:
+    enumeration = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+            f"{base_revision}..{head_revision}",
+            "--",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
+except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+    fail("changed_file_enumeration_failed", 2)
+
+if enumeration.stdout and not enumeration.stdout.endswith(b"\0"):
+    fail("changed_file_enumeration_malformed", 2)
+
+repository = Path.cwd().resolve()
+relative_paths = [
+    os.fsdecode(raw_path)
+    for raw_path in enumeration.stdout.split(b"\0")
+    if raw_path
+]
+validated_files: list[Path] = []
+for relative_path in relative_paths:
+    if Path(relative_path).is_absolute():
+        fail("changed_file_validation_failed", 3)
+    try:
+        candidate = (repository / relative_path).resolve(strict=True)
+        candidate.relative_to(repository)
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative_path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (
+        OSError,
+        ValueError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
+        fail("changed_file_validation_failed", 3)
+    if not candidate.is_file():
+        fail("changed_file_validation_failed", 3)
+    validated_files.append(candidate)
+
+matching_files = 0
+try:
+    for candidate in validated_files:
+        matching_files += bool(SECRET_SHAPES.search(candidate.read_bytes()))
+except OSError:
+    fail("file_scan_failed", 3)
+
+print(
+    f"changed_files={len(validated_files)} "
+    f"matching_files={matching_files} scan_errors=0"
+)
+raise SystemExit(1 if matching_files else 0)
+PY
 ```
 
-结果：`changed_files=8 matching_files=0 scan_errors=0`，30 秒上限，wrapper
-exit 0；未输出任何匹配值。
+实际三态验证均使用上述完整脚本，仅环境参数不同：
+
+- 合法范围：`BASE_REV=dd8ac2033a214fdd1af340f75d03b49b394d1b85`，
+  `HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`；输出
+  `changed_files=8 matching_files=0 scan_errors=0`，exit 0，0.61 秒。
+- 合法空范围：`BASE_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`，
+  `HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`；输出
+  `changed_files=0 matching_files=0 scan_errors=0`，exit 0，0.49 秒。
+- 非法 revision：`BASE_REV=invalid-revision-for-fix3`，
+  `HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`；只在 stderr 输出
+  扫描器安全摘要 `secret_scan_error=changed_file_enumeration_failed`，exit 2，
+  0.48 秒；扫描器未输出 `changed_files`、`matching_files` 或 `scan_errors`
+  成功计数，也未输出捕获的 Git stderr。
 
 ## 完整回归与前端
 

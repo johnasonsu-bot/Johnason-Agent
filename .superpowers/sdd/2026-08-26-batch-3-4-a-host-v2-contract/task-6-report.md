@@ -16,6 +16,9 @@
 - Fix2 参数化覆盖 wrong state、run/term/step identity、cursor、`sealed=False`
   和错误类型 ack；7 个变体均稳定 fail closed、无错误值回显或挂起，生产现有
   exact-response 校验无需修改。
+- Fix3 将 Secret scan 的 changed-file 枚举改为独立 checked subprocess；Git
+  枚举失败立即非零退出且不输出成功计数，路径限制为仓库内 tracked changed
+  files，bytes regex 不跳过二进制内容。
 
 ## Task 5 承重 P0
 
@@ -34,6 +37,8 @@
 - terminal immediate-extra 独立进程重复：`passes=50 failures=0`；
 - frontend build：exit 0；既有完整 Playwright 证据：`38 passed`；
 - compileall、`git diff --check`、高置信 Secret scan：通过。
+- Secret scan 三态：合法范围 `8/0/0` exit 0、合法空范围 `0/0/0` exit 0、
+  invalid revision 仅输出安全错误类别并 exit 2。
 
 Source revision C 上未取得完整必需后端 `pytest -q` 的 PASS、exit code 与最终
 计数；不把实施前 development graph 观测写成本次已证明的 baseline failure。
@@ -46,8 +51,8 @@ Real runtime status: NOT_YET_EVALUATED
 ```
 
 Source revision under test：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`。
-Fix2 代码/测试提交 C 的历史包含 A/A2/B；本报告由 C 的独立
-documentation-only child D 提交，不 amend 任何代码/测试提交。
+Fix2 代码/测试提交 C 的历史包含 A/A2/B；D 与本次 documentation-only E
+均为 C 的可达 descendants，不 amend 任何既有提交。
 
 阻塞与完整命令、版本、HEAD、Fake revision、v1 兼容、Secret scan 和残余风险
 详见 `docs/superpowers/reports/2026-08-26-host-v2-contract-validation.md`。
