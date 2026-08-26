@@ -11,6 +11,44 @@ from workbench.agui.stream import replay_agui
 from workbench.workflow.event_store import EventStore
 
 
+_SENSITIVE_ROOTS = (
+    ("reasoning",),
+    ("chain", "of", "thought"),
+    ("private", "prompt"),
+    ("private", "history"),
+    ("history",),
+    ("provider",),
+    ("workspace",),
+    ("manifest",),
+    ("vault",),
+    ("secret",),
+    ("credential",),
+    ("api", "key"),
+    ("access", "key"),
+    ("private", "key"),
+    ("bearer",),
+    ("access", "token"),
+    ("api", "token"),
+)
+_SENSITIVE_METADATA_SUFFIXES = (
+    "content", "prompt", "history", "id", "ref", "reference", "path", "digest", "key", "token"
+)
+_LABEL_STYLES = ("snake", "kebab", "dot", "space", "colon", "equals", "camel", "pascal")
+_IDENTIFIER_STYLES = ("snake", "kebab", "dot", "colon", "camel", "pascal")
+
+
+def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> str:
+    parts = (*root, suffix)
+    if style == "camel":
+        return parts[0] + "".join(part.title() for part in parts[1:])
+    if style == "pascal":
+        return "".join(part.title() for part in parts)
+    separator = {
+        "snake": "_", "kebab": "-", "dot": ".", "space": " ", "colon": ":", "equals": "="
+    }[style]
+    return separator.join(parts)
+
+
 @pytest.mark.parametrize(
     ("runtime_type", "payload", "domain_type"),
     [
@@ -204,7 +242,7 @@ def test_rejects_sensitive_identifier_variants_at_runtime_boundary(sensitive_ide
         map_runtime_event(event)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("safe_identifier", ["provider-1", "workspace-1", "manifestation-1", "digestive-1", "vaulted-1"])
+@pytest.mark.parametrize("safe_identifier", ["providers-1", "workspaces-1", "manifestation-1", "digestive-1", "vaulted-1"])
 def test_accepts_ordinary_identifier_neighbors(safe_identifier: str) -> None:
     """Catches secret-prefix protection rejecting ordinary opaque identifiers."""
     mapped = map_runtime_event(
@@ -242,9 +280,121 @@ def test_rejects_sensitive_reference_identifier_variants_in_runtime_fields(
         )
 
 
-@pytest.mark.parametrize("safe_identifier", ["manifestation-ref-1", "workspace-note-1", "vaulted-reference-1"])
+@pytest.mark.parametrize("safe_identifier", ["manifestation-ref-1", "workspaces-note-1", "vaulted-reference-1"])
 def test_accepts_non_sensitive_reference_neighbors(safe_identifier: str) -> None:
     """Catches reference hardening rejecting normal opaque IDs with similar words."""
+    mapped = map_runtime_event(
+        runtime_event("artifact.proposed", payload={"artifact_id": safe_identifier})
+    )
+    assert mapped[0].payload["artifact_id"] == safe_identifier
+
+
+@pytest.mark.parametrize(
+    ("root", "suffix"),
+    [(root, suffix) for root in _SENSITIVE_ROOTS for suffix in _SENSITIVE_METADATA_SUFFIXES],
+)
+def test_runtime_public_summaries_reject_normalized_sensitive_root_suffix_combinations(
+    root: tuple[str, ...], suffix: str
+) -> None:
+    """Catches any supported word boundary bypassing a sensitive summary label."""
+    for style in _LABEL_STYLES:
+        unsafe = _styled_sensitive_label(root, suffix, style) + ": hidden"
+        with pytest.raises(ValueError):
+            map_runtime_event(
+                runtime_event(
+                    "artifact.proposed",
+                    payload={"artifact_id": "artifact-1", "summary": unsafe},
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("root", "suffix"),
+    [(root, suffix) for root in _SENSITIVE_ROOTS for suffix in _SENSITIVE_METADATA_SUFFIXES],
+)
+def test_runtime_artifact_refs_reject_normalized_sensitive_prefix_combinations(
+    root: tuple[str, ...], suffix: str
+) -> None:
+    """Catches sensitive opaque metadata prefixes crossing the artifact-ref boundary."""
+    for style in _IDENTIFIER_STYLES:
+        unsafe = _styled_sensitive_label(root, suffix, style) + "-1"
+        forged_identity = SimpleNamespace(
+            event_id="event-1",
+            run_id=unsafe,
+            term_id="term-1",
+            step_id="step-1",
+            cursor=1,
+            type="assistant.delta",
+            payload={"text": "hello"},
+            required=False,
+        )
+        with pytest.raises(ValueError, match="identity"):
+            map_runtime_event(forged_identity)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            map_runtime_event(
+                runtime_event(
+                    "tool.call",
+                    payload={
+                        "tool_id": "search",
+                        "tool_call_id": "call-1",
+                        "read_only": True,
+                        "artifact_ref": unsafe,
+                    },
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ["token=hidden", "token-ref-1", "vault-private", "sk-short", "bearerValue"],
+)
+def test_runtime_boundaries_reject_explicit_credential_and_private_identifier_shapes(
+    unsafe: str,
+) -> None:
+    """Catches credential assignments and strict private opaque-ID prefixes."""
+    if "=" in unsafe:
+        with pytest.raises(ValueError):
+            map_runtime_event(runtime_event("assistant.delta", payload={"text": unsafe}))
+    else:
+        with pytest.raises(ValueError):
+            map_runtime_event(
+                runtime_event(
+                    "tool.call",
+                    payload={
+                        "tool_id": "search",
+                        "tool_call_id": "call-1",
+                        "read_only": True,
+                        "artifact_ref": unsafe,
+                    },
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "secretary approved the release",
+        "token_count=3",
+        "tokenCount: 3",
+        "token-count = 3",
+        "The workspace supports ordinary team planning.",
+        "This provider offers a public service.",
+    ],
+)
+def test_runtime_public_text_allows_safe_counters_and_business_neighbors(safe_text: str) -> None:
+    """Catches normalization overreach against ordinary public prose and counters."""
+    mapped = map_runtime_event(runtime_event("assistant.delta", payload={"text": safe_text}))
+    assert mapped[0].payload["content"] == safe_text
+
+
+@pytest.mark.parametrize(
+    "safe_identifier",
+    ["token_count", "tokenCount", "token-count", "secretary-1", "manifestation-ref-1", "vaulted-reference-1"],
+)
+def test_runtime_opaque_ids_allow_safe_counters_and_lexical_neighbors(
+    safe_identifier: str,
+) -> None:
+    """Catches strict opaque validation rejecting explicitly safe adjacent terms."""
     mapped = map_runtime_event(
         runtime_event("artifact.proposed", payload={"artifact_id": safe_identifier})
     )

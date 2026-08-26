@@ -23,3 +23,11 @@
 - GREEN: shared validator 将 ref/reference 纳入 manifest/workspace/vault 的敏感后缀，统一覆盖 camel、snake、kebab、`:` 与 `=`。term/artifact ID、runtime `artifact_ref`、以及伪造持久 Event 均 fail closed；`manifestation-ref`、`workspace-note`、`vaulted-reference` 等合法邻近 ID 可通过。
 - Cross-runtime: Python adapter 使用 typed kwargs；Fake Goose 从 NDJSON-shaped mapping `model_validate`；Fake DSH 从异构 source event 显式规范化。三条独立 decode 路径再共享公开投影断言。
 - Verification: Task 5 mapper/AG-UI、AG-UI resume、Task 4 query/lifecycle/run 共 263 项通过；`compileall` 与 `git diff --check` 通过。仅既有 Starlette TestClient 弃用警告。
+
+## Fix 4
+
+- RED: 用 root × metadata suffix × separator/camel/Pascal 组合表覆盖 runtime summary、runtime identity、`artifact_ref` 与伪造 persisted `DomainEvent`；旧枚举正则出现 643 项预期失败。随后单独加入 `historyRef` 根并再次观察到预期红测。
+- GREEN: 删除三套易分叉的敏感字符串枚举，统一将 camelCase/PascalCase（含 acronym 边界）以及 snake/kebab/dot/space/colon/equals 拆成 lowercase tokens；public text 只拒绝“敏感根/短语 + 元数据”、敏感赋值标签或 credential/path/traceback 形态，opaque ID 则拒绝敏感词组和 `sk`/bearer 等严格前缀。
+- False positives: `secretary`、`token_count`/`tokenCount`/`token-count`、workspace/provider 普通业务句子，以及 `manifestation`/`vaulted` 等合法邻近词均通过；`token=`、`token-ref-*`、`vault-private`、`reasoningRef`、`chainOfThoughtReference`、`privatePromptRef`、`history_reference` 均 fail closed。
+- Boundaries: AG-UI 继续直接复用 runtime mapper 的共享 validator，无需额外适配；runtime identity/summary、persisted identity/summary 与 runtime/persisted `artifact_ref` 使用同一规范化语义。
+- Verification: Task 5、AG-UI、resume、Task 4 与 V1/Host 回归共 1188 项通过；独立恶意 probe 覆盖 17 个危险文本、8 个危险 ID 和 11 个安全邻近项；`compileall`、`git diff --check` 均通过。仅有既存 Starlette TestClient 弃用警告。

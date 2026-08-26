@@ -12,43 +12,66 @@ from workbench.runtime.engine_host.v2.contracts import RuntimeEventV2
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-_SENSITIVE_KEY = re.compile(
-    r"(?:api[_ -]?(?:key|token)|access[_ -]?(?:key|token)|authorization|"
-    r"bearer|credential|password|passwd|secret|token|vault|reasoning|"
-    r"chain[_ -]?of[_ -]?thought|private[_ -]?(?:prompt|history)|"
-    r"provider[_ -]?ref|workspace|manifest|digest)",
-    re.IGNORECASE,
-)
-_SENSITIVE_VALUE = re.compile(
-    r"(?:api[_ -]?(?:key|token)\s*[:=]|authorization\s*[:=]|"
-    r"bearer\s+[A-Za-z0-9._~+/=-]{8,}|(?:github_pat_|gh[pousr]_|sk-|AKIA)"
-    r"[A-Za-z0-9_-]{8,}|(?:^|[\\/])\.\.(?:[\\/]|$)|(?:^|\s)/[^\s]{1,})",
-    re.IGNORECASE,
-)
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_PRIVATE_TEXT = re.compile(
-    r"(?:\b(?:reasoning(?:[ _-]?(?:content|id))?|reasoningContent|"
-    r"chain[ _-]?of[ _-]?thought|private[ _-]?(?:prompt|history|reasoning)|"
-    r"provider(?:[ _-]?(?:ref|reference|id))?|providerRef|"
-    r"workspace(?:[ _-]?(?:path|id|ref|reference))?|workspace(?:Path|Ref|Reference)|"
-    r"manifest(?:[ _-]?(?:digest|id|ref|reference))?|manifest(?:Digest|Ref|Reference)|digest|"
-    r"vault(?:[ _-]?(?:id|ref|reference))?|vault(?:Id|Ref|Reference)|"
-    r"secret(?:[ _-]?(?:token|id))?|secretToken|"
-    r"credential(?:[ _-]?(?:id|token))?|credentialId)\s*[:=]|"
-    r"\b(?:exception|error)\s*[:=]|\btraceback\s*\(|"
-    r"\bstack(?:[ _-]?trace)?\s*[:=])",
+_CAMEL_ACRONYM_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_WORD = re.compile(r"[A-Za-z0-9]+")
+_ASSIGNMENT = re.compile(r"[:=]")
+_CREDENTIAL_VALUE = re.compile(
+    r"(?:github_pat_|gh[pousr]_|sk-|AKIA)[A-Za-z0-9_-]+|"
+    r"\bbearer(?:\s+|\s*[:=]\s*)[A-Za-z0-9._~+/=-]{8,}",
     re.IGNORECASE,
 )
-_SECRET_IDENTIFIER = re.compile(
-    r"(?:^sk-[A-Za-z0-9_-]{8,}|^bearer(?:[-_:]|$)|"
-    r"^(?:provider(?:[_:-]?(?:ref|reference|id)|Ref)|"
-    r"workspace(?:[_:-]?(?:path|id|ref|reference)|(?:Path|Ref|Reference))|"
-    r"manifest(?:[_:-]?(?:digest|id|ref|reference)|(?:Digest|Ref|Reference))|digest(?:[-_:]|$)|"
-    r"reasoning(?:[_:-]?(?:content|id)|Content)|vault(?:[_:-]?(?:id|ref|reference)|(?:Id|Ref|Reference))|"
-    r"secret(?:[_:-]?(?:token|id)|Token)|credential(?:[_:-]?(?:id|token)|Id))|"
-    r"api[_ -]?(?:key|token)|access[_ -]?(?:key|token)|authorization|password)",
-    re.IGNORECASE,
+_UNSAFE_PATH = re.compile(
+    r"(?:^|[\\/])\.\.(?:[\\/]|$)|(?:^|\s)/[^\s]{1,}"
 )
+_TRACEBACK = re.compile(r"\btraceback\s*\(", re.IGNORECASE)
+_SENSITIVE_ROOTS = (
+    ("reasoning",),
+    ("chain", "of", "thought"),
+    ("private", "prompt"),
+    ("private", "history"),
+    ("history",),
+    ("provider",),
+    ("workspace",),
+    ("manifest",),
+    ("vault",),
+    ("secret",),
+    ("credential",),
+    ("api", "key"),
+    ("access", "key"),
+    ("private", "key"),
+    ("bearer",),
+    ("access", "token"),
+    ("api", "token"),
+    ("authorization",),
+    ("password",),
+    ("passwd",),
+)
+_DIAGNOSTIC_LABELS = (
+    ("exception",),
+    ("error",),
+    ("stack",),
+    ("stack", "trace"),
+    ("traceback",),
+)
+_SENSITIVE_METADATA_SUFFIXES = frozenset(
+    {
+        "content",
+        "prompt",
+        "history",
+        "id",
+        "ref",
+        "reference",
+        "path",
+        "digest",
+        "key",
+        "token",
+        "private",
+    }
+)
+_TOKEN_SAFE_SUFFIXES = frozenset({"count"})
+_TOKEN_SENSITIVE_SUFFIXES = frozenset({"id", "ref", "reference", "key", "token", "private", "secret"})
 _STATUSES = frozenset({"queued", "running", "paused", "completed", "failed", "cancelled"})
 _TOOL_RESULT_STATUSES = frozenset({"completed", "failed"})
 _STATE_OPERATIONS = frozenset({"add", "remove", "replace", "update"})
@@ -56,10 +79,17 @@ _STATE_OPERATIONS = frozenset({"add", "remove", "replace", "update"})
 
 def is_opaque_identifier(value: Any) -> bool:
     """Return whether an identifier is bounded and cannot carry a secret."""
-    return (
-        isinstance(value, str)
-        and bool(_IDENTIFIER.fullmatch(value))
-        and not _SECRET_IDENTIFIER.search(value)
+    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+        return False
+    words = _normalized_words(value)
+    if not words or _is_safe_token_counter(words):
+        return bool(words)
+    return not (
+        _contains_phrase(words, ("sk",))
+        or _contains_any_phrase(words, _SENSITIVE_ROOTS)
+        or _contains_sensitive_metadata_label(words)
+        or _contains_token_sensitive_suffix(words)
+        or words[0] == "digest"
     )
 
 
@@ -70,11 +100,91 @@ def validate_public_text(value: Any, *, maximum: int) -> str:
         or not value
         or len(value) > maximum
         or _CONTROL.search(value)
-        or _SENSITIVE_VALUE.search(value)
-        or _PRIVATE_TEXT.search(value)
+        or _contains_private_public_label(value)
+        or _contains_credential_value(value)
+        or _UNSAFE_PATH.search(value)
+        or _TRACEBACK.search(value)
     ):
         raise ValueError("value must be bounded public text")
     return value
+
+
+def _normalized_words(value: str) -> tuple[str, ...]:
+    """Split identifier styles into one lowercase semantic representation."""
+    separated = _CAMEL_ACRONYM_BOUNDARY.sub(" ", value)
+    separated = _CAMEL_WORD_BOUNDARY.sub(" ", separated)
+    return tuple(match.group(0).lower() for match in _WORD.finditer(separated))
+
+
+def _contains_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
+    width = len(phrase)
+    return any(words[index : index + width] == phrase for index in range(len(words) - width + 1))
+
+
+def _contains_any_phrase(
+    words: tuple[str, ...], phrases: tuple[tuple[str, ...], ...]
+) -> bool:
+    return any(_contains_phrase(words, phrase) for phrase in phrases)
+
+
+def _contains_sensitive_metadata_label(words: tuple[str, ...]) -> bool:
+    for root in _SENSITIVE_ROOTS:
+        width = len(root)
+        for index in range(len(words) - width):
+            if words[index : index + width] == root and words[index + width] in _SENSITIVE_METADATA_SUFFIXES:
+                return True
+    return False
+
+
+def _contains_token_sensitive_suffix(words: tuple[str, ...]) -> bool:
+    return any(
+        words[index] == "token" and words[index + 1] in _TOKEN_SENSITIVE_SUFFIXES
+        for index in range(len(words) - 1)
+    )
+
+
+def _is_safe_token_counter(words: tuple[str, ...]) -> bool:
+    return len(words) == 2 and words[0] == "token" and words[1] in _TOKEN_SAFE_SUFFIXES
+
+
+def _ends_with_phrase(words: tuple[str, ...], phrase: tuple[str, ...]) -> bool:
+    return len(words) >= len(phrase) and words[-len(phrase) :] == phrase
+
+
+def _contains_sensitive_assignment(value: str) -> bool:
+    assignment_labels = (*_SENSITIVE_ROOTS, *_DIAGNOSTIC_LABELS, ("token",))
+    for assignment in _ASSIGNMENT.finditer(value):
+        label_words = _normalized_words(value[: assignment.start()])
+        if _is_safe_token_counter(label_words):
+            continue
+        if any(_ends_with_phrase(label_words, label) for label in assignment_labels):
+            return True
+    return False
+
+
+def _contains_private_public_label(value: str) -> bool:
+    words = _normalized_words(value)
+    return (
+        _contains_sensitive_metadata_label(words)
+        or _contains_token_sensitive_suffix(words)
+        or _contains_sensitive_assignment(value)
+    )
+
+
+def _contains_credential_value(value: str) -> bool:
+    return bool(_CREDENTIAL_VALUE.search(value))
+
+
+def _is_sensitive_payload_key(value: str) -> bool:
+    words = _normalized_words(value)
+    if _is_safe_token_counter(words):
+        return False
+    return (
+        _contains_any_phrase(words, _SENSITIVE_ROOTS)
+        or _contains_token_sensitive_suffix(words)
+        or _contains_phrase(words, ("token",))
+        or _contains_phrase(words, ("digest",))
+    )
 
 
 def is_public_text(value: Any, *, maximum: int) -> bool:
@@ -153,13 +263,15 @@ def _payload(event: RuntimeEventV2) -> Mapping[str, Any]:
 def _reject_sensitive_payload(value: Any) -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            if not isinstance(key, str) or _SENSITIVE_KEY.search(key):
+            if not isinstance(key, str) or _is_sensitive_payload_key(key):
                 raise ValueError("runtime event payload contains a sensitive field")
             _reject_sensitive_payload(nested)
     elif isinstance(value, (tuple, list)):
         for nested in value:
             _reject_sensitive_payload(nested)
-    elif isinstance(value, str) and _SENSITIVE_VALUE.search(value):
+    elif isinstance(value, str) and (
+        _contains_credential_value(value) or _UNSAFE_PATH.search(value)
+    ):
         raise ValueError("runtime event payload contains a sensitive value")
     elif value is not None and (isinstance(value, bool) or isinstance(value, (int, float, str))):
         return

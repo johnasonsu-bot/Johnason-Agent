@@ -6,6 +6,44 @@ from workbench.agui.stream import replay_agui
 from workbench.protocol.events import DomainEvent
 
 
+_SENSITIVE_ROOTS = (
+    ("reasoning",),
+    ("chain", "of", "thought"),
+    ("private", "prompt"),
+    ("private", "history"),
+    ("history",),
+    ("provider",),
+    ("workspace",),
+    ("manifest",),
+    ("vault",),
+    ("secret",),
+    ("credential",),
+    ("api", "key"),
+    ("access", "key"),
+    ("private", "key"),
+    ("bearer",),
+    ("access", "token"),
+    ("api", "token"),
+)
+_SENSITIVE_METADATA_SUFFIXES = (
+    "content", "prompt", "history", "id", "ref", "reference", "path", "digest", "key", "token"
+)
+_LABEL_STYLES = ("snake", "kebab", "dot", "space", "colon", "equals", "camel", "pascal")
+_IDENTIFIER_STYLES = ("snake", "kebab", "dot", "colon", "camel", "pascal")
+
+
+def _styled_sensitive_label(root: tuple[str, ...], suffix: str, style: str) -> str:
+    parts = (*root, suffix)
+    if style == "camel":
+        return parts[0] + "".join(part.title() for part in parts[1:])
+    if style == "pascal":
+        return "".join(part.title() for part in parts)
+    separator = {
+        "snake": "_", "kebab": "-", "dot": ".", "space": " ", "colon": ":", "equals": "="
+    }[style]
+    return separator.join(parts)
+
+
 @pytest.mark.parametrize(
     ("domain_type", "payload", "agui_type"),
     [
@@ -396,3 +434,96 @@ def test_v2_forged_persisted_reference_identity_is_rejected(sensitive_identifier
         run_id="run-1", step_id="step-1", sequence=1,
     )
     assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    ("root", "suffix"),
+    [(root, suffix) for root in _SENSITIVE_ROOTS for suffix in _SENSITIVE_METADATA_SUFFIXES],
+)
+def test_v2_forged_summaries_reject_normalized_sensitive_root_suffix_combinations(
+    root: tuple[str, ...], suffix: str
+) -> None:
+    """Catches persisted summaries bypassing any supported normalized word boundary."""
+    for style in _LABEL_STYLES:
+        unsafe = _styled_sensitive_label(root, suffix, style) + ": hidden"
+        event = DomainEvent.new(
+            "artifact.proposed",
+            "engine_host.v2",
+            {
+                "artifact_id": "artifact-1",
+                "summary": unsafe,
+                "term_id": "term-1",
+                "cursor": 1,
+            },
+            run_id="run-1",
+            step_id="step-1",
+            sequence=1,
+        )
+        assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    ("root", "suffix"),
+    [(root, suffix) for root in _SENSITIVE_ROOTS for suffix in _SENSITIVE_METADATA_SUFFIXES],
+)
+def test_v2_forged_artifact_refs_reject_normalized_sensitive_prefix_combinations(
+    root: tuple[str, ...], suffix: str
+) -> None:
+    """Catches persisted artifact refs bypassing strict opaque-ID normalization."""
+    for style in _IDENTIFIER_STYLES:
+        unsafe = _styled_sensitive_label(root, suffix, style) + "-1"
+        event = DomainEvent.new(
+            "agent.tool.completed",
+            "engine_host.v2",
+            {
+                "tool_id": "search",
+                "tool_call_id": "call-1",
+                "read_only": True,
+                "artifact_ref": unsafe,
+                "term_id": "term-1",
+                "cursor": 1,
+            },
+            run_id="run-1",
+            step_id="step-1",
+            sequence=1,
+        )
+        assert map_domain_event(event) == []
+        forged_identity = event.model_copy(
+            update={
+                "payload": {
+                    "tool_id": "search",
+                    "tool_call_id": "call-1",
+                    "read_only": True,
+                    "artifact_ref": "artifact-1",
+                    "term_id": unsafe,
+                    "cursor": 1,
+                }
+            }
+        )
+        assert map_domain_event(forged_identity) == []
+
+
+@pytest.mark.parametrize(
+    "safe_text",
+    [
+        "secretary approved the release",
+        "token_count=3",
+        "tokenCount: 3",
+        "token-count = 3",
+        "The workspace supports ordinary team planning.",
+        "This provider offers a public service.",
+    ],
+)
+def test_v2_forged_public_text_allows_safe_counters_and_business_neighbors(
+    safe_text: str,
+) -> None:
+    """Catches second-boundary normalization overreach against public text."""
+    event = DomainEvent.new(
+        "agent.message.delta",
+        "engine_host.v2",
+        {"content": safe_text, "term_id": "term-1", "cursor": 1},
+        run_id="run-1",
+        step_id="step-1",
+        sequence=1,
+    )
+    assert map_domain_event(event)[0]["delta"] == safe_text
