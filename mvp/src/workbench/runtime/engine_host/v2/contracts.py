@@ -225,6 +225,9 @@ class RuntimeCapabilitiesV2(FrozenModel):
     """Capabilities advertised by a runtime before it can receive a v2 query."""
 
     runtime_id: OpaqueIdentifier
+    build_id: OpaqueIdentifier
+    protocol_version: Literal["2.0"] = "2.0"
+    query: StrictBool = False
     model: StrictBool = False
     tools: StrictBool = False
     skills: StrictBool = False
@@ -234,6 +237,12 @@ class RuntimeCapabilitiesV2(FrozenModel):
     pause_resume: StrictBool = False
     compaction: StrictBool = False
     checkpoints: StrictBool = False
+    streaming: StrictBool = False
+    plan: StrictBool = False
+    todo: StrictBool = False
+    prompt_sections: StrictBool = False
+    tool_interceptors: StrictBool = False
+    event_cursor: StrictBool = False
 
 
 QueryCommandTypeV2 = Literal[

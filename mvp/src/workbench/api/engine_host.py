@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, ConfigDict
 
 from workbench.runtime.engine_host.contracts import HostCapabilities, HostStatus
+from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 
 
 class EngineHostStatusSource(Protocol):
@@ -53,6 +54,60 @@ def engine_host_router(source: EngineHostStatusSource | None) -> APIRouter:
             protocol=snapshot.protocol,
             capabilities=snapshot.capabilities,
             runner_mode=source.runner_mode,
+        )
+
+    return router
+
+
+class EngineHostV2RuntimeDiagnostic(BaseModel):
+    """The public subset of a registered v2 runtime."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    runtime_id: str
+    build_id: str
+    state: Literal["ready", "disabled"]
+    capabilities: tuple[str, ...]
+
+
+class EngineHostV2Diagnostic(BaseModel):
+    """Read-only v2 registry status; intentionally omits all executable configuration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool
+    protocol: Literal["2.0"]
+    runtimes: tuple[EngineHostV2RuntimeDiagnostic, ...]
+
+
+class EngineHostDiagnosticV2Envelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    v2: EngineHostV2Diagnostic
+
+
+def engine_host_v2_router(registry: RuntimeRegistryV2 | None, *, enabled: bool) -> APIRouter:
+    """Expose the additive v2 registry diagnostic without changing v1 routes."""
+
+    router = APIRouter(prefix="/api/v1/engine-host", tags=["engine-host"])
+
+    @router.get("", response_model=EngineHostDiagnosticV2Envelope)
+    def status() -> EngineHostDiagnosticV2Envelope:
+        snapshots = () if registry is None else registry.snapshot()
+        return EngineHostDiagnosticV2Envelope(
+            v2=EngineHostV2Diagnostic(
+                enabled=enabled,
+                protocol="2.0",
+                runtimes=tuple(
+                    EngineHostV2RuntimeDiagnostic(
+                        runtime_id=item.runtime_id,
+                        build_id=item.build_id,
+                        state=item.state,
+                        capabilities=item.capabilities,
+                    )
+                    for item in snapshots
+                ),
+            )
         )
 
     return router

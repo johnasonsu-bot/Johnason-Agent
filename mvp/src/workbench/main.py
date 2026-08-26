@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.adapters.hermes.runtime import AgentRuntime, WorkflowInterventions
 from workbench.api.app import AppSettings, create_app
+from workbench.api.engine_host import engine_host_v2_router
 from workbench.conversations.repository import ConversationRepository
 from workbench.credentials.service import VaultService
 from workbench.models.deepseek import DeepSeekProvider
@@ -27,7 +28,9 @@ from workbench.models.openai_compatible import OpenAICompatibleProvider
 from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.client import EngineHostClient
 from workbench.runtime.engine_host.selector import RunnerSelector
-from workbench.settings import WorkbenchSettings
+from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
 from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
 from workbench.orchestration.development_processor import DurableDevelopmentProcessor
@@ -107,8 +110,21 @@ def build_app(
             development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
         )
     )
+    runtime_registry_v2 = (
+        RuntimeRegistryV2(RuntimeV2Repository(resolved.database))
+        if resolved.engine_host_v2_enabled
+        else None
+    )
+    include_router = getattr(app, "include_router", None)
+    if callable(include_router):
+        include_router(
+            engine_host_v2_router(
+                runtime_registry_v2, enabled=resolved.engine_host_v2_enabled
+            )
+        )
     app.state.agent_runtime = agent_runtime
     app.state.execution_runner = selected_runner
+    app.state.runtime_registry_v2 = runtime_registry_v2
     return app
 
 
@@ -243,6 +259,19 @@ def _json_string_array(name: str, value: str) -> tuple[str, ...]:
     return tuple(parsed)
 
 
+def _json_runtime_processes(value: str) -> tuple[RuntimeProcessConfig, ...]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("engine host v2 runtimes must be a JSON array") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("engine host v2 runtimes must be a JSON array")
+    try:
+        return tuple(RuntimeProcessConfig.model_validate(item) for item in parsed)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("engine host v2 runtimes must contain structured argv") from exc
+
+
 def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings:
     """Apply the bounded Engine Host environment contract without shell parsing."""
     updates: dict[str, object] = {}
@@ -252,6 +281,12 @@ def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings
         if normalized not in {"true", "false", "1", "0"}:
             raise ValueError("engine host enabled must be true or false")
         updates["engine_host_enabled"] = normalized in {"true", "1"}
+    v2_enabled = os.environ.get("WORKBENCH_ENGINE_HOST_V2_ENABLED")
+    if v2_enabled is not None:
+        normalized = v2_enabled.casefold()
+        if normalized not in {"true", "false", "1", "0"}:
+            raise ValueError("engine host v2 enabled must be true or false")
+        updates["engine_host_v2_enabled"] = normalized in {"true", "1"}
     command = os.environ.get("WORKBENCH_ENGINE_HOST_COMMAND_JSON")
     if command is not None:
         updates["engine_host_command"] = _json_string_array("command", command)
@@ -260,6 +295,9 @@ def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings
         updates["engine_host_provider_allowlist"] = _json_string_array(
             "provider allowlist", allowlist
         )
+    v2_runtimes = os.environ.get("WORKBENCH_ENGINE_HOST_V2_RUNTIMES_JSON")
+    if v2_runtimes is not None:
+        updates["engine_host_v2_runtimes"] = _json_runtime_processes(v2_runtimes)
     return settings.model_copy(update=updates)
 
 

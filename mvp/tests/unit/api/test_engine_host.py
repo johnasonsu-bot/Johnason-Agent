@@ -1,13 +1,18 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
 from workbench.adapters.hermes.runner import AgentStepResult
 from workbench.api.app import AppSettings, create_app
+from workbench.api.engine_host import engine_host_v2_router
 from workbench.runtime.engine_host.contracts import HostCapabilities, HostStatus
 from workbench.runtime.engine_host.selector import RunnerSelector
+from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from tests.fixtures.host_v2 import runtime_capabilities
 
 
 class NoopRunner:
@@ -164,3 +169,37 @@ def test_engine_host_diagnostic_has_no_mutation_routes(tmp_path: Path) -> None:
         assert client.post("/api/engine-host/status").status_code == 405
         assert client.put("/api/engine-host/status").status_code == 405
         assert client.delete("/api/engine-host/status").status_code == 405
+
+
+def test_v2_engine_host_diagnostic_exposes_only_safe_runtime_summary(
+    tmp_path: Path,
+) -> None:
+    """Catches a v2 diagnostic exposing executable or private registration data."""
+    registry = RuntimeRegistryV2(RuntimeV2Repository(tmp_path / "api.sqlite"))
+    registry.register(
+        runtime_capabilities("fake-v2", build_id="fake:test", query=True, tools=True)
+    )
+    app = FastAPI()
+    app.include_router(engine_host_v2_router(registry, enabled=True))
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "v2": {
+            "enabled": True,
+            "protocol": "2.0",
+            "runtimes": [
+                {
+                    "runtime_id": "fake-v2",
+                    "build_id": "fake:test",
+                    "state": "ready",
+                    "capabilities": ["query", "tools"],
+                }
+            ],
+        }
+    }
+    assert "argv" not in response.text
+    assert "environment" not in response.text
+    assert "digest" not in response.text

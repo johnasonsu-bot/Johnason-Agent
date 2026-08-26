@@ -26,18 +26,23 @@ def _replace_path(value: dict[str, JsonValue], path: str, replacement: JsonValue
 
 def run_envelope(
     *,
-    runtime_id: str = "fake-v2",
+    runtime_id: str | None = None,
     command_id: str = "command-1",
     attempt: int = 0,
     host_generation: str = "host-a",
     overrides: Mapping[str, JsonValue] | None = None,
 ) -> RunEnvelopeV2:
     """Build and validate a complete, safe v2 run envelope."""
+    resolved_runtime_id = runtime_id or "fake-v2"
     value: dict[str, JsonValue] = {
         "protocol_version": "2.0",
         "runtime": {
-            "runtime_id": runtime_id,
-            "build_id": "python:test-build",
+            "runtime_id": resolved_runtime_id,
+            "build_id": (
+                "python:test-build"
+                if runtime_id is None
+                else f"{resolved_runtime_id}:test"
+            ),
             "config_digest": "c" * 64,
             "host_generation": host_generation,
         },
@@ -117,8 +122,16 @@ def run_envelope(
     return RunEnvelopeV2.model_validate(value)
 
 
-def runtime_capabilities(runtime_id: str, **flags: bool) -> RuntimeCapabilitiesV2:
-    return RuntimeCapabilitiesV2.model_validate({"runtime_id": runtime_id, **flags})
+def runtime_capabilities(
+    runtime_id: str, *, build_id: str | None = None, **flags: bool
+) -> RuntimeCapabilitiesV2:
+    return RuntimeCapabilitiesV2.model_validate(
+        {
+            "runtime_id": runtime_id,
+            "build_id": build_id or f"{runtime_id}:test",
+            **flags,
+        }
+    )
 
 
 def runtime_event(

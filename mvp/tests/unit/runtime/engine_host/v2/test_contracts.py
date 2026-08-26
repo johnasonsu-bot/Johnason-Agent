@@ -422,3 +422,38 @@ def test_v2_package_exports_only_task_one_contracts() -> None:
         "WorkspaceGrantV2",
         "CheckpointHintV2",
     }
+
+
+def test_runtime_capabilities_pin_public_runtime_build_and_v2_features() -> None:
+    """Catches a registration capability record missing its selection identity."""
+    capabilities = runtime_capabilities(
+        "python",
+        build_id="python:test-build",
+        query=True,
+        streaming=True,
+        plan=True,
+        todo=True,
+        prompt_sections=True,
+        tool_interceptors=True,
+        event_cursor=True,
+    )
+
+    assert capabilities.protocol_version == "2.0"
+    assert capabilities.build_id == "python:test-build"
+    assert capabilities.query is True
+    assert capabilities.event_cursor is True
+
+
+@pytest.mark.parametrize("wire_value", [1, 0, "true", "false"])
+def test_new_runtime_capability_flags_reject_non_boolean_wire_values(
+    wire_value: object,
+) -> None:
+    """Catches permissive coercion for v2 runtime selection requirements."""
+    with pytest.raises(ValidationError):
+        runtime_capabilities("python", query=wire_value)  # type: ignore[arg-type]
+
+
+def test_runtime_capabilities_reject_extra_registration_metadata() -> None:
+    """Catches secret or mutable process configuration crossing the registry boundary."""
+    with pytest.raises(ValidationError):
+        runtime_capabilities("python", argv=("python", "-m", "host"))
