@@ -187,172 +187,29 @@ changed-file 枚举命令：
 结果为 8 个文件：Task report、公共验证报告、v2 client、acceptance conformance、
 conformance helper、Fake Host、Host factory fixture、v2 query integration test。
 
-Secret scan 的完整可复制命令如下。cwd 为任意可读取该 Git 仓库的位置；revision
-仅通过 `BASE_REV` / `HEAD_REV` 环境参数传入，且必须为 40 位十六进制 commit
-id，因此不能注入 Git option。pattern 只包含 OpenAI-style、GitHub token、AWS
-access key、Bearer high-entropy token 的敏感形状，不包含真实 secret。整体由
-`SIGALRM` 限制为 30 秒，每个 Git subprocess 限制为 10 秒。
-
-扫描器以 checked `git diff --name-only -z BASE..HEAD` 语义枚举 changed paths，
-并以同样 checked 的删除项枚举决定 blob revision：非删除路径只从 `HEAD_REV`
-（本报告为 Source C）读取，删除路径只从 `BASE_REV` 读取。路径自 Git NUL 输出
-起始终保留为 bytes，另做 strict UTF-8 和相对 Git path 校验；所有 Git 调用均用
-argv，不拼 shell。逐路径执行 checked `git cat-file blob REV:path`，所以普通文件、
-二进制和 symlink 均扫描提交中的原始 blob bytes，绝不访问、`resolve()` 或跟随
-工作树文件。选定对象缺失、不可读或不是 blob 一律 fail closed。
-
-enumeration、blob、timeout、path decode/validation 任一失败时，只输出固定安全
-错误类别并非零退出，不输出 Git stderr、path、匹配值、traceback 或成功计数；
-只有所有 blob 均成功扫描后才输出三个计数。
+Secret scan 已提取为仓库内受测试的 Git-object CLI。cwd 可以是任意可读取目标
+Git 仓库的位置；revision 仅通过 `BASE_REV` / `HEAD_REV` 环境参数传入，且必须为
+40 位十六进制 commit id，因此不能注入 Git option。执行命令为：
 
 ```bash
-BASE_REV=dd8ac2033a214fdd1af340f75d03b49b394d1b85 \
-HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9 \
-/usr/bin/python3 -I - <<'PY'
-import os
-import re
-import signal
-import subprocess
-import sys
-
-OVERALL_TIMEOUT_SECONDS = 30
-SUBPROCESS_TIMEOUT_SECONDS = 10
-SECRET_SHAPES = re.compile(
-    rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
-    rb"AKIA[0-9A-Z]{16}|(?i:bearer)[\t\r\n ]+[A-Za-z0-9._-]{20,})"
-)
-
-def fail(category: str, code: int) -> None:
-    print(f"secret_scan_error={category}", file=sys.stderr)
-    raise SystemExit(code)
-
-def on_timeout(_signum: int, _frame: object) -> None:
-    fail("timeout", 4)
-
-signal.signal(signal.SIGALRM, on_timeout)
-signal.alarm(OVERALL_TIMEOUT_SECONDS)
-
-def strict_revision(variable: str) -> bytes:
-    value = os.environ.get(variable)
-    if value is None:
-        fail("revision_environment_missing", 2)
-    try:
-        revision = value.encode("ascii", errors="strict")
-    except UnicodeEncodeError:
-        fail("revision_invalid", 2)
-    if re.fullmatch(rb"[0-9A-Fa-f]{40}", revision) is None:
-        fail("revision_invalid", 2)
-    return revision
-
-def run_git(arguments: list[bytes], failure_category: str, code: int) -> bytes:
-    try:
-        result = subprocess.run(
-            [b"git", *arguments],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        fail("git_subprocess_timeout", 4)
-    except (subprocess.CalledProcessError, OSError):
-        fail(failure_category, code)
-    return result.stdout
-
-def parse_git_paths(payload: bytes) -> list[bytes]:
-    if payload and not payload.endswith(b"\0"):
-        fail("changed_file_enumeration_malformed", 2)
-    paths = [path for path in payload.split(b"\0") if path]
-    if len(paths) != len(set(paths)):
-        fail("changed_file_enumeration_malformed", 2)
-    for path in paths:
-        try:
-            path.decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            fail("changed_path_decode_failed", 3)
-        components = path.split(b"/")
-        if path.startswith(b"/") or any(
-            component in (b"", b".", b"..") for component in components
-        ):
-            fail("changed_path_validation_failed", 3)
-    return paths
-
-def enumerate_paths(diff_filter=None) -> list[bytes]:
-    arguments = [
-        b"diff",
-        b"--no-ext-diff",
-        b"--no-renames",
-        b"--name-only",
-        b"-z",
-    ]
-    if diff_filter is not None:
-        arguments.append(b"--diff-filter=" + diff_filter)
-    arguments.extend([base_revision + b".." + head_revision, b"--"])
-    return parse_git_paths(
-        run_git(arguments, "changed_file_enumeration_failed", 2)
-    )
-
-base_revision = strict_revision("BASE_REV")
-head_revision = strict_revision("HEAD_REV")
-changed_paths = enumerate_paths()
-deleted_paths = set(enumerate_paths(b"D"))
-if not deleted_paths.issubset(set(changed_paths)):
-    fail("changed_file_enumeration_malformed", 2)
-
-matching_files = 0
-for path in changed_paths:
-    blob_revision = base_revision if path in deleted_paths else head_revision
-    blob = run_git(
-        [b"cat-file", b"blob", blob_revision + b":" + path],
-        "blob_read_failed",
-        3,
-    )
-    matching_files += bool(SECRET_SHAPES.search(blob))
-
-signal.alarm(0)
-print(
-    f"changed_files={len(changed_paths)} "
-    f"matching_files={matching_files} scan_errors=0"
-)
-raise SystemExit(1 if matching_files else 0)
-PY
+BASE_REV=<40-hex-base> HEAD_REV=<40-hex-head> \
+  /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
 ```
 
-实际十态验证均使用上述完整脚本，仅环境参数或临时 Git fixture 不同：
+扫描器以 checked `git diff --name-only -z BASE..HEAD` 枚举变更，以单独 checked
+删除枚举选择 blob revision：非删除从 `HEAD_REV` 读取，删除从 `BASE_REV` 读取。
+它只用 `git cat-file blob REV:path` 读取 Git 对象，绝不访问、resolve 或跟随工作树；
+非 blob、对象读取失败、超时、路径解码/校验失败与 Git 枚举失败均 fail closed。
 
-- 合法范围：`BASE_REV=dd8ac2033a214fdd1af340f75d03b49b394d1b85`，
-  `HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`；输出
-  `changed_files=8 matching_files=0 scan_errors=0`，exit 0，0.15 秒。
-- 合法空范围：`BASE_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`，
-  `HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`；输出
-  `changed_files=0 matching_files=0 scan_errors=0`，exit 0，0.05 秒。
-- 非法 revision：`BASE_REV=invalid-revision-for-fix4`，
-  `HEAD_REV=c803de37c6328330fda214ab0b4d9ecffdcd9ab9`；只在 stderr 输出
-  扫描器安全摘要 `secret_scan_error=revision_invalid`，exit 2；扫描器未输出
-  `changed_files`、`matching_files` 或 `scan_errors` 成功计数，也未输出 Git
-  stderr、path 或 traceback。
-- 枚举失败：`BASE_REV` 使用格式合法但仓库不存在的全零 40 位 object id；只输出
-  `secret_scan_error=changed_file_enumeration_failed`，exit 2；无成功计数、Git
-  stderr、path、traceback 或绝对路径。
-- symlink blob：临时 Git 仓库的 changed symlink target bytes 为合成 token 形状，
-  其工作树目标文件内容安全；输出 `changed_files=2 matching_files=1
-  scan_errors=0`，exit 1，证明扫描的是 symlink blob 而不是目标文件。测试 harness
-  只检查计数和 exit，不输出合成匹配值。
-- symlink loop：临时 Git 仓库含 `loop -> loop`；输出
-  `changed_files=1 matching_files=0 scan_errors=0`，exit 0；不跟随 symlink，
-  stderr 无 traceback 或临时绝对路径。
-- blob 读取失败：临时 Git 仓库用 gitlink（commit 对象）作为 changed path；只在
-  stderr 输出 `secret_scan_error=blob_read_failed`，exit 3；无成功计数、Git
-  stderr、path、traceback 或临时绝对路径。
-- 删除普通 blob：临时 Git 仓库从 BASE 删除含合成 token 形状的 tracked blob；
-  扫描器在 HEAD 无该 path 时读取 BASE blob，输出
-  `changed_files=1 matching_files=1 scan_errors=0`，exit 1，避免删除 secret 逃逸。
-- 删除且两端无可扫描 blob：临时 Git 仓库从 BASE 删除 gitlink；HEAD 无该 path，
-  BASE 对象也不是 blob；只输出 `secret_scan_error=blob_read_failed`，exit 3，
-  无成功计数、Git stderr、path、traceback 或临时绝对路径。
-- path decode 失败：临时 Git tree 含非 UTF-8 path bytes；只输出
-  `secret_scan_error=changed_path_decode_failed`，exit 3；不读取 blob，且无成功
-  计数、Git stderr、path、traceback 或临时绝对路径。
+每一个 credential-shaped match 都独立判断：仅当 path 位于 `mvp/tests/`，且该
+match 前后有限字节窗口同时包含拒绝/不安全/敏感的测试语义和
+credential/secret/token/private 语义时，才计作 fixture allowance。一个文件内的
+远端无关命中不会因同文件的 reject 标记被整体放行。成功 stdout 仅包含
+`scanned_blobs`、`fixture_allowances` 与 `findings` 三个计数；错误 stdout 为空，
+stderr 只包含固定错误类别，从不回显 path、匹配值、Git stderr 或 traceback。
+
+本节的旧内联实现与其历史十态计数已由上述 CLI 契约替代；本次文档改动不将那些
+历史数字表述为重新验证的当前 PASS。
 
 ## 完整回归与前端
 
