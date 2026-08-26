@@ -13,6 +13,13 @@ from workbench.runtime.engine_host.v2.contracts import (
 )
 
 
+def _nested_json(depth: int, leaf: object = "safe") -> object:
+    value = leaf
+    for _ in range(depth):
+        value = {"safe": value}
+    return value
+
+
 def test_run_envelope_freezes_every_resume_identity() -> None:
     """Catches a v2 envelope that omits a checkpoint-resume identity."""
     envelope = run_envelope()
@@ -41,6 +48,89 @@ def test_v2_payload_recursively_rejects_secret_shaped_fields() -> None:
 
     with pytest.raises((ValidationError, ValueError), match="sensitive"):
         RunEnvelopeV2.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    "credential_value",
+    [
+        "sk-proj-abcdefghijklmnopqrstuvwx",
+        "github_pat_11AAabcdefghijklmnopqrstuv",
+        "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "AKIAIOSFODNN7EXAMPLE",
+        "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+        "-----BEGIN PRIVATE KEY-----",
+    ],
+)
+@pytest.mark.parametrize("boundary", ["extensions", "event", "query", "schema"])
+def test_host_json_recursively_rejects_high_confidence_credential_values(
+    boundary: str, credential_value: str
+) -> None:
+    """Catches credential material crossing a Host JSON value with an innocuous key."""
+    payload = {"safe": [{"note": credential_value}]}
+
+    with pytest.raises((ValidationError, ValueError), match="sensitive"):
+        if boundary == "extensions":
+            run_envelope(overrides={"extensions": payload})
+        elif boundary == "event":
+            runtime_event("assistant.delta", payload=payload)
+        elif boundary == "query":
+            QueryCommandV2(
+                type="query.status", command_id="command-1", payload=payload
+            )
+        else:
+            run_envelope(
+                overrides={
+                    "tool_manifest": (
+                        {
+                            "tool_id": "tool-1",
+                            "schema": {"description": credential_value},
+                            "version": "1",
+                            "read_only": True,
+                            "timeout_ms": 1,
+                            "idempotency": "idempotent",
+                        },
+                    )
+                }
+            )
+
+
+@pytest.mark.parametrize(
+    "business_text",
+    [
+        "Follow the password reset procedure",
+        "password=reset procedures are documented",
+        "The token count is 32",
+        "token_count=32",
+    ],
+)
+def test_host_json_allows_ordinary_password_and_token_count_text(
+    business_text: str,
+) -> None:
+    """Catches credential-value matching that blocks ordinary business prose."""
+    envelope = run_envelope(overrides={"extensions": {"note": business_text}})
+
+    assert envelope.extensions["note"] == business_text
+
+
+def test_host_json_accepts_the_maximum_supported_nesting_depth() -> None:
+    """Catches an off-by-one depth budget that rejects the documented safe boundary."""
+    command = QueryCommandV2(
+        type="query.status",
+        command_id="command-1",
+        payload={"value": _nested_json(31)},
+    )
+
+    assert command.payload["value"] is not None
+
+
+def test_host_json_rejects_nesting_above_the_supported_depth() -> None:
+    """Catches unbounded recursion before JSON payloads are frozen."""
+    with pytest.raises((ValidationError, ValueError), match="nesting depth"):
+        QueryCommandV2(
+            type="query.status",
+            command_id="command-1",
+            payload={"value": _nested_json(32)},
+        )
 
 
 def test_v2_envelope_rejects_an_invalid_digest() -> None:
@@ -73,6 +163,36 @@ def test_manifest_entries_freeze_required_execution_metadata() -> None:
     assert skill.prompt_section_ids == ("section-1",)
     assert plugin.source_revision == "revision-1"
     assert plugin.order == 0
+
+
+@pytest.mark.parametrize(
+    "workspace_path",
+    [
+        "workspace/read",
+        "/workspace//read",
+        "/workspace/./read",
+        "/workspace/../read",
+        "/workspace/read/",
+        "/workspace\\read",
+    ],
+)
+def test_workspace_grant_rejects_noncanonical_posix_paths(
+    workspace_path: str,
+) -> None:
+    """Catches ambiguous workspace paths being normalized after admission."""
+    with pytest.raises(ValidationError, match="canonical absolute POSIX"):
+        run_envelope(
+            overrides={"workspace_grant.readable_paths": (workspace_path,)}
+        )
+
+
+def test_workspace_grant_accepts_canonical_root_and_nested_posix_paths() -> None:
+    """Catches canonical path validation accidentally excluding the POSIX root."""
+    envelope = run_envelope(
+        overrides={"workspace_grant.readable_paths": ("/", "/workspace/read")}
+    )
+
+    assert envelope.workspace_grant.readable_paths == ("/", "/workspace/read")
 
 
 @pytest.mark.parametrize(

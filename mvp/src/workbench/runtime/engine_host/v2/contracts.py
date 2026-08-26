@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -26,6 +27,15 @@ from workbench.runtime.engine_host.contracts import FrozenJsonMapping
 
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+_MAX_JSON_NESTING_DEPTH = 32
+_HIGH_CONFIDENCE_CREDENTIAL_VALUE = re.compile(
+    r"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})|"
+    r"(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])|"
+    r"\bbearer[ \t]+[A-Za-z0-9._~+/=-]{20,}|"
+    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+    re.IGNORECASE,
+)
 warnings.filterwarnings(
     "ignore",
     message='Field name "schema" in "ToolManifestEntryV2" shadows an attribute',
@@ -73,19 +83,21 @@ def _is_sensitive_key(key: str) -> bool:
     )
 
 
-def _validate_json_value(value: Any) -> None:
+def _validate_json_value(value: Any, *, depth: int = 0) -> None:
     """Accept JSON values only after recursively enforcing the secret boundary."""
+    if depth > _MAX_JSON_NESTING_DEPTH:
+        raise ValueError("payload exceeds the maximum JSON nesting depth")
     if isinstance(value, Mapping):
         for key, nested_value in value.items():
             if not isinstance(key, str):
                 raise ValueError("payload keys must be strings")
             if _is_sensitive_key(key):
                 raise ValueError("payload contains a sensitive field")
-            _validate_json_value(nested_value)
+            _validate_json_value(nested_value, depth=depth + 1)
         return
     if isinstance(value, (list, tuple)):
         for item in value:
-            _validate_json_value(item)
+            _validate_json_value(item, depth=depth + 1)
         return
     if value is None or isinstance(value, (bool, int)):
         return
@@ -94,6 +106,8 @@ def _validate_json_value(value: Any) -> None:
             return
         raise ValueError("payload must contain only JSON values")
     if isinstance(value, str):
+        if _HIGH_CONFIDENCE_CREDENTIAL_VALUE.search(value):
+            raise ValueError("payload contains a sensitive value")
         return
     raise ValueError("payload must contain only JSON values")
 
@@ -116,7 +130,26 @@ def _serialize_json_value(value: Any) -> JsonValue:
     return value
 
 
-WorkspacePath = Annotated[str, StringConstraints(pattern=r"^/[^\x00\r\n]{0,1023}$")]
+def _validate_workspace_path(value: str) -> str:
+    if (
+        not value.startswith("/")
+        or "\\" in value
+        or "//" in value
+        or (value != "/" and value.endswith("/"))
+        or (
+            value != "/"
+            and any(segment in {"", ".", ".."} for segment in value[1:].split("/"))
+        )
+    ):
+        raise ValueError("workspace path must be a canonical absolute POSIX path")
+    return value
+
+
+WorkspacePath = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=1024, pattern=r"^[^\x00\r\n]+$"),
+    AfterValidator(_validate_workspace_path),
+]
 
 
 class FrozenModel(BaseModel):
