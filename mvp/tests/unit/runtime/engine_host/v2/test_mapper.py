@@ -5,6 +5,7 @@ import pytest
 
 from tests.fixtures.host_v2 import runtime_event
 from workbench.runtime.engine_host.v2.mapper import map_runtime_event
+from workbench.runtime.engine_host.v2.contracts import RuntimeEventV2
 from workbench.agui.mapper import map_domain_event
 from workbench.agui.stream import replay_agui
 from workbench.workflow.event_store import EventStore
@@ -215,27 +216,78 @@ def test_accepts_ordinary_identifier_neighbors(safe_identifier: str) -> None:
     assert mapped[0].payload["artifact_ref"] == safe_identifier
 
 
+@pytest.mark.parametrize(
+    "sensitive_identifier",
+    [
+        "manifestRef-1", "manifest_ref-1", "manifest-reference-1",
+        "workspaceRef-1", "workspace_reference-1", "vault-ref-1", "vaultReference-1",
+    ],
+)
+def test_rejects_sensitive_reference_identifier_variants_in_runtime_fields(
+    sensitive_identifier: str,
+) -> None:
+    """Catches manifest/workspace/vault reference IDs entering public runtime fields."""
+    event = SimpleNamespace(
+        event_id="event-1", run_id="run-1", term_id=sensitive_identifier, step_id="step-1",
+        cursor=1, type="artifact.proposed", payload={"artifact_id": sensitive_identifier}, required=False,
+    )
+    with pytest.raises(ValueError, match="identity"):
+        map_runtime_event(event)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        map_runtime_event(
+            runtime_event(
+                "tool.call",
+                payload={"tool_id": "search", "tool_call_id": "call-1", "read_only": True, "artifact_ref": sensitive_identifier},
+            )
+        )
+
+
+@pytest.mark.parametrize("safe_identifier", ["manifestation-ref-1", "workspace-note-1", "vaulted-reference-1"])
+def test_accepts_non_sensitive_reference_neighbors(safe_identifier: str) -> None:
+    """Catches reference hardening rejecting normal opaque IDs with similar words."""
+    mapped = map_runtime_event(
+        runtime_event("artifact.proposed", payload={"artifact_id": safe_identifier})
+    )
+    assert mapped[0].payload["artifact_id"] == safe_identifier
+
+
 @pytest.mark.asyncio
 async def test_runtime_emitters_project_equivalently_and_resume_without_duplicates(tmp_path: Path) -> None:
     """Catches runtime-specific fields changing public projection or SSE resume."""
-    def emit_python(cursor: int) -> object:
-        return runtime_event(
-            "assistant.delta", cursor=cursor, payload={"text": "shared output"}
-        ).model_copy(update={"event_id": f"event-{cursor}"})
+    def emit_python(cursor: int) -> RuntimeEventV2:
+        return RuntimeEventV2(
+            event_id=f"event-{cursor}", run_id="run-1", term_id="term-1", step_id="step-1",
+            cursor=cursor, type="assistant.delta", payload={"text": "shared output"}, required=False,
+        )
 
-    def emit_fake_goose(cursor: int) -> object:
-        return runtime_event(
-            "assistant.delta", cursor=cursor, payload={"text": "shared output"}
-        ).model_copy(update={"event_id": f"event-{cursor}"})
+    def emit_fake_goose(cursor: int) -> RuntimeEventV2:
+        goose_ndjson_record = {
+            "event_id": f"event-{cursor}", "run_id": "run-1", "term_id": "term-1", "step_id": "step-1",
+            "cursor": cursor, "type": "assistant.delta", "payload": {"text": "shared output"}, "required": False,
+        }
+        return RuntimeEventV2.model_validate(goose_ndjson_record)
 
-    def emit_fake_dsh(cursor: int) -> object:
-        return runtime_event(
-            "assistant.delta", cursor=cursor, payload={"text": "shared output"}
-        ).model_copy(update={"event_id": f"event-{cursor}"})
+    def emit_fake_dsh(cursor: int) -> RuntimeEventV2:
+        dsh_source_event = {
+            "event": {"id": f"event-{cursor}", "run": "run-1", "term": "term-1", "step": "step-1"},
+            "offset": cursor, "kind": "assistant.delta", "body": {"text": "shared output"},
+        }
+        return RuntimeEventV2.model_validate(
+            {
+                "event_id": dsh_source_event["event"]["id"],
+                "run_id": dsh_source_event["event"]["run"],
+                "term_id": dsh_source_event["event"]["term"],
+                "step_id": dsh_source_event["event"]["step"],
+                "cursor": dsh_source_event["offset"],
+                "type": dsh_source_event["kind"],
+                "payload": dsh_source_event["body"],
+                "required": False,
+            }
+        )
 
     projections = []
     for emitter in (emit_python, emit_fake_goose, emit_fake_dsh):
-        event = map_runtime_event(emitter(1))[0]  # type: ignore[arg-type]
+        event = map_runtime_event(emitter(1))[0]
         wire = map_domain_event(event)[0]
         projections.append(
             {
@@ -257,7 +309,7 @@ async def test_runtime_emitters_project_equivalently_and_resume_without_duplicat
     store = EventStore(tmp_path / "events.sqlite")
     for cursor in (1, 2):
         store.append(
-            map_runtime_event(emit_python(cursor))[0],  # type: ignore[arg-type]
+            map_runtime_event(emit_python(cursor))[0],
             command_id=f"event-{cursor}",
         )
     persisted = store.read_stream("step:step-1", after_sequence=1)

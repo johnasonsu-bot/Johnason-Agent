@@ -16,3 +16,10 @@
 - Identity: V2 二次边界要求 timezone-aware `occurred_at`、正整数 `sequence == cursor`，并对 `model_construct` 的 list/dict/bool/naive 值 fail closed。
 - Cross-runtime: Python、Fake Goose、Fake DSH 分别通过独立 emitter 构造相同规范 event，再验证公开投影与 EventStore/SSE resume 等价。
 - Verification: Task 5 mapper/AG-UI、AG-UI resume、Task 4 query/lifecycle/run 共 242 项通过；`compileall` 与 `git diff --check` 通过。仅既有 Starlette TestClient 弃用警告。
+
+## Fix 3
+
+- RED: `manifestRef`/`manifest_reference`/`manifest-ref`/`manifestReference` 及 workspace/vault 的 ref/reference 变体能绕过 public-text 和 opaque-ID 边界。
+- GREEN: shared validator 将 ref/reference 纳入 manifest/workspace/vault 的敏感后缀，统一覆盖 camel、snake、kebab、`:` 与 `=`。term/artifact ID、runtime `artifact_ref`、以及伪造持久 Event 均 fail closed；`manifestation-ref`、`workspace-note`、`vaulted-reference` 等合法邻近 ID 可通过。
+- Cross-runtime: Python adapter 使用 typed kwargs；Fake Goose 从 NDJSON-shaped mapping `model_validate`；Fake DSH 从异构 source event 显式规范化。三条独立 decode 路径再共享公开投影断言。
+- Verification: Task 5 mapper/AG-UI、AG-UI resume、Task 4 query/lifecycle/run 共 263 项通过；`compileall` 与 `git diff --check` 通过。仅既有 Starlette TestClient 弃用警告。

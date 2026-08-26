@@ -364,3 +364,35 @@ def test_v2_tool_artifact_ref_is_an_opaque_identifier_not_public_text() -> None:
         run_id="run-1", step_id="step-1", sequence=1,
     )
     assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "manifestRef: private", "manifest_reference=private", "manifest-ref: private",
+        "manifestReference=private", "workspaceRef: private", "workspace-reference=private",
+        "vault_ref: private", "vaultReference=private",
+    ],
+)
+def test_v2_public_text_rejects_sensitive_reference_labels(unsafe_text: str) -> None:
+    """Catches ref/reference suffix variants bypassing the shared public-text policy."""
+    event = DomainEvent.new(
+        "artifact.proposed", "engine_host.v2",
+        {"artifact_id": "artifact-1", "summary": unsafe_text, "term_id": "term-1", "cursor": 1},
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize("sensitive_identifier", ["manifestRef-1", "workspace_reference-1", "vault-reference-1"])
+def test_v2_forged_persisted_reference_identity_is_rejected(sensitive_identifier: str) -> None:
+    """Catches ref/reference IDs bypassing runtime validation after persistence."""
+    event = DomainEvent.new(
+        "agent.tool.completed", "engine_host.v2",
+        {
+            "tool_id": "search", "tool_call_id": "call-1", "read_only": True,
+            "artifact_ref": sensitive_identifier, "term_id": sensitive_identifier, "cursor": 1,
+        },
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []

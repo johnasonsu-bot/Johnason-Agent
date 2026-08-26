@@ -30,9 +30,10 @@ _PRIVATE_TEXT = re.compile(
     r"(?:\b(?:reasoning(?:[ _-]?(?:content|id))?|reasoningContent|"
     r"chain[ _-]?of[ _-]?thought|private[ _-]?(?:prompt|history|reasoning)|"
     r"provider(?:[ _-]?(?:ref|reference|id))?|providerRef|"
-    r"workspace(?:[ _-]?(?:path|id))?|workspacePath|"
-    r"manifest(?:[ _-]?(?:digest|id))?|manifestDigest|digest|"
-    r"vault(?:[ _-]?id)?|vaultId|secret(?:[ _-]?(?:token|id))?|secretToken|"
+    r"workspace(?:[ _-]?(?:path|id|ref|reference))?|workspace(?:Path|Ref|Reference)|"
+    r"manifest(?:[ _-]?(?:digest|id|ref|reference))?|manifest(?:Digest|Ref|Reference)|digest|"
+    r"vault(?:[ _-]?(?:id|ref|reference))?|vault(?:Id|Ref|Reference)|"
+    r"secret(?:[ _-]?(?:token|id))?|secretToken|"
     r"credential(?:[ _-]?(?:id|token))?|credentialId)\s*[:=]|"
     r"\b(?:exception|error)\s*[:=]|\btraceback\s*\(|"
     r"\bstack(?:[ _-]?trace)?\s*[:=])",
@@ -41,9 +42,9 @@ _PRIVATE_TEXT = re.compile(
 _SECRET_IDENTIFIER = re.compile(
     r"(?:^sk-[A-Za-z0-9_-]{8,}|^bearer(?:[-_:]|$)|"
     r"^(?:provider(?:[_:-]?(?:ref|reference|id)|Ref)|"
-    r"workspace(?:[_:-]?(?:path|id)|Path)|"
-    r"manifest(?:[_:-]?(?:digest|id)|Digest)|digest(?:[-_:]|$)|"
-    r"reasoning(?:[_:-]?(?:content|id)|Content)|vault(?:[_:-]?id|Id)|"
+    r"workspace(?:[_:-]?(?:path|id|ref|reference)|(?:Path|Ref|Reference))|"
+    r"manifest(?:[_:-]?(?:digest|id|ref|reference)|(?:Digest|Ref|Reference))|digest(?:[-_:]|$)|"
+    r"reasoning(?:[_:-]?(?:content|id)|Content)|vault(?:[_:-]?(?:id|ref|reference)|(?:Id|Ref|Reference))|"
     r"secret(?:[_:-]?(?:token|id)|Token)|credential(?:[_:-]?(?:id|token)|Id))|"
     r"api[_ -]?(?:key|token)|access[_ -]?(?:key|token)|authorization|password)",
     re.IGNORECASE,
