@@ -4,7 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from tests.fixtures.host_v2 import run_envelope, runtime_event
+from workbench.runtime.engine_host import v2
 from workbench.runtime.engine_host.v2.contracts import (
+    CheckpointHintV2,
     QueryCommandV2,
     RunEnvelopeV2,
     RuntimeEventV2,
@@ -110,6 +112,35 @@ def test_runtime_event_allows_unknown_optional_extension_event() -> None:
     assert event.required is False
 
 
+def test_runtime_event_rejects_unknown_required_extension_event() -> None:
+    """Catches a required unknown event being admitted without a projector."""
+    with pytest.raises(ValidationError, match="required"):
+        RuntimeEventV2(
+            event_id="event-1",
+            run_id="run-1",
+            term_id="term-1",
+            step_id="step-1",
+            cursor=1,
+            type="vendor.mutating-event",
+            required=True,
+        )
+
+
+def test_runtime_event_allows_declared_required_event() -> None:
+    """Catches a known control-plane event being blocked as an extension."""
+    event = RuntimeEventV2(
+        event_id="event-1",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        required=True,
+    )
+
+    assert event.required is True
+
+
 def test_runtime_event_requires_a_positive_cursor() -> None:
     """Catches a runtime event that can overwrite the first event cursor."""
     with pytest.raises(ValidationError):
@@ -128,3 +159,113 @@ def test_contract_models_are_frozen() -> None:
 
     with pytest.raises(ValidationError):
         envelope.command_id = "command-2"  # type: ignore[misc]
+
+
+def _set_path(value: object, path: str, replacement: object) -> None:
+    target = value
+    *parents, leaf = path.split(".")
+    for parent in parents:
+        if isinstance(target, list):
+            target = target[int(parent)]
+        else:
+            assert isinstance(target, dict)
+            target = target[parent]
+    if isinstance(target, list):
+        target[int(leaf)] = replacement
+    else:
+        assert isinstance(target, dict)
+        target[leaf] = replacement
+
+
+@pytest.mark.parametrize("wire_value", [True, "1", 1.0])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "attempt",
+        "checkpoint_cursor",
+        "deadline_ms",
+        "context.version",
+        "context_budget.max_input_tokens",
+        "context_budget.reserved_output_tokens",
+        "tool_manifest.0.timeout_ms",
+        "plugin_pins.0.order",
+        "workspace_grant.expires_at_ms",
+    ],
+)
+def test_run_envelope_rejects_non_integer_wire_values(
+    path: str, wire_value: object
+) -> None:
+    """Catches Pydantic coercing non-integer values in durable wire identity."""
+    value = run_envelope().model_dump(mode="json")
+    _set_path(value, path, wire_value)
+
+    with pytest.raises(ValidationError):
+        RunEnvelopeV2.model_validate(value)
+
+
+@pytest.mark.parametrize("wire_value", [True, "1", 1.0])
+def test_event_and_checkpoint_cursors_reject_non_integer_wire_values(
+    wire_value: object,
+) -> None:
+    """Catches coercion of cursors before ordering and resume decisions."""
+    event = runtime_event("assistant.delta").model_dump(mode="json")
+    event["cursor"] = wire_value
+
+    with pytest.raises(ValidationError):
+        RuntimeEventV2.model_validate(event)
+    with pytest.raises(ValidationError):
+        CheckpointHintV2(
+            checkpoint_ref="checkpoint-1",
+            checkpoint_digest="a" * 64,
+            cursor=wire_value,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "api_key",
+        "accessKey",
+        "x_access_key",
+        "token",
+        "password",
+        "secret",
+        "credential",
+    ],
+)
+def test_extensions_reject_sensitive_key_variants(field: str) -> None:
+    """Catches boundary validation that misses canonical credential key forms."""
+    value = run_envelope().model_dump(mode="json")
+    value["extensions"] = {field: "redacted"}
+
+    with pytest.raises(ValidationError, match="sensitive"):
+        RunEnvelopeV2.model_validate(value)
+
+
+def test_extensions_allow_non_sensitive_business_content() -> None:
+    """Catches an overbroad secret matcher rejecting ordinary business metadata."""
+    value = run_envelope().model_dump(mode="json")
+    value["extensions"] = {
+        "secretary": "Alice",
+        "note": "password=reset procedures are documented",
+    }
+
+    envelope = RunEnvelopeV2.model_validate(value)
+
+    assert envelope.extensions["secretary"] == "Alice"
+
+
+def test_v2_package_exports_only_task_one_contracts() -> None:
+    """Catches auxiliary implementation types leaking through the package API."""
+    assert set(v2.__all__) == {
+        "RunEnvelopeV2",
+        "RuntimeCapabilitiesV2",
+        "QueryCommandV2",
+        "RuntimeEventV2",
+        "ContextBudgetV2",
+        "ToolManifestEntryV2",
+        "SkillPinV2",
+        "PluginPinV2",
+        "WorkspaceGrantV2",
+        "CheckpointHintV2",
+    }

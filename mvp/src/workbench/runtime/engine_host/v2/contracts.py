@@ -13,8 +13,10 @@ from pydantic import (
     ConfigDict,
     Field,
     JsonValue,
+    StrictInt,
     field_serializer,
     field_validator,
+    model_validator,
 )
 from pydantic.types import StringConstraints
 
@@ -23,21 +25,6 @@ from workbench.runtime.engine_host.contracts import FrozenJsonMapping
 
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-_SENSITIVE_KEY = re.compile(
-    r"(?:api[_-]?key|access[_-]?key|access[_-]?token|authorization|bearer|"
-    r"password|passwd|secret|vault|credential|private[_-]?(?:prompt|key)|"
-    r"(?:^|[_-])token$)",
-    re.IGNORECASE,
-)
-_SENSITIVE_VALUE = re.compile(
-    r"(?:"
-    r"(?:api|access)[ _-]?(?:key|token)\s*[:=]|"
-    r"(?:password|passwd|secret|vault|authorization)\s*[:=]|"
-    r"bearer\s+[A-Za-z0-9._~+/=-]{8,}|"
-    r"(?:github_pat_|gh[pousr]_|sk-|AKIA)[A-Za-z0-9_-]{8,}"
-    r")",
-    re.IGNORECASE,
-)
 warnings.filterwarnings(
     "ignore",
     message='Field name "schema" in "ToolManifestEntryV2" shadows an attribute',
@@ -46,22 +33,30 @@ warnings.filterwarnings(
 
 
 def _is_sensitive_key(key: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
-    return bool(_SENSITIVE_KEY.search(key)) or any(
-        part in normalized
-        for part in (
-            "apikey",
-            "accesskey",
-            "accesstoken",
-            "authorization",
-            "password",
-            "passwd",
-            "secret",
-            "vault",
-            "credential",
-            "privateprompt",
-        )
-    ) or normalized == "token"
+    segmented = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).casefold()
+    parts = tuple(part for part in re.split(r"[^a-z0-9]+", segmented) if part)
+    sensitive_names = {
+        "authorization",
+        "bearer",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "vault",
+    }
+    sensitive_pairs = {
+        "apikey",
+        "accesskey",
+        "accesstoken",
+        "privatekey",
+        "privateprompt",
+    }
+    return any(part in sensitive_names for part in parts) or any(
+        f"{first}{second}" in sensitive_pairs
+        for first, second in zip(parts, parts[1:], strict=False)
+    )
 
 
 def _validate_json_value(value: Any) -> None:
@@ -85,8 +80,6 @@ def _validate_json_value(value: Any) -> None:
             return
         raise ValueError("payload must contain only JSON values")
     if isinstance(value, str):
-        if _SENSITIVE_VALUE.search(value):
-            raise ValueError("payload contains a sensitive value")
         return
     raise ValueError("payload must contain only JSON values")
 
@@ -146,12 +139,12 @@ class RuntimeRefV2(FrozenModel):
 class ContextRefV2(FrozenModel):
     snapshot_ref: OpaqueReference
     snapshot_digest: Digest
-    version: int = Field(ge=0)
+    version: StrictInt = Field(ge=0)
 
 
 class ContextBudgetV2(FrozenModel):
-    max_input_tokens: int = Field(gt=0)
-    reserved_output_tokens: int = Field(ge=0)
+    max_input_tokens: StrictInt = Field(gt=0)
+    reserved_output_tokens: StrictInt = Field(ge=0)
     protected_message_ids: tuple[OpaqueIdentifier, ...] = ()
     protected_prompt_section_ids: tuple[OpaqueIdentifier, ...] = ()
     compaction_policy: Literal["none", "summarize"]
@@ -163,7 +156,7 @@ class ToolManifestEntryV2(FrozenModel):
     schema: Mapping[str, JsonValue]
     version: OpaqueIdentifier
     read_only: bool
-    timeout_ms: int = Field(gt=0)
+    timeout_ms: StrictInt = Field(gt=0)
     idempotency: Literal["idempotent", "non_idempotent"]
 
     @field_validator("schema", mode="before")
@@ -195,7 +188,7 @@ class PluginPinV2(FrozenModel):
     source_revision: OpaqueIdentifier
     digest: Digest
     capabilities: tuple[OpaqueIdentifier, ...]
-    order: int = Field(ge=0)
+    order: StrictInt = Field(ge=0)
 
 
 class WorkspaceGrantV2(FrozenModel):
@@ -205,13 +198,13 @@ class WorkspaceGrantV2(FrozenModel):
     writable_paths: tuple[WorkspacePath, ...]
     command_policy: Literal["allow", "deny", "ask", "supervisor_approval"]
     network_policy: Literal["allow", "deny", "ask", "supervisor_approval"]
-    expires_at_ms: int = Field(gt=0)
+    expires_at_ms: StrictInt = Field(gt=0)
 
 
 class CheckpointHintV2(FrozenModel):
     checkpoint_ref: OpaqueReference
     checkpoint_digest: Digest
-    cursor: int = Field(ge=0)
+    cursor: StrictInt = Field(ge=0)
 
 
 class RuntimeCapabilitiesV2(FrozenModel):
@@ -240,6 +233,26 @@ QueryCommandTypeV2 = Literal[
     "checkpoint.get",
     "runtime.capabilities",
 ]
+
+_KNOWN_RUNTIME_EVENT_TYPES = frozenset(
+    {
+        "user.message",
+        "assistant.delta",
+        "assistant.message",
+        "reasoning.delta",
+        "tool.call",
+        "tool.result",
+        "plan.snapshot",
+        "plan.delta",
+        "todo.snapshot",
+        "todo.delta",
+        "intervention.requested",
+        "intervention.applied",
+        "artifact.proposed",
+        "runtime.status",
+        "error",
+    }
+)
 
 
 class QueryCommandV2(FrozenModel):
@@ -270,7 +283,7 @@ class RuntimeEventV2(FrozenModel):
     run_id: OpaqueIdentifier
     term_id: OpaqueIdentifier
     step_id: OpaqueIdentifier
-    cursor: int = Field(gt=0)
+    cursor: StrictInt = Field(gt=0)
     type: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
     required: bool = False
@@ -290,6 +303,12 @@ class RuntimeEventV2(FrozenModel):
     def serialize_payload(self, value: Mapping[str, JsonValue]) -> JsonValue:
         return _serialize_json_value(value)
 
+    @model_validator(mode="after")
+    def validate_required_event_type(self) -> Self:
+        if self.required and self.type not in _KNOWN_RUNTIME_EVENT_TYPES:
+            raise ValueError("required event type is not registered")
+        return self
+
 
 class RunEnvelopeV2(FrozenModel):
     protocol_version: Literal["2.0"] = "2.0"
@@ -299,7 +318,7 @@ class RunEnvelopeV2(FrozenModel):
     term_id: OpaqueIdentifier
     step_id: OpaqueIdentifier
     command_id: OpaqueIdentifier
-    attempt: int = Field(ge=0)
+    attempt: StrictInt = Field(ge=0)
     agent_id: OpaqueIdentifier
     agent_role: OpaqueIdentifier
     provider_ref: OpaqueReference
@@ -316,8 +335,8 @@ class RunEnvelopeV2(FrozenModel):
     plugin_manifest_digest: Digest
     permission_policy_digest: Digest
     workspace_grant: WorkspaceGrantV2
-    checkpoint_cursor: int = Field(ge=0)
-    deadline_ms: int = Field(gt=0)
+    checkpoint_cursor: StrictInt = Field(ge=0)
+    deadline_ms: StrictInt = Field(gt=0)
     traceparent: OpaqueIdentifier
     extensions: Mapping[str, JsonValue] = Field(default_factory=dict)
 
