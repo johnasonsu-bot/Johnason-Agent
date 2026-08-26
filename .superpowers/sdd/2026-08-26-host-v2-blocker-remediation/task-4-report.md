@@ -36,8 +36,8 @@
    单独运行具体内层单测也稳定 exit 1。
 2. checkpoint 只读反序列化显示外层实际状态为 `awaiting_replan`；regression summary
    是 `backend=failed`、`electron_playwright=passed`。
-3. 保留的 integration worktree 以相同 backend policy 命令复现：exit 1，
-   `1 failed, 2201 passed, 6 skipped`，1 warning，169.27s；失败单测是
+3. fix review round 2 在可解析当前 source 的 `mvp/` 以相同 backend policy 命令
+   复现：exit 1，`1 failed, 2201 passed, 6 skipped`，1 warning，165.98s；失败单测是
    `test_development_projections_reject_absolute_windows_and_traversal_values`。
 4. 四个样例逐项探测只输出 case 编号与布尔状态：case 1、2、4 被拒绝，case 3
    的 `is_local_path=False` 且 `projected=True`。
@@ -209,7 +209,7 @@ Git repository 根目录为基准描述。
 
 | ID | cwd | 实际 source SHA | exit | count / 结果 |
 |---|---|---|---:|---|
-| D1 integration backend policy 重跑 | disposable fixture integration worktree 的 `mvp/` | fixture candidate `ea6f91ce226e06a5aaa93f87f7541c53b45b4e91`；其 source base 为 `5ca52d2` | 1 | `1 failed, 2201 passed, 6 skipped, 1 warning in 169.27s` |
+| D1 backend policy fresh 重跑 | `mvp/` | current HEAD `8f6b531020c5fac4ad6bc0bdb20a80adefdc775c`；`mvp/` code-equivalent source `5ca52d2db3256f94cabfaddc69377304970effcf` | 1 | `1 failed, 2201 passed, 6 skipped, 1 warning in 165.98s`；首败为 development projections path-rejection 单测 |
 | D2 主工作树具体单测 | `mvp/` | `5ca52d2db3256f94cabfaddc69377304970effcf` | 1 | `1 failed in 0.05s` |
 | D3 fix round 当前 worktree focused traceback | `mvp/` | `23cd299c74acea4a123c4dd0fa76908e816fee30`（相对 `5ca52d2` 仅新增报告 commits） | 1 | `1 failed in 0.05s`；frame/异常与 D2 一致，fresh event ID 不同 |
 | D4 四样例 probe | `mvp/` | `5ca52d2db3256f94cabfaddc69377304970effcf` | 0 | case 1/2/4：`local_path=True, projected=False`；case 3：`local_path=False, projected=True` |
@@ -217,8 +217,12 @@ Git repository 根目录为基准描述。
 精确命令：
 
 ```bash
-# D1；原绝对 executable 路径仅规范化为 <repo>
-<repo>/mvp/.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q --ignore=tests/acceptance/test_development_graph_blueprint.py
+# D1 source/cwd proof；均从 repository root 执行
+git rev-parse HEAD
+git diff --quiet 5ca52d2db3256f94cabfaddc69377304970effcf..HEAD -- mvp
+
+# D1 test；cwd=mvp/
+.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q --ignore=tests/acceptance/test_development_graph_blueprint.py
 
 # D2
 cd mvp && env PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q tests/unit/api/test_development_graph.py::test_development_projections_reject_absolute_windows_and_traversal_values
@@ -237,6 +241,18 @@ for index,value in enumerate(values,1):
     print(f"case={index} local_path={is_local_path(value)} projected={bool(map_domain_event(event))}")
 PY
 ```
+
+### Fix review round 2：D1 可解析 source 替换
+
+D1 precheck 在 repository root 的实际结果：`git rev-parse HEAD` exit `0` 并输出
+`8f6b531020c5fac4ad6bc0bdb20a80adefdc775c`；`git diff --quiet
+5ca52d2db3256f94cabfaddc69377304970effcf..HEAD -- mvp` exit `0`、无输出。因此 fresh
+D1 虽运行于当前报告 commit，其 `mvp/` source/tests 与 `5ca52d2` 完全相同。D1 test
+在 `mvp/` exit `1`，完整计数为 `1 failed, 2201 passed, 6 skipped, 1 warning in
+165.98s`，首败为
+`tests/unit/api/test_development_graph.py::test_development_projections_reject_absolute_windows_and_traversal_values`。
+该结果替换 fix review round 1 的 disposable fixture execution 证据；报告不再保留其
+ephemeral commit 或不可定位 cwd。
 
 ### 静态门禁：动态 HEAD 与固定 source reproduction
 
