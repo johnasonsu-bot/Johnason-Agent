@@ -51,6 +51,21 @@ def _write_envelope() -> RunEnvelopeV2:
     return RunEnvelopeV2.model_validate(value)
 
 
+def _mixed_tool_envelope() -> RunEnvelopeV2:
+    value = run_envelope().model_dump(mode="json")
+    value["tool_manifest"].append(
+        {
+            "tool_id": "tool-2",
+            "schema": {"type": "object"},
+            "version": "1",
+            "read_only": False,
+            "timeout_ms": 1,
+            "idempotency": "non_idempotent",
+        }
+    )
+    return RunEnvelopeV2.model_validate(value)
+
+
 @pytest.mark.asyncio
 async def test_query_negotiates_capabilities_before_streaming_normal_events() -> None:
     events = await _collect_mode("normal")
@@ -492,6 +507,80 @@ async def test_delayed_unknown_write_requires_a_durable_write_pin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mixed_manifest_read_tool_signal_cannot_claim_the_write_pin() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("cancel_timeout_delayed_unknown_write"),
+        request_timeout=0.1,
+        shutdown_timeout=0.2,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(_mixed_tool_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        with pytest.raises(RuntimeProtocolError, match="after query failure"):
+            await asyncio.wait_for(client.cancel(), timeout=1.0)
+        assert client.state == "unavailable"
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_mixed_manifest_exact_write_tool_signal_promotes_failure() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("cancel_timeout_delayed_unknown_write_tool_2"),
+        request_timeout=0.1,
+        shutdown_timeout=0.2,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(_mixed_tool_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        with pytest.raises(RuntimeReconciliationRequired):
+            await asyncio.wait_for(client.cancel(), timeout=1.0)
+        assert client.state == "reconciliation_required"
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_cursor"),
+    [
+        ("cancel_timeout_observed_write_exact", 3),
+        ("cancel_timeout_observed_write_mismatch", 2),
+    ],
+)
+@pytest.mark.asyncio
+async def test_delayed_signal_must_correlate_every_observed_write_identifier(
+    mode: str, expected_cursor: int
+) -> None:
+    client = EngineHostV2Client(
+        fake_v2_command(mode),
+        request_timeout=0.1,
+        shutdown_timeout=0.2,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(_mixed_tool_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+
+        async def wait_for_observed_call() -> None:
+            while client._active is None or not client._active.active_tool_calls:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_observed_call(), timeout=1.0)
+        with pytest.raises(RuntimeReconciliationRequired):
+            await asyncio.wait_for(client.cancel(), timeout=1.0)
+        active = client._active
+        assert active is not None
+        assert active.cursor_values[active.key][0] == expected_cursor
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_failure_priority_can_upgrade_but_never_downgrade() -> None:
     client = EngineHostV2Client(fake_v2_command("cancel"))
     await asyncio.wait_for(client.start(), timeout=1.0)
@@ -661,6 +750,70 @@ async def test_aclose_is_repeatable_and_reaps_process_tasks_and_pipes() -> None:
     assert client.returncode is not None
     assert client.state == "unavailable"
     assert client.reader_tasks_done
+
+
+@pytest.mark.asyncio
+async def test_aclose_stubborn_process_is_bounded_and_preserves_cleanup_error() -> None:
+    class StubbornProcess:
+        stdin = None
+        pid = 1234
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.active_waiters = 0
+            self._exited = asyncio.Event()
+
+        async def wait(self) -> int:
+            self.active_waiters += 1
+            try:
+                await self._exited.wait()
+                assert self.returncode is not None
+                return self.returncode
+            finally:
+                self.active_waiters -= 1
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def release(self) -> None:
+            self.returncode = -9
+            self._exited.set()
+
+    process = StubbornProcess()
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+    client._process = process  # type: ignore[assignment]
+    client._state = "ready"
+    closing = asyncio.create_task(client.aclose())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=0.2)
+        assert closing in done
+        with pytest.raises(RuntimeUnavailableError, match="cleanup was not confirmed"):
+            await closing
+        assert client._process is process
+        assert client.returncode is None
+        assert client.diagnostics == (
+            "engine-host v2 process tree cleanup was not confirmed"
+        )
+        assert client.cleanup_confirmed is False
+        assert process.active_waiters == 0
+        assert client.reader_tasks_done
+        with pytest.raises(
+            RuntimeUnavailableError, match="cleanup was not confirmed"
+        ):
+            await asyncio.wait_for(client.aclose(), timeout=0.05)
+        assert client._process is process
+        assert process.active_waiters == 0
+    finally:
+        process.release()
+        if not closing.done():
+            await asyncio.wait_for(closing, timeout=1.0)
 
 
 @pytest.mark.asyncio

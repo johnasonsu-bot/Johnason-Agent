@@ -206,7 +206,11 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
                 v2_event(
                     first_cursor + 1,
                     "error",
-                    {"code": "unknown_write_effect", "effect_id": "effect-1"},
+                    {
+                        "code": "unknown_write_effect",
+                        "tool_id": "tool-1",
+                        "effect_id": "effect-1",
+                    },
                 )
             )
             write_v2_terminal(first_cursor + 2)
@@ -217,6 +221,9 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             "cancel",
             "cancel_crash",
             "cancel_timeout_delayed_unknown_write",
+            "cancel_timeout_delayed_unknown_write_tool_2",
+            "cancel_timeout_observed_write_exact",
+            "cancel_timeout_observed_write_mismatch",
             "control_cycles",
             "grandchild",
             "grandchild_ignore_term",
@@ -225,6 +232,24 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             "pause_terminal",
             "resume_crash",
         }:
+            if mode in {
+                "cancel_timeout_observed_write_exact",
+                "cancel_timeout_observed_write_mismatch",
+            }:
+                cursor = first_cursor + 1
+                V2_STATE["cursor"] = cursor
+                write_v2(
+                    v2_event(
+                        cursor,
+                        "tool.call",
+                        {
+                            "tool_call_id": "observed-call-1",
+                            "tool_id": "tool-2",
+                            "read_only": False,
+                            "effect_id": "observed-effect-1",
+                        },
+                    )
+                )
             return False
         if mode == "backpressure_consumer_close":
             for cursor in range(first_cursor + 1, first_cursor + 301):
@@ -518,19 +543,36 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
     if command_type == "query.cancel":
         if mode == "cancel_crash":
             return True
-        if mode == "cancel_timeout_delayed_unknown_write":
+        if mode in {
+            "cancel_timeout_delayed_unknown_write",
+            "cancel_timeout_delayed_unknown_write_tool_2",
+            "cancel_timeout_observed_write_exact",
+            "cancel_timeout_observed_write_mismatch",
+        }:
             def report_unknown_write() -> None:
                 time.sleep(0.15)
                 cursor = int(V2_STATE["cursor"]) + 1
                 V2_STATE["cursor"] = cursor
+                tool_id = (
+                    "tool-2"
+                    if mode != "cancel_timeout_delayed_unknown_write"
+                    else "tool-1"
+                )
+                payload: dict[str, object] = {
+                    "code": "unknown_write_effect",
+                    "tool_id": tool_id,
+                    "effect_id": "late-effect-1",
+                }
+                if mode == "cancel_timeout_observed_write_exact":
+                    payload["tool_call_id"] = "observed-call-1"
+                    payload["effect_id"] = "observed-effect-1"
+                elif mode == "cancel_timeout_observed_write_mismatch":
+                    payload["tool_call_id"] = "wrong-call"
                 write_v2(
                     v2_event(
                         cursor,
                         "error",
-                        {
-                            "code": "unknown_write_effect",
-                            "effect_id": "late-effect-1",
-                        },
+                        payload,
                     )
                 )
 
@@ -558,6 +600,9 @@ def main_v2(mode: str) -> int:
         return 3
     if mode in {
         "cancel_timeout_delayed_unknown_write",
+        "cancel_timeout_delayed_unknown_write_tool_2",
+        "cancel_timeout_observed_write_exact",
+        "cancel_timeout_observed_write_mismatch",
         "grandchild_ignore_term",
     }:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -572,7 +617,7 @@ def main_v2(mode: str) -> int:
             return 2
         if respond_v2(command, mode):
             return 0
-    if mode == "cancel_timeout_delayed_unknown_write":
+    if mode.startswith("cancel_timeout_") and mode != "cancel_timeout":
         time.sleep(0.3)
     return 0
 
