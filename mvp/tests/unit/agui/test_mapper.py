@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 
 from workbench.agui.mapper import map_domain_event
 from workbench.agui.stream import replay_agui
@@ -217,3 +218,65 @@ def test_v2_agui_projects_applied_intervention_and_rejects_forged_tool_or_messag
     }
     assert map_domain_event(tool) == []
     assert map_domain_event(message) == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "reasoning: private scratch work",
+        "chain-of-thought: hidden steps",
+        "private prompt: do not reveal",
+        "Exception: upstream failure",
+        "Traceback (most recent call last):",
+        "provider reference: internal-provider",
+        "workspace path: /private/project",
+        "manifest digest: abc123",
+        "api key: sk-abcdefghijklmnop",
+    ],
+)
+def test_v2_second_boundary_filters_every_private_public_text_variant(unsafe_text: str) -> None:
+    """Catches direct persisted events bypassing runtime public-text checks."""
+    event = DomainEvent.new(
+        "agent.message.delta", "engine_host.v2",
+        {"content": unsafe_text, "term_id": "term-1", "cursor": 1},
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []
+
+
+@pytest.mark.parametrize(
+    ("event_id", "run_id", "term_id", "step_id", "correlation_id", "sequence", "cursor"),
+    [
+        ("sk-abcdefghijklmnop", "run-1", "term-1", "step-1", None, 1, 1),
+        ("event-1", "sk-abcdefghijklmnop", "term-1", "step-1", None, 1, 1),
+        ("event-1", "run-1", "term-1", "step-1", "bearer-secret", 1, 1),
+        ("event-1", "run-1", "term-1", "step-1", None, 2, 1),
+    ],
+)
+def test_v2_agui_rejects_forged_public_identity(
+    event_id: str, run_id: str, term_id: str, step_id: str, correlation_id: str | None,
+    sequence: int, cursor: int,
+) -> None:
+    """Catches persisted v2 identity values bypassing the runtime contract."""
+    event = DomainEvent(
+        event_id=event_id,
+        event_type="agent.message.delta",
+        source="engine_host.v2",
+        occurred_at=datetime.now(timezone.utc),
+        payload={"content": "hello", "term_id": term_id, "cursor": cursor},
+        run_id=run_id,
+        step_id=step_id,
+        correlation_id=correlation_id,
+        sequence=sequence,
+    )
+    assert map_domain_event(event) == []
+
+
+def test_v2_agui_malformed_custom_status_returns_empty_instead_of_type_error() -> None:
+    """Catches unhashable custom status values terminating the SSE mapping loop."""
+    event = DomainEvent.new(
+        "runtime.status.changed", "engine_host.v2",
+        {"status": [], "term_id": "term-1", "cursor": 1},
+        run_id="run-1", step_id="step-1", sequence=1,
+    )
+    assert map_domain_event(event) == []

@@ -1,9 +1,13 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
 from tests.fixtures.host_v2 import runtime_event
 from workbench.runtime.engine_host.v2.mapper import map_runtime_event
+from workbench.agui.mapper import map_domain_event
+from workbench.agui.stream import replay_agui
+from workbench.workflow.event_store import EventStore
 
 
 @pytest.mark.parametrize(
@@ -128,3 +132,96 @@ def test_reasoning_payload_rejects_unallowlisted_content_even_when_not_secret_sh
     """Catches private chain text being accepted only because its key is innocuous."""
     with pytest.raises(ValueError, match="unapproved"):
         map_runtime_event(runtime_event("reasoning.delta", payload={"text": "private"}))
+
+
+@pytest.mark.parametrize(
+    "unsafe_text",
+    [
+        "reasoning: private scratch work",
+        "chain-of-thought: hidden steps",
+        "private prompt: do not reveal",
+        "Exception: upstream failure",
+        "Traceback (most recent call last):",
+        "provider reference: internal-provider",
+        "workspace path: /private/project",
+        "manifest digest: abc123",
+        "api key: sk-abcdefghijklmnop",
+    ],
+)
+def test_rejects_private_text_variants_from_every_public_runtime_text_field(
+    unsafe_text: str,
+) -> None:
+    """Catches a private diagnostic variant being projected as public text."""
+    with pytest.raises(ValueError):
+        map_runtime_event(runtime_event("assistant.delta", payload={"text": unsafe_text}))
+    with pytest.raises(ValueError):
+        map_runtime_event(
+            runtime_event("artifact.proposed", payload={"artifact_id": "artifact-1", "summary": unsafe_text})
+        )
+
+
+@pytest.mark.parametrize("safe_text", ["3 records found", "The public report is ready."])
+def test_accepts_ordinary_public_text(safe_text: str) -> None:
+    """Catches public-text validation becoming broad enough to reject normal output."""
+    mapped = map_runtime_event(runtime_event("assistant.delta", payload={"text": safe_text}))
+    assert mapped[0].payload["content"] == safe_text
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        SimpleNamespace(
+            event_id="event-1", run_id="run-1", term_id="term-1", step_id="step-1",
+            cursor=1, type=[], payload={}, required=False,
+        ),
+        SimpleNamespace(
+            event_id="event-1", run_id="run-1", term_id="term-1", step_id="step-1",
+            cursor=1, type="runtime.status", payload={"status": []}, required=False,
+        ),
+    ],
+)
+def test_malformed_runtime_type_or_status_raises_stable_value_error(event: SimpleNamespace) -> None:
+    """Catches unhashable attacker values escaping as TypeError from a projector."""
+    with pytest.raises(ValueError):
+        map_runtime_event(event)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_runtime_emitters_project_equivalently_and_resume_without_duplicates(tmp_path: Path) -> None:
+    """Catches runtime-specific fields changing public projection or SSE resume."""
+    def emit(runtime_name: str, cursor: int) -> object:
+        _ = runtime_name
+        return runtime_event(
+            "assistant.delta", cursor=cursor, payload={"text": "shared output"}
+        ).model_copy(update={"event_id": f"event-{cursor}"})
+
+    projections = []
+    for runtime_name in ("python", "fake-goose", "fake-dsh"):
+        event = map_runtime_event(emit(runtime_name, 1))[0]  # type: ignore[arg-type]
+        wire = map_domain_event(event)[0]
+        projections.append(
+            {
+                key: wire[key]
+                for key in ("type", "runId", "termId", "stepId", "cursor", "delta")
+            }
+        )
+    assert projections == [
+        {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "runId": "run-1",
+            "termId": "term-1",
+            "stepId": "step-1",
+            "cursor": 1,
+            "delta": "shared output",
+        }
+    ] * 3
+
+    store = EventStore(tmp_path / "events.sqlite")
+    for cursor in (1, 2):
+        store.append(
+            map_runtime_event(emit("python", cursor))[0],  # type: ignore[arg-type]
+            command_id=f"event-{cursor}",
+        )
+    persisted = store.read_stream("step:step-1", after_sequence=1)
+    replayed = [event async for event in replay_agui(persisted, after_sequence=1)]
+    assert [event["cursor"] for event in replayed] == [2]

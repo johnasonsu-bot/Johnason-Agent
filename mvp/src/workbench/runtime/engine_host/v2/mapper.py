@@ -26,9 +26,53 @@ _SENSITIVE_VALUE = re.compile(
     re.IGNORECASE,
 )
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_PRIVATE_TEXT = re.compile(
+    r"(?:\b(?:reasoning|chain[ _-]?of[ _-]?thought|private[ _-]?(?:prompt|"
+    r"history|reasoning)|provider[ _-]?(?:ref|reference)|workspace(?:[ _-]?path)?|"
+    r"(?:manifest|config)[ _-]?(?:digest|ref)|digest)\s*[:=]|"
+    r"\b(?:exception|error)\s*[:=]|\btraceback\s*\(|"
+    r"\bstack(?:[ _-]?trace)?\s*[:=])",
+    re.IGNORECASE,
+)
+_SECRET_IDENTIFIER = re.compile(
+    r"(?:^sk-[A-Za-z0-9_-]{8,}|\bbearer\b|api[_ -]?(?:key|token)|"
+    r"access[_ -]?(?:key|token)|authorization|credential|password|secret|token)",
+    re.IGNORECASE,
+)
 _STATUSES = frozenset({"queued", "running", "paused", "completed", "failed", "cancelled"})
 _TOOL_RESULT_STATUSES = frozenset({"completed", "failed"})
 _STATE_OPERATIONS = frozenset({"add", "remove", "replace", "update"})
+
+
+def is_opaque_identifier(value: Any) -> bool:
+    """Return whether an identifier is bounded and cannot carry a secret."""
+    return (
+        isinstance(value, str)
+        and bool(_IDENTIFIER.fullmatch(value))
+        and not _SECRET_IDENTIFIER.search(value)
+    )
+
+
+def validate_public_text(value: Any, *, maximum: int) -> str:
+    """Validate the one text policy shared by runtime and AG-UI boundaries."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or _CONTROL.search(value)
+        or _SENSITIVE_VALUE.search(value)
+        or _PRIVATE_TEXT.search(value)
+    ):
+        raise ValueError("value must be bounded public text")
+    return value
+
+
+def is_public_text(value: Any, *, maximum: int) -> bool:
+    try:
+        validate_public_text(value, maximum=maximum)
+    except ValueError:
+        return False
+    return True
 
 
 def map_runtime_event(event: RuntimeEventV2) -> tuple[DomainEvent, ...]:
@@ -75,7 +119,7 @@ def _identity(event: RuntimeEventV2) -> _Identity:
         name: getattr(event, name, None)
         for name in ("event_id", "run_id", "term_id", "step_id")
     }
-    if any(not isinstance(value, str) or not _IDENTIFIER.fullmatch(value) for value in values.values()):
+    if any(not is_opaque_identifier(value) for value in values.values()):
         raise ValueError("runtime event identity must be bounded opaque identifiers")
     cursor = getattr(event, "cursor", None)
     if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 1:
@@ -133,7 +177,7 @@ def _identifier(payload: Mapping[str, Any], key: str, *, required: bool = True) 
     value = payload.get(key)
     if value is None and not required:
         return None
-    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+    if not is_opaque_identifier(value):
         raise ValueError(f"{key} must be a bounded opaque identifier")
     return value
 
@@ -142,15 +186,10 @@ def _public_text(payload: Mapping[str, Any], key: str, *, required: bool = False
     value = payload.get(key)
     if value is None and not required:
         return None
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > maximum
-        or _CONTROL.search(value)
-        or _SENSITIVE_VALUE.search(value)
-    ):
-        raise ValueError(f"{key} must be a bounded public summary")
-    return value
+    try:
+        return validate_public_text(value, maximum=maximum)
+    except ValueError as error:
+        raise ValueError(f"{key} must be bounded public text") from error
 
 
 def _strict_int(payload: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
@@ -206,7 +245,7 @@ def _tool_fields(payload: Mapping[str, Any], *, result: bool) -> tuple[str, dict
         value["artifact_ref"] = artifact_ref
     if result:
         status = payload.get("status")
-        if status not in _TOOL_RESULT_STATUSES:
+        if not isinstance(status, str) or status not in _TOOL_RESULT_STATUSES:
             raise ValueError("tool result status must be completed or failed")
         value["status"] = status
         return "agent.tool.completed", value
@@ -236,7 +275,7 @@ def _state_fields(payload: Mapping[str, Any], *, collection: str, delta: bool) -
         if base_version >= version:
             raise ValueError("base_version must precede version")
         operation = payload.get("operation")
-        if operation not in _STATE_OPERATIONS:
+        if not isinstance(operation, str) or operation not in _STATE_OPERATIONS:
             raise ValueError("operation must be an allowed state operation")
         value.update(base_version=base_version, operation=operation)
     for key in ("plan_id", "item_id"):
@@ -295,7 +334,7 @@ def _project_artifact(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
 def _project_runtime_status(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     _allow_only(payload, "status")
     status = payload.get("status")
-    if status not in _STATUSES:
+    if not isinstance(status, str) or status not in _STATUSES:
         raise ValueError("runtime status is not registered")
     return "runtime.status.changed", {"status": status}
 
