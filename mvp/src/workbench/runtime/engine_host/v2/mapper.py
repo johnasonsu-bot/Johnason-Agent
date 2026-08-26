@@ -43,12 +43,11 @@ _DIGEST_VALUE = re.compile(
     re.IGNORECASE,
 )
 _HTTP_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
-_LOCAL_PATH = re.compile(
-    r"(?<![A-Za-z0-9_./\\-])/[^\s]*|"
-    r"(?<![A-Za-z0-9_./\\-])[A-Za-z]:[\\/][^\s]*|"
-    r"(?<![A-Za-z0-9_./\\-])\\\\[^\s\\/]+[\\/][^\s\\/]+|"
-    r"(?<![A-Za-z0-9_.-])\.\.(?:[\\/]|$)"
+_TRAVERSAL_PATH = re.compile(r"(?<![A-Za-z0-9_.-])\.\.(?:[\\/]|$)")
+_PATH_BOUNDARY_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./\\-"
 )
+_PATH_SEPARATORS = frozenset("/\\")
 _TRACEBACK = re.compile(r"\btraceback\s*\(", re.IGNORECASE)
 _SENSITIVE_ROOTS = (
     ("reasoning",),
@@ -186,10 +185,33 @@ def is_local_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     url_spans = tuple(match.span() for match in _HTTP_URL.finditer(value))
-    return any(
-        not any(start <= match.start() < end for start, end in url_spans)
-        for match in _LOCAL_PATH.finditer(value)
-    )
+
+    def outside_http_url(position: int) -> bool:
+        return not any(start <= position < end for start, end in url_spans)
+
+    if any(
+        outside_http_url(match.start())
+        for match in _TRAVERSAL_PATH.finditer(value)
+    ):
+        return True
+
+    for index, character in enumerate(value):
+        if not outside_http_url(index):
+            continue
+        at_boundary = index == 0 or value[index - 1] not in _PATH_BOUNDARY_CHARS
+        if not at_boundary:
+            continue
+        if character in _PATH_SEPARATORS:
+            return True
+        if (
+            character.isascii()
+            and character.isalpha()
+            and index + 2 < len(value)
+            and value[index + 1] == ":"
+            and value[index + 2] in _PATH_SEPARATORS
+        ):
+            return True
+    return False
 
 
 def _normalized_token_words(value: str) -> tuple[str, ...]:

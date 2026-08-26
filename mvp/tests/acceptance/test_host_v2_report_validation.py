@@ -26,6 +26,34 @@ def _synthetic_github_token(*, body: str) -> str:
     return "g" + "h" + "p" + "_" + body
 
 
+def _synthetic_fine_grained_github_token(*, body: str) -> str:
+    """Build a test-only fine-grained GitHub value without storing it in source."""
+    return "github" + "_pat_" + body
+
+
+def _synthetic_bearer(*, whitespace: str = " ") -> str:
+    """Build a test-only Bearer value without storing one in source."""
+    return "Bear" + "er" + whitespace + ("j" * 24)
+
+
+def _synthetic_private_key_header() -> str:
+    """Build a test-only private-key header without storing one in source."""
+    return "-----BEGIN " + "PRIVATE " + "KEY-----"
+
+
+def _host_high_confidence_shapes() -> tuple[str, ...]:
+    """Mirror the Host validator vocabulary using source-safe runtime assembly."""
+    return (
+        _synthetic_token(body="proj-" + ("a" * 24)),
+        _synthetic_fine_grained_github_token(body="11AA_" + ("b" * 20)),
+        _synthetic_github_token(body="c" * 24),
+        "A" + "KIA" + ("D" * 16),
+        "A" + "SIA" + ("E" * 16),
+        _synthetic_bearer(),
+        _synthetic_private_key_header(),
+    )
+
+
 def _git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],
@@ -246,6 +274,163 @@ def test_one_fixture_marker_does_not_allow_an_adjacent_second_match() -> None:
         assert result.stderr == ""
         _assert_private_output(result, path=path, token=allowed)
         _assert_private_output(result, path=path, token=adjacent)
+    finally:
+        directory.cleanup()
+
+
+def test_same_line_fixture_marker_cannot_authorize_a_match_200000_bytes_away() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_token()
+        path = "mvp/tests/test_far_fixture.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        marker = b"# credential-fixture: reject unsafe "
+        target.write_bytes(
+            marker + (b"x" * 199_999) + b" " + token.encode("ascii") + b"\n"
+        )
+        head = _commit(repo, "add far fixture candidate")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=0 findings=1\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
+    finally:
+        directory.cleanup()
+
+
+def test_bounded_same_line_and_adjacent_fixture_markers_each_bind_one_match() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        same_line = _synthetic_token(body="k" * 24)
+        adjacent_line = _synthetic_token(body="l" * 24)
+        path = "mvp/tests/test_bounded_fixtures.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            "# credential-fixture: reject unsafe "
+            f"same = {same_line!r}\n\n"
+            "# credential-fixture: reject sensitive\n"
+            f"adjacent = {adjacent_line!r}\n",
+            encoding="utf-8",
+        )
+        head = _commit(repo, "add bounded fixture candidates")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 0
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=2 findings=0\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=same_line)
+        _assert_private_output(result, path=path, token=adjacent_line)
+    finally:
+        directory.cleanup()
+
+
+def test_long_adjacent_line_marker_binds_only_the_nearby_match() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_token(body="m" * 24)
+        path = "mvp/tests/test_long_adjacent_fixture.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        marker = b"# credential-fixture: reject unsafe"
+        target.write_bytes(
+            (b"x" * 200_000)
+            + marker
+            + b"\nvalue = '"
+            + token.encode("ascii")
+            + b"'\n"
+        )
+        head = _commit(repo, "add long adjacent fixture line")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 0
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=1 findings=0\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
+    finally:
+        directory.cleanup()
+
+
+def test_high_density_credential_matches_are_counted_independently() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        match_count = 2_000
+        token = _synthetic_token(body="n" * 24)
+        path = "mvp/src/high_density.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_text((f"value = {token!r}\n" * match_count), encoding="utf-8")
+        head = _commit(repo, "add high density findings")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == (
+            f"scanned_blobs=1 fixture_allowances=0 findings={match_count}\n"
+        )
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
+    finally:
+        directory.cleanup()
+
+
+def test_scanner_covers_every_host_high_confidence_credential_shape() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        shapes = _host_high_confidence_shapes()
+        path = "mvp/src/host_vocabulary.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_text("\n".join(shapes) + "\n", encoding="utf-8")
+        head = _commit(repo, "add host credential vocabulary")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == (
+            f"scanned_blobs=1 fixture_allowances=0 findings={len(shapes)}\n"
+        )
+        assert result.stderr == ""
+        for shape in shapes:
+            _assert_private_output(result, path=path, token=shape)
+    finally:
+        directory.cleanup()
+
+
+def test_fine_grained_github_token_in_a_git_blob_is_a_finding() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_fine_grained_github_token(body="11AA_" + ("p" * 20))
+        path = "mvp/src/fine_grained_pat.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_text(f"value = {token!r}\n", encoding="utf-8")
+        head = _commit(repo, "add fine grained finding")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=0 findings=1\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
+    finally:
+        directory.cleanup()
+
+
+def test_bearer_with_more_than_one_chunk_of_whitespace_is_a_finding() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_bearer(whitespace=" \t" * 40_000)
+        path = "mvp/src/cross_chunk_bearer.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_bytes(token.encode("ascii") + b"\n")
+        head = _commit(repo, "add cross chunk bearer finding")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=0 findings=1\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
     finally:
         directory.cleanup()
 

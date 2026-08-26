@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 import os
 import re
 import subprocess
@@ -13,19 +14,24 @@ import time
 OVERALL_TIMEOUT_SECONDS = 30
 SUBPROCESS_TIMEOUT_SECONDS = 10
 SCAN_CHUNK_BYTES = 64 * 1024
-SCAN_OVERLAP_BYTES = 64
+MAX_FIXTURE_MARKER_DISTANCE_BYTES = 256
 ALPHANUMERIC_HYPHEN_UNDERSCORE = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 )
 ALPHANUMERIC = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 )
-ALPHANUMERIC_DOT_HYPHEN_UNDERSCORE = (
-    ALPHANUMERIC_HYPHEN_UNDERSCORE | frozenset(b".")
+ALPHANUMERIC_UNDERSCORE = ALPHANUMERIC | frozenset(b"_")
+BEARER_TOKEN_BYTES = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-"
 )
-SECRET_SHAPES = re.compile(
-    rb"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|"
-    rb"AKIA[0-9A-Z]{16}|(?i:bearer)[\t\r\n ]+[A-Za-z0-9._-]{20,})"
+BEARER_WHITESPACE_BYTES = frozenset(b" \t\r\n")
+FINE_GRAINED_GITHUB_PREFIX = b"github_pat_"
+PRIVATE_KEY_HEADER_PREFIX = b"-----begin "
+PRIVATE_KEY_HEADER_SUFFIX = b"private key-----"
+PRIVATE_KEY_HEADERS = tuple(
+    PRIVATE_KEY_HEADER_PREFIX + kind + PRIVATE_KEY_HEADER_SUFFIX
+    for kind in (b"", b"rsa ", b"ec ", b"openssh ")
 )
 REJECTION_TERMS = (b"reject", b"unsafe", b"sensitive")
 FIXTURE_MARKER = re.compile(
@@ -61,6 +67,8 @@ def run_git(
 ) -> bytes:
     check_deadline(deadline)
     remaining_seconds = deadline - time.monotonic()
+    if remaining_seconds <= 0:
+        fail("timeout", 4)
     try:
         result = subprocess.run(
             [b"git", *arguments],
@@ -76,13 +84,15 @@ def run_git(
     return result.stdout
 
 
-def parse_git_paths(payload: bytes) -> list[bytes]:
+def parse_git_paths(payload: bytes, deadline: float) -> list[bytes]:
     if payload and not payload.endswith(b"\0"):
         fail("changed_file_enumeration_malformed", 2)
     paths = [path for path in payload.split(b"\0") if path]
     if len(paths) != len(set(paths)):
         fail("changed_file_enumeration_malformed", 2)
-    for path in paths:
+    for index, path in enumerate(paths):
+        if index % 1024 == 0:
+            check_deadline(deadline)
         try:
             path.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
@@ -92,6 +102,7 @@ def parse_git_paths(payload: bytes) -> list[bytes]:
             component in (b"", b".", b"..") for component in components
         ):
             fail("changed_path_validation_failed", 3)
+    check_deadline(deadline)
     return paths
 
 
@@ -112,175 +123,249 @@ def enumerate_paths(
         arguments.append(b"--diff-filter=" + diff_filter)
     arguments.extend([base_revision + b".." + head_revision, b"--"])
     return parse_git_paths(
-        run_git(arguments, "changed_file_enumeration_failed", 2, deadline)
+        run_git(arguments, "changed_file_enumeration_failed", 2, deadline),
+        deadline,
     )
 
 
-def match_continuation_bytes(blob: bytes, start: int) -> frozenset[int] | None:
-    """Return the unbounded token alphabet for a matched secret shape."""
-    if blob.startswith(b"sk-", start):
-        return ALPHANUMERIC_HYPHEN_UNDERSCORE
-    if blob.startswith(b"gh", start):
-        return ALPHANUMERIC
-    if blob[start : start + 6].lower() == b"bearer":
-        return ALPHANUMERIC_DOT_HYPHEN_UNDERSCORE
-    return None
-
-
-def extend_unterminated_match(
-    blob: bytes, start: int, end: int, deadline: float
+def consume_bytes(
+    blob: bytes, start: int, allowed: frozenset[int], deadline: float
 ) -> int:
-    """Continue a chunk-edge match until its token terminator or EOF."""
-    continuation_bytes = match_continuation_bytes(blob, start)
-    if continuation_bytes is None:
-        return end
-    cursor = end
+    """Consume one unbounded alphabet with a shared deadline check per chunk."""
+    cursor = start
     while cursor < len(blob):
-        check_deadline(deadline)
         block_end = min(cursor + SCAN_CHUNK_BYTES, len(blob))
-        while cursor < block_end and blob[cursor] in continuation_bytes:
+        while cursor < block_end and blob[cursor] in allowed:
             cursor += 1
         if cursor < block_end:
             return cursor
+        check_deadline(deadline)
     return cursor
 
 
+def credential_span_at(
+    blob: bytes, start: int, deadline: float
+) -> tuple[int, int] | None:
+    """Parse one Host-validator credential shape without chunk-boundary overlap."""
+    initial = blob[start]
+    if initial in (ord("s"), ord("S")):
+        if blob[start : start + 3].lower() == b"sk-":
+            body_start = start + 3
+            end = consume_bytes(
+                blob, body_start, ALPHANUMERIC_HYPHEN_UNDERSCORE, deadline
+            )
+            if end - body_start >= 20:
+                return start, end
+        return None
+
+    if initial in (ord("g"), ord("G")):
+        if (
+            blob[start : start + len(FINE_GRAINED_GITHUB_PREFIX)].lower()
+            == FINE_GRAINED_GITHUB_PREFIX
+        ):
+            body_start = start + len(FINE_GRAINED_GITHUB_PREFIX)
+            end = consume_bytes(
+                blob, body_start, ALPHANUMERIC_UNDERSCORE, deadline
+            )
+            if end - body_start >= 20:
+                return start, end
+        short_prefix = blob[start : start + 4].lower()
+        if (
+            len(short_prefix) == 4
+            and short_prefix[:2] == b"gh"
+            and short_prefix[2] in b"pousr"
+            and short_prefix[3:] == b"_"
+        ):
+            body_start = start + 4
+            end = consume_bytes(blob, body_start, ALPHANUMERIC, deadline)
+            if end - body_start >= 20:
+                return start, end
+        return None
+
+    if initial in (ord("a"), ord("A")):
+        prefix = blob[start : start + 4].lower()
+        body_start = start + 4
+        body_end = body_start + 16
+        if (
+            prefix in (b"akia", b"asia")
+            and body_end <= len(blob)
+            and all(byte in ALPHANUMERIC for byte in blob[body_start:body_end])
+        ):
+            return start, body_end
+        return None
+
+    if initial in (ord("b"), ord("B")):
+        prefix_end = start + 6
+        if blob[start:prefix_end].lower() == b"bearer":
+            body_start = consume_bytes(
+                blob, prefix_end, BEARER_WHITESPACE_BYTES, deadline
+            )
+            if body_start == prefix_end:
+                return None
+            end = consume_bytes(blob, body_start, BEARER_TOKEN_BYTES, deadline)
+            if end - body_start >= 20:
+                return start, end
+        return None
+
+    if initial == ord("-"):
+        for header in PRIVATE_KEY_HEADERS:
+            if blob[start : start + len(header)].lower() == header:
+                return start, start + len(header)
+    return None
+
+
 def find_secret_spans(blob: bytes, deadline: float) -> list[tuple[int, int]]:
-    """Scan bounded chunks so a large blob cannot bypass the total deadline check."""
+    """Parse the blob once while checking the shared monotonic deadline."""
     spans: list[tuple[int, int]] = []
-    covered_until = 0
-    step = SCAN_CHUNK_BYTES - SCAN_OVERLAP_BYTES
-    for offset in range(0, len(blob), step):
-        check_deadline(deadline)
-        chunk = blob[offset : offset + SCAN_CHUNK_BYTES]
-        for match in SECRET_SHAPES.finditer(chunk):
+    cursor = 0
+    next_deadline_check = 0
+    while cursor < len(blob):
+        if cursor >= next_deadline_check:
             check_deadline(deadline)
-            start = offset + match.start()
-            if start < covered_until:
-                continue
-            end = offset + match.end()
-            if end == offset + len(chunk) and end < len(blob):
-                end = extend_unterminated_match(blob, start, end, deadline)
-            spans.append((start, end))
-            covered_until = end
-        check_deadline(deadline)
+            next_deadline_check = cursor + SCAN_CHUNK_BYTES
+        span = credential_span_at(blob, cursor, deadline)
+        if span is None:
+            cursor += 1
+            continue
+        spans.append(span)
+        cursor = span[1]
+    check_deadline(deadline)
     return spans
 
 
-def line_bounds(blob: bytes, position: int) -> tuple[int, int]:
-    start = blob.rfind(b"\n", 0, position) + 1
-    end = blob.find(b"\n", position)
-    return start, len(blob) if end == -1 else end
-
-
-def masked_line(
-    blob: bytes, line_start: int, line_end: int, spans: list[tuple[int, int]]
-) -> bytes:
-    """Remove all match bytes before marker checks, including the candidate itself."""
-    line = bytearray(blob[line_start:line_end])
-    for start, end in spans:
-        overlap_start = max(start, line_start)
-        overlap_end = min(end, line_end)
-        if overlap_start < overlap_end:
-            line[overlap_start - line_start : overlap_end - line_start] = b" " * (
-                overlap_end - overlap_start
-            )
-    return bytes(line)
-
-
-def line_has_fixture_marker(line: bytes) -> bool:
-    lowered = line.lower()
-    return FIXTURE_MARKER.search(lowered) is not None and any(
-        term in lowered for term in REJECTION_TERMS
-    )
-
-
-def is_unique_match_on_line(
-    spans: list[tuple[int, int]], line_start: int, line_end: int, candidate: tuple[int, int]
-) -> bool:
-    return [
-        span for span in spans if span[0] < line_end and span[1] > line_start
-    ] == [candidate]
-
-
-def marker_binds_first_same_line_match(
-    masked: bytes,
-    line_start: int,
-    line_end: int,
-    candidate: tuple[int, int],
-    spans: list[tuple[int, int]],
-) -> bool:
-    """A same-line marker binds only the first span after that marker."""
-    for marker in FIXTURE_MARKER.finditer(masked):
-        marker_end = line_start + marker.end()
-        following_spans = [
-            span
-            for span in spans
-            if marker_end <= span[0] < line_end and span[1] > line_start
-        ]
-        if following_spans and following_spans[0] == candidate:
-            return True
-    return False
-
-
-def marker_binds_adjacent_unique_match(
+def index_fixture_lines(
     blob: bytes,
-    marker_start: int,
-    marker_end: int,
-    candidate: tuple[int, int],
     spans: list[tuple[int, int]],
-) -> bool:
-    """A standalone marker may bind one, and only one, immediately adjacent span."""
-    if any(start < marker_end and end > marker_start for start, end in spans):
-        return False
-    adjacent_spans: list[tuple[int, int]] = []
-    if marker_start:
-        previous_start, previous_end = line_bounds(blob, marker_start - 1)
-        adjacent_spans.extend(
-            span
-            for span in spans
-            if span[0] < previous_end and span[1] > previous_start
+    deadline: float,
+) -> tuple[
+    list[tuple[int, int, tuple[int, ...], tuple[int, ...]]],
+    list[tuple[int, int, int]],
+]:
+    """Mask credential spans and index each line and marker exactly once."""
+    lines: list[tuple[int, int, tuple[int, ...], tuple[int, ...]]] = []
+    markers: list[tuple[int, int, int]] = []
+    line_start = 0
+    first_possible_span = 0
+    while True:
+        check_deadline(deadline)
+        newline = blob.find(b"\n", line_start)
+        line_end = len(blob) if newline == -1 else newline
+        advanced_spans = 0
+        while (
+            first_possible_span < len(spans)
+            and spans[first_possible_span][1] <= line_start
+        ):
+            first_possible_span += 1
+            advanced_spans += 1
+            if advanced_spans % 1024 == 0:
+                check_deadline(deadline)
+
+        overlapping_indices: list[int] = []
+        span_index = first_possible_span
+        while span_index < len(spans) and spans[span_index][0] < line_end:
+            if span_index % 1024 == 0:
+                check_deadline(deadline)
+            if spans[span_index][1] > line_start:
+                overlapping_indices.append(span_index)
+            span_index += 1
+
+        masked = bytearray(blob[line_start:line_end])
+        for offset, index in enumerate(overlapping_indices):
+            if offset % 1024 == 0:
+                check_deadline(deadline)
+            start, end = spans[index]
+            overlap_start = max(start, line_start)
+            overlap_end = min(end, line_end)
+            masked[overlap_start - line_start : overlap_end - line_start] = (
+                b" " * (overlap_end - overlap_start)
+            )
+        lowered = bytes(masked).lower()
+        line_index = len(lines)
+        lines.append(
+            (
+                line_start,
+                line_end,
+                tuple(overlapping_indices),
+                tuple(spans[index][0] for index in overlapping_indices),
+            )
         )
-    if marker_end < len(blob):
-        following_start, following_end = line_bounds(blob, marker_end + 1)
-        adjacent_spans.extend(
-            span
-            for span in spans
-            if span[0] < following_end and span[1] > following_start
-        )
-    return adjacent_spans == [candidate]
+        if any(term in lowered for term in REJECTION_TERMS):
+            for marker_index, marker in enumerate(FIXTURE_MARKER.finditer(lowered)):
+                if marker_index % 1024 == 0:
+                    check_deadline(deadline)
+                markers.append(
+                    (
+                        line_start + marker.start(),
+                        line_start + marker.end(),
+                        line_index,
+                    )
+                )
+        check_deadline(deadline)
+        if newline == -1:
+            break
+        line_start = newline + 1
+    return lines, markers
 
 
-def is_allowed_fixture_match(
+def allowed_fixture_spans(
     path: bytes,
     blob: bytes,
-    candidate: tuple[int, int],
     spans: list[tuple[int, int]],
-) -> bool:
-    """Bind one match to an explicit marker on its own or an adjacent unique line."""
-    if not path.startswith(b"mvp/tests/"):
-        return False
-    line_start, line_end = line_bounds(blob, candidate[0])
-    masked = masked_line(blob, line_start, line_end, spans)
-    if line_has_fixture_marker(masked) and marker_binds_first_same_line_match(
-        masked, line_start, line_end, candidate, spans
-    ):
-        return True
-    if not is_unique_match_on_line(spans, line_start, line_end, candidate):
-        return False
-    if line_start:
-        marker_start, marker_end = line_bounds(blob, line_start - 1)
-        if line_has_fixture_marker(masked_line(blob, marker_start, marker_end, spans)) and marker_binds_adjacent_unique_match(
-            blob, marker_start, marker_end, candidate, spans
+    deadline: float,
+) -> set[tuple[int, int]]:
+    """Bind each bounded marker to at most one same-line or adjacent match."""
+    if not path.startswith(b"mvp/tests/") or not spans:
+        return set()
+    lines, markers = index_fixture_lines(blob, spans, deadline)
+    allowed: set[tuple[int, int]] = set()
+    for marker_index, (marker_start, marker_end, line_index) in enumerate(markers):
+        if marker_index % 1024 == 0:
+            check_deadline(deadline)
+        _, line_end, match_indices, match_starts = lines[line_index]
+        following_position = bisect_left(match_starts, marker_end)
+        if (
+            following_position < len(match_indices)
+            and match_starts[following_position] < line_end
         ):
-            return True
-    if line_end < len(blob):
-        marker_start, marker_end = line_bounds(blob, line_end + 1)
-        if line_has_fixture_marker(masked_line(blob, marker_start, marker_end, spans)) and marker_binds_adjacent_unique_match(
-            blob, marker_start, marker_end, candidate, spans
-        ):
-            return True
-    return False
+            candidate = spans[match_indices[following_position]]
+            if candidate[0] - marker_end <= MAX_FIXTURE_MARKER_DISTANCE_BYTES:
+                allowed.add(candidate)
+            continue
+        if match_indices:
+            continue
+
+        adjacent: set[tuple[int, int]] = set()
+        if line_index > 0:
+            for index in reversed(lines[line_index - 1][2]):
+                candidate = spans[index]
+                if marker_start - candidate[1] > MAX_FIXTURE_MARKER_DISTANCE_BYTES:
+                    break
+                if (
+                    candidate[1] <= marker_start
+                    and marker_start - candidate[1]
+                    <= MAX_FIXTURE_MARKER_DISTANCE_BYTES
+                ):
+                    adjacent.add(candidate)
+        if line_index + 1 < len(lines):
+            next_indices = lines[line_index + 1][2]
+            next_starts = lines[line_index + 1][3]
+            next_position = bisect_left(next_starts, marker_end)
+            while next_position < len(next_indices):
+                index = next_indices[next_position]
+                candidate = spans[index]
+                if candidate[0] - marker_end > MAX_FIXTURE_MARKER_DISTANCE_BYTES:
+                    break
+                if (
+                    marker_end <= candidate[0]
+                    and candidate[0] - marker_end
+                    <= MAX_FIXTURE_MARKER_DISTANCE_BYTES
+                ):
+                    adjacent.add(candidate)
+                next_position += 1
+        if len(adjacent) == 1:
+            allowed.update(adjacent)
+    check_deadline(deadline)
+    return allowed
 
 
 def main() -> int:
@@ -304,9 +389,10 @@ def main() -> int:
             deadline,
         )
         spans = find_secret_spans(blob, deadline)
+        fixture_spans = allowed_fixture_spans(path, blob, spans, deadline)
         for candidate in spans:
             check_deadline(deadline)
-            if is_allowed_fixture_match(path, blob, candidate, spans):
+            if candidate in fixture_spans:
                 fixture_allowances += 1
             else:
                 findings += 1
@@ -319,5 +405,15 @@ def main() -> int:
     return 1 if findings else 0
 
 
+def cli() -> int:
+    """Fail closed without exposing an unexpected traceback or private value."""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except BaseException:
+        fail("internal_failure", 5)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

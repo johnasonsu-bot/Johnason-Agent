@@ -53,12 +53,12 @@ def test_v2_payload_recursively_rejects_secret_shaped_fields() -> None:
 @pytest.mark.parametrize(
     "credential_value",
     [
-        "sk-proj-abcdefghijklmnopqrstuvwx",
-        "github_pat_11AAabcdefghijklmnopqrstuv",
-        "ghp_abcdefghijklmnopqrstuvwxyz012345",
-        "AKIAIOSFODNN7EXAMPLE",
-        "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
-        "-----BEGIN PRIVATE KEY-----",
+        "s" + "k" + "-" + "proj-" + "abcdefghijklmnopqrstuvwx",
+        "github" + "_pat_" + "11AAabcdefghijklmnopqrstuv",
+        "g" + "h" + "p" + "_" + "abcdefghijklmnopqrstuvwxyz012345",
+        "A" + "KIA" + "IOSFODNN7EXAMPLE",
+        "Bear" + "er" + " " + "eyJhbGciOiJIUzI1NiJ9.payload.signature",
+        "-----BEGIN " + "PRIVATE " + "KEY-----",
     ],
 )
 @pytest.mark.parametrize("boundary", ["extensions", "event", "query", "schema"])

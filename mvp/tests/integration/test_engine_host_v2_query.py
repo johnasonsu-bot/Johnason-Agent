@@ -29,7 +29,7 @@ from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2, RuntimeEve
     [
         "--password",
         "--client-secret=abcdefghijklmnopqrstuvwx",
-        "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "g" + "h" + "p" + "_" + "abcdefghijklmnopqrstuvwxyz012345",
         "bad\x00argument",
         "bad\rargument",
         "bad\x1fargument",
@@ -1009,6 +1009,179 @@ async def test_close_before_spawn_completion_cannot_publish_a_late_process(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_aclose_calls_keep_a_delayed_spawn_supervised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a repeated close cancelling startup before late-spawn anchoring."""
+    class LateProcess:
+        stdin = None
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.exited = asyncio.Event()
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.returncode = -15
+            self.exited.set()
+
+    real_wait = asyncio.wait
+    spawn_entered = asyncio.Event()
+    cancellation_wait_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    spawn_task: asyncio.Task[object] | None = None
+    process = LateProcess()
+
+    async def delayed_spawn(*args: object, **kwargs: object) -> LateProcess:
+        nonlocal spawn_task
+        del args, kwargs
+        spawn_task = asyncio.current_task()
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    async def terminate_late_process(
+        spawned_process: LateProcess, process_group_id: int | None
+    ) -> client_module._ProcessCleanupResult:
+        del process_group_id
+        spawned_process.terminate()
+        return client_module._ProcessCleanupResult(returncode=-15, confirmed=True)
+
+    async def observed_wait(awaitables: object, *args: object, **kwargs: object):
+        tasks = set(awaitables)  # type: ignore[arg-type]
+        if spawn_task is not None and spawn_task in tasks:
+            cancellation_wait_entered.set()
+        return await real_wait(tasks, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    monkeypatch.setattr(asyncio, "wait", observed_wait)
+    client = EngineHostV2Client(fake_v2_command("normal"), shutdown_timeout=0.05)
+    monkeypatch.setattr(client, "_terminate_process_tree", terminate_late_process)
+    starting = asyncio.create_task(client.start())
+    first_close: asyncio.Task[None] | None = None
+    second_close: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(spawn_entered.wait(), timeout=1.0)
+        first_close = asyncio.create_task(client.aclose())
+        await asyncio.wait_for(cancellation_wait_entered.wait(), timeout=1.0)
+        second_close = asyncio.create_task(client.aclose())
+
+        results = await asyncio.wait_for(
+            asyncio.gather(first_close, second_close, return_exceptions=True),
+            timeout=1.0,
+        )
+        assert all(isinstance(result, RuntimeUnavailableError) for result in results)
+        assert client.cleanup_confirmed is False
+
+        release_spawn.set()
+        await asyncio.wait_for(process.exited.wait(), timeout=1.0)
+        await _wait_for_cleanup_confirmation(client)
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        assert client.cleanup_confirmed is True
+        assert client.returncode is not None
+        assert process.terminate_calls == 1
+    finally:
+        release_spawn.set()
+        await asyncio.gather(
+            starting,
+            *(task for task in (first_close, second_close) if task is not None),
+            return_exceptions=True,
+        )
+        if not process.exited.is_set():
+            process.terminate()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_then_concurrent_aclose_keeps_delayed_spawn_supervised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches close callers reopening the cancellation window after start cancellation."""
+    class LateProcess:
+        stdin = None
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.exited = asyncio.Event()
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.returncode = -15
+            self.exited.set()
+
+    real_wait = asyncio.wait
+    spawn_entered = asyncio.Event()
+    cancellation_wait_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    spawn_task: asyncio.Task[object] | None = None
+    process = LateProcess()
+
+    async def delayed_spawn(*args: object, **kwargs: object) -> LateProcess:
+        nonlocal spawn_task
+        del args, kwargs
+        spawn_task = asyncio.current_task()
+        spawn_entered.set()
+        await release_spawn.wait()
+        return process
+
+    async def terminate_late_process(
+        spawned_process: LateProcess, process_group_id: int | None
+    ) -> client_module._ProcessCleanupResult:
+        del process_group_id
+        spawned_process.terminate()
+        return client_module._ProcessCleanupResult(returncode=-15, confirmed=True)
+
+    async def observed_wait(awaitables: object, *args: object, **kwargs: object):
+        tasks = set(awaitables)  # type: ignore[arg-type]
+        if spawn_task is not None and spawn_task in tasks:
+            cancellation_wait_entered.set()
+        return await real_wait(tasks, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    monkeypatch.setattr(asyncio, "wait", observed_wait)
+    client = EngineHostV2Client(fake_v2_command("normal"), shutdown_timeout=0.05)
+    monkeypatch.setattr(client, "_terminate_process_tree", terminate_late_process)
+    starting = asyncio.create_task(client.start())
+    close_calls: tuple[asyncio.Task[None], asyncio.Task[None]] | None = None
+    try:
+        await asyncio.wait_for(spawn_entered.wait(), timeout=1.0)
+        starting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await starting
+        await asyncio.wait_for(cancellation_wait_entered.wait(), timeout=1.0)
+
+        close_calls = (
+            asyncio.create_task(client.aclose()),
+            asyncio.create_task(client.aclose()),
+        )
+        results = await asyncio.wait_for(
+            asyncio.gather(*close_calls, return_exceptions=True), timeout=1.0
+        )
+        assert all(isinstance(result, RuntimeUnavailableError) for result in results)
+        assert client.cleanup_confirmed is False
+
+        release_spawn.set()
+        await asyncio.wait_for(process.exited.wait(), timeout=1.0)
+        await _wait_for_cleanup_confirmation(client)
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        assert client.cleanup_confirmed is True
+        assert client.returncode is not None
+        assert process.terminate_calls == 1
+    finally:
+        release_spawn.set()
+        await asyncio.gather(
+            starting,
+            *(close_calls or ()),
+            return_exceptions=True,
+        )
+        if not process.exited.is_set():
+            process.terminate()
+
+
+@pytest.mark.asyncio
 async def test_aclose_reaps_the_entire_host_process_group() -> None:
     client = EngineHostV2Client(
         fake_v2_command("grandchild"), request_timeout=0.2, shutdown_timeout=0.05
@@ -1874,6 +2047,14 @@ async def _consume_remaining(
 async def _wait_for_reap(client: EngineHostV2Client) -> None:
     async def wait() -> None:
         while client.returncode is None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout=1.0)
+
+
+async def _wait_for_cleanup_confirmation(client: EngineHostV2Client) -> None:
+    async def wait() -> None:
+        while client.cleanup_confirmed is not True:
             await asyncio.sleep(0)
 
     await asyncio.wait_for(wait(), timeout=1.0)

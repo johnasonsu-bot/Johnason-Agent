@@ -195,4 +195,3 @@
   报告逐条记录命令、source revision、exit code、测试计数和失败 traceback 摘要。只有所有必需门禁均 exit `0` 才能改为 `GO_HOST_V2_CONTRACT`。
 
   `git add docs/superpowers/reports/2026-08-26-host-v2-contract-validation.md && git commit -m "docs: record host v2 remediation gate"`
-

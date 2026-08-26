@@ -329,6 +329,12 @@ def test_v2_second_boundary_filters_every_private_public_text_variant(unsafe_tex
         "artifact=(C:/private/state)",
         "//private/state",
         "///private/state",
+        r"artifact=\\\host\share\state.json",
+        r"artifact=\\\\host\share\state.json",
+        r"artifact=\\host\\share\state.json",
+        r"artifact=\/host\\share/state.json",
+        r"artifact=\private/state.json",
+        r"artifact=\\host/share\state.json",
         "../state.json",
     ],
 )

@@ -299,18 +299,16 @@ class EngineHostV2Client:
             try:
                 process = await asyncio.shield(spawn_task)
             except asyncio.CancelledError:
+                self._schedule_late_spawn_reap(spawn_task)
                 done, _ = await asyncio.wait(
                     {spawn_task}, timeout=self.shutdown_timeout
                 )
                 if spawn_task not in done:
-                    self._schedule_late_spawn_reap(spawn_task)
                     raise
-                try:
-                    process = spawn_task.result()
-                except BaseException:
-                    raise asyncio.CancelledError
-                self._publish_process(process)
-                await self._close_process()
+                self._ensure_late_spawn_reap(spawn_task)
+                reaper = self._late_spawn_reap_task
+                if reaper is not None:
+                    await asyncio.shield(reaper)
                 raise
             finally:
                 if spawn_task.done() and self._spawn_task is spawn_task:
@@ -850,6 +848,8 @@ class EngineHostV2Client:
     ) -> asyncio.Task[None]:
         self._closed = True
         async with self._close_lock:
+            if self._close_task is not None:
+                return self._close_task
             start_task = self._start_task
             if (
                 cancel_start
@@ -858,8 +858,7 @@ class EngineHostV2Client:
                 and not start_task.done()
             ):
                 start_task.cancel()
-            if self._close_task is None:
-                self._close_task = asyncio.create_task(self._supervise_close())
+            self._close_task = asyncio.create_task(self._supervise_close())
             return self._close_task
 
     async def _supervise_close(self) -> None:
@@ -1522,8 +1521,13 @@ class EngineHostV2Client:
                         "engine-host v2 process tree cleanup was not confirmed"
                     )
             else:
+                spawn_pending = self._spawn_task is not None
                 late_spawn_pending = self._late_spawn_supervised_task is not None
-                if self._start_cleanup_unconfirmed or late_spawn_pending:
+                if (
+                    self._start_cleanup_unconfirmed
+                    or spawn_pending
+                    or late_spawn_pending
+                ):
                     self._cleanup_confirmed = False
                     self._report_unconfirmed_tree_cleanup()
                     self._cleanup_error = RuntimeUnavailableError(

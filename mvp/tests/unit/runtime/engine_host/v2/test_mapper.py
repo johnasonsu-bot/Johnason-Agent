@@ -584,6 +584,12 @@ def test_runtime_public_values_reject_digests_paths_and_internal_proofs(
         "artifact=(C:/private/state)",
         "//private/state",
         "///private/state",
+        r"artifact=\\\host\share\state.json",
+        r"artifact=\\\\host\share\state.json",
+        r"artifact=\\host\\share\state.json",
+        r"artifact=\/host\\share/state.json",
+        r"artifact=\private/state.json",
+        r"artifact=\\host/share\state.json",
         "../state.json",
     ],
 )
@@ -609,6 +615,13 @@ def test_runtime_public_boundary_allows_http_urls_with_path_segments(url: str) -
     assert mapper_module.validate_public_text(url, maximum=4096) == url
     mapped = map_runtime_event(runtime_event("assistant.delta", payload={"text": url}))
     assert mapped[0].payload["content"] == url
+
+
+def test_runtime_public_boundary_allows_relative_text_with_path_separators() -> None:
+    """Catches rooted-path hardening rejecting ordinary relative public text."""
+    text = "report stored at artifacts/current/report.txt"
+
+    assert mapper_module.validate_public_text(text, maximum=4096) == text
 
 
 @pytest.mark.parametrize(
