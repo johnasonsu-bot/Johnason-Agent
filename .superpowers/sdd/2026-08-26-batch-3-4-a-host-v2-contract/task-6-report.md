@@ -13,6 +13,9 @@
   Client/进程/repository/registry/SQLite/cursor，并在正常/异常退出清理临时目录。
 - 修复 terminal 后 Event 的竞态：有序 `query.status` seal ack 在 terminal 对
   consumer 可见前完成；timeout 和非法后续 Event 均 fail closed。
+- Fix2 参数化覆盖 wrong state、run/term/step identity、cursor、`sealed=False`
+  和错误类型 ack；7 个变体均稳定 fail closed、无错误值回显或挂起，生产现有
+  exact-response 校验无需修改。
 
 ## Task 5 承重 P0
 
@@ -24,14 +27,15 @@
 ## 验证
 
 - v2 acceptance（九场景完整执行两遍）：`6 passed`；
-- Task 4：`141 passed`；
-- mapper + AG-UI + v2 query：`1137 passed`；
-- 简报指定 Host 专项：`901 passed`；
-- terminal immediate-extra 独立进程重复：`50/50`；
+- malformed seal：`7 passed`；
+- Task 4：`148 passed`；
+- mapper + AG-UI + v2 query：`1144 passed`；
+- 简报指定 Host 专项：`908 passed`；
+- terminal immediate-extra 独立进程重复：`passes=50 failures=0`；
 - frontend build：exit 0；既有完整 Playwright 证据：`38 passed`；
 - compileall、`git diff --check`、高置信 Secret scan：通过。
 
-Source revision A2 上未取得完整必需后端 `pytest -q` 的 PASS、exit code 与最终
+Source revision C 上未取得完整必需后端 `pytest -q` 的 PASS、exit code 与最终
 计数；不把实施前 development graph 观测写成本次已证明的 baseline failure。
 
 ## 判定
@@ -41,9 +45,9 @@ Decision: BLOCKED
 Real runtime status: NOT_YET_EVALUATED
 ```
 
-Source revision under test：`652954f5740b68183c97603174c4b660956fff65`。
-代码提交 A 为 `cd95147db24fb1547afd63a3374a1e3ebef868a0`，A2 是其可达
-child；本报告由 A2 的独立 documentation-only child B 提交，不 amend A/A2。
+Source revision under test：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`。
+Fix2 代码/测试提交 C 的历史包含 A/A2/B；本报告由 C 的独立
+documentation-only child D 提交，不 amend 任何代码/测试提交。
 
 阻塞与完整命令、版本、HEAD、Fake revision、v1 兼容、Secret scan 和残余风险
 详见 `docs/superpowers/reports/2026-08-26-host-v2-contract-validation.md`。

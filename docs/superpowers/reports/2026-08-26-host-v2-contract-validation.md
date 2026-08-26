@@ -1,19 +1,21 @@
 # Engine Host v2 合同验证报告
 
 - 日期：2026-08-26
-- Source revision under test：`652954f5740b68183c97603174c4b660956fff65`
+- Source revision under test：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
 - 代码提交 A：`cd95147db24fb1547afd63a3374a1e3ebef868a0`
 - 终态封口修复 A2：`652954f5740b68183c97603174c4b660956fff65`
-- A2 的 parent 为 A，均保持可达。
-- Report revision：本文件所在的 documentation-only commit B；B 是 A2 的直接
-  child，最终 SHA 在交付记录中给出，未 amend A/A2。
+- malformed seal 测试提交 C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
+- C 的历史包含 A/A2/B，均保持可达。
+- Report revision：本文件所在的 documentation-only commit D；D 是 C 的直接
+  child，最终 SHA 在交付记录中给出，未 amend 任何代码/测试提交。
 - Python：`3.13.5`；Node.js：`v22.20.0`；npm：`10.9.3`
 - Fake Host revision：`fake-host-v2/r2`
 
 ## 结论
 
-九场景合同、Task 4、Host 专项、mapper/AG-UI、终态封口稳定性及静态检查均在
-A2 上通过；但 A2 上没有获得完整必需后端回归 `pytest -q` 的 PASS 结果。
+九场景合同、Task 4、Host 专项、mapper/AG-UI、终态封口稳定性、malformed ack
+矩阵及静态检查均在 C 上通过；但 C 上没有获得完整必需后端回归 `pytest -q`
+的 PASS 结果。
 因此不能发布 GO，也不把实施前 development graph 观测描述为本次已证明的
 baseline failure。
 
@@ -40,6 +42,11 @@ Real runtime status: NOT_YET_EVALUATED
   `DID NOT RAISE RuntimeUnavailableError`。A2 增加有序 `query.status` seal ack；
   terminal 在 ack 前不向消费者暴露，ack timeout 和 terminal 后 Event 均 fail
   closed。GREEN：专项 `3 passed`，immediate-extra 独立进程重复 50 次零失败。
+- Fix2 malformed ack RED：7 个 mode 在 Fake 尚未发出恶意 ack 时均得到
+  `DID NOT RAISE RuntimeProtocolError`。补齐 wrong state、run、term、step、
+  cursor、`sealed=False` 和错误类型响应后，现有生产 exact-response 校验全部
+  fail closed：`7 passed`；异常与 diagnostics 不回显 Host 错误 identity/type，
+  wait、aclose、process cleanup 和 reader cleanup 均有界完成。生产代码无需修改。
 
 ## 九场景与隔离证据
 
@@ -61,44 +68,63 @@ Real runtime status: NOT_YET_EVALUATED
   新实例 B 使用原值恢复，校验新进程/identity/cursor/terminal/public payload，
   并覆盖错误 digest 分支。
 
-## A2 上的可复现命令
+## C 上的可复现命令
 
 所有后端命令 cwd 均为
 `/Users/sushi/Downloads/Johnason-Agent/.worktrees/batch-3-4-a-host-v2/mvp`，
-环境均为 `PYTHONPATH="$PWD/src:$PWD"`。`perl alarm` 数字是命令级上限；以下
-命令均在上限内 exit 0。
+环境均为 `PYTHONPATH="$PWD/src:$PWD"`。macOS 没有 `timeout`，因此用系统
+Python 的 `subprocess.run(timeout=...)` 提供真实命令级上限；以下命令均在
+上限内 exit 0。
 
 ```bash
-env PYTHONPATH="$PWD/src:$PWD" perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 60 \
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
+  env PYTHONPATH="$PWD/src:$PWD" \
   /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
   tests/acceptance/test_engine_host_v2_conformance.py
 ```
 
 结果：`6 passed, 0 failed, 0 skipped`，1 条既有 Starlette 弃用警告，
-pytest 2.88 秒。
+pytest 3.14 秒，wrapper exit 0。
 
 ```bash
-env PYTHONPATH="$PWD/src:$PWD" perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 90 \
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
+  env PYTHONPATH="$PWD/src:$PWD" \
+  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+  tests/integration/test_engine_host_v2_query.py::test_terminal_seal_malformed_ack_fails_closed
+```
+
+结果：`7 passed, 0 failed, 0 skipped`，pytest 0.32 秒，wrapper exit 0。
+
+```bash
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
+  env PYTHONPATH="$PWD/src:$PWD" \
   /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
   tests/integration/test_engine_host_v2_query.py \
   tests/integration/test_engine_host_lifecycle.py \
   tests/integration/test_engine_host_run.py
 ```
 
-结果：`141 passed, 0 failed, 0 skipped`，pytest 12.58 秒。
+结果：`148 passed, 0 failed, 0 skipped`，pytest 13.55 秒，wrapper exit 0。
 
 ```bash
-env PYTHONPATH="$PWD/src:$PWD" perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 90 \
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
+  env PYTHONPATH="$PWD/src:$PWD" \
   /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
   tests/unit/runtime/engine_host/v2/test_mapper.py \
   tests/unit/agui/test_mapper.py \
   tests/integration/test_engine_host_v2_query.py
 ```
 
-结果：`1137 passed, 0 failed, 0 skipped`，pytest 5.71 秒。
+结果：`1144 passed, 0 failed, 0 skipped`，pytest 6.29 秒，wrapper exit 0。
 
 ```bash
-env PYTHONPATH="$PWD/src:$PWD" perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 120 \
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
+  env PYTHONPATH="$PWD/src:$PWD" \
   /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
   tests/unit/runtime/engine_host \
   tests/integration/test_engine_host_lifecycle.py \
@@ -108,18 +134,66 @@ env PYTHONPATH="$PWD/src:$PWD" perl -e 'alarm shift; exec @ARGV or die "exec: $!
   tests/acceptance/test_engine_host_v2_conformance.py
 ```
 
-结果：`901 passed, 0 failed, 0 skipped`，1 条既有 Starlette 弃用警告，
-pytest 17.93 秒。
+结果：`908 passed, 0 failed, 0 skipped`，1 条既有 Starlette 弃用警告，
+pytest 19.89 秒，wrapper exit 0。
 
 ```bash
-perl -e 'alarm shift; exec @ARGV or die "exec: $!"' 120 bash -c \
-  'for run in {1..50}; do env PYTHONPATH="$PWD/src:$PWD" \
-  /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
-  tests/integration/test_engine_host_v2_query.py::test_terminal_seals_the_stream_and_rejects_every_later_event \
-  >/dev/null || exit 1; done'
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=120); raise SystemExit(result.returncode)' \
+  bash -c 'passes=0; failures=0; for run in $(seq 1 50); do \
+    if env PYTHONPATH="$PWD/src:$PWD" \
+      /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m pytest -q \
+      tests/integration/test_engine_host_v2_query.py::test_terminal_seals_the_stream_and_rejects_every_later_event \
+      >/dev/null 2>&1; then passes=$((passes + 1)); \
+    else failures=$((failures + 1)); fi; done; \
+    printf "passes=%d failures=%d\n" "$passes" "$failures"; \
+    test "$passes" -eq 50 && test "$failures" -eq 0'
 ```
 
-结果：`repeated_runs=50 failures=0`，exit 0，22.75 秒。
+结果：准确输出 `passes=50 failures=0`，wrapper exit 0，28.38 秒。
+
+## Fix1 + Fix2 全范围 diff 与 Secret scan
+
+以下命令 cwd 为
+`/Users/sushi/Downloads/Johnason-Agent/.worktrees/batch-3-4-a-host-v2`。
+diff 范围从原 Task 6 提交 `dd8ac2033a214fdd1af340f75d03b49b394d1b85`
+到 Source C，覆盖全部 Fix1 + Fix2 代码、测试和既有报告。
+
+```bash
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=30); raise SystemExit(result.returncode)' \
+  git diff --check \
+  dd8ac2033a214fdd1af340f75d03b49b394d1b85..c803de37c6328330fda214ab0b4d9ecffdcd9ab9
+```
+
+结果：无输出，wrapper exit 0，30 秒上限。
+
+changed-file 枚举命令：
+
+```bash
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=30); raise SystemExit(result.returncode)' \
+  git diff --name-only --diff-filter=ACMR \
+  dd8ac2033a214fdd1af340f75d03b49b394d1b85..c803de37c6328330fda214ab0b4d9ecffdcd9ab9
+```
+
+结果为 8 个文件：Task report、公共验证报告、v2 client、acceptance conformance、
+conformance helper、Fake Host、Host factory fixture、v2 query integration test。
+
+Secret scan 的完整可复制命令如下。pattern 只包含 OpenAI-style、GitHub token、
+AWS access key、Bearer high-entropy token 的敏感形状，不包含真实 secret。文件名
+通过 NUL 分隔读取，可处理空列表；`rg --text` 不跳过二进制内容；`-l` 的文件名
+和任何诊断均重定向到 `/dev/null`，命令只输出安全计数。
+
+```bash
+/usr/bin/python3 -c \
+  'import subprocess,sys; result=subprocess.run(sys.argv[1:], timeout=30); raise SystemExit(result.returncode)' \
+  bash -c 'set -uo pipefail; base="$1"; revision="$2"; pattern="(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|(?i:bearer)[[:space:]]+[A-Za-z0-9._-]{20,})"; changed_files=0; matching_files=0; scan_errors=0; while IFS= read -r -d "" file; do changed_files=$((changed_files + 1)); if LC_ALL=C rg --text -l -- "$pattern" "$file" >/dev/null 2>&1; then matching_files=$((matching_files + 1)); else status=$?; if [ "$status" -gt 1 ]; then scan_errors=$((scan_errors + 1)); fi; fi; done < <(git diff --name-only --diff-filter=ACMR -z "$base..$revision"); printf "changed_files=%d matching_files=%d scan_errors=%d\n" "$changed_files" "$matching_files" "$scan_errors"; test "$matching_files" -eq 0 && test "$scan_errors" -eq 0' \
+  _ dd8ac2033a214fdd1af340f75d03b49b394d1b85 c803de37c6328330fda214ab0b4d9ecffdcd9ab9
+```
+
+结果：`changed_files=8 matching_files=0 scan_errors=0`，30 秒上限，wrapper
+exit 0；未输出任何匹配值。
 
 ## 完整回归与前端
 
@@ -131,11 +205,11 @@ PYTHONPATH="$PWD/src:$PWD" /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/p
   -m pytest -q
 ```
 
-A2 上未取得该命令的完整 PASS、exit code 和最终计数，因此不推断具体 baseline
+C 上未取得该命令的完整 PASS、exit code 和最终计数，因此不推断具体 baseline
 根因，直接按必需门禁未完成判定 BLOCKED。实施前曾有 development graph 失败
-观测，但不是本次 A2 验证结论。
+观测，但不是本次 C 验证结论。
 
-前端代码从既有完整证据到 A2 没有变化；按复审允许复用既有结果：build exit 0，
+前端代码从既有完整证据到 C 没有变化；按复审允许复用既有结果：build exit 0，
 Vite `45 modules transformed`；Playwright `38 passed`。另一次 A2 fresh Playwright
 尝试在 `conversation.spec.ts:4` 出现单测 30 秒 timeout，且整体超过计划的
 180 秒后终止，未把该不完整运行粉饰为 PASS。
@@ -146,12 +220,12 @@ Vite `45 modules transformed`；Playwright `38 passed`。另一次 A2 fresh Play
   disabled 默认 registry 为 `None`，现有 `/api/v1/engine-host` 行为不变。
 - Fake 边界：仅声明 `contract_fake` / `fake-v2`，不冒充 Python、Goose、DSH；
   公共导出仍仅为现有 v1 名称加 `v2` namespace。
-- compile：cwd `mvp`，`python -m compileall -q src tests`，exit 0。
-- diff：cwd worktree root，`git diff --check 652954f^ 652954f`，exit 0。
-- Secret scan：scope 为 `dd8ac2..652954f` 的 patch 与全部 changed tracked files；
-  pattern 类别为 OpenAI-style、GitHub token、AWS access key、Bearer high-entropy
-  token。扫描仅输出计数，不输出匹配值；`source_patch_matches=0`、
-  `source_changed_file_matches=0`。
+- compile：cwd `mvp`，使用同一 120 秒 Python wrapper 执行
+  `env PYTHONPATH="$PWD/src:$PWD" /Users/sushi/Downloads/Johnason-Agent/mvp/.venv/bin/python -m compileall -q src tests`，
+  wrapper exit 0。
+- 全范围 diff、changed-file 枚举和 Secret scan 使用上一节的完整命令；范围为
+  `dd8ac2033a214fdd1af340f75d03b49b394d1b85..c803de37c6328330fda214ab0b4d9ecffdcd9ab9`，
+  均 exit 0。
 
 ## 残余风险
 
