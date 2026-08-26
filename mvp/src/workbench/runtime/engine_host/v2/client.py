@@ -21,6 +21,7 @@ from .contracts import (
     RuntimeCapabilitiesV2,
     RuntimeEventV2,
 )
+from .security import validate_runtime_argv
 
 
 MAX_FRAME_BYTES = 1_048_576
@@ -165,8 +166,7 @@ class EngineHostV2Client:
         request_timeout: float = 5.0,
         shutdown_timeout: float = 2.0,
     ) -> None:
-        if not command or any(not isinstance(item, str) or not item for item in command):
-            raise ValueError("runtime command must be non-empty structured argv")
+        command = validate_runtime_argv(command)
         if request_timeout <= 0 or shutdown_timeout <= 0:
             raise ValueError("runtime timeouts must be positive")
         self.command = command
@@ -179,6 +179,9 @@ class EngineHostV2Client:
         self._reader_close_task: asyncio.Task[None] | None = None
         self._start_lock = asyncio.Lock()
         self._start_task: asyncio.Task[None] | None = None
+        self._spawn_task: asyncio.Task[Any] | None = None
+        self._late_spawn_reap_task: asyncio.Task[None] | None = None
+        self._start_cleanup_unconfirmed = False
         self._start_waiters = 0
         self._start_failure: BaseException | None = None
         self._write_lock = asyncio.Lock()
@@ -231,7 +234,12 @@ class EngineHostV2Client:
     def reader_tasks_done(self) -> bool:
         return all(
             task is None or task.done()
-            for task in (self._start_task, self._stdout_task, self._stderr_task)
+            for task in (
+                self._start_task,
+                self._spawn_task,
+                self._stdout_task,
+                self._stderr_task,
+            )
         )
 
     def _transition(self, target: str, *, expected: set[str]) -> bool:
@@ -288,13 +296,26 @@ class EngineHostV2Client:
                     **self._process_group_options(),
                 )
             )
+            self._spawn_task = spawn_task
             try:
                 process = await asyncio.shield(spawn_task)
             except asyncio.CancelledError:
-                process = await asyncio.shield(spawn_task)
+                done, _ = await asyncio.wait(
+                    {spawn_task}, timeout=self.shutdown_timeout
+                )
+                if spawn_task not in done:
+                    self._schedule_late_spawn_reap(spawn_task)
+                    raise
+                try:
+                    process = spawn_task.result()
+                except BaseException:
+                    raise asyncio.CancelledError
                 self._publish_process(process)
                 await self._close_process()
                 raise
+            finally:
+                if spawn_task.done() and self._spawn_task is spawn_task:
+                    self._spawn_task = None
             self._publish_process(process)
             if self._closed:
                 raise asyncio.CancelledError
@@ -315,7 +336,7 @@ class EngineHostV2Client:
             self._transition("unavailable", expected={"created", "starting"})
             await self._close_process()
             raise failure from error
-        except (ValidationError, ValueError) as error:
+        except (ValidationError, ValueError, RecursionError) as error:
             failure = RuntimeProtocolError(
                 "engine-host v2 returned invalid capabilities"
             )
@@ -333,6 +354,33 @@ class EngineHostV2Client:
         self._process = process
         if os.name == "posix":
             self._process_group_id = process.pid
+
+    def _schedule_late_spawn_reap(self, spawn_task: asyncio.Task[Any]) -> None:
+        if self._late_spawn_reap_task is None:
+            self._late_spawn_reap_task = asyncio.create_task(
+                self._reap_late_spawn(spawn_task)
+            )
+
+    async def _reap_late_spawn(self, spawn_task: asyncio.Task[Any]) -> None:
+        try:
+            process = await asyncio.shield(spawn_task)
+        except BaseException:
+            self._cleanup_confirmed = True
+            self._cleanup_error = None
+            return
+        process_group_id = process.pid if os.name == "posix" else None
+        cleanup = await self._terminate_process_tree(process, process_group_id)
+        self._returncode = cleanup.returncode
+        self._cleanup_confirmed = cleanup.confirmed
+        if cleanup.confirmed:
+            self._cleanup_error = None
+        else:
+            self._report_unconfirmed_tree_cleanup()
+            self._cleanup_error = RuntimeUnavailableError(
+                "engine-host v2 process tree cleanup was not confirmed"
+            )
+        if self._spawn_task is spawn_task:
+            self._spawn_task = None
 
     async def run_query(
         self, envelope: RunEnvelopeV2
@@ -612,7 +660,7 @@ class EngineHostV2Client:
         )
         try:
             checkpoint = CheckpointHintV2.model_validate(response)
-        except ValidationError as error:
+        except (ValidationError, ValueError, RecursionError) as error:
             await self._control_protocol_failure(
                 stream, "engine-host v2 returned invalid checkpoint", cause=error
             )
@@ -766,10 +814,17 @@ class EngineHostV2Client:
     async def _supervise_close(self) -> None:
         start_task = self._start_task
         if start_task is not None and start_task is not asyncio.current_task():
-            try:
-                await asyncio.shield(start_task)
-            except BaseException:
-                pass
+            done, _ = await asyncio.wait(
+                {start_task}, timeout=self.shutdown_timeout * 2
+            )
+            if start_task in done:
+                await asyncio.gather(start_task, return_exceptions=True)
+            else:
+                self._start_cleanup_unconfirmed = True
+                self._report_unconfirmed_tree_cleanup()
+                self._cleanup_error = RuntimeUnavailableError(
+                    "engine-host v2 process tree cleanup was not confirmed"
+                )
         await self._close_process()
 
     def _validate_capabilities(self, envelope: RunEnvelopeV2) -> None:
@@ -839,7 +894,7 @@ class EngineHostV2Client:
                     "payload": dict(payload),
                 }
             )
-        except (ValidationError, ValueError) as error:
+        except (ValidationError, ValueError, RecursionError) as error:
             raise RuntimeProtocolError("invalid engine-host v2 command") from error
         future: asyncio.Future[Mapping[str, Any]] = (
             asyncio.get_running_loop().create_future()
@@ -934,7 +989,7 @@ class EngineHostV2Client:
                     raise RuntimeProtocolError("engine-host v2 frame exceeds 1 MiB")
                 try:
                     frame = json.loads(raw)
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
                     raise RuntimeProtocolError("invalid engine-host v2 frame") from error
                 if not isinstance(frame, dict):
                     raise RuntimeProtocolError("invalid engine-host v2 frame")
@@ -954,7 +1009,7 @@ class EngineHostV2Client:
             else:
                 failure = RuntimeUnavailableError("engine-host v2 output closed")
             self._reader_failed(failure)
-        except (RuntimeProtocolError, ValidationError, ValueError) as error:
+        except (RuntimeProtocolError, ValidationError, ValueError, RecursionError) as error:
             failure = (
                 error
                 if isinstance(error, RuntimeProtocolError)
@@ -995,7 +1050,7 @@ class EngineHostV2Client:
         raw_event = frame.get("payload")
         try:
             event = RuntimeEventV2.model_validate(raw_event)
-        except ValidationError as error:
+        except (ValidationError, ValueError, RecursionError) as error:
             message = (
                 "engine-host v2 emitted an unknown required event"
                 if "required event" in str(error)
@@ -1387,8 +1442,10 @@ class EngineHostV2Client:
                 if process.stdin is not None:
                     process.stdin.close()
                     try:
-                        await process.stdin.wait_closed()
-                    except (BrokenPipeError, ConnectionResetError):
+                        await asyncio.wait_for(
+                            process.stdin.wait_closed(), timeout=self.shutdown_timeout
+                        )
+                    except (BrokenPipeError, ConnectionResetError, TimeoutError):
                         pass
                 cleanup = await self._terminate_process_tree(
                     process, process_group_id
@@ -1403,8 +1460,19 @@ class EngineHostV2Client:
                         "engine-host v2 process tree cleanup was not confirmed"
                     )
             else:
-                self._cleanup_confirmed = True
-                self._cleanup_error = None
+                late_spawn_pending = (
+                    self._late_spawn_reap_task is not None
+                    and not self._late_spawn_reap_task.done()
+                )
+                if self._start_cleanup_unconfirmed or late_spawn_pending:
+                    self._cleanup_confirmed = False
+                    self._report_unconfirmed_tree_cleanup()
+                    self._cleanup_error = RuntimeUnavailableError(
+                        "engine-host v2 process tree cleanup was not confirmed"
+                    )
+                else:
+                    self._cleanup_confirmed = True
+                    self._cleanup_error = None
             current = asyncio.current_task()
             tasks = [
                 task
@@ -1472,7 +1540,8 @@ class EngineHostV2Client:
                 try:
                     action()
                 except ProcessLookupError:
-                    pass
+                    if os.name == "posix":
+                        return process.returncode if process.returncode is not None else 0
             try:
                 return await asyncio.wait_for(
                     process.wait(), timeout=self.shutdown_timeout

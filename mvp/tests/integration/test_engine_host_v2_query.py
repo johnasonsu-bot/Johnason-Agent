@@ -9,6 +9,7 @@ import signal
 
 import pytest
 
+import workbench.runtime.engine_host.v2.client as client_module
 from tests.fixtures.host_v2 import fake_v2_command, run_envelope
 from workbench.runtime.engine_host.v2.client import (
     EngineHostV2Client,
@@ -20,6 +21,32 @@ from workbench.runtime.engine_host.v2.client import (
     RuntimeUnavailableError,
 )
 from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2, RuntimeEventV2
+
+
+@pytest.mark.parametrize(
+    "unsafe_argument",
+    [
+        "--password",
+        "--client-secret=abcdefghijklmnopqrstuvwx",
+        "ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "bad\x00argument",
+        "bad\rargument",
+        "bad\x1fargument",
+    ],
+)
+def test_client_constructor_rejects_sensitive_or_control_argv(
+    unsafe_argument: str,
+) -> None:
+    """Catches direct client construction bypassing the settings argv boundary."""
+    with pytest.raises(ValueError, match="sensitive|control"):
+        EngineHostV2Client(("fake-v2", unsafe_argument))
+
+
+def test_client_constructor_allows_safe_business_argv() -> None:
+    """Catches direct argv validation rejecting safe business command names."""
+    client = EngineHostV2Client(("password-reset-helper", "--token-count=32"))
+
+    assert client.command == ("password-reset-helper", "--token-count=32")
 
 
 async def _collect(
@@ -1038,6 +1065,7 @@ async def test_posix_process_group_wait_remains_bounded_after_sigkill(
         ("invalid_json", "invalid"),
         ("partial_frame", "incomplete"),
         ("oversize_frame", "exceeds 1 MiB"),
+        ("deeply_nested_frame", "invalid"),
     ],
 )
 @pytest.mark.asyncio
@@ -1053,8 +1081,212 @@ async def test_adversarial_transport_frames_fail_closed_and_reap(
             await _collect(client)
         assert client.state == "unavailable"
         await _wait_for_reap(client)
+        if client._reader_close_task is not None:
+            await asyncio.wait_for(
+                asyncio.shield(client._reader_close_task), timeout=1.0
+            )
     finally:
         await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_reader_converts_json_recursion_error_and_reclaims_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches parser recursion escaping the supervised reader as a hung stream."""
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), request_timeout=0.2, shutdown_timeout=0.05
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+
+    def recursive_loads(value: object) -> object:
+        del value
+        raise RecursionError("synthetic parser depth")
+
+    monkeypatch.setattr(client_module.json, "loads", recursive_loads)
+    try:
+        with pytest.raises(RuntimeProtocolError, match="invalid"):
+            await _collect(client)
+        assert client.state == "unavailable"
+        await _wait_for_reap(client)
+        assert client._reader_close_task is not None
+        await asyncio.wait_for(
+            asyncio.shield(client._reader_close_task), timeout=1.0
+        )
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_aclose_bounds_stdin_wait_closed() -> None:
+    """Catches a pipe implementation blocking Host reclamation forever."""
+    class BlockingStdin:
+        def __init__(self) -> None:
+            self.closed = False
+            self.active_waiters = 0
+            self.release = asyncio.Event()
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            self.active_waiters += 1
+            try:
+                await self.release.wait()
+            finally:
+                self.active_waiters -= 1
+
+    class ExitedProcess:
+        pid = 1234
+        returncode = 0
+
+        def __init__(self, stdin: BlockingStdin) -> None:
+            self.stdin = stdin
+
+        async def wait(self) -> int:
+            return 0
+
+    stdin = BlockingStdin()
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+    client._process = ExitedProcess(stdin)  # type: ignore[assignment]
+    client._state = "ready"
+    closing = asyncio.create_task(client.aclose())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=0.2)
+        assert closing in done
+        await closing
+        assert stdin.closed
+        assert stdin.active_waiters == 0
+        assert client.cleanup_confirmed is True
+    finally:
+        stdin.release.set()
+        if not closing.done():
+            await asyncio.wait_for(closing, timeout=1.0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX missing-process contract")
+@pytest.mark.asyncio
+async def test_posix_process_lookup_during_direct_termination_counts_as_exited() -> None:
+    """Catches a vanished POSIX process being reported as unconfirmed cleanup."""
+    class MissingProcess:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()
+            return 0
+
+        def terminate(self) -> None:
+            raise ProcessLookupError
+
+        def kill(self) -> None:
+            raise ProcessLookupError
+
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+
+    returncode = await asyncio.wait_for(
+        client._bounded_process_exit(MissingProcess()),  # type: ignore[arg-type]
+        timeout=0.2,
+    )
+
+    assert returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_aclose_bounds_a_cancellation_resistant_start_task() -> None:
+    """Catches closure waiting forever for a start supervisor that ignores cancel."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_start() -> None:
+        entered.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+    client._state = "starting"
+    client._start_task = asyncio.create_task(blocking_start())
+    await entered.wait()
+    closing = asyncio.create_task(client.aclose())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=0.2)
+        assert closing in done
+        with pytest.raises(RuntimeUnavailableError, match="cleanup was not confirmed"):
+            await closing
+    finally:
+        release.set()
+        await asyncio.gather(client._start_task, return_exceptions=True)
+        if not closing.done():
+            await asyncio.wait_for(closing, timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_aclose_bounds_spawn_cancellation_and_reclaims_late_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a late subprocess escaping after cancellation of process creation."""
+    class LateProcess:
+        stdin = None
+        pid = 4321
+
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.terminate_calls = 0
+            self.exited = asyncio.Event()
+
+        async def wait(self) -> int:
+            await self.exited.wait()
+            assert self.returncode is not None
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+            self.returncode = -15
+            self.exited.set()
+
+        def kill(self) -> None:
+            self.returncode = -9
+            self.exited.set()
+
+    spawn_entered = asyncio.Event()
+    release_spawn = asyncio.Event()
+    process = LateProcess()
+
+    async def blocking_spawn(*args: object, **kwargs: object) -> LateProcess:
+        spawn_entered.set()
+        try:
+            await release_spawn.wait()
+        except asyncio.CancelledError:
+            await release_spawn.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", blocking_spawn)
+    client = EngineHostV2Client(
+        fake_v2_command("normal"), shutdown_timeout=0.01
+    )
+    starting = asyncio.create_task(client.start())
+    await asyncio.wait_for(spawn_entered.wait(), timeout=1.0)
+    closing = asyncio.create_task(client.aclose())
+    try:
+        done, _ = await asyncio.wait({closing}, timeout=0.2)
+        assert closing in done
+        with pytest.raises(RuntimeUnavailableError, match="cleanup was not confirmed"):
+            await closing
+        release_spawn.set()
+        await asyncio.wait_for(process.exited.wait(), timeout=1.0)
+        assert process.terminate_calls == 1
+        with pytest.raises((asyncio.CancelledError, RuntimeUnavailableError)):
+            await starting
+    finally:
+        release_spawn.set()
+        await asyncio.gather(starting, closing, return_exceptions=True)
 
 
 @pytest.mark.asyncio

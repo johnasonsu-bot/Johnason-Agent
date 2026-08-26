@@ -130,6 +130,39 @@ def test_v2_runtime_process_settings_accept_only_structured_argv(tmp_path: Path)
         RuntimeProcessConfig(runtime_id="fake-v2", argv="fake-v2 --stdio")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    "unsafe_argument",
+    [
+        "--api-key",
+        "--token=abcdefghijklmnopqrstuvwx",
+        "OPENAI_API_KEY=abcdefghijklmnopqrstuvwx",
+        "sk-proj-abcdefghijklmnopqrstuvwx",
+        "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature",
+        "bad\x00argument",
+        "bad\nargument",
+        "bad\x7fargument",
+    ],
+)
+def test_v2_runtime_process_settings_reject_sensitive_or_control_argv(
+    unsafe_argument: str,
+) -> None:
+    """Catches credentials or control bytes crossing the settings argv boundary."""
+    with pytest.raises(ValidationError, match="sensitive|control"):
+        RuntimeProcessConfig(
+            runtime_id="fake-v2", argv=("fake-v2", unsafe_argument)
+        )
+
+
+def test_v2_runtime_process_settings_allow_safe_business_argv() -> None:
+    """Catches argv validation rejecting ordinary token metrics or reset commands."""
+    config = RuntimeProcessConfig(
+        runtime_id="fake-v2",
+        argv=("password-reset-helper", "--token-count=32"),
+    )
+
+    assert config.argv == ("password-reset-helper", "--token-count=32")
+
+
 def test_build_app_assembles_v2_registry_without_replacing_v1_runner(
     tmp_path: Path,
 ) -> None:

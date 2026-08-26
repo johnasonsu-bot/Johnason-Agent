@@ -5,6 +5,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
 
+from workbench.runtime.engine_host.v2.security import validate_runtime_argv
+
 
 class RuntimeProcessConfig(BaseModel):
     """Structured process identity only; execution and environment stay outside settings."""
@@ -24,9 +26,7 @@ class RuntimeProcessConfig(BaseModel):
     @field_validator("argv")
     @classmethod
     def validate_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not item.strip() for item in value):
-            raise ValueError("runtime argv entries must not be blank")
-        return value
+        return validate_runtime_argv(value)
 
 
 class WorkbenchSettings(BaseModel):

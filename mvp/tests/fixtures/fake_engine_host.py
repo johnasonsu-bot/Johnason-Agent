@@ -413,6 +413,15 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         if mode == "oversize_frame":
             write_raw_v2(b"x" * (MAX_FRAME_BYTES + 1) + b"\n")
             return False
+        if mode == "deeply_nested_frame":
+            write_raw_v2(
+                b'{"kind":"event","payload":'
+                + (b"[" * 2_000)
+                + b"null"
+                + (b"]" * 2_000)
+                + b"}\n"
+            )
+            return False
         if mode == "unknown_write_effect":
             write_v2(
                 v2_event(

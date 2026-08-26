@@ -25,17 +25,11 @@ from pydantic.types import StringConstraints
 from workbench.orchestration.contracts import OpaqueIdentifier, OpaqueReference
 from workbench.runtime.engine_host.contracts import FrozenJsonMapping
 
+from .security import contains_high_confidence_credential_value
+
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _MAX_JSON_NESTING_DEPTH = 32
-_HIGH_CONFIDENCE_CREDENTIAL_VALUE = re.compile(
-    r"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
-    r"(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})|"
-    r"(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])|"
-    r"\bbearer[ \t]+[A-Za-z0-9._~+/=-]{20,}|"
-    r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    re.IGNORECASE,
-)
 warnings.filterwarnings(
     "ignore",
     message='Field name "schema" in "ToolManifestEntryV2" shadows an attribute',
@@ -106,7 +100,7 @@ def _validate_json_value(value: Any, *, depth: int = 0) -> None:
             return
         raise ValueError("payload must contain only JSON values")
     if isinstance(value, str):
-        if _HIGH_CONFIDENCE_CREDENTIAL_VALUE.search(value):
+        if contains_high_confidence_credential_value(value):
             raise ValueError("payload contains a sensitive value")
         return
     raise ValueError("payload must contain only JSON values")
