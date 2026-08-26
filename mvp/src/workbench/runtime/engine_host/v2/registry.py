@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 import sqlite3
 import threading
 import time
@@ -17,7 +15,11 @@ from workbench.runtime.engine_host.v2.contracts import (
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
 )
-from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from workbench.runtime.engine_host.v2.repository import (
+    RuntimeV2Repository,
+    canonical_capability_snapshot,
+    parse_capability_snapshot,
+)
 
 
 _CAPABILITY_NAMES = (
@@ -111,7 +113,7 @@ class RuntimeRegistryV2:
             raise TypeError("capabilities must be a RuntimeCapabilitiesV2")
         if status not in _REGISTRATION_STATES:
             raise ValueError("registration status is invalid")
-        snapshot_json, digest = _capability_snapshot(capabilities)
+        snapshot_json, digest = canonical_capability_snapshot(capabilities)
         now = time.time()
         with self._lock, self.repository.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -212,7 +214,7 @@ class RuntimeRegistryV2:
             runtime_id=pin.runtime_id,
             build_id=pin.runtime_build_id,
             state="pinned",
-            capabilities=(),
+            capabilities=_enabled_capabilities(pin.capabilities),
             command_id=pin.command_id,
         )
 
@@ -279,10 +281,21 @@ class RuntimeRegistryV2:
             with self.repository.store.connect() as connection:
                 return self._registrations(connection)
         else:
-            rows = connection.execute(
-                "SELECT * FROM runtime_v2_registrations ORDER BY runtime_id"
-            ).fetchall()
-        return tuple(self._validated_registration(row) for row in rows)
+            try:
+                rows = connection.execute(
+                    "SELECT * FROM runtime_v2_registrations ORDER BY runtime_id"
+                ).fetchall()
+            except sqlite3.DatabaseError as error:
+                raise RuntimeRegistryIntegrityError(
+                    "runtime registration store is corrupt"
+                ) from error
+        registrations: list[_Registration] = []
+        for row in rows:
+            try:
+                registrations.append(self._validated_registration(row))
+            except RuntimeRegistryIntegrityError:
+                continue
+        return tuple(registrations)
 
     def _validated_registration(self, row: sqlite3.Row | None) -> _Registration:
         if row is None:
@@ -296,13 +309,9 @@ class RuntimeRegistryV2:
             snapshot_json = _required_text(row, "capabilities_json")
             if status not in _REGISTRATION_STATES:
                 raise ValueError("registration state is invalid")
-            parsed = json.loads(snapshot_json)
-            capabilities = RuntimeCapabilitiesV2.model_validate(parsed)
-            canonical_json, calculated_digest = _capability_snapshot(capabilities)
+            capabilities = parse_capability_snapshot(snapshot_json, digest)
             if (
-                digest != calculated_digest
-                or snapshot_json != canonical_json
-                or capabilities.runtime_id != runtime_id
+                capabilities.runtime_id != runtime_id
                 or capabilities.build_id != build_id
                 or capabilities.protocol_version != protocol
             ):
@@ -315,18 +324,8 @@ class RuntimeRegistryV2:
             if advertised != capabilities:
                 raise ValueError("registration snapshot does not match current capabilities")
             return _Registration(capabilities=capabilities, state=status)  # type: ignore[arg-type]
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+        except (KeyError, TypeError, ValueError, RecursionError) as error:
             raise RuntimeRegistryIntegrityError("runtime registration is corrupt") from error
-
-
-def _capability_snapshot(capabilities: RuntimeCapabilitiesV2) -> tuple[str, str]:
-    encoded = json.dumps(
-        capabilities.model_dump(mode="json"),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _required_text(row: sqlite3.Row, field: str) -> str:

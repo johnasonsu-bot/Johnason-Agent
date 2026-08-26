@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 18
+PHASE1_SCHEMA_VERSION = 19
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -106,6 +106,8 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             identity_json TEXT NOT NULL,
             runtime_id TEXT NOT NULL,
             runtime_build_id TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
             latest_attempt INTEGER NOT NULL,
             host_generation TEXT NOT NULL,
             created_at REAL NOT NULL,
@@ -485,6 +487,12 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(
         connection, "research_graph_jobs", "resume_json", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "runtime_v2_command_pins", "capability_digest", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "runtime_v2_command_pins", "capabilities_json", "TEXT"
     )
     # ``DevelopmentJobRepository`` refuses rows without this immutable snapshot.
     # Legacy rows cannot be resumed safely, so preserve them as failed audit rows

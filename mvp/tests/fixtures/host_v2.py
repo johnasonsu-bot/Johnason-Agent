@@ -254,6 +254,11 @@ class FakeHostV2Factory:
             process = client._process
             if process is None or process.pid <= 0:
                 raise RuntimeError("fake Host v2 process marker is unavailable")
+            capabilities = client.capabilities
+            if capabilities is None:
+                raise RuntimeError("fake Host v2 capabilities are unavailable")
+            registry = RuntimeRegistryV2(repository)
+            registry.register(capabilities)
             runtime = FakeHostV2Runtime(
                 implementation=self.implementation,
                 runtime_id=self.runtime_id,
@@ -265,7 +270,7 @@ class FakeHostV2Factory:
                 database=database,
                 client=client,
                 repository=repository,
-                registry=RuntimeRegistryV2(repository),
+                registry=registry,
             )
             yield runtime
         finally:

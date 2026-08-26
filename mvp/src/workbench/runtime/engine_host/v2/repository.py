@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -11,7 +13,10 @@ import sqlite3
 import time
 from typing import Any, Generic, TypeVar
 
-from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2
+from workbench.runtime.engine_host.v2.contracts import (
+    RunEnvelopeV2,
+    RuntimeCapabilitiesV2,
+)
 from workbench.runtime.engine_host.v2.identity import (
     FrozenEnvelopeIdentity,
     canonical_envelope_identity,
@@ -36,12 +41,18 @@ class CorruptCommandPin(RuntimeError):
     """A durable pin failed integrity validation and cannot be trusted."""
 
 
+class CommandCapabilityUnavailable(RuntimeError):
+    """A new command has no trustworthy registered capability snapshot to pin."""
+
+
 @dataclass(frozen=True)
 class CommandPinV2:
     command_id: str
     identity_digest: str
     runtime_id: str
     runtime_build_id: str
+    capability_digest: str
+    capabilities: RuntimeCapabilitiesV2
     latest_attempt: int
     host_generation: str
     created_at: float
@@ -120,13 +131,16 @@ class RuntimeV2Repository:
             (envelope.command_id,),
         ).fetchone()
         if row is None:
+            capabilities, capabilities_json, capability_digest = (
+                self._capability_snapshot_for_runtime(connection, envelope)
+            )
             connection.execute(
                 """
                 INSERT INTO runtime_v2_command_pins(
                     command_id, identity_digest, identity_json, runtime_id,
-                    runtime_build_id, latest_attempt, host_generation,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    runtime_build_id, capability_digest, capabilities_json,
+                    latest_attempt, host_generation, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     envelope.command_id,
@@ -134,6 +148,8 @@ class RuntimeV2Repository:
                     identity.canonical_json,
                     envelope.runtime.runtime_id,
                     envelope.runtime.build_id,
+                    capability_digest,
+                    capabilities_json,
                     envelope.attempt,
                     envelope.runtime.host_generation,
                     now,
@@ -145,6 +161,8 @@ class RuntimeV2Repository:
                 identity_digest=identity.identity_digest,
                 runtime_id=envelope.runtime.runtime_id,
                 runtime_build_id=envelope.runtime.build_id,
+                capability_digest=capability_digest,
+                capabilities=capabilities,
                 latest_attempt=envelope.attempt,
                 host_generation=envelope.runtime.host_generation,
                 created_at=now,
@@ -175,6 +193,8 @@ class RuntimeV2Repository:
             identity_digest=pin.identity_digest,
             runtime_id=pin.runtime_id,
             runtime_build_id=pin.runtime_build_id,
+            capability_digest=pin.capability_digest,
+            capabilities=pin.capabilities,
             latest_attempt=envelope.attempt,
             host_generation=envelope.runtime.host_generation,
             created_at=pin.created_at,
@@ -205,6 +225,9 @@ class RuntimeV2Repository:
             if (
                 runtime["runtime_id"] != pin.runtime_id
                 or runtime["build_id"] != pin.runtime_build_id
+                or pin.capabilities.runtime_id != pin.runtime_id
+                or pin.capabilities.build_id != pin.runtime_build_id
+                or pin.capabilities.protocol_version != "2.0"
             ):
                 raise ValueError("runtime metadata does not match identity_json")
             restored = dict(identity_document)
@@ -216,19 +239,51 @@ class RuntimeV2Repository:
             if canonical_envelope_identity(restored_envelope) != identity:
                 raise ValueError("retry metadata changed immutable identity")
             return pin
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError, RecursionError) as error:
             raise CorruptCommandPin("runtime v2 command pin is corrupt") from error
+
+    def _capability_snapshot_for_runtime(
+        self, connection: sqlite3.Connection, envelope: RunEnvelopeV2
+    ) -> tuple[RuntimeCapabilitiesV2, str, str]:
+        row = connection.execute(
+            "SELECT * FROM runtime_v2_registrations WHERE runtime_id = ?",
+            (envelope.runtime.runtime_id,),
+        ).fetchone()
+        try:
+            if row is None or _required_str(row, "status") != "ready":
+                raise ValueError("runtime registration is unavailable")
+            snapshot_json = _required_str(row, "capabilities_json")
+            digest = _required_str(row, "capability_digest")
+            capabilities = parse_capability_snapshot(snapshot_json, digest)
+            if (
+                capabilities.runtime_id != envelope.runtime.runtime_id
+                or capabilities.build_id != envelope.runtime.build_id
+                or _required_str(row, "build_id") != capabilities.build_id
+                or _required_str(row, "protocol_version") != "2.0"
+            ):
+                raise ValueError("runtime registration does not match command")
+            return capabilities, snapshot_json, digest
+        except (KeyError, TypeError, ValueError, RecursionError) as error:
+            raise CommandCapabilityUnavailable(
+                "runtime capability snapshot is unavailable for command admission"
+            ) from error
 
 
 def _pin_from_row(row: sqlite3.Row) -> CommandPinV2:
     identity_digest = _required_str(row, "identity_digest")
     if _DIGEST.fullmatch(identity_digest) is None:
         raise ValueError("identity_digest is invalid")
+    capability_digest = _required_str(row, "capability_digest")
+    capabilities = parse_capability_snapshot(
+        _required_str(row, "capabilities_json"), capability_digest
+    )
     return CommandPinV2(
         command_id=_required_str(row, "command_id"),
         identity_digest=identity_digest,
         runtime_id=_required_str(row, "runtime_id"),
         runtime_build_id=_required_str(row, "runtime_build_id"),
+        capability_digest=capability_digest,
+        capabilities=capabilities,
         latest_attempt=_required_attempt(row, "latest_attempt"),
         host_generation=_required_str(row, "host_generation"),
         created_at=_required_timestamp(row, "created_at"),
@@ -238,12 +293,35 @@ def _pin_from_row(row: sqlite3.Row) -> CommandPinV2:
 
 def _identity_document(identity: FrozenEnvelopeIdentity) -> dict[str, Any]:
     # parse_persisted_identity already validated canonical JSON, so this cannot fail.
-    import json
-
     value = json.loads(identity.canonical_json)
     if not isinstance(value, dict):  # pragma: no cover - defensive exhaustiveness.
         raise ValueError("identity must be an object")
     return value
+
+
+def canonical_capability_snapshot(
+    capabilities: RuntimeCapabilitiesV2,
+) -> tuple[str, str]:
+    encoded = json.dumps(
+        capabilities.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def parse_capability_snapshot(
+    snapshot_json: str, capability_digest: str
+) -> RuntimeCapabilitiesV2:
+    if _DIGEST.fullmatch(capability_digest) is None:
+        raise ValueError("capability digest is invalid")
+    parsed = json.loads(snapshot_json)
+    capabilities = RuntimeCapabilitiesV2.model_validate(parsed)
+    canonical_json, calculated_digest = canonical_capability_snapshot(capabilities)
+    if snapshot_json != canonical_json or capability_digest != calculated_digest:
+        raise ValueError("capability snapshot is not canonical")
+    return capabilities
 
 
 def _required_str(row: sqlite3.Row, field: str) -> str:

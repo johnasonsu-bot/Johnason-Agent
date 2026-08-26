@@ -33,7 +33,10 @@ from workbench.runtime.engine_host.v2.client import (
 from workbench.runtime.engine_host.v2.contracts import JsonValue, RunEnvelopeV2
 from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.mapper import map_runtime_event
-from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.engine_host.v2.registry import (
+    RuntimeRegistryV2,
+    RuntimeRequirementsV2,
+)
 from workbench.runtime.engine_host.v2.repository import (
     CommandIdentityConflict,
     RuntimeV2Repository,
@@ -197,12 +200,19 @@ async def _isolated(
 
 
 async def _collect(
-    runtime: HostV2Runtime, envelope: RunEnvelopeV2 | None = None
+    runtime: HostV2Runtime,
+    envelope: RunEnvelopeV2 | None = None,
+    *,
+    admit: bool = True,
 ) -> list:
+    selected_envelope = envelope or runtime.envelope()
+    if admit:
+        _admit(runtime, selected_envelope)
+
     async def consume() -> list:
         return [
             event
-            async for event in runtime.client.run_query(envelope or runtime.envelope())
+            async for event in runtime.client.run_query(selected_envelope)
         ]
 
     events = await asyncio.wait_for(consume(), timeout=2.0)
@@ -213,6 +223,34 @@ async def _collect(
     assert runtime.process_marker.removeprefix("process-") not in public_strings
     assert not any(str(runtime.instance_root) in value for value in public_strings)
     return events
+
+
+def _admit(runtime: HostV2Runtime, envelope: RunEnvelopeV2) -> None:
+    selection = runtime.registry.select_and_pin(
+        envelope,
+        RuntimeRequirementsV2(
+            preferred_runtime_id=envelope.runtime.runtime_id,
+            query=True,
+            model=True,
+            tools=True,
+            skills=True,
+            plugins=True,
+            workspace=True,
+            interventions=True,
+            pause_resume=True,
+            compaction=True,
+            checkpoints=True,
+            streaming=True,
+            plan=True,
+            todo=True,
+            prompt_sections=True,
+            tool_interceptors=True,
+            event_cursor=True,
+        ),
+    )
+    assert selection.command_id == envelope.command_id
+    assert selection.runtime_id == envelope.runtime.runtime_id
+    assert selection.build_id == envelope.runtime.build_id
 
 
 def _changed_envelope(
@@ -268,27 +306,28 @@ async def _scenario_capabilities(factory, seen_clients, seen_databases) -> None:
         factory, "identity_mismatch", seen_clients, seen_databases
     ) as runtime:
         with pytest.raises(RuntimeCapabilityError, match="runtime identity"):
-            await _collect(runtime)
+            await _collect(runtime, admit=False)
         assert runtime.client.state == "ready"
 
 
 async def _scenario_identity_conflict(factory, seen_clients, seen_databases) -> None:
     async with _isolated(factory, "normal", seen_clients, seen_databases) as runtime:
         envelope = runtime.envelope()
-        first = runtime.repository.pin_command(envelope)
+        _admit(runtime, envelope)
+        first = runtime.repository.get_pin(envelope.command_id)
+        assert first is not None
         assert _DIGEST.fullmatch(first.identity_digest)
         assert first.identity_digest == canonical_envelope_identity(envelope).identity_digest
-        retry = runtime.repository.pin_command(
-            runtime.envelope(attempt=1, host_generation="host-b")
-        )
+        retry_envelope = runtime.envelope(attempt=1, host_generation="host-b")
+        _admit(runtime, retry_envelope)
+        retry = runtime.repository.get_pin(retry_envelope.command_id)
+        assert retry is not None
         assert retry.identity_digest == first.identity_digest
         assert retry.latest_attempt == 1
         with pytest.raises(CommandIdentityConflict):
-            runtime.repository.pin_command(
-                _changed_envelope(envelope, "model", "other-model")
-            )
+            _admit(runtime, _changed_envelope(envelope, "model", "other-model"))
         assert runtime.repository.get_pin(envelope.command_id) == retry
-        events = await _collect(runtime)
+        events = await _collect(runtime, retry_envelope)
         assert events[-1].payload["status"] == "completed"
         assert events[-1].cursor == 4
 
@@ -560,7 +599,9 @@ async def _consume_remaining(stream) -> list:
 
 async def _scenario_intervention_cancel(factory, seen_clients, seen_databases) -> None:
     async with _isolated(factory, "controls", seen_clients, seen_databases) as runtime:
-        stream = runtime.client.run_query(runtime.envelope())
+        envelope = runtime.envelope()
+        _admit(runtime, envelope)
+        stream = runtime.client.run_query(envelope)
         try:
             first = await asyncio.wait_for(anext(stream), timeout=1.0)
             assert first.cursor == 1
@@ -591,7 +632,9 @@ async def _scenario_intervention_cancel(factory, seen_clients, seen_databases) -
             await stream.aclose()
 
     async with _isolated(factory, "cancel", seen_clients, seen_databases) as runtime:
-        stream = runtime.client.run_query(runtime.envelope())
+        envelope = runtime.envelope()
+        _admit(runtime, envelope)
+        stream = runtime.client.run_query(envelope)
         try:
             assert (await asyncio.wait_for(anext(stream), timeout=1.0)).cursor == 1
             await runtime.client.cancel("run-1")
@@ -612,7 +655,9 @@ async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> 
     ) as runtime:
         source_runtime = runtime
         source_envelope = runtime.envelope(command_id="checkpoint-command")
-        source_pin = runtime.repository.pin_command(source_envelope)
+        _admit(runtime, source_envelope)
+        source_pin = runtime.repository.get_pin(source_envelope.command_id)
+        assert source_pin is not None
         stream = runtime.client.run_query(source_envelope)
         first = await asyncio.wait_for(anext(stream), timeout=1.0)
         assert first.cursor == 1
@@ -636,7 +681,7 @@ async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> 
         assert runtime.process_marker != source_marker
         assert runtime.host_generation != source_generation
         resume_envelope = runtime.envelope(
-            command_id="checkpoint-command",
+            command_id="checkpoint-resume-command",
             overrides={
                 "checkpoint_cursor": checkpoint.cursor,
                 "extensions": {
@@ -645,7 +690,9 @@ async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> 
                 },
             },
         )
-        resume_pin = runtime.repository.pin_command(resume_envelope)
+        _admit(runtime, resume_envelope)
+        resume_pin = runtime.repository.get_pin(resume_envelope.command_id)
+        assert resume_pin is not None
         assert _DIGEST.fullmatch(resume_pin.identity_digest)
         assert resume_pin.identity_digest != source_pin.identity_digest
         events = await _collect(runtime, resume_envelope)
@@ -691,7 +738,9 @@ async def _scenario_unknown_write(factory, seen_clients, seen_databases) -> None
         factory, "unknown_write_effect", seen_clients, seen_databases
     ) as runtime:
         envelope = _write_envelope(runtime)
-        pin = runtime.repository.pin_command(envelope)
+        _admit(runtime, envelope)
+        pin = runtime.repository.get_pin(envelope.command_id)
+        assert pin is not None
         assert _DIGEST.fullmatch(pin.identity_digest)
         with pytest.raises(RuntimeReconciliationRequired) as raised:
             await _collect(runtime, envelope)

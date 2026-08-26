@@ -81,8 +81,29 @@ def test_accepted_pin_never_reroutes_when_registry_changes(tmp_path: Path) -> No
     assert registry.resume(selection.command_id).runtime_id == "goose"
 
 
-def test_registry_rejects_tampered_persisted_capability_snapshot(tmp_path: Path) -> None:
-    """Catches a database mutation that decouples a registration from its digest."""
+def test_resume_uses_the_pinned_capability_snapshot_after_live_registry_changes(
+    tmp_path: Path,
+) -> None:
+    """Catches resume replacing admitted capabilities with a later live snapshot."""
+    database = tmp_path / "state.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("goose", query=True, model=True))
+    registry.select_and_pin(
+        run_envelope(runtime_id="goose", command_id="command-capabilities"),
+        RuntimeRequirementsV2(query=True, model=True),
+    )
+
+    registry.register(runtime_capabilities("goose", query=False, tools=True))
+    resumed = RuntimeRegistryV2(RuntimeV2Repository(database)).resume(
+        "command-capabilities"
+    )
+
+    assert resumed.runtime_id == "goose"
+    assert resumed.capabilities == ("query", "model")
+
+
+def test_registry_isolates_a_tampered_capability_snapshot(tmp_path: Path) -> None:
+    """Catches a tampered registration remaining eligible for admission."""
     database = tmp_path / "state.sqlite"
     registry = RuntimeRegistryV2(RuntimeV2Repository(database))
     registry.register(runtime_capabilities("python", query=True))
@@ -92,7 +113,41 @@ def test_registry_rejects_tampered_persisted_capability_snapshot(tmp_path: Path)
             ('{"runtime_id":"python"}', "python"),
         )
 
-    with pytest.raises(RuntimeRegistryIntegrityError):
+    with pytest.raises(NoConformantRuntime):
+        registry.select(RuntimeRequirementsV2(query=True))
+    assert registry.snapshot() == ()
+
+
+def test_corrupt_registration_row_is_isolated_from_healthy_selection(
+    tmp_path: Path,
+) -> None:
+    """Catches one corrupt runtime preventing every healthy runtime from admission."""
+    database = tmp_path / "state.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("alpha", query=True))
+    registry.register(runtime_capabilities("broken", query=True))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE runtime_v2_registrations SET capabilities_json = ? WHERE runtime_id = ?",
+            ("{}", "broken"),
+        )
+
+    selected = registry.select(RuntimeRequirementsV2(query=True))
+    snapshot = registry.snapshot()
+
+    assert selected.runtime_id == "alpha"
+    assert [item.runtime_id for item in snapshot] == ["alpha"]
+
+
+def test_systemic_registration_store_corruption_fails_closed(tmp_path: Path) -> None:
+    """Catches a missing registry table being mistaken for no eligible runtime."""
+    database = tmp_path / "state.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("alpha", query=True))
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE runtime_v2_registrations")
+
+    with pytest.raises(RuntimeRegistryIntegrityError, match="store"):
         registry.select(RuntimeRequirementsV2(query=True))
 
 
@@ -251,6 +306,56 @@ def test_atomic_admission_blocks_cross_registry_disable_until_command_is_pinned(
     assert not disabler.is_alive()
     assert first.repository.get_pin("command-atomic") is not None
     assert first.resume("command-atomic").runtime_id == "goose"
+
+
+def test_atomic_admission_pins_the_selected_capability_snapshot_before_reregister(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches capability persistence occurring after the admission transaction."""
+    database = tmp_path / "state.sqlite"
+    admitting = RuntimeRegistryV2(RuntimeV2Repository(database))
+    updating = RuntimeRegistryV2(RuntimeV2Repository(database))
+    admitting.register(runtime_capabilities("goose", query=True, model=True))
+    selected = threading.Event()
+    release_pin = threading.Event()
+    update_finished = threading.Event()
+    original = admitting.repository._pin_command_in_transaction
+
+    def pause_before_pin(connection, envelope):
+        selected.set()
+        assert release_pin.wait(timeout=2)
+        return original(connection, envelope)
+
+    monkeypatch.setattr(
+        admitting.repository, "_pin_command_in_transaction", pause_before_pin
+    )
+    outcomes: dict[str, object] = {}
+
+    def admit() -> None:
+        outcomes["selection"] = admitting.select_and_pin(
+            run_envelope(runtime_id="goose", command_id="command-snapshot"),
+            RuntimeRequirementsV2(query=True, model=True),
+        )
+
+    def update() -> None:
+        outcomes["updated"] = updating.register(
+            runtime_capabilities("goose", tools=True)
+        )
+        update_finished.set()
+
+    admission = threading.Thread(target=admit)
+    admission.start()
+    assert selected.wait(timeout=2)
+    updater = threading.Thread(target=update)
+    updater.start()
+    assert not update_finished.wait(timeout=0.1)
+    release_pin.set()
+    admission.join(timeout=2)
+    updater.join(timeout=2)
+
+    assert not admission.is_alive()
+    assert not updater.is_alive()
+    assert admitting.resume("command-snapshot").capabilities == ("query", "model")
 
 
 def test_reopened_registry_marks_unadvertised_runtime_unavailable_not_corrupt(
