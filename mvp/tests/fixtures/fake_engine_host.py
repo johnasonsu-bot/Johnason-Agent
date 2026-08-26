@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from queue import Empty, Queue
+import subprocess
 import sys
 from threading import Lock, Thread
 import time
@@ -26,6 +27,9 @@ V2_STATE: dict[str, object] = {
     "cursor": 1,
     "paused": False,
     "resumed": False,
+    "pause_count": 0,
+    "resume_count": 0,
+    "grandchild": None,
 }
 
 
@@ -59,6 +63,13 @@ def write_v2(frame: dict[str, object]) -> None:
     encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
     with WRITE_LOCK:
         sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
+
+
+def write_raw_v2(payload: bytes) -> None:
+    """Emit intentionally adversarial transport bytes for parser tests."""
+    with WRITE_LOCK:
+        sys.stdout.buffer.write(payload)
         sys.stdout.buffer.flush()
 
 
@@ -130,6 +141,13 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
     """Respond to one v2 command; return whether the fixture should exit."""
     command_type = command.get("type")
     if command_type == "runtime.capabilities":
+        if mode == "handshake_eof":
+            return True
+        if mode == "ignore_capabilities":
+            return False
+        if mode == "stderr_flood":
+            sys.stderr.buffer.write(b"diagnostic\n" * 200_000)
+            sys.stderr.buffer.flush()
         write_v2(v2_response(command, v2_capabilities(mode)))
         return False
 
@@ -153,9 +171,44 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         )
         V2_STATE["cursor"] = first_cursor
         write_v2(v2_response(command, {"accepted": True}))
-        write_v2(v2_event(first_cursor, "runtime.status", {"status": "running"}))
+        running_payload: dict[str, object] = {"status": "running"}
+        if mode == "grandchild":
+            grandchild = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            V2_STATE["grandchild"] = grandchild
+            running_payload["grandchild_pid"] = grandchild.pid
+        write_v2(v2_event(first_cursor, "runtime.status", running_payload))
 
-        if mode in {"controls", "cancel", "missing_control_capabilities"}:
+        if mode == "ack_terminal_same_batch":
+            write_v2_terminal(first_cursor + 1)
+            return False
+        if mode == "failure_then_terminal":
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "error",
+                    {"code": "unknown_write_effect", "effect_id": "effect-1"},
+                )
+            )
+            write_v2_terminal(first_cursor + 2)
+            return False
+
+        if mode in {
+            "controls",
+            "cancel",
+            "cancel_crash",
+            "control_cycles",
+            "grandchild",
+            "ignore_pause",
+            "missing_control_capabilities",
+            "pause_terminal",
+            "resume_crash",
+        }:
             return False
         if mode == "backpressure_consumer_close":
             for cursor in range(first_cursor + 1, first_cursor + 301):
@@ -166,6 +219,15 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             return False
         if mode == "host_crash":
             return True
+        if mode == "invalid_json":
+            write_raw_v2(b"{invalid-json}\n")
+            return False
+        if mode == "partial_frame":
+            write_raw_v2(b'{"kind":"event"')
+            return True
+        if mode == "oversize_frame":
+            write_raw_v2(b"x" * (MAX_FRAME_BYTES + 1) + b"\n")
+            return False
         if mode == "unknown_write_effect":
             write_v2(
                 v2_event(
@@ -180,6 +242,56 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
                 )
             )
             return True
+        if mode in {
+            "manifest_readonly_reports_write",
+            "manifest_write_reports_read",
+            "unknown_tool",
+        }:
+            read_only = mode != "manifest_readonly_reports_write"
+            tool_id = "missing-tool" if mode == "unknown_tool" else "tool-1"
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "tool.call",
+                    {
+                        "tool_call_id": "call-1",
+                        "tool_id": tool_id,
+                        "read_only": read_only,
+                        "effect_id": "effect-1",
+                    },
+                )
+            )
+            write_v2_terminal(first_cursor + 2)
+            return False
+        if mode in {
+            "read_result_effect_mismatch",
+            "write_result_effect_mismatch",
+            "write_result_missing_status",
+        }:
+            read_only = mode == "read_result_effect_mismatch"
+            call_payload: dict[str, object] = {
+                "tool_call_id": "call-1",
+                "tool_id": "tool-1",
+                "read_only": read_only,
+            }
+            if not read_only:
+                call_payload["effect_id"] = "effect-1"
+            write_v2(v2_event(first_cursor + 1, "tool.call", call_payload))
+            result_payload: dict[str, object] = {
+                "tool_call_id": "call-1",
+                "tool_id": "tool-1",
+                "read_only": read_only,
+                "effect_id": (
+                    "effect-1"
+                    if mode == "write_result_missing_status"
+                    else "wrong-effect"
+                ),
+            }
+            if mode != "write_result_missing_status":
+                result_payload["status"] = "completed"
+            write_v2(v2_event(first_cursor + 2, "tool.result", result_payload))
+            write_v2_terminal(first_cursor + 3)
+            return False
         if mode == "write_ignore_cancel":
             write_v2(
                 v2_event(
@@ -297,11 +409,30 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             write_v2(
                 v2_event(first_cursor + 4, "assistant.delta", {"text": "late"})
             )
+        if mode == "terminal_delayed_extra":
+            def write_late_v2_event() -> None:
+                time.sleep(0.05)
+                write_v2(
+                    v2_event(
+                        first_cursor + 4,
+                        "assistant.delta",
+                        {"text": "late"},
+                    )
+                )
+
+            Thread(target=write_late_v2_event, daemon=True).start()
         return False
 
     if command_type == "query.pause":
+        if mode == "ignore_pause":
+            return False
+        V2_STATE["pause_count"] = int(V2_STATE["pause_count"]) + 1
         V2_STATE["paused"] = True
         write_v2(v2_response(command, {"state": "paused"}))
+        if mode == "pause_terminal":
+            cursor = int(V2_STATE["cursor"]) + 1
+            V2_STATE["cursor"] = cursor
+            write_v2_terminal(cursor)
         return False
     if command_type == "query.intervene":
         write_v2(v2_response(command, {"accepted": True}))
@@ -324,13 +455,24 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         )
         return False
     if command_type == "query.resume":
+        if mode == "resume_crash":
+            return True
+        V2_STATE["resume_count"] = int(V2_STATE["resume_count"]) + 1
         V2_STATE["resumed"] = True
         write_v2(v2_response(command, {"state": "running"}))
+        if mode == "control_cycles" and int(V2_STATE["resume_count"]) < 2:
+            return False
         cursor = int(V2_STATE["cursor"]) + 1
         V2_STATE["cursor"] = cursor
-        write_v2_terminal(cursor)
+        write_v2_terminal(
+            cursor,
+            pause_count=int(V2_STATE["pause_count"]),
+            resume_count=int(V2_STATE["resume_count"]),
+        )
         return False
     if command_type == "query.cancel":
+        if mode == "cancel_crash":
+            return True
         if mode == "write_ignore_cancel":
             return False
         V2_STATE["cancel_count"] = int(V2_STATE["cancel_count"]) + 1

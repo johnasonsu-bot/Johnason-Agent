@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+import os
+import signal
 
 import pytest
 
@@ -40,6 +42,13 @@ async def _collect_mode(
         return await _collect(client, envelope)
     finally:
         await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+def _write_envelope() -> RunEnvelopeV2:
+    value = run_envelope().model_dump(mode="json")
+    value["tool_manifest"][0]["read_only"] = False
+    value["tool_manifest"][0]["idempotency"] = "non_idempotent"
+    return RunEnvelopeV2.model_validate(value)
 
 
 @pytest.mark.asyncio
@@ -204,6 +213,82 @@ async def test_controls_default_to_the_only_active_query() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pause_resume_tasks_are_recreated_for_each_control_cycle() -> None:
+    client = EngineHostV2Client(fake_v2_command("control_cycles"))
+    await client.start()
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        for _ in range(2):
+            await asyncio.wait_for(client.pause(), timeout=1.0)
+            assert client.state == "paused"
+            await asyncio.wait_for(client.resume(), timeout=1.0)
+        terminal = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert terminal.payload["pause_count"] == 2
+        assert terminal.payload["resume_count"] == 2
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pause_response_cannot_overwrite_terminal_state() -> None:
+    client = EngineHostV2Client(fake_v2_command("pause_terminal"))
+    await client.start()
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        await asyncio.wait_for(client.pause(), timeout=1.0)
+        terminal = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert terminal.payload["status"] == "completed"
+        assert client.state == "terminal"
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resume_crash_cannot_leave_client_in_resuming() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("resume_crash"), request_timeout=0.1, shutdown_timeout=0.05
+    )
+    await client.start()
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        await asyncio.wait_for(client.pause(), timeout=1.0)
+        with pytest.raises(RuntimeUnavailableError):
+            await asyncio.wait_for(client.resume(), timeout=1.0)
+        assert client.state == "unavailable"
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_controls_share_one_command() -> None:
+    client = EngineHostV2Client(fake_v2_command("control_cycles"))
+    await client.start()
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        await asyncio.wait_for(
+            asyncio.gather(client.pause(), client.pause()), timeout=1.0
+        )
+        await asyncio.wait_for(
+            asyncio.gather(client.resume(), client.resume()), timeout=1.0
+        )
+        await client.pause()
+        await client.resume()
+        terminal = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert terminal.payload["pause_count"] == 2
+        assert terminal.payload["resume_count"] == 2
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_controls_reject_states_where_the_command_is_not_legal() -> None:
     client = EngineHostV2Client(fake_v2_command("normal"))
     await client.start()
@@ -336,7 +421,7 @@ async def test_unknown_write_effect_takes_precedence_over_crash_retry() -> None:
     await client.start()
     try:
         with pytest.raises(RuntimeReconciliationRequired) as raised:
-            await _collect(client)
+            await _collect(client, _write_envelope())
         assert raised.value.retryable is False
         assert raised.value.reconciliation_required is True
         assert client.state == "reconciliation_required"
@@ -352,7 +437,7 @@ async def test_unknown_write_effect_takes_precedence_over_cancel_timeout() -> No
         shutdown_timeout=0.05,
     )
     await client.start()
-    stream = client.run_query(run_envelope())
+    stream = client.run_query(_write_envelope())
     try:
         assert (await asyncio.wait_for(anext(stream), timeout=1.0)).cursor == 1
         assert (await asyncio.wait_for(anext(stream), timeout=1.0)).type == "tool.call"
@@ -364,6 +449,46 @@ async def test_unknown_write_effect_takes_precedence_over_cancel_timeout() -> No
         await client.aclose()
 
 
+@pytest.mark.parametrize(
+    ("mode", "envelope"),
+    [
+        ("manifest_readonly_reports_write", run_envelope()),
+        ("manifest_write_reports_read", _write_envelope()),
+        ("unknown_tool", run_envelope()),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tool_call_must_match_the_durable_manifest(
+    mode: str, envelope: RunEnvelopeV2
+) -> None:
+    client = EngineHostV2Client(fake_v2_command(mode))
+    await client.start()
+    try:
+        with pytest.raises(RuntimeProtocolError, match="tool manifest"):
+            await _collect(client, envelope)
+        assert client.state == "unavailable"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_read_tool_result_cannot_introduce_an_unpinned_effect() -> None:
+    with pytest.raises(RuntimeProtocolError, match="does not match"):
+        await _collect_mode("read_result_effect_mismatch")
+
+
+@pytest.mark.asyncio
+async def test_write_tool_result_mismatch_preserves_reconciliation_precedence() -> None:
+    with pytest.raises(RuntimeReconciliationRequired):
+        await _collect_mode("write_result_effect_mismatch", _write_envelope())
+
+
+@pytest.mark.asyncio
+async def test_write_tool_result_without_an_outcome_requires_reconciliation() -> None:
+    with pytest.raises(RuntimeReconciliationRequired):
+        await _collect_mode("write_result_missing_status", _write_envelope())
+
+
 @pytest.mark.asyncio
 async def test_terminal_seals_the_stream_and_rejects_every_later_event() -> None:
     client = EngineHostV2Client(fake_v2_command("terminal_extra"))
@@ -372,6 +497,48 @@ async def test_terminal_seals_the_stream_and_rejects_every_later_event() -> None
         with pytest.raises(RuntimeProtocolError, match="after terminal"):
             await _collect(client)
         assert client.state == "unavailable"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_query_ack_cannot_overwrite_a_terminal_from_the_same_read_batch() -> None:
+    client = EngineHostV2Client(fake_v2_command("ack_terminal_same_batch"))
+    await client.start()
+    try:
+        events = await _collect(client)
+        assert events[-1].payload["status"] == "completed"
+        assert client.state == "terminal"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failure_cannot_be_downgraded_or_sealed_by_a_later_terminal() -> None:
+    client = EngineHostV2Client(fake_v2_command("failure_then_terminal"))
+    await client.start()
+    try:
+        with pytest.raises(RuntimeReconciliationRequired):
+            await _collect(client)
+        assert client.state == "reconciliation_required"
+        assert ("run-1", "term-1", "step-1") not in client._sealed
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delayed_event_after_delivered_terminal_quarantines_host() -> None:
+    client = EngineHostV2Client(fake_v2_command("terminal_delayed_extra"))
+    await client.start()
+    try:
+        events = await _collect(client)
+        assert events[-1].payload["status"] == "completed"
+
+        async def wait_until_unavailable() -> None:
+            while client.state != "unavailable":
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_until_unavailable(), timeout=1.0)
     finally:
         await client.aclose()
 
@@ -418,6 +585,241 @@ async def test_aclose_delivers_cancel_terminal_to_an_active_consumer() -> None:
         await client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_close_before_spawn_completion_cannot_publish_a_late_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_spawn = asyncio.create_subprocess_exec
+    spawn_entered = asyncio.Event()
+    allow_spawn = asyncio.Event()
+
+    async def delayed_spawn(*args: object, **kwargs: object):
+        spawn_entered.set()
+        await allow_spawn.wait()
+        return await real_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    client = EngineHostV2Client(fake_v2_command("normal"), shutdown_timeout=0.05)
+    starting = asyncio.create_task(client.start())
+    await asyncio.wait_for(spawn_entered.wait(), timeout=1.0)
+    closing = asyncio.create_task(client.aclose())
+    await asyncio.sleep(0)
+    allow_spawn.set()
+    try:
+        await asyncio.wait_for(closing, timeout=1.0)
+        with pytest.raises((asyncio.CancelledError, RuntimeUnavailableError)):
+            await asyncio.wait_for(starting, timeout=1.0)
+        assert client.state == "unavailable"
+        assert client.returncode is not None
+        assert client.reader_tasks_done
+    finally:
+        allow_spawn.set()
+        await _force_reap(client)
+
+
+@pytest.mark.asyncio
+async def test_aclose_reaps_the_entire_host_process_group() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("grandchild"), request_timeout=0.2, shutdown_timeout=0.05
+    )
+    await client.start()
+    stream = client.run_query(run_envelope())
+    grandchild_pid = -1
+    try:
+        running = await asyncio.wait_for(anext(stream), timeout=1.0)
+        grandchild_pid = int(running.payload["grandchild_pid"])
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        await _wait_for_pid_exit(grandchild_pid)
+    finally:
+        await stream.aclose()
+        await client.aclose()
+        if grandchild_pid > 0 and _pid_exists(grandchild_pid):
+            os.kill(grandchild_pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("invalid_json", "invalid"),
+        ("partial_frame", "incomplete"),
+        ("oversize_frame", "exceeds 1 MiB"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_adversarial_transport_frames_fail_closed_and_reap(
+    mode: str, message: str
+) -> None:
+    client = EngineHostV2Client(
+        fake_v2_command(mode), request_timeout=0.2, shutdown_timeout=0.05
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    try:
+        with pytest.raises(RuntimeProtocolError, match=message):
+            await _collect(client)
+        assert client.state == "unavailable"
+        await _wait_for_reap(client)
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_handshake_eof_fails_start_and_reaps_without_a_pending_reader() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("handshake_eof"),
+        request_timeout=0.2,
+        shutdown_timeout=0.05,
+    )
+    try:
+        with pytest.raises(RuntimeUnavailableError, match="output closed"):
+            await asyncio.wait_for(client.start(), timeout=1.0)
+        assert client.state == "unavailable"
+        await _wait_for_reap(client)
+        assert client.reader_tasks_done
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_stderr_flood_is_drained_without_blocking_handshake_or_query() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("stderr_flood"),
+        request_timeout=0.5,
+        shutdown_timeout=0.05,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    try:
+        events = await _collect(client)
+        assert events[-1].payload["status"] == "completed"
+        assert client.diagnostics == "engine-host v2 emitted diagnostics"
+    finally:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_close_during_capability_handshake_cancels_start_and_reaps() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("ignore_capabilities"),
+        request_timeout=10.0,
+        shutdown_timeout=0.05,
+    )
+    starting = asyncio.create_task(client.start())
+
+    async def wait_for_handshake() -> None:
+        while client._process is None or not client._pending:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_handshake(), timeout=1.0)
+    try:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        with pytest.raises((asyncio.CancelledError, RuntimeUnavailableError)):
+            await asyncio.wait_for(starting, timeout=1.0)
+        assert client.state == "unavailable"
+        assert client.returncode is not None
+        assert client.reader_tasks_done
+    finally:
+        if not starting.done():
+            starting.cancel()
+            await asyncio.gather(starting, return_exceptions=True)
+        await _force_reap(client)
+
+
+@pytest.mark.asyncio
+async def test_aclose_reclaims_an_inflight_control_task() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("ignore_pause"),
+        request_timeout=10.0,
+        shutdown_timeout=0.05,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(run_envelope())
+    _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+    pausing = asyncio.create_task(client.pause())
+
+    async def wait_for_pause_request() -> None:
+        while not any(kind == "query.pause" for kind, _ in client._pending.values()):
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_pause_request(), timeout=1.0)
+    try:
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        assert pausing.done()
+        assert not client._control_tasks
+        assert client.reader_tasks_done
+    finally:
+        pausing.cancel()
+        await asyncio.gather(pausing, return_exceptions=True)
+        await stream.aclose()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_consumer_cancel_during_admission_supervises_uncertain_start() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("ignore_query_start"),
+        request_timeout=10.0,
+        shutdown_timeout=0.05,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(run_envelope())
+    admission = asyncio.create_task(anext(stream))
+
+    async def wait_for_admission() -> None:
+        while client.state != "accepting" or not client._pending:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_admission(), timeout=1.0)
+    admission.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(admission, timeout=1.0)
+        assert client.active_run_id is None
+        assert client.state == "unavailable"
+        await _wait_for_reap(client)
+    finally:
+        await stream.aclose()
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_racing_with_host_crash_fails_once_and_reaps() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("cancel_crash"),
+        request_timeout=0.2,
+        shutdown_timeout=0.05,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        with pytest.raises(RuntimeUnavailableError):
+            await asyncio.wait_for(client.cancel(), timeout=1.0)
+        assert client.state == "unavailable"
+        await _wait_for_reap(client)
+    finally:
+        await stream.aclose()
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_aclose_cancel_crash_has_no_supervisor_dependency_cycle() -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("cancel_crash"),
+        request_timeout=0.2,
+        shutdown_timeout=0.05,
+    )
+    await asyncio.wait_for(client.start(), timeout=1.0)
+    stream = client.run_query(run_envelope())
+    try:
+        _ = await asyncio.wait_for(anext(stream), timeout=1.0)
+        await asyncio.wait_for(client.aclose(), timeout=1.0)
+        assert client.state == "unavailable"
+        assert client.returncode is not None
+        assert client.reader_tasks_done
+    finally:
+        await stream.aclose()
+        await client.aclose()
+
+
 async def _consume_remaining(
     stream: AsyncIterator[RuntimeEventV2],
 ) -> list[RuntimeEventV2]:
@@ -427,6 +829,37 @@ async def _consume_remaining(
 async def _wait_for_reap(client: EngineHostV2Client) -> None:
     async def wait() -> None:
         while client.returncode is None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait(), timeout=1.0)
+
+
+async def _force_reap(client: EngineHostV2Client) -> None:
+    process = client._process
+    if process is not None and process.returncode is None:
+        process.kill()
+        await asyncio.wait_for(process.wait(), timeout=1.0)
+    tasks = [
+        task
+        for task in (client._stdout_task, client._stderr_task)
+        if task is not None and not task.done()
+    ]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_for_pid_exit(pid: int) -> None:
+    async def wait() -> None:
+        while _pid_exists(pid):
             await asyncio.sleep(0)
 
     await asyncio.wait_for(wait(), timeout=1.0)
