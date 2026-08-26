@@ -57,3 +57,163 @@ async def test_replay_resumes_after_sequence_without_duplicates() -> None:
     replayed = [event async for event in replay_agui(events, after_sequence=1)]
 
     assert [event["sequence"] for event in replayed] == [2, 3]
+
+
+def test_v2_projection_preserves_identity_and_filters_reasoning_audit() -> None:
+    """Catches v2 cursor identity loss or private reasoning reaching SSE."""
+    event = DomainEvent.new(
+        "agent.message.delta",
+        "engine_host.v2",
+        {"content": "hello", "term_id": "term-1", "cursor": 7},
+        run_id="run-1",
+        step_id="step-1",
+        sequence=7,
+    )
+    reasoning = DomainEvent.new(
+        "runtime.reasoning.observed",
+        "engine_host.v2",
+        {"count": 3, "term_id": "term-1", "cursor": 8},
+        run_id="run-1",
+        step_id="step-1",
+        sequence=8,
+    )
+
+    assert map_domain_event(event) == [
+        {
+            "type": "TEXT_MESSAGE_CONTENT",
+            "runId": "run-1",
+            "stepId": "step-1",
+            "termId": "term-1",
+            "cursor": 7,
+            "timestamp": event.occurred_at.isoformat(),
+            "sequence": 7,
+            "eventId": event.event_id,
+            "messageId": event.event_id,
+            "delta": "hello",
+        }
+    ]
+    assert map_domain_event(reasoning) == []
+
+
+def test_v2_tool_public_projection_drops_unapproved_fields() -> None:
+    """Catches tool arguments, provider references, or results leaking to SSE."""
+    event = DomainEvent.new(
+        "agent.tool.completed",
+        "engine_host.v2",
+        {
+            "tool_id": "search",
+            "tool_call_id": "call-1",
+            "read_only": True,
+            "summary": "found 2 records",
+            "artifact_ref": "artifact-1",
+            "arguments": {"query": "private"},
+            "provider_ref": "provider-1",
+            "raw_result": "private",
+            "term_id": "term-1",
+            "cursor": 9,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=9,
+    )
+
+    mapped = map_domain_event(event)
+
+    assert {
+        key: mapped[0][key]
+        for key in ("toolCallId", "toolCallName", "readOnly", "summary", "artifactRef")
+    } == {
+        "toolCallId": "call-1",
+        "toolCallName": "search",
+        "readOnly": True,
+        "summary": "found 2 records",
+        "artifactRef": "artifact-1",
+    }
+    assert "arguments" not in mapped[0]
+    assert "provider_ref" not in mapped[0]
+    assert "raw_result" not in mapped[0]
+
+
+def test_v2_agui_defense_in_depth_drops_forged_result_and_unsafe_custom_summary() -> None:
+    """Catches bypassed domain events leaking raw tool output or credentials."""
+    tool = DomainEvent.new(
+        "agent.tool.completed",
+        "engine_host.v2",
+        {
+            "tool_id": "search",
+            "tool_call_id": "call-1",
+            "read_only": True,
+            "public_result": "private raw result",
+            "term_id": "term-1",
+            "cursor": 9,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=9,
+    )
+    artifact = DomainEvent.new(
+        "artifact.proposed",
+        "engine_host.v2",
+        {
+            "artifact_id": "artifact-1",
+            "summary": "Authorization: bearer abcdefghijklmnop",
+            "term_id": "term-1",
+            "cursor": 10,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=10,
+    )
+
+    assert "result" not in map_domain_event(tool)[0]
+    assert map_domain_event(artifact) == []
+
+
+def test_v2_agui_projects_applied_intervention_and_rejects_forged_tool_or_message_identity() -> None:
+    """Catches dropped applied interventions and unchecked v2 public primitives."""
+    applied = DomainEvent.new(
+        "intervention.applied",
+        "engine_host.v2",
+        {
+            "intervention_id": "intervention-1",
+            "summary": "review applied",
+            "term_id": "term-1",
+            "cursor": 11,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=11,
+    )
+    tool = DomainEvent.new(
+        "agent.tool.started",
+        "engine_host.v2",
+        {
+            "tool_id": "search",
+            "tool_call_id": "Authorization: bearer abcdefghijklmnop",
+            "read_only": True,
+            "term_id": "term-1",
+            "cursor": 12,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=12,
+    )
+    message = DomainEvent.new(
+        "agent.message.delta",
+        "engine_host.v2",
+        {
+            "content": "Authorization: bearer abcdefghijklmnop",
+            "term_id": "term-1",
+            "cursor": 13,
+        },
+        run_id="run-1",
+        step_id="step-1",
+        sequence=13,
+    )
+
+    assert map_domain_event(applied)[0]["value"] == {
+        "intervention_id": "intervention-1",
+        "summary": "review applied",
+    }
+    assert map_domain_event(tool) == []
+    assert map_domain_event(message) == []

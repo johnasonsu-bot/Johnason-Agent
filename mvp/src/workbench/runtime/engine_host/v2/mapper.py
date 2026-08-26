@@ -1,0 +1,327 @@
+"""Allowlisted projection from Engine Host v2 runtime events to domain events."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime, timezone
+import re
+from typing import Any, Callable
+
+from workbench.protocol.events import DomainEvent
+from workbench.runtime.engine_host.v2.contracts import RuntimeEventV2
+
+
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+_SENSITIVE_KEY = re.compile(
+    r"(?:api[_ -]?(?:key|token)|access[_ -]?(?:key|token)|authorization|"
+    r"bearer|credential|password|passwd|secret|token|vault|reasoning|"
+    r"chain[_ -]?of[_ -]?thought|private[_ -]?(?:prompt|history)|"
+    r"provider[_ -]?ref|workspace|manifest|digest)",
+    re.IGNORECASE,
+)
+_SENSITIVE_VALUE = re.compile(
+    r"(?:api[_ -]?(?:key|token)\s*[:=]|authorization\s*[:=]|"
+    r"bearer\s+[A-Za-z0-9._~+/=-]{8,}|(?:github_pat_|gh[pousr]_|sk-|AKIA)"
+    r"[A-Za-z0-9_-]{8,}|(?:^|[\\/])\.\.(?:[\\/]|$)|(?:^|\s)/[^\s]{1,})",
+    re.IGNORECASE,
+)
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_STATUSES = frozenset({"queued", "running", "paused", "completed", "failed", "cancelled"})
+_TOOL_RESULT_STATUSES = frozenset({"completed", "failed"})
+_STATE_OPERATIONS = frozenset({"add", "remove", "replace", "update"})
+
+
+def map_runtime_event(event: RuntimeEventV2) -> tuple[DomainEvent, ...]:
+    """Map one normalized event without copying its untrusted payload.
+
+    Unknown optional extensions are retained solely as a private diagnostic.  A
+    caller cannot turn one into a public event by selecting a convenient name.
+    """
+    identity = _identity(event)
+    payload = _payload(event)
+    _reject_sensitive_payload(payload)
+
+    projector = _PROJECTORS.get(identity.runtime_type)
+    if projector is None:
+        if identity.required:
+            raise ValueError("required runtime event type is not registered")
+        return (_domain_event(identity, "runtime.extension.observed", {}),)
+    return (_domain_event(identity, *projector(payload)),)
+
+
+class _Identity:
+    def __init__(
+        self,
+        *,
+        event_id: str,
+        run_id: str,
+        term_id: str,
+        step_id: str,
+        cursor: int,
+        runtime_type: str,
+        required: bool,
+    ) -> None:
+        self.event_id = event_id
+        self.run_id = run_id
+        self.term_id = term_id
+        self.step_id = step_id
+        self.cursor = cursor
+        self.runtime_type = runtime_type
+        self.required = required
+
+
+def _identity(event: RuntimeEventV2) -> _Identity:
+    values = {
+        name: getattr(event, name, None)
+        for name in ("event_id", "run_id", "term_id", "step_id")
+    }
+    if any(not isinstance(value, str) or not _IDENTIFIER.fullmatch(value) for value in values.values()):
+        raise ValueError("runtime event identity must be bounded opaque identifiers")
+    cursor = getattr(event, "cursor", None)
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 1:
+        raise ValueError("runtime event cursor must be a positive integer")
+    runtime_type = getattr(event, "type", None)
+    if not isinstance(runtime_type, str) or not runtime_type or len(runtime_type) > 128:
+        raise ValueError("runtime event type must be a bounded string")
+    required = getattr(event, "required", None)
+    if not isinstance(required, bool):
+        raise ValueError("runtime event required flag must be boolean")
+    return _Identity(cursor=cursor, runtime_type=runtime_type, required=required, **values)  # type: ignore[arg-type]
+
+
+def _payload(event: RuntimeEventV2) -> Mapping[str, Any]:
+    value = getattr(event, "payload", None)
+    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
+        raise ValueError("runtime event payload must be an object with string keys")
+    return value
+
+
+def _reject_sensitive_payload(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if not isinstance(key, str) or _SENSITIVE_KEY.search(key):
+                raise ValueError("runtime event payload contains a sensitive field")
+            _reject_sensitive_payload(nested)
+    elif isinstance(value, (tuple, list)):
+        for nested in value:
+            _reject_sensitive_payload(nested)
+    elif isinstance(value, str) and _SENSITIVE_VALUE.search(value):
+        raise ValueError("runtime event payload contains a sensitive value")
+    elif value is not None and (isinstance(value, bool) or isinstance(value, (int, float, str))):
+        return
+    elif value is not None:
+        raise ValueError("runtime event payload must contain JSON values")
+
+
+def _domain_event(
+    identity: _Identity, event_type: str, public_payload: dict[str, Any]
+) -> DomainEvent:
+    payload = {"term_id": identity.term_id, "cursor": identity.cursor, **public_payload}
+    return DomainEvent(
+        event_id=identity.event_id,
+        event_type=event_type,
+        source="engine_host.v2",
+        occurred_at=datetime.now(timezone.utc),
+        run_id=identity.run_id,
+        step_id=identity.step_id,
+        sequence=identity.cursor,
+        payload=payload,
+    )
+
+
+def _identifier(payload: Mapping[str, Any], key: str, *, required: bool = True) -> str | None:
+    value = payload.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
+        raise ValueError(f"{key} must be a bounded opaque identifier")
+    return value
+
+
+def _public_text(payload: Mapping[str, Any], key: str, *, required: bool = False, maximum: int = 4096) -> str | None:
+    value = payload.get(key)
+    if value is None and not required:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or _CONTROL.search(value)
+        or _SENSITIVE_VALUE.search(value)
+    ):
+        raise ValueError(f"{key} must be a bounded public summary")
+    return value
+
+
+def _strict_int(payload: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{key} must be an integer >= {minimum}")
+    return value
+
+
+def _allow_only(payload: Mapping[str, Any], *allowed: str) -> None:
+    unexpected = set(payload).difference(allowed)
+    if unexpected:
+        raise ValueError("runtime event payload contains unapproved fields")
+
+
+def _tool_fields(payload: Mapping[str, Any], *, result: bool) -> tuple[str, dict[str, Any]]:
+    _allow_only(
+        payload,
+        "tool_id",
+        "tool_call_id",
+        "call_id",
+        "read_only",
+        "name",
+        "summary",
+        "artifact_ref",
+        "effect_id",
+        "status",
+    )
+    tool_id = _identifier(payload, "tool_id")
+    wire_call_id = _identifier(payload, "tool_call_id", required=False)
+    alias_call_id = _identifier(payload, "call_id", required=False)
+    if wire_call_id is None and alias_call_id is None:
+        raise ValueError("tool call must include a call id")
+    if wire_call_id is not None and alias_call_id is not None and wire_call_id != alias_call_id:
+        raise ValueError("tool call id aliases disagree")
+    call_id = wire_call_id or alias_call_id
+    read_only = payload.get("read_only")
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    value: dict[str, Any] = {
+        "tool_id": tool_id,
+        "tool_call_id": call_id,
+        "read_only": read_only,
+    }
+    name = _public_text(payload, "name", maximum=128)
+    summary = _public_text(payload, "summary", maximum=280)
+    artifact_ref = _identifier(payload, "artifact_ref", required=False)
+    if summary is not None:
+        value["summary"] = summary
+    if name is not None:
+        value["tool_name"] = name
+    if artifact_ref is not None:
+        value["artifact_ref"] = artifact_ref
+    if result:
+        status = payload.get("status")
+        if status not in _TOOL_RESULT_STATUSES:
+            raise ValueError("tool result status must be completed or failed")
+        value["status"] = status
+        return "agent.tool.completed", value
+    return "agent.tool.started", value
+
+
+def _state_fields(payload: Mapping[str, Any], *, collection: str, delta: bool) -> tuple[str, dict[str, Any]]:
+    _allow_only(
+        payload,
+        "version",
+        "base_version",
+        "operation",
+        "snapshot",
+        "delta",
+        "plan_id",
+        "item_id",
+        "summary",
+    )
+    version = _strict_int(payload, "version", minimum=1)
+    shape = payload.get("delta" if delta else "snapshot")
+    expected = (Mapping,) if collection == "plan" else (tuple, list)
+    if not isinstance(shape, expected):
+        raise ValueError(("delta" if delta else "snapshot") + " must have the required JSON shape")
+    value: dict[str, Any] = {"version": version}
+    if delta:
+        base_version = _strict_int(payload, "base_version", minimum=1)
+        if base_version >= version:
+            raise ValueError("base_version must precede version")
+        operation = payload.get("operation")
+        if operation not in _STATE_OPERATIONS:
+            raise ValueError("operation must be an allowed state operation")
+        value.update(base_version=base_version, operation=operation)
+    for key in ("plan_id", "item_id"):
+        item = _identifier(payload, key, required=False)
+        if item is not None:
+            value[key] = item
+    summary = _public_text(payload, "summary", maximum=280)
+    if summary is not None:
+        value["summary"] = summary
+    return (f"run.{collection}.delta" if delta else f"run.{collection}.snapshot", value)
+
+
+def _project_user_message(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "content")
+    return "user.message.received", {"content": _public_text(payload, "content", required=True)}
+
+
+def _project_assistant_delta(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "text", "content")
+    text = _public_text(payload, "text") or _public_text(payload, "content", required=True)
+    return "agent.message.delta", {"content": text}
+
+
+def _project_assistant_message(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "content")
+    return "agent.message.completed", {"content": _public_text(payload, "content", required=True)}
+
+
+def _project_reasoning_delta(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "char_count")
+    count = _strict_int(payload, "char_count", minimum=0) if "char_count" in payload else 1
+    return "runtime.reasoning.observed", {"count": count}
+
+
+def _project_intervention(payload: Mapping[str, Any], event_type: str) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "intervention_id", "summary")
+    value = {"intervention_id": _identifier(payload, "intervention_id")}
+    summary = _public_text(payload, "summary", maximum=280)
+    if summary is not None:
+        value["summary"] = summary
+    return event_type, value
+
+
+def _project_artifact(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "artifact_id", "summary", "media_type")
+    value = {"artifact_id": _identifier(payload, "artifact_id")}
+    summary = _public_text(payload, "summary", maximum=280)
+    if summary is not None:
+        value["summary"] = summary
+    media_type = _public_text(payload, "media_type", maximum=128)
+    if media_type is not None:
+        value["media_type"] = media_type
+    return "artifact.proposed", value
+
+
+def _project_runtime_status(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "status")
+    status = payload.get("status")
+    if status not in _STATUSES:
+        raise ValueError("runtime status is not registered")
+    return "runtime.status.changed", {"status": status}
+
+
+def _project_error(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    _allow_only(payload, "code", "summary")
+    return "runtime.error", {
+        "code": _identifier(payload, "code"),
+        "summary": _public_text(payload, "summary", required=True, maximum=280),
+    }
+
+
+_PROJECTORS: dict[str, Callable[[Mapping[str, Any]], tuple[str, dict[str, Any]]]] = {
+    "user.message": _project_user_message,
+    "assistant.delta": _project_assistant_delta,
+    "assistant.message": _project_assistant_message,
+    "reasoning.delta": _project_reasoning_delta,
+    "tool.call": lambda payload: _tool_fields(payload, result=False),
+    "tool.result": lambda payload: _tool_fields(payload, result=True),
+    "plan.snapshot": lambda payload: _state_fields(payload, collection="plan", delta=False),
+    "plan.delta": lambda payload: _state_fields(payload, collection="plan", delta=True),
+    "todo.snapshot": lambda payload: _state_fields(payload, collection="todo", delta=False),
+    "todo.delta": lambda payload: _state_fields(payload, collection="todo", delta=True),
+    "intervention.requested": lambda payload: _project_intervention(payload, "intervention.requested"),
+    "intervention.applied": lambda payload: _project_intervention(payload, "intervention.applied"),
+    "artifact.proposed": _project_artifact,
+    "runtime.status": _project_runtime_status,
+    "error": _project_error,
+}

@@ -107,6 +107,7 @@ _SIMPLE_TYPES = {
     "run.completed": "RUN_FINISHED",
     "run.failed": "RUN_ERROR",
     "agent.message.delta": "TEXT_MESSAGE_CONTENT",
+    "agent.message.completed": "TEXT_MESSAGE_END",
     "agent.tool.started": "TOOL_CALL_START",
     "agent.tool.arguments.delta": "TOOL_CALL_ARGS",
     "agent.tool.completed": "TOOL_CALL_END",
@@ -150,6 +151,29 @@ _CUSTOM_TYPES = {
     "development.merge.completed",
     "development.global_verification.decided",
     "development.interrupt.required",
+    "user.message.received",
+    "run.plan.snapshot",
+    "run.plan.delta",
+    "run.todo.snapshot",
+    "run.todo.delta",
+    "intervention.requested",
+    "intervention.applied",
+    "artifact.proposed",
+    "runtime.status.changed",
+    "runtime.error",
+}
+
+_V2_CUSTOM_TYPES = {
+    "user.message.received",
+    "run.plan.snapshot",
+    "run.plan.delta",
+    "run.todo.snapshot",
+    "run.todo.delta",
+    "intervention.requested",
+    "intervention.applied",
+    "artifact.proposed",
+    "runtime.status.changed",
+    "runtime.error",
 }
 
 
@@ -166,21 +190,41 @@ def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
         "eventId": event.event_id,
     }
     payload = event.payload
+    if event.source == "engine_host.v2":
+        term_id = payload.get("term_id")
+        cursor = payload.get("cursor")
+        if not isinstance(term_id, str) or not term_id or isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 1:
+            return []
+        result["stepId"] = event.step_id
+        result["termId"] = term_id
+        result["cursor"] = cursor
     if event.event_type == "run.failed":
         result["message"] = payload.get("message", "Run failed")
     elif event.event_type == "agent.message.delta":
+        if event.source == "engine_host.v2" and _v2_public_text(payload, "content", 4096) is None:
+            return []
         result["messageId"] = event.correlation_id or event.event_id
         result["delta"] = payload.get("content", "")
+    elif event.event_type == "agent.message.completed":
+        result["messageId"] = event.correlation_id or event.event_id
     elif event.event_type == "agent.tool.started":
-        result["toolCallId"] = payload.get("tool_call_id") or event.correlation_id
-        result["toolCallName"] = payload.get("name", "")
+        if event.source == "engine_host.v2":
+            if not _add_v2_tool_fields(result, payload):
+                return []
+        else:
+            result["toolCallId"] = payload.get("tool_call_id") or event.correlation_id
+            result["toolCallName"] = payload.get("tool_id") or payload.get("name", "")
     elif event.event_type == "agent.tool.arguments.delta":
         result["toolCallId"] = payload.get("tool_call_id") or event.correlation_id
         result["delta"] = payload.get("delta", "")
     elif event.event_type == "agent.tool.completed":
-        result["toolCallId"] = payload.get("tool_call_id") or event.correlation_id
+        if event.source == "engine_host.v2":
+            if not _add_v2_tool_fields(result, payload):
+                return []
+        else:
+            result["toolCallId"] = payload.get("tool_call_id") or event.correlation_id
         public_result = payload.get("public_result")
-        if isinstance(public_result, str):
+        if event.source != "engine_host.v2" and isinstance(public_result, str):
             result["result"] = public_result[:4096]
     elif event.event_type == "run.state.snapshot":
         result["snapshot"] = payload.get("snapshot", {})
@@ -193,7 +237,13 @@ def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
             "conversation.turn.failed": "turn_failed",
             "conversation.turn.retryable": "turn_retryable",
         }.get(event.event_type, event.event_type)
-        value = _public_custom_payload(event.event_type, payload)
+        value = (
+            _public_v2_custom_payload(event.event_type, payload)
+            if event.source == "engine_host.v2" and event.event_type in _V2_CUSTOM_TYPES
+            else _public_custom_payload(event.event_type, payload)
+        )
+        if event.event_type in _V2_CUSTOM_TYPES and not value:
+            return []
         if event.event_type in _DEVELOPMENT_MODELS and not value:
             return []
         result["value"] = value
@@ -411,6 +461,15 @@ def _public_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str
             "pending_branch_ids",
             "status",
         ),
+        "user.message.received": ("content",),
+        "run.plan.snapshot": ("version", "plan_id", "summary"),
+        "run.plan.delta": ("version", "base_version", "operation", "plan_id", "item_id", "summary"),
+        "run.todo.snapshot": ("version", "summary"),
+        "run.todo.delta": ("version", "base_version", "operation", "item_id", "summary"),
+        "intervention.requested": ("intervention_id", "summary"),
+        "artifact.proposed": ("artifact_id", "summary", "media_type"),
+        "runtime.status.changed": ("status",),
+        "runtime.error": ("code", "summary"),
     }.get(event_type)
     if event_type in _DEVELOPMENT_MODELS and _unsafe_development_payload(payload):
         return {}
@@ -433,3 +492,140 @@ def _unsafe_development_payload(value: Any) -> bool:
     if isinstance(value, str):
         return bool(_SECRET_OR_CREDENTIAL.search(value) or _UNSAFE_PATH.search(value))
     return False
+
+
+def _v2_public_text(payload: dict[str, Any], key: str, maximum: int = 280) -> str | None:
+    value = payload.get(key)
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or _UNSAFE_PATH.search(value)
+        or _SECRET_OR_CREDENTIAL.search(value)
+    ):
+        return None
+    return value
+
+
+def _public_v2_custom_payload(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the second public boundary for forged persisted v2 events."""
+    identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+    summary = re.compile(r"[\x00-\x1f\x7f]|(?:^|\s)/|(?:^|[\\/])\.\.(?:[\\/]|$)")
+
+    def opaque(key: str) -> str | None:
+        value = payload.get(key)
+        return value if isinstance(value, str) and identifier.fullmatch(value) else None
+
+    def text(key: str, maximum: int = 280) -> str | None:
+        value = _v2_public_text(payload, key, maximum)
+        return None if value is None or summary.search(value) else value
+
+    version = payload.get("version")
+    base_version = payload.get("base_version")
+    if event_type == "user.message.received":
+        content = text("content", 4096)
+        return {"content": content} if content is not None else {}
+    if event_type in {"run.plan.snapshot", "run.todo.snapshot"}:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            return {}
+        result: dict[str, Any] = {"version": version}
+        for key in ("plan_id",):
+            value = opaque(key)
+            if key in payload and value is None:
+                return {}
+            if value is not None:
+                result[key] = value
+        public_summary = text("summary")
+        if "summary" in payload and public_summary is None:
+            return {}
+        if public_summary is not None:
+            result["summary"] = public_summary
+        return result
+    if event_type in {"run.plan.delta", "run.todo.delta"}:
+        if (
+            isinstance(version, bool)
+            or isinstance(base_version, bool)
+            or not isinstance(version, int)
+            or not isinstance(base_version, int)
+            or base_version < 1
+            or version <= base_version
+            or payload.get("operation") not in {"add", "remove", "replace", "update"}
+        ):
+            return {}
+        result = {
+            "version": version,
+            "base_version": base_version,
+            "operation": payload["operation"],
+        }
+        for key in ("plan_id", "item_id"):
+            value = opaque(key)
+            if key in payload and value is None:
+                return {}
+            if value is not None:
+                result[key] = value
+        public_summary = text("summary")
+        if "summary" in payload and public_summary is None:
+            return {}
+        if public_summary is not None:
+            result["summary"] = public_summary
+        return result
+    if event_type in {"intervention.requested", "intervention.applied"}:
+        intervention_id = opaque("intervention_id")
+        public_summary = text("summary") if "summary" in payload else None
+        if intervention_id is None or ("summary" in payload and public_summary is None):
+            return {}
+        return {"intervention_id": intervention_id, **({"summary": public_summary} if public_summary else {})}
+    if event_type == "artifact.proposed":
+        artifact_id = opaque("artifact_id")
+        if artifact_id is None:
+            return {}
+        result = {"artifact_id": artifact_id}
+        for key, maximum in (("summary", 280), ("media_type", 128)):
+            value = text(key, maximum)
+            if key in payload and value is None:
+                return {}
+            if value is not None:
+                result[key] = value
+        return result
+    if event_type == "runtime.status.changed":
+        status = payload.get("status")
+        return {"status": status} if status in {"queued", "running", "paused", "completed", "failed", "cancelled"} else {}
+    if event_type == "runtime.error":
+        code = opaque("code")
+        public_summary = text("summary")
+        return {"code": code, "summary": public_summary} if code and public_summary else {}
+    return {}
+
+
+def _add_v2_tool_fields(result: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Expose only the v2 tool metadata, never arguments or raw results."""
+    if not all(key in payload for key in ("tool_id", "tool_call_id", "read_only")):
+        return False
+    tool_id = payload["tool_id"]
+    call_id = payload["tool_call_id"]
+    read_only = payload["read_only"]
+    if not isinstance(tool_id, str) or not isinstance(call_id, str) or not isinstance(read_only, bool):
+        return False
+    identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+    if not identifier.fullmatch(tool_id) or not identifier.fullmatch(call_id):
+        return False
+    result["toolCallId"] = call_id
+    result["toolCallName"] = tool_id
+    result["readOnly"] = read_only
+    tool_name = payload.get("tool_name")
+    if isinstance(tool_name, str) and 0 < len(tool_name) <= 128:
+        if _v2_public_text({"tool_name": tool_name}, "tool_name", 128) is None:
+            return False
+        result["toolCallName"] = tool_name
+    for source, target, maximum in (("summary", "summary", 280), ("artifact_ref", "artifactRef", 128)):
+        value = payload.get(source)
+        if (
+            isinstance(value, str)
+            and 0 < len(value) <= maximum
+            and not _SECRET_OR_CREDENTIAL.search(value)
+            and not _UNSAFE_PATH.search(value)
+        ):
+            result[target] = value
+        elif source in payload:
+            return False
+    return True
