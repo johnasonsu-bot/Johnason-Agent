@@ -178,6 +178,7 @@ class EngineHostV2Client:
         self._start_lock = asyncio.Lock()
         self._start_task: asyncio.Task[None] | None = None
         self._spawn_task: asyncio.Task[Any] | None = None
+        self._late_spawn_supervised_task: asyncio.Task[Any] | None = None
         self._late_spawn_reap_task: asyncio.Task[None] | None = None
         self._start_cleanup_unconfirmed = False
         self._start_waiters = 0
@@ -354,54 +355,69 @@ class EngineHostV2Client:
             self._process_group_id = process.pid
 
     def _schedule_late_spawn_reap(self, spawn_task: asyncio.Task[Any]) -> None:
+        if self._late_spawn_supervised_task is spawn_task:
+            if spawn_task.done():
+                self._ensure_late_spawn_reap(spawn_task)
+            return
+        self._late_spawn_supervised_task = spawn_task
+        if spawn_task.done():
+            self._ensure_late_spawn_reap(spawn_task)
+        else:
+            spawn_task.add_done_callback(self._late_spawn_completed)
+
+    def _late_spawn_completed(self, spawn_task: asyncio.Task[Any]) -> None:
+        if self._late_spawn_supervised_task is spawn_task:
+            self._ensure_late_spawn_reap(spawn_task)
+
+    def _ensure_late_spawn_reap(self, spawn_task: asyncio.Task[Any]) -> None:
+        if self._late_spawn_supervised_task is not spawn_task:
+            return
         existing = self._late_spawn_reap_task
-        if (
-            existing is None
-            or existing.done()
-            or existing is asyncio.current_task()
-        ):
-            self._late_spawn_reap_task = asyncio.create_task(
-                self._reap_late_spawn(spawn_task)
+        if existing is not None and not existing.done():
+            return
+        reaper = asyncio.create_task(self._reap_late_spawn(spawn_task))
+        self._late_spawn_reap_task = reaper
+        reaper.add_done_callback(
+            lambda completed: self._late_spawn_reap_completed(
+                spawn_task, completed
+            )
+        )
+
+    def _late_spawn_reap_completed(
+        self,
+        spawn_task: asyncio.Task[Any],
+        reaper: asyncio.Task[None],
+    ) -> None:
+        if self._late_spawn_reap_task is not reaper:
+            return
+        if reaper.cancelled():
+            self._mark_cleanup_unconfirmed()
+            self._ensure_late_spawn_reap(spawn_task)
+
+    def _mark_cleanup_unconfirmed(self) -> None:
+        self._cleanup_confirmed = False
+        self._report_unconfirmed_tree_cleanup()
+        if self._cleanup_error is None:
+            self._cleanup_error = RuntimeUnavailableError(
+                "engine-host v2 process tree cleanup was not confirmed"
             )
 
     async def _reap_late_spawn(self, spawn_task: asyncio.Task[Any]) -> None:
         try:
-            process = await asyncio.shield(spawn_task)
-        except asyncio.CancelledError:
-            if spawn_task.done():
-                try:
-                    spawn_task.result()
-                except BaseException:
-                    self._cleanup_confirmed = True
-                    self._cleanup_error = None
-                    if self._spawn_task is spawn_task:
-                        self._spawn_task = None
-                    return
-            self._cleanup_confirmed = False
-            self._report_unconfirmed_tree_cleanup()
-            if self._cleanup_error is None:
-                self._cleanup_error = RuntimeUnavailableError(
-                    "engine-host v2 process tree cleanup was not confirmed"
-                )
-            self._schedule_late_spawn_reap(spawn_task)
-            raise
+            process = spawn_task.result()
         except BaseException:
             self._cleanup_confirmed = True
             self._cleanup_error = None
             if self._spawn_task is spawn_task:
                 self._spawn_task = None
+            if self._late_spawn_supervised_task is spawn_task:
+                self._late_spawn_supervised_task = None
             return
         process_group_id = process.pid if os.name == "posix" else None
         try:
             cleanup = await self._terminate_process_tree(process, process_group_id)
         except asyncio.CancelledError:
-            self._cleanup_confirmed = False
-            self._report_unconfirmed_tree_cleanup()
-            if self._cleanup_error is None:
-                self._cleanup_error = RuntimeUnavailableError(
-                    "engine-host v2 process tree cleanup was not confirmed"
-                )
-            self._schedule_late_spawn_reap(spawn_task)
+            self._mark_cleanup_unconfirmed()
             raise
         self._returncode = cleanup.returncode
         self._cleanup_confirmed = cleanup.confirmed
@@ -414,6 +430,8 @@ class EngineHostV2Client:
             )
         if self._spawn_task is spawn_task:
             self._spawn_task = None
+        if self._late_spawn_supervised_task is spawn_task:
+            self._late_spawn_supervised_task = None
 
     async def run_query(
         self, envelope: RunEnvelopeV2
@@ -1504,10 +1522,7 @@ class EngineHostV2Client:
                         "engine-host v2 process tree cleanup was not confirmed"
                     )
             else:
-                late_spawn_pending = (
-                    self._late_spawn_reap_task is not None
-                    and not self._late_spawn_reap_task.done()
-                )
+                late_spawn_pending = self._late_spawn_supervised_task is not None
                 if self._start_cleanup_unconfirmed or late_spawn_pending:
                     self._cleanup_confirmed = False
                     self._report_unconfirmed_tree_cleanup()
