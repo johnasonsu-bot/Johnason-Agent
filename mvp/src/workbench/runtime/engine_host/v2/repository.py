@@ -84,12 +84,12 @@ class RuntimeV2Repository:
                 connection.rollback()
                 raise
 
-    def admit_command(
+    def _admit_command(
         self,
         envelope: RunEnvelopeV2,
         select: Callable[[sqlite3.Connection], _Selection],
     ) -> AtomicCommandAdmissionV2[_Selection]:
-        """Select and pin a new command while holding one SQLite write transaction."""
+        """Registry-only select-and-pin seam; callers must not retain the connection."""
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
         with self.store.connect() as connection:

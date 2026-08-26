@@ -238,6 +238,22 @@ def test_reopened_registry_marks_unadvertised_runtime_unavailable_not_corrupt(
         reopened.select(RuntimeRequirementsV2(query=True))
 
 
+def test_reopened_disabled_runtime_remains_disabled_and_unselectable(
+    tmp_path: Path,
+) -> None:
+    """Catches a disabled durable registration becoming ambiguous after restart."""
+    database = tmp_path / "state.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("goose", query=True))
+    registry.disable("goose")
+
+    reopened = RuntimeRegistryV2(RuntimeV2Repository(database))
+
+    assert reopened.snapshot()[0].state == "disabled"
+    with pytest.raises(NoConformantRuntime):
+        reopened.select(RuntimeRequirementsV2(query=True))
+
+
 def test_reopened_registry_resumes_durable_pin_without_live_advertisement(
     tmp_path: Path,
 ) -> None:

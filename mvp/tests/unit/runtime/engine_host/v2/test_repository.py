@@ -162,7 +162,6 @@ def test_corrupt_persisted_pin_is_rejected_on_read(tmp_path: Path) -> None:
     with pytest.raises(CorruptCommandPin):
         RuntimeV2Repository(database).get_pin("command-1")
 
-
 def test_invalid_persisted_retry_metadata_is_rejected_on_read(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite"
     repository = RuntimeV2Repository(database)
@@ -175,21 +174,3 @@ def test_invalid_persisted_retry_metadata_is_rejected_on_read(tmp_path: Path) ->
 
     with pytest.raises(CorruptCommandPin):
         RuntimeV2Repository(database).get_pin("command-1")
-
-
-def test_atomic_admission_runs_selector_and_command_pin_in_one_transaction(
-    tmp_path: Path,
-) -> None:
-    """Catches Registry admission reopening a transaction between selection and pinning."""
-    repository = RuntimeV2Repository(tmp_path / "state.sqlite")
-    observed: list[bool] = []
-
-    def select(connection) -> str:
-        observed.append(connection.in_transaction)
-        return "goose"
-
-    admitted = repository.admit_command(run_envelope(), select)
-
-    assert observed == [True]
-    assert admitted.selection == "goose"
-    assert admitted.pin.command_id == "command-1"

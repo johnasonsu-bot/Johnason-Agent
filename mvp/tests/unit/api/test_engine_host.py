@@ -228,6 +228,28 @@ def test_v2_engine_host_diagnostic_reports_reopened_runtime_as_unavailable(
     assert response.json()["v2"]["runtimes"][0]["state"] == "unavailable"
 
 
+def test_v2_engine_host_diagnostic_preserves_disabled_state_after_reopen(
+    tmp_path: Path,
+) -> None:
+    """Catches the v2 diagnostic forgetting an intentional persisted disable."""
+    database = tmp_path / "api.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    registry.register(runtime_capabilities("fake-v2", build_id="fake:test", query=True))
+    registry.disable("fake-v2")
+    app = FastAPI()
+    app.include_router(
+        engine_host_v2_router(
+            RuntimeRegistryV2(RuntimeV2Repository(database)), enabled=True
+        )
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    assert response.json()["v2"]["runtimes"][0]["state"] == "disabled"
+
+
 def test_v2_engine_host_diagnostic_hides_corrupt_registration_details(
     tmp_path: Path,
 ) -> None:

@@ -182,7 +182,7 @@ class RuntimeRegistryV2:
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
         with self._lock:
-            admitted = self.repository.admit_command(
+            admitted = self.repository._admit_command(
                 envelope,
                 lambda connection: self._select_for_admission(
                     envelope, requirements, connection
@@ -309,6 +309,8 @@ class RuntimeRegistryV2:
                 raise ValueError("registration snapshot does not match persisted metadata")
             advertised = self._advertised.get(runtime_id)
             if advertised is None:
+                if status == "disabled":
+                    return _Registration(capabilities=capabilities, state="disabled")
                 return _Registration(capabilities=capabilities, state="unavailable")
             if advertised != capabilities:
                 raise ValueError("registration snapshot does not match current capabilities")
