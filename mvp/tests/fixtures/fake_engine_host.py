@@ -12,6 +12,7 @@ from typing import Any
 
 
 PROTOCOL = "workbench.engine-host/v1"
+PROTOCOL_V2 = "2.0"
 MAX_FRAME_BYTES = 1_048_576
 INTERLEAVED_RUNS: list[tuple[str, str]] = []
 CANCEL_COUNTS: dict[str, int] = {}
@@ -19,6 +20,13 @@ PENDING_STARTS: list[dict[str, object]] = []
 LATE_EVENT_RUNS: list[str] = []
 WRITE_LOCK = Lock()
 CAPTURE_PATH: str | None = None
+V2_STATE: dict[str, object] = {
+    "accepted": False,
+    "cancel_count": 0,
+    "cursor": 1,
+    "paused": False,
+    "resumed": False,
+}
 
 
 def record_frame(direction: str, frame: dict[str, object], byte_count: int) -> None:
@@ -44,6 +52,317 @@ def write(frame: dict[str, object]) -> None:
         record_frame("out", frame, len(encoded))
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
+
+
+def write_v2(frame: dict[str, object]) -> None:
+    """Write one deterministic v2 transport frame without touching v1 framing."""
+    encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
+    with WRITE_LOCK:
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
+
+
+def v2_response(
+    command: dict[str, object], payload: dict[str, object]
+) -> dict[str, object]:
+    return {
+        "kind": "response",
+        "type": command["type"],
+        "command_id": command["command_id"],
+        "payload": payload,
+    }
+
+
+def v2_event(
+    cursor: int,
+    event_type: str,
+    payload: dict[str, object],
+    *,
+    event_id: str | None = None,
+    required: bool = False,
+    step_id: str = "step-1",
+) -> dict[str, object]:
+    return {
+        "kind": "event",
+        "payload": {
+            "event_id": event_id or f"event-{cursor}-{event_type}",
+            "run_id": "run-1",
+            "term_id": "term-1",
+            "step_id": step_id,
+            "cursor": cursor,
+            "type": event_type,
+            "payload": payload,
+            "required": required,
+        },
+    }
+
+
+def v2_capabilities(mode: str) -> dict[str, object]:
+    capabilities: dict[str, object] = {
+        "runtime_id": "other-v2" if mode == "identity_mismatch" else "fake-v2",
+        "build_id": "python:test-build",
+        "protocol_version": PROTOCOL_V2,
+        "query": True,
+        "model": True,
+        "tools": True,
+        "skills": True,
+        "plugins": True,
+        "workspace": True,
+        "interventions": mode != "missing_control_capabilities",
+        "pause_resume": mode != "missing_control_capabilities",
+        "compaction": True,
+        "checkpoints": mode != "missing_control_capabilities",
+        "streaming": True,
+        "plan": True,
+        "todo": True,
+        "prompt_sections": True,
+        "tool_interceptors": True,
+        "event_cursor": mode != "missing_capability",
+    }
+    return capabilities
+
+
+def write_v2_terminal(cursor: int, status: str = "completed", **extra: object) -> None:
+    write_v2(v2_event(cursor, "runtime.status", {"status": status, **extra}))
+
+
+def respond_v2(command: dict[str, object], mode: str) -> bool:
+    """Respond to one v2 command; return whether the fixture should exit."""
+    command_type = command.get("type")
+    if command_type == "runtime.capabilities":
+        write_v2(v2_response(command, v2_capabilities(mode)))
+        return False
+
+    if command_type == "query.start":
+        if mode == "ignore_query_start":
+            return False
+        if not V2_STATE["accepted"]:
+            V2_STATE["accepted"] = True
+        payload = command.get("payload")
+        if not isinstance(payload, dict) or "envelope" not in payload:
+            return True
+        envelope = payload["envelope"]
+        if not isinstance(envelope, dict):
+            return True
+        checkpoint_cursor = envelope.get("checkpoint_cursor")
+        first_cursor = (
+            int(checkpoint_cursor) + 1
+            if isinstance(checkpoint_cursor, int)
+            and not isinstance(checkpoint_cursor, bool)
+            else 1
+        )
+        V2_STATE["cursor"] = first_cursor
+        write_v2(v2_response(command, {"accepted": True}))
+        write_v2(v2_event(first_cursor, "runtime.status", {"status": "running"}))
+
+        if mode in {"controls", "cancel", "missing_control_capabilities"}:
+            return False
+        if mode == "backpressure_consumer_close":
+            for cursor in range(first_cursor + 1, first_cursor + 301):
+                write_v2(
+                    v2_event(cursor, "assistant.delta", {"text": f"chunk-{cursor}"})
+                )
+            V2_STATE["cursor"] = first_cursor + 300
+            return False
+        if mode == "host_crash":
+            return True
+        if mode == "unknown_write_effect":
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "tool.call",
+                    {
+                        "tool_call_id": "write-1",
+                        "tool_id": "tool-1",
+                        "read_only": False,
+                        "effect_id": "effect-1",
+                    },
+                )
+            )
+            return True
+        if mode == "write_ignore_cancel":
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "tool.call",
+                    {
+                        "tool_call_id": "write-1",
+                        "tool_id": "tool-1",
+                        "read_only": False,
+                        "effect_id": "effect-1",
+                    },
+                )
+            )
+            V2_STATE["cursor"] = first_cursor + 1
+            return False
+        if mode == "cursor_gap":
+            write_v2(v2_event(first_cursor + 2, "assistant.delta", {"text": "gap"}))
+            return False
+        if mode == "cursor_regression":
+            write_v2(v2_event(first_cursor + 1, "assistant.delta", {"text": "ok"}))
+            write_v2(v2_event(first_cursor, "assistant.delta", {"text": "back"}))
+            return False
+        if mode in {"duplicate_same", "duplicate_changed"}:
+            duplicate = v2_event(
+                first_cursor,
+                "runtime.status",
+                {"status": "running" if mode == "duplicate_same" else "paused"},
+            )
+            write_v2(duplicate)
+            write_v2_terminal(first_cursor + 1)
+            return False
+        if mode == "checkpoint_resume":
+            write_v2_terminal(first_cursor + 1)
+            return False
+        if mode == "unknown_required_event":
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "vendor.required",
+                    {"diagnostic": "safe"},
+                    required=True,
+                )
+            )
+            return False
+        if mode == "unknown_optional_event":
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "vendor.trace",
+                    {"status": "completed", "diagnostic": "safe"},
+                )
+            )
+            write_v2_terminal(first_cursor + 2)
+            return False
+        if mode == "token_delta":
+            write_v2(v2_event(first_cursor + 1, "assistant.delta", {"text": "hel"}))
+            write_v2(v2_event(first_cursor + 2, "assistant.delta", {"text": "lo"}))
+            write_v2_terminal(first_cursor + 3)
+            return False
+        if mode == "tool_events":
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "tool.call",
+                    {
+                        "tool_call_id": "read-1",
+                        "tool_id": "tool-1",
+                        "read_only": True,
+                    },
+                )
+            )
+            write_v2(
+                v2_event(
+                    first_cursor + 2,
+                    "tool.result",
+                    {
+                        "tool_call_id": "read-1",
+                        "tool_id": "tool-1",
+                        "read_only": True,
+                        "status": "completed",
+                    },
+                )
+            )
+            write_v2_terminal(first_cursor + 3)
+            return False
+        if mode == "plan_todo_delta":
+            write_v2(
+                v2_event(first_cursor + 1, "plan.delta", {"version": 1})
+            )
+            write_v2(
+                v2_event(first_cursor + 2, "todo.delta", {"version": 1})
+            )
+            write_v2_terminal(first_cursor + 3)
+            return False
+        if mode == "independent_step_cursors":
+            write_v2(
+                v2_event(
+                    1,
+                    "assistant.delta",
+                    {"text": "second step"},
+                    step_id="step-2",
+                )
+            )
+            write_v2_terminal(first_cursor + 1)
+            return False
+
+        write_v2(
+            v2_event(first_cursor + 1, "assistant.delta", {"text": "hello"})
+        )
+        write_v2(
+            v2_event(first_cursor + 2, "assistant.message", {"text": "hello"})
+        )
+        write_v2_terminal(first_cursor + 3)
+        if mode == "terminal_extra":
+            write_v2(
+                v2_event(first_cursor + 4, "assistant.delta", {"text": "late"})
+            )
+        return False
+
+    if command_type == "query.pause":
+        V2_STATE["paused"] = True
+        write_v2(v2_response(command, {"state": "paused"}))
+        return False
+    if command_type == "query.intervene":
+        write_v2(v2_response(command, {"accepted": True}))
+        cursor = int(V2_STATE["cursor"]) + 1
+        V2_STATE["cursor"] = cursor
+        write_v2(
+            v2_event(cursor, "intervention.applied", {"context_version": 1})
+        )
+        return False
+    if command_type == "checkpoint.get":
+        write_v2(
+            v2_response(
+                command,
+                {
+                    "checkpoint_ref": "checkpoint-1",
+                    "checkpoint_digest": "6" * 64,
+                    "cursor": int(V2_STATE["cursor"]),
+                },
+            )
+        )
+        return False
+    if command_type == "query.resume":
+        V2_STATE["resumed"] = True
+        write_v2(v2_response(command, {"state": "running"}))
+        cursor = int(V2_STATE["cursor"]) + 1
+        V2_STATE["cursor"] = cursor
+        write_v2_terminal(cursor)
+        return False
+    if command_type == "query.cancel":
+        if mode == "write_ignore_cancel":
+            return False
+        V2_STATE["cancel_count"] = int(V2_STATE["cancel_count"]) + 1
+        write_v2(v2_response(command, {"accepted": True}))
+        cursor = int(V2_STATE["cursor"]) + 1
+        V2_STATE["cursor"] = cursor
+        write_v2_terminal(
+            cursor,
+            "cancelled",
+            cancel_count=int(V2_STATE["cancel_count"]),
+        )
+        return False
+    return True
+
+
+def main_v2(mode: str) -> int:
+    if mode == "environment_guard" and (
+        "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
+    ):
+        return 3
+    while raw_line := sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1):
+        if len(raw_line) > MAX_FRAME_BYTES:
+            return 2
+        try:
+            command: dict[str, Any] = json.loads(raw_line)
+        except json.JSONDecodeError:
+            return 2
+        if command.get("kind") != "command":
+            return 2
+        if respond_v2(command, mode):
+            return 0
+    return 0
 
 
 def response(command: dict[str, object], name: str, payload: dict[str, object]) -> dict[str, object]:
@@ -484,6 +803,8 @@ def respond(command: dict[str, object], mode: str) -> bool:
 
 def main() -> int:
     global CAPTURE_PATH
+    if len(sys.argv) >= 2 and sys.argv[1] == "--v2":
+        return main_v2(sys.argv[2] if len(sys.argv) >= 3 else "normal")
     mode = sys.argv[1] if len(sys.argv) >= 2 else "normal"
     CAPTURE_PATH = sys.argv[2] if len(sys.argv) >= 3 else None
     if mode in {"environment_guard", "capture_metadata"} and (

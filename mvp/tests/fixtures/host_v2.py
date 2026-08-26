@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from pathlib import Path
+import sys
 
 from workbench.runtime.engine_host.v2.contracts import (
     JsonValue,
@@ -152,4 +154,5 @@ def runtime_event(
 
 
 def fake_v2_command(mode: str) -> tuple[str, ...]:
-    return ("fake-v2", mode)
+    fixture = Path(__file__).with_name("fake_engine_host.py")
+    return (sys.executable, str(fixture), "--v2", mode)
