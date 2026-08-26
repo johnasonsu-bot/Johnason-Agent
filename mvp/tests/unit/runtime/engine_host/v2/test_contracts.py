@@ -263,6 +263,51 @@ def test_runtime_event_payload_allows_safe_token_count() -> None:
     assert event.payload["token_count"] == 3
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "apikey",
+        "accesskey",
+        "accesstoken",
+        "apitoken",
+        "privatekey",
+        "privateprompt",
+    ],
+)
+def test_extensions_recursively_reject_undelimited_credential_keys(field: str) -> None:
+    """Catches canonical credential keys that evade separator-based matching."""
+    value = run_envelope().model_dump(mode="json")
+    value["extensions"] = {"safe": {field: "redacted"}}
+
+    with pytest.raises(ValidationError, match="sensitive"):
+        RunEnvelopeV2.model_validate(value)
+
+
+def test_runtime_event_payload_recursively_rejects_undelimited_api_key() -> None:
+    """Catches an API key escaping through nested normalized event payloads."""
+    with pytest.raises(ValidationError, match="sensitive"):
+        runtime_event("assistant.delta", payload={"safe": {"apikey": "redacted"}})
+
+
+def test_tool_schema_recursively_rejects_undelimited_access_token() -> None:
+    """Catches an access token escaping through nested Tool JSON Schema."""
+    with pytest.raises(ValidationError, match="sensitive"):
+        run_envelope(
+            overrides={
+                "tool_manifest": (
+                    {
+                        "tool_id": "tool-1",
+                        "schema": {"properties": {"accesstoken": {"type": "string"}}},
+                        "version": "1",
+                        "read_only": True,
+                        "timeout_ms": 1,
+                        "idempotency": "idempotent",
+                    },
+                )
+            }
+        )
+
+
 def test_query_payload_allows_safe_camel_case_token_count() -> None:
     """Catches the secret matcher rejecting a query's safe camel-case metric."""
     command = QueryCommandV2(

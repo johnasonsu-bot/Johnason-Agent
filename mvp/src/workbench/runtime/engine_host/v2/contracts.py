@@ -55,6 +55,8 @@ def _is_sensitive_key(key: str) -> bool:
         "privatekey",
         "privateprompt",
     }
+    if any(part in sensitive_pairs for part in parts):
+        return True
     if any(
         f"{first}{second}" in sensitive_pairs
         for first, second in zip(parts, parts[1:], strict=False)
