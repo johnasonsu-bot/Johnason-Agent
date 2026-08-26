@@ -13,7 +13,7 @@ const allowedApiRequests = new Set([
   "GET /api/engine-host/status",
 ]);
 
-interface ApiRequest { method: "GET" | "POST" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }
+interface ApiRequest { method: "GET" | "POST" | "PUT" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }
 interface BackendHandshake { service: string; instance_id: string; port: number; }
 interface BackendProcess {
   child: ChildProcessWithoutNullStreams;
@@ -35,11 +35,32 @@ let quitting = false;
 function isApiRequest(value: unknown): value is ApiRequest {
   if (!value || typeof value !== "object") return false;
   const request = value as Partial<ApiRequest>;
-  if ((request.method !== "GET" && request.method !== "POST" && request.method !== "DELETE") || typeof request.path !== "string") return false;
+  if ((request.method !== "GET" && request.method !== "POST" && request.method !== "PUT" && request.method !== "DELETE") || typeof request.path !== "string") return false;
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
     const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
     const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events|interventions|pause|resume))?)?$/.exec(request.path);
-    if (!providerPath && !conversationPath) return false;
+    const orchestrationResumePath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orchestrations\/[A-Za-z0-9_-]{1,128}\/resume$/.exec(request.path);
+    const agentPath = /^\/agents(?:\/[A-Za-z0-9_-]{1,64})?$/.exec(request.path);
+    const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}$/i.exec(request.path);
+    const graphPlanPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/plans(?:\/[A-Za-z0-9._:-]{1,128}\/versions\/\d+(?:\/(approve|replan))?)?$/.exec(request.path);
+    const graphInterruptPath = /^\/graph-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
+    const developmentInterruptPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/development-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
+    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath && !graphPlanPath && !graphInterruptPath && !developmentInterruptPath) return false;
+    if (developmentInterruptPath) return request.method === "POST";
+    if (graphInterruptPath) return request.method === "POST";
+    if (graphPlanPath) {
+      const operation = graphPlanPath[1];
+      return (!operation && request.method === "GET")
+        || (operation === "approve" && request.method === "POST")
+        || (operation === "replan" && request.method === "POST")
+        || (/\/plans$/.test(request.path) && request.method === "POST");
+    }
+    if (artifactPath) return request.method === "GET";
+    if (agentPath) {
+      return (request.path === "/agents" && ["GET", "POST"].includes(request.method))
+        || (request.path !== "/agents" && request.method === "PUT");
+    }
+    if (orchestrationResumePath) return request.method === "POST";
     if (conversationPath) {
       const operation = conversationPath[1];
       return (operation === "events" && request.method === "GET")

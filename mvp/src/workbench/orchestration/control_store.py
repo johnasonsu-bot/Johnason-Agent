@@ -33,6 +33,16 @@ class GraphControlStore:
         plan_json = _canonical_json(plan.model_dump(mode="json"))
         digest = hashlib.sha256(plan_json.encode("utf-8")).hexdigest()
         with self._store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT plan_digest FROM graph_execution_plans
+                WHERE plan_id = ? AND version = ?""",
+                (plan.plan_id, plan.version),
+            ).fetchone()
+            if existing is not None:
+                if existing["plan_digest"] != digest:
+                    raise ApprovedPlanImmutable(plan.plan_id)
+                return
             connection.execute(
                 """
                 INSERT INTO graph_execution_plans(
@@ -41,6 +51,26 @@ class GraphControlStore:
                 """,
                 (plan.plan_id, plan.version, plan_json, digest),
             )
+
+    def get_plan(self, plan_id: str, version: int) -> ExecutionPlan:
+        with self._store.connect() as connection:
+            row = connection.execute(
+                """SELECT plan_json FROM graph_execution_plans
+                WHERE plan_id = ? AND version = ?""",
+                (plan_id, version),
+            ).fetchone()
+        if row is None:
+            raise KeyError((plan_id, version))
+        return ExecutionPlan.model_validate_json(row["plan_json"])
+
+    def approval_decisions(self, plan_id: str, version: int) -> tuple[str, ...]:
+        with self._store.connect() as connection:
+            rows = connection.execute(
+                """SELECT decision FROM graph_plan_approvals
+                WHERE plan_id = ? AND version = ? ORDER BY created_at, approval_id""",
+                (plan_id, version),
+            ).fetchall()
+        return tuple(str(row["decision"]) for row in rows)
 
     def replace_plan(self, plan: ExecutionPlan) -> None:
         """Replace an unapproved draft only; approvals permanently seal a version."""
@@ -84,6 +114,16 @@ class GraphControlStore:
     def approve_plan(
         self, plan_id: str, version: int, *, actor_id: str
     ) -> ApprovalRecord:
+        with self._store.connect() as connection:
+            row = connection.execute(
+                """SELECT approval_json FROM graph_plan_approvals
+                WHERE plan_id = ? AND version = ? AND actor_id = ?
+                  AND decision = 'approved'
+                ORDER BY created_at LIMIT 1""",
+                (plan_id, version, actor_id),
+            ).fetchone()
+        if row is not None:
+            return ApprovalRecord.model_validate_json(row["approval_json"])
         record = ApprovalRecord(
             plan_id=plan_id,
             plan_version=version,
@@ -118,6 +158,30 @@ class GraphControlStore:
         with self._store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                existing = connection.execute(
+                    """SELECT plan_id, version, generation, thread_id, checkpoint_ref
+                    FROM graph_run_refs WHERE graph_run_id = ?""",
+                    (run.graph_run_id,),
+                ).fetchone()
+                if existing is not None:
+                    identity = (
+                        existing["plan_id"],
+                        existing["version"],
+                        existing["generation"],
+                        existing["thread_id"],
+                        existing["checkpoint_ref"],
+                    )
+                    expected = (
+                        run.plan_id,
+                        run.plan_version,
+                        run.generation,
+                        run.thread_id,
+                        run.checkpoint_ref,
+                    )
+                    if identity != expected:
+                        raise ValueError("graph run identity cannot change")
+                    connection.commit()
+                    return
                 approval = connection.execute(
                     """
                     SELECT 1 FROM graph_plan_approvals
@@ -148,6 +212,25 @@ class GraphControlStore:
             except Exception:
                 connection.rollback()
                 raise
+
+    def get_run(self, graph_run_id: str) -> GraphRunRef:
+        with self._store.connect() as connection:
+            row = connection.execute(
+                """SELECT graph_run_id, plan_id, version, generation, thread_id,
+                          checkpoint_ref
+                FROM graph_run_refs WHERE graph_run_id = ?""",
+                (graph_run_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(graph_run_id)
+        return GraphRunRef(
+            graph_run_id=row["graph_run_id"],
+            plan_id=row["plan_id"],
+            plan_version=row["version"],
+            generation=row["generation"],
+            thread_id=row["thread_id"],
+            checkpoint_ref=row["checkpoint_ref"],
+        )
 
     def append_projection(self, event: PublicGraphEvent) -> None:
         event_json = _canonical_json(event.model_dump(mode="json"))

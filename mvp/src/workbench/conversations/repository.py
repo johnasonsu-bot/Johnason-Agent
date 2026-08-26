@@ -73,6 +73,64 @@ class ConversationRepository:
         assert row is not None
         return ConversationSession.model_validate_json(row["record_json"])
 
+    def load_sequential_result(
+        self, graph_run_id: str, node_id: str, attempt: int
+    ) -> tuple[str, dict[str, Any]] | None:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT result_kind, result_json
+                FROM sequential_execution_records
+                WHERE graph_run_id = ? AND node_id = ? AND attempt = ?""",
+                (graph_run_id, node_id, attempt),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["result_json"])
+        if not isinstance(value, dict):
+            raise TurnSnapshotCorruption("invalid sequential execution result")
+        return str(row["result_kind"]), value
+
+    def save_sequential_result(
+        self,
+        graph_run_id: str,
+        node_id: str,
+        attempt: int,
+        *,
+        result_kind: str,
+        result: dict[str, Any],
+    ) -> None:
+        if result_kind not in {"worker", "review"}:
+            raise ValueError("sequential result kind is invalid")
+        encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT result_kind, result_json
+                FROM sequential_execution_records
+                WHERE graph_run_id = ? AND node_id = ? AND attempt = ?""",
+                (graph_run_id, node_id, attempt),
+            ).fetchone()
+            if row is not None:
+                if row["result_kind"] != result_kind or row["result_json"] != encoded:
+                    raise TurnSnapshotCorruption(
+                        "sequential execution result identity cannot change"
+                    )
+                return
+            connection.execute(
+                """INSERT INTO sequential_execution_records(
+                    graph_run_id, node_id, attempt, result_kind, result_json,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    graph_run_id,
+                    node_id,
+                    attempt,
+                    result_kind,
+                    encoded,
+                    time.time(),
+                ),
+            )
+
     @staticmethod
     def _preserve_turn_routing_metadata(
         connection: Any,
@@ -897,6 +955,79 @@ class ConversationRepository:
             )
         if changed.rowcount != 1:
             raise RuntimeError("turn claim is no longer owned")
+
+    def pause_turn_for_interrupt(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        owner_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        with self.store.connect() as connection:
+            changed = connection.execute(
+                """UPDATE conversation_turns
+                SET status = 'interrupted', state_json = ?, owner_id = NULL,
+                    lease_expires_at = 0, updated_at = ?
+                WHERE session_id = ? AND command_id = ? AND owner_id = ?
+                  AND status = 'running'""",
+                (
+                    json.dumps(state, sort_keys=True),
+                    time.time(),
+                    session_id,
+                    command_id,
+                    owner_id,
+                ),
+            )
+        if changed.rowcount != 1:
+            raise RuntimeError("turn claim is no longer owned")
+
+    def resume_interrupted_turn(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        response: dict[str, Any],
+    ) -> TurnStatus:
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((session_id, command_id))
+            state = json.loads(row["state_json"])
+            orchestration = state.get("orchestration")
+            if not isinstance(orchestration, dict):
+                raise TurnSnapshotCorruption("turn is not a sequential orchestration")
+            existing_response = orchestration.get("resume_response")
+            if row["status"] == "interrupted":
+                orchestration["resume_response"] = response
+                state["orchestration"] = orchestration
+                connection.execute(
+                    """UPDATE conversation_turns
+                    SET status = 'queued', state_json = ?, updated_at = ?
+                    WHERE session_id = ? AND command_id = ?
+                      AND status = 'interrupted'""",
+                    (
+                        json.dumps(state, sort_keys=True),
+                        time.time(),
+                        session_id,
+                        command_id,
+                    ),
+                )
+            elif existing_response != response:
+                raise ValueError("orchestration resume identity cannot change")
+            refreshed = connection.execute(
+                """SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            connection.commit()
+        assert refreshed is not None
+        return self._turn_status(refreshed)
 
     def fail_corrupt_turn(
         self,

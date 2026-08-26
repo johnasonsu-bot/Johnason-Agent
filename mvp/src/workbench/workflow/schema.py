@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 9
+PHASE1_SCHEMA_VERSION = 17
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -159,6 +159,31 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             PRIMARY KEY (plan_id, version)
         );
+        CREATE TABLE IF NOT EXISTS research_plan_versions (
+            plan_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            plan_json TEXT NOT NULL,
+            plan_digest TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (plan_id, version),
+            FOREIGN KEY (plan_id, version)
+                REFERENCES graph_execution_plans(plan_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS research_plan_owners (
+            plan_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS research_plan_commands (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
         CREATE TABLE IF NOT EXISTS graph_plan_approvals (
             approval_id TEXT PRIMARY KEY,
             plan_id TEXT NOT NULL,
@@ -182,6 +207,37 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (plan_id, version)
                 REFERENCES graph_execution_plans(plan_id, version)
         );
+        CREATE TABLE IF NOT EXISTS research_graph_jobs (
+            graph_run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            plan_json TEXT,
+            status TEXT NOT NULL,
+            owner_id TEXT,
+            lease_expires_at REAL NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            last_error_code TEXT,
+            resume_json TEXT,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            interrupt_id TEXT,
+            interrupt_kind TEXT,
+            interrupt_digest TEXT,
+            interrupt_payload_json TEXT,
+            interrupt_actor_id TEXT,
+            interrupt_decision TEXT,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS research_execution_records (
+            graph_run_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            branch_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (graph_run_id, stage, branch_id, attempt),
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
         CREATE TABLE IF NOT EXISTS graph_external_effect_refs (
             effect_ref_id TEXT PRIMARY KEY,
             graph_run_id TEXT NOT NULL,
@@ -196,6 +252,99 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             event_json TEXT NOT NULL,
             created_at REAL NOT NULL,
             FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS agent_profiles (
+            agent_id TEXT PRIMARY KEY,
+            current_version INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS agent_profile_versions (
+            agent_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (agent_id, version),
+            FOREIGN KEY (agent_id) REFERENCES agent_profiles(agent_id)
+        );
+        CREATE TABLE IF NOT EXISTS project_context_versions (
+            project_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (project_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS project_context_entries (
+            project_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            entry_json TEXT NOT NULL,
+            PRIMARY KEY (project_id, version, ordinal),
+            FOREIGN KEY (project_id, version)
+                REFERENCES project_context_versions(project_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS sequential_execution_records (
+            graph_run_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            result_kind TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (graph_run_id, node_id, attempt),
+            FOREIGN KEY (graph_run_id) REFERENCES graph_run_refs(graph_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS development_effects (
+            operation_id TEXT PRIMARY KEY,
+            effect_kind TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            base_sha TEXT NOT NULL,
+            expected_result_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_ref TEXT,
+            exit_code INTEGER,
+            stdout_digest TEXT,
+            stderr_digest TEXT,
+            reconciliation_json TEXT,
+            started_at REAL,
+            completed_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS development_graph_jobs (
+            graph_run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            plan_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner_id TEXT,
+            lease_expires_at REAL NOT NULL DEFAULT 0,
+            attempt INTEGER NOT NULL DEFAULT 0,
+            resume_json TEXT,
+            interrupt_id TEXT,
+            interrupt_kind TEXT,
+            interrupt_digest TEXT,
+            interrupt_payload_json TEXT,
+            interrupt_actor_id TEXT,
+            interrupt_decision TEXT,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS development_job_commands (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id),
+            FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id)
+        );
+        CREATE TABLE IF NOT EXISTS development_job_resolved_interrupts (
+            graph_run_id TEXT NOT NULL,
+            interrupt_id TEXT NOT NULL,
+            interrupt_kind TEXT NOT NULL,
+            interrupt_digest TEXT NOT NULL,
+            interrupt_payload_json TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            resolved_at REAL NOT NULL,
+            PRIMARY KEY (graph_run_id, interrupt_id),
+            FOREIGN KEY (graph_run_id) REFERENCES development_graph_jobs(graph_run_id)
         );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
@@ -216,6 +365,56 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         BEFORE DELETE ON public_graph_projections
         BEGIN
             SELECT RAISE(ABORT, 'public graph projections are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS agent_profile_versions_no_update
+        BEFORE UPDATE ON agent_profile_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent profile versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS agent_profile_versions_no_delete
+        BEFORE DELETE ON agent_profile_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'agent profile versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_versions_no_update
+        BEFORE UPDATE ON project_context_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'project context versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_versions_no_delete
+        BEFORE DELETE ON project_context_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'project context versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_entries_no_update
+        BEFORE UPDATE ON project_context_entries
+        BEGIN
+            SELECT RAISE(ABORT, 'project context entries are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS project_context_entries_no_delete
+        BEFORE DELETE ON project_context_entries
+        BEGIN
+            SELECT RAISE(ABORT, 'project context entries are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sequential_execution_records_no_update
+        BEFORE UPDATE ON sequential_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'sequential execution records are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS sequential_execution_records_no_delete
+        BEFORE DELETE ON sequential_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'sequential execution records are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS research_execution_records_no_update
+        BEFORE UPDATE ON research_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'research execution records are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS research_execution_records_no_delete
+        BEFORE DELETE ON research_execution_records
+        BEGIN
+            SELECT RAISE(ABORT, 'research execution records are append-only');
         END;
         CREATE TRIGGER IF NOT EXISTS graph_execution_plans_no_change_when_approved
         BEFORE UPDATE ON graph_execution_plans
@@ -239,6 +438,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         BEGIN
             SELECT RAISE(ABORT, 'approved graph plans are immutable');
         END;
+        CREATE TRIGGER IF NOT EXISTS research_plan_versions_no_update
+        BEFORE UPDATE ON research_plan_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'research plan versions are append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS research_plan_versions_no_delete
+        BEFORE DELETE ON research_plan_versions
+        BEGIN
+            SELECT RAISE(ABORT, 'research plan versions are append-only');
+        END;
         """
     )
     _add_column_if_missing(
@@ -254,11 +463,41 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection, "conversation_turns", "enqueue_sequence", "INTEGER"
     )
+    _add_column_if_missing(
+        connection, "research_graph_jobs", "resume_json", "TEXT"
+    )
+    # ``DevelopmentJobRepository`` refuses rows without this immutable snapshot.
+    # Legacy rows cannot be resumed safely, so preserve them as failed audit rows
+    # while rebuilding the table with the admission invariant enforced by SQLite.
+    if not _column_is_not_null(connection, "development_graph_jobs", "plan_json"):
+        _migrate_development_job_plan_snapshot(connection)
+    _add_column_if_missing(
+        connection, "research_graph_jobs", "next_attempt_at", "REAL NOT NULL DEFAULT 0"
+    )
+    for column in (
+        "interrupt_id",
+        "interrupt_kind",
+        "interrupt_digest",
+        "interrupt_payload_json",
+        "interrupt_actor_id",
+        "interrupt_decision",
+    ):
+        _add_column_if_missing(connection, "research_graph_jobs", column, "TEXT")
     connection.execute(
         """
         UPDATE conversation_turns
         SET enqueue_sequence = rowid
         WHERE enqueue_sequence IS NULL
+        """
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS idx_development_graph_jobs_queue
+        ON development_graph_jobs(status, lease_expires_at, updated_at)"""
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_research_graph_jobs_queue
+        ON research_graph_jobs(status, next_attempt_at, lease_expires_at, updated_at)
         """
     )
     connection.execute(
@@ -354,3 +593,38 @@ def _add_column_if_missing(
     if any(_pragma_value(row, "name", 1) == column for row in columns):
         return
     connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def _column_is_not_null(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(
+        _pragma_value(row, "name", 1) == column and bool(_pragma_value(row, "notnull", 3))
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    )
+
+
+def _migrate_development_job_plan_snapshot(connection: sqlite3.Connection) -> None:
+    """Rebuild the small job table; a legacy missing plan is terminal, never runnable."""
+    connection.execute("DROP INDEX IF EXISTS idx_development_graph_jobs_queue")
+    connection.execute("ALTER TABLE development_graph_jobs RENAME TO development_graph_jobs_legacy")
+    connection.execute(
+        """CREATE TABLE development_graph_jobs (
+        graph_run_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, plan_json TEXT NOT NULL,
+        status TEXT NOT NULL, owner_id TEXT, lease_expires_at REAL NOT NULL DEFAULT 0,
+        attempt INTEGER NOT NULL DEFAULT 0, resume_json TEXT, interrupt_id TEXT,
+        interrupt_kind TEXT, interrupt_digest TEXT, interrupt_payload_json TEXT,
+        interrupt_actor_id TEXT, interrupt_decision TEXT, updated_at REAL NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES conversation_sessions(session_id))"""
+    )
+    columns = {str(_pragma_value(row, "name", 1)) for row in connection.execute("PRAGMA table_info(development_graph_jobs_legacy)").fetchall()}
+    plan = "plan_json" if "plan_json" in columns else "NULL"
+    connection.execute(
+        f"""INSERT INTO development_graph_jobs
+        SELECT graph_run_id, session_id, COALESCE({plan}, '{{}}'),
+        CASE WHEN {plan} IS NULL THEN 'failed' ELSE status END,
+        CASE WHEN {plan} IS NULL THEN NULL ELSE owner_id END,
+        CASE WHEN {plan} IS NULL THEN 0 ELSE lease_expires_at END,
+        attempt, resume_json, interrupt_id, interrupt_kind, interrupt_digest,
+        interrupt_payload_json, interrupt_actor_id, interrupt_decision, updated_at
+        FROM development_graph_jobs_legacy"""
+    )
+    connection.execute("DROP TABLE development_graph_jobs_legacy")

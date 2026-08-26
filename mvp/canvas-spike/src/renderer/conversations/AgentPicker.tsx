@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { providerLabels, type AgentModelProfile } from "../models/agentConfig";
 
 export type AgentProfile = {
   id: string;
@@ -23,12 +24,13 @@ export type AgentPickerResult = {
   selected: AgentProfile[];
 };
 
-export function AgentPicker({ open, onClose, onCreate }: { open: boolean; onClose: () => void; onCreate: (result: AgentPickerResult) => void }) {
+export function AgentPicker({ open, onClose, onCreate, profiles }: { open: boolean; onClose: () => void; onCreate: (result: AgentPickerResult) => void; profiles?: AgentModelProfile[] }) {
   const [mode, setMode] = useState<"single" | "multi">("single");
   const [query, setQuery] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const selected = selectedIds.map((id) => agents.find((agent) => agent.id === id)).filter((agent): agent is AgentProfile => Boolean(agent));
-  const visible = useMemo(() => agents.filter((agent) => `${agent.name} ${agent.role} ${agent.provider}`.toLowerCase().includes(query.toLowerCase())), [query]);
+  const available = useMemo(() => profiles?.filter((profile) => profile.enabled).map((profile, index) => ({ id: profile.id, name: profile.name, role: profile.roleLabel, provider: `${providerLabels[profile.providerId] ?? profile.providerId} / ${profile.model}`, color: ["blue", "purple", "green", "orange", "teal", "dark"][index % 6], glyph: profile.name.slice(0, 1) })) ?? agents, [profiles]);
+  const selected = selectedIds.map((id) => available.find((agent) => agent.id === id)).filter((agent): agent is AgentProfile => Boolean(agent));
+  const visible = useMemo(() => available.filter((agent) => `${agent.name} ${agent.role} ${agent.provider}`.toLowerCase().includes(query.toLowerCase())), [available, query]);
 
   if (!open) return null;
   const toggle = (id: string) => {

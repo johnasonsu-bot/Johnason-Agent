@@ -24,6 +24,8 @@ class RunAgentTurn(BaseModel):
     runner_mode: Literal["python", "engine_host"] | None = None
     host_run_id: str | None = None
     message_snapshot: tuple[ModelMessage, ...] = ()
+    allowed_tool_ids: tuple[str, ...] | None = None
+    allowed_skill_refs: tuple[str, ...] | None = None
 
 
 class AgentEvent(BaseModel):

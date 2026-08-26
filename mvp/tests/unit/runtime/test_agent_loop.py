@@ -194,6 +194,38 @@ async def test_runtime_executes_tool_then_returns_answer(tmp_path: Path) -> None
     )
 
 
+@pytest.mark.asyncio
+async def test_runtime_hides_and_rejects_tools_outside_frozen_allowlist(
+    tmp_path: Path,
+) -> None:
+    operations: list[str] = []
+    gateway = SequencedGateway()
+    runtime = AgentRuntime(
+        gateway=gateway,
+        profile=profile(),
+        conversations=ConversationRepository(tmp_path / "scoped.sqlite"),
+        tools=[RecordingTool(operations)],
+    )
+
+    events = [
+        event
+        async for event in runtime.run_turn(
+            RunAgentTurn(
+                session_id="session-scoped",
+                run_id="run-scoped",
+                command_id="turn-scoped",
+                prompt="try tool",
+                allowed_tool_ids=(),
+                allowed_skill_refs=(),
+            )
+        )
+    ]
+
+    assert gateway.requests[0][0].tools == []
+    assert operations == []
+    assert "tool_failed" in [event.kind for event in events]
+
+
 def test_agent_tool_is_a_runtime_protocol() -> None:
     assert isinstance(RecordingTool([]), AgentTool)
 

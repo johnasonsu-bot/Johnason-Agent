@@ -91,6 +91,10 @@ class RunnerSelector:
         mode = command.runner_mode or self.mode_for(
             command.session_id, command.provider_id or "", command.model
         )
+        if command.allowed_tool_ids is not None or command.allowed_skill_refs is not None:
+            # G1 Host advertises empty manifests. Route capability-scoped turns to
+            # the Python runtime, which enforces the frozen node allowlists.
+            mode = "python"
         if mode == "python":
             async for event in self.python_runner.run_turn(command):
                 yield event

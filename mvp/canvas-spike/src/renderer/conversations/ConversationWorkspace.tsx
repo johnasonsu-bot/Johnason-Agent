@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { artifacts } from "../artifacts";
-import { conversationApi, type ConversationEvent } from "../api";
+import { agentApi, conversationApi, type ConversationEvent } from "../api";
 import { registry } from "../renderers";
 import { Composer } from "./Composer";
 import { SessionSidebar } from "./SessionSidebar";
 import { Timeline, type TimelineEntry } from "./Timeline";
 import { createConversationCommandId } from "./commandIds";
-import { agentModelProfileFor, loadAgentModelProfiles, providerLabels, type AgentModelProfile } from "../models/agentConfig";
+import { agentModelProfileFor, loadAgentModelProfiles, mergeAgentRecords, orderedMentionBindings, providerLabels, type AgentModelProfile } from "../models/agentConfig";
+import { HtmlArtifactPreview } from "./HtmlArtifactPreview";
+import { SequentialGraph } from "./SequentialGraph";
+import { emptySequentialState, reduceSequentialEvent } from "./sequentialReducer";
+import { PlanApproval } from "./PlanApproval";
+import { GraphRun } from "./GraphRun";
+import { emptyResearchGraphState, reduceResearchEvent } from "./graphReducer";
 
 const seededTitles: Record<string, string> = {
   "ui-session-0": "Jira 看板配置修复指引",
@@ -89,6 +95,9 @@ function mapEvent(event: ConversationEvent, index: number): TimelineEntry | null
 }
 
 function statusForEvent(event: ConversationEvent): { label: string; terminal: boolean } | null {
+  if (event.name === "orchestration.graph.queued") return { label: "多 Agent 已排队 · queued", terminal: false };
+  if (event.name === "orchestration.node.progress") return { label: "多 Agent 执行中 · running", terminal: false };
+  if (event.name === "orchestration.interrupted") return { label: "等待人工审批 · needs human", terminal: true };
   if (event.name === "turn_queued") return { label: "排队中 · queued", terminal: false };
   if (event.name === "conversation.status") {
     const status = String(event.value?.status ?? "running");
@@ -124,6 +133,8 @@ export function ConversationWorkspace() {
   const [artifactId, setArtifactId] = useState("markdown");
   const [canvasOpen, setCanvasOpen] = useState(true);
   const [modelProfiles, setModelProfiles] = useState<AgentModelProfile[]>(loadAgentModelProfiles);
+  const [sequential, setSequential] = useState(emptySequentialState);
+  const [research, setResearch] = useState(emptyResearchGraphState);
   const [selectedModel, setSelectedModel] = useState("local-agent");
   const [selectedProviderId, setSelectedProviderId] = useState("lmstudio");
   const cursorsRef = useRef<Record<string, string>>(loadConversationCursors());
@@ -143,14 +154,17 @@ export function ConversationWorkspace() {
     const seen = seenEventsRef.current[sessionId] ?? new Set<string>();
     seenEventsRef.current[sessionId] = seen;
     const storedTimeline = loadConversationTimeline(sessionId);
+    let hydratedGraph = false;
     setEntries(storedTimeline.length ? storedTimeline : (sessionId === "ui-session-0" ? initialTimeline : []));
+    setSequential(emptySequentialState());
+    setResearch(emptyResearchGraphState());
     setStatus("准备就绪 · ready");
     setSource("Task 3 REST/SSE");
     const consume = async () => {
       if (!active || watcherGenerationRef.current !== generation) return;
       try {
         await conversationApi.createSession(sessionId);
-        const events = await conversationApi.events(sessionId, storedTimeline.length ? cursorsRef.current[sessionId] : undefined);
+        const events = await conversationApi.events(sessionId, hydratedGraph ? cursorsRef.current[sessionId] : undefined);
         if (!active || watcherGenerationRef.current !== generation) return;
         const fresh = events.filter((event) => {
           const id = event.cursor ?? event.eventId ?? `${event.sequence ?? ""}:${event.name ?? event.type ?? ""}`;
@@ -159,6 +173,14 @@ export function ConversationWorkspace() {
           return true;
         });
         const mapped = fresh.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry));
+        if (!hydratedGraph) {
+          setSequential(events.reduce(reduceSequentialEvent, emptySequentialState()));
+          setResearch(events.reduce(reduceResearchEvent, emptyResearchGraphState()));
+          hydratedGraph = true;
+        } else if (fresh.length) {
+          setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
+          setResearch((current) => fresh.reduce(reduceResearchEvent, current));
+        }
         if (mapped.length) {
           setEntries((current) => {
             const next = current.concat(mapped);
@@ -191,7 +213,11 @@ export function ConversationWorkspace() {
   }, [sessionId]);
 
   useEffect(() => {
-    setModelProfiles(loadAgentModelProfiles());
+    let active = true;
+    void agentApi.list().then((records) => {
+      if (active) setModelProfiles(mergeAgentRecords(records));
+    }).catch(() => { /* Agent settings displays the actionable backend error. */ });
+    return () => { active = false; };
   }, [sessionId]);
 
   useEffect(() => {
@@ -218,10 +244,19 @@ export function ConversationWorkspace() {
   const send = (prompt: string, contexts: string[] = []) => {
     const apiPrompt = contexts.length ? `${prompt}\n\n[本轮上下文]\n${contexts.map((context) => `- ${context}`).join("\n")}` : prompt;
     addUserEntry(prompt);
+    let agentBindings: Array<{ agent_id: string; expected_version: number }> = [];
+    try {
+      agentBindings = orderedMentionBindings(prompt, modelProfiles);
+    } catch (error) {
+      const reason = describeConversationError(error);
+      setStatus(`执行失败 · ${reason}`);
+      setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · Agent 配置", content: reason, agent: "Agent Profile API", status: "failed" }]);
+      return;
+    }
     setPending(true);
     setStatus("排队中 · queued");
     const commandId = createConversationCommandId("message", sessionId);
-    void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId).then((result) => {
+    void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId, agentBindings).then((result) => {
       setSource("Task 3 REST/SSE · queued");
       if (result.cursor) {
         cursorsRef.current[sessionId] = result.cursor;
@@ -249,16 +284,34 @@ export function ConversationWorkspace() {
     setPaused((current) => !current);
     void (paused ? conversationApi.resume(sessionId, commandId) : conversationApi.pause(sessionId, commandId)).then(() => setStatus(paused ? "已恢复 · running" : "已暂停 · paused")).catch(() => setStatus("状态同步失败 · fixture"));
   };
+  const approveOrchestration = () => {
+    if (!sequential.commandId) return;
+    setStatus("人工审批已提交 · queued");
+    void conversationApi.resumeOrchestration(sessionId, sequential.commandId, createConversationCommandId("orchestration-resume", sessionId)).then(() => {
+      setSequential((current) => ({ ...current, interrupted: undefined }));
+    }).catch((error: unknown) => setStatus(`审批失败 · ${describeConversationError(error)}`));
+  };
+  const htmlArtifact = Object.values(sequential.artifacts).filter((item) => item.mediaType === "text/html").at(-1);
+  const resumeResearch = (preference?: string) => {
+    if (!research.graphRunId || !research.interruptId) return;
+    setStatus("人工审核已批准 · queued");
+    void graphPlanApi.resumeInterrupt(research.graphRunId, research.interruptId, createConversationCommandId("research-interrupt", sessionId), preference).catch((error: unknown) => setStatus(`审核恢复失败 · ${describeConversationError(error)}`));
+  };
 
   return <section className="conversation-workspace" aria-label="会话工作区">
-    <SessionSidebar group={group} activeSessionId={sessionId} onCreateGroup={createGroup} onSessionChange={selectSession} />
+    <SessionSidebar group={group} activeSessionId={sessionId} onCreateGroup={createGroup} onSessionChange={selectSession} agentProfiles={modelProfiles} />
     <main className="conversation-main">
       <header className="conversation-header"><div className="conversation-heading"><div className="agent-avatar agent-avatar-blue">{group[0]?.slice(0, 1) ?? "苏"}</div><div><h2 data-testid="conversation-title">{title}</h2><p>项目实施讨论 · 持续上下文 · {group.length > 1 ? `${group.length} Agents` : "单 Agent"}</p></div></div><div className="conversation-header-actions"><div className="agent-stack" data-testid="agent-avatar-stack" aria-label="当前会话 Agent">{group.slice(0, 3).map((agent) => <span key={agent}>{agent.slice(0, 1)}</span>)}{group.length > 3 && <span>+{group.length - 3}</span>}</div><button type="button" className="quiet" onClick={togglePause}>{paused ? "恢复" : "暂停"}</button><button type="button" className="quiet" aria-label="会话详情">⋯</button></div></header>
       <div className="conversation-source" data-testid="conversation-source">来源 · {source} · session {sessionId}</div>
       <div className={`conversation-status ${status.includes("执行中") ? "running" : ""}`} data-testid="conversation-status" aria-live="polite">{status}</div>
+      <div className="conversation-execution-panels">
+        <SequentialGraph state={sequential} profiles={modelProfiles} onApprove={approveOrchestration} />
+        <PlanApproval sessionId={sessionId} onApproved={() => setStatus("研究计划已批准并排队 · queued")} />
+        <GraphRun state={research} onResume={resumeResearch} sessionId={sessionId} />
+      </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
       <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} />
     </main>
-    {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section><section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>v3 当前结果 · v2 人工批注 · v1 原始证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
+    {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header>{htmlArtifact ? <HtmlArtifactPreview artifactId={htmlArtifact.artifactId} /> : <><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section></>}<section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>当前结果 · 历史 Attempt · 审核证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
   </section>;
 }

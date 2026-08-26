@@ -139,7 +139,10 @@ class AgentRuntime:
             "phase": "before_model",
             "messages": [
                 self._serialize_message(message)
-                for message in self._model_messages(command.session_id)
+                for message in self._model_messages(
+                    command.session_id,
+                    allowed_skill_refs=command.allowed_skill_refs,
+                )
             ],
             "events": [],
             "model_step_count": 0,
@@ -278,7 +281,10 @@ class AgentRuntime:
                         ModelRequest(
                             model=command.model,
                             messages=messages,
-                            tools=[tool.definition for tool in self.tools.values()],
+                            tools=[
+                                tool.definition
+                                for tool in self._allowed_tools(command).values()
+                            ],
                         ),
                         profile,
                     ),
@@ -453,7 +459,7 @@ class AgentRuntime:
                     state=state,
                 )
                 yield started
-            tool = self.tools.get(call.name)
+            tool = self._allowed_tools(command).get(call.name)
             if tool is None:
                 result = f"Unknown tool: {call.name}"
                 failed = self._event(
@@ -589,17 +595,33 @@ class AgentRuntime:
             state=state,
         )
 
-    def _model_messages(self, session_id: str) -> list[ModelMessage]:
+    def _allowed_tools(self, command: RunAgentTurn) -> dict[str, AgentTool]:
+        if command.allowed_tool_ids is None:
+            return self.tools
+        allowed = set(command.allowed_tool_ids)
+        return {name: tool for name, tool in self.tools.items() if name in allowed}
+
+    def _model_messages(
+        self,
+        session_id: str,
+        *,
+        allowed_skill_refs: tuple[str, ...] | None = None,
+    ) -> list[ModelMessage]:
         messages = [
             ModelMessage(role=message.role, content=message.content)
             for message in self.conversations.list_messages(session_id)
         ]
-        if self.skills:
+        skills = (
+            self.skills
+            if allowed_skill_refs is None
+            else tuple(skill for skill in self.skills if skill in set(allowed_skill_refs))
+        )
+        if skills:
             messages.insert(
                 0,
                 ModelMessage(
                     role="system",
-                    content="\n\n".join(self.skills),
+                    content="\n\n".join(skills),
                 ),
             )
         return messages
