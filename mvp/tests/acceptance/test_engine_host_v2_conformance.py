@@ -27,7 +27,9 @@ class _PythonV1Runner:
             yield command
 
 
-@pytest.mark.parametrize("runtime_factory", [fake_host_v2_factory()])
+@pytest.mark.parametrize(
+    "runtime_factory", [fake_host_v2_factory(), fake_host_v2_factory()]
+)
 @pytest.mark.asyncio
 async def test_host_v2_conformance(
     runtime_factory: HostV2RuntimeFactory,
@@ -35,13 +37,55 @@ async def test_host_v2_conformance(
     await assert_host_v2_conformance(runtime_factory)
 
 
+@pytest.mark.asyncio
+async def test_fake_factory_cleans_normal_and_exceptional_runtime_instances() -> None:
+    """Catches process/database directories surviving either context exit path."""
+    runtime_factory = fake_host_v2_factory()
+    factory_root = runtime_factory.temporary_root
+    normal_runtime = None
+    async with runtime_factory.create("normal") as runtime:
+        normal_runtime = runtime
+        normal_root = runtime.instance_root
+        normal_marker = runtime.process_marker
+        assert normal_root.exists()
+        assert runtime.client.returncode is None
+    assert normal_runtime is not None
+    assert normal_runtime.client.returncode is not None
+    assert normal_runtime.client.cleanup_confirmed is True
+    assert normal_runtime.client.reader_tasks_done is True
+    assert not normal_root.exists()
+
+    class ExpectedFailure(RuntimeError):
+        pass
+
+    exceptional_runtime = None
+    with pytest.raises(ExpectedFailure, match="exercise exceptional cleanup"):
+        async with runtime_factory.create("normal") as runtime:
+            exceptional_runtime = runtime
+            exceptional_root = runtime.instance_root
+            assert runtime.process_marker != normal_marker
+            raise ExpectedFailure("exercise exceptional cleanup")
+    assert exceptional_runtime is not None
+    assert exceptional_runtime.client.returncode is not None
+    assert exceptional_runtime.client.cleanup_confirmed is True
+    assert exceptional_runtime.client.reader_tasks_done is True
+    assert not exceptional_root.exists()
+
+    runtime_factory.cleanup()
+    assert not factory_root.exists()
+
+
 def test_fake_host_v2_is_identified_only_as_a_contract_fixture() -> None:
     runtime_factory = fake_host_v2_factory()
-
-    assert runtime_factory.implementation == "contract_fake"
-    assert runtime_factory.runtime_id == "fake-v2"
-    assert runtime_factory.runtime_id not in {"python", "goose", "dsh"}
-    assert runtime_factory.revision.startswith("fake-host-v2/")
+    factory_root = runtime_factory.temporary_root
+    try:
+        assert runtime_factory.implementation == "contract_fake"
+        assert runtime_factory.runtime_id == "fake-v2"
+        assert runtime_factory.runtime_id not in {"python", "goose", "dsh"}
+        assert runtime_factory.revision.startswith("fake-host-v2/")
+    finally:
+        runtime_factory.cleanup()
+    assert not factory_root.exists()
 
 
 def test_v1_and_v2_coexist_without_expanding_the_stable_package_surface(

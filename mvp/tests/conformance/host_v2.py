@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,6 @@ import re
 from typing import Protocol
 
 import pytest
-from pydantic import ValidationError
 
 from workbench.agui.mapper import map_domain_event
 from workbench.protocol.events import DomainEvent
@@ -79,6 +79,10 @@ class HostV2Runtime(Protocol):
     implementation: str
     runtime_id: str
     revision: str
+    host_generation: str
+    instance_nonce: str
+    process_marker: str
+    instance_root: Path
     database: Path
     client: EngineHostV2Client
     repository: RuntimeV2Repository
@@ -89,7 +93,7 @@ class HostV2Runtime(Protocol):
         *,
         command_id: str = "command-1",
         attempt: int = 0,
-        host_generation: str = "host-a",
+        host_generation: str | None = None,
         overrides: Mapping[str, JsonValue] | None = None,
     ) -> RunEnvelopeV2: ...
 
@@ -101,8 +105,11 @@ class HostV2RuntimeFactory(Protocol):
     runtime_id: str
     revision: str
     supported_modes: frozenset[str]
+    temporary_root: Path
 
     def create(self, mode: str) -> AbstractAsyncContextManager[HostV2Runtime]: ...
+
+    def cleanup(self) -> None: ...
 
 
 async def assert_host_v2_conformance(factory: HostV2RuntimeFactory) -> None:
@@ -110,7 +117,7 @@ async def assert_host_v2_conformance(factory: HostV2RuntimeFactory) -> None:
     assert factory.runtime_id not in {"python", "goose", "dsh"} or (
         factory.implementation != "contract_fake"
     )
-    seen_clients: list[EngineHostV2Client] = []
+    seen_runtimes: list[HostV2Runtime] = []
     seen_databases: set[Path] = set()
     scenarios = (
         ("capabilities", _scenario_capabilities),
@@ -124,28 +131,69 @@ async def assert_host_v2_conformance(factory: HostV2RuntimeFactory) -> None:
         ("public_redaction", _scenario_public_redaction),
     )
     assert tuple(name for name, _ in scenarios) == HOST_V2_SCENARIOS
-    for _, scenario in scenarios:
-        await scenario(factory, seen_clients, seen_databases)
+    factory_root = factory.temporary_root
+    try:
+        for _, scenario in scenarios:
+            await scenario(factory, seen_runtimes, seen_databases)
+    finally:
+        factory.cleanup()
+    assert not factory_root.exists()
 
 
 @asynccontextmanager
 async def _isolated(
     factory: HostV2RuntimeFactory,
     mode: str,
-    seen_clients: list[EngineHostV2Client],
+    seen_runtimes: list[HostV2Runtime],
     seen_databases: set[Path],
 ) -> AsyncIterator[HostV2Runtime]:
     assert mode in factory.supported_modes
-    async with factory.create(mode) as runtime:
-        assert runtime.implementation == factory.implementation
-        assert runtime.runtime_id == factory.runtime_id
-        assert runtime.revision == factory.revision
-        assert all(runtime.client is not client for client in seen_clients)
-        assert runtime.database not in seen_databases
-        assert runtime.client.returncode is None
-        seen_clients.append(runtime.client)
-        seen_databases.add(runtime.database)
-        yield runtime
+    runtime: HostV2Runtime | None = None
+    try:
+        async with factory.create(mode) as created:
+            runtime = created
+            assert runtime.implementation == factory.implementation
+            assert runtime.runtime_id == factory.runtime_id
+            assert runtime.revision == factory.revision
+            assert runtime.process_marker.startswith("process-")
+            assert runtime.instance_nonce.startswith("instance-")
+            assert runtime.host_generation.startswith("host-")
+            assert all(
+                runtime.process_marker != previous.process_marker
+                for previous in seen_runtimes
+            )
+            assert all(
+                runtime.instance_nonce != previous.instance_nonce
+                for previous in seen_runtimes
+            )
+            assert all(
+                runtime.host_generation != previous.host_generation
+                for previous in seen_runtimes
+            )
+            assert all(
+                runtime.repository is not previous.repository
+                for previous in seen_runtimes
+            )
+            assert all(
+                runtime.registry is not previous.registry for previous in seen_runtimes
+            )
+            assert runtime.database not in seen_databases
+            assert runtime.repository.store.path == runtime.database
+            assert runtime.registry.repository is runtime.repository
+            assert runtime.instance_root.exists()
+            assert runtime.database.exists()
+            assert runtime.client.returncode is None
+            assert runtime.envelope().runtime.host_generation == runtime.host_generation
+            seen_runtimes.append(runtime)
+            seen_databases.add(runtime.database)
+            yield runtime
+    finally:
+        if runtime is not None:
+            assert runtime.client.returncode is not None
+            assert runtime.client.cleanup_confirmed is True
+            assert runtime.client.reader_tasks_done is True
+            assert not runtime.database.exists()
+            assert not runtime.instance_root.exists()
 
 
 async def _collect(
@@ -157,7 +205,14 @@ async def _collect(
             async for event in runtime.client.run_query(envelope or runtime.envelope())
         ]
 
-    return await asyncio.wait_for(consume(), timeout=2.0)
+    events = await asyncio.wait_for(consume(), timeout=2.0)
+    public_values = [event.model_dump(mode="json") for event in events]
+    wire = json.dumps(public_values)
+    public_strings = set(re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', wire))
+    assert runtime.process_marker not in public_strings
+    assert runtime.process_marker.removeprefix("process-") not in public_strings
+    assert not any(str(runtime.instance_root) in value for value in public_strings)
+    return events
 
 
 def _changed_envelope(
@@ -179,6 +234,13 @@ def _write_envelope(runtime: HostV2Runtime) -> RunEnvelopeV2:
     value["tool_manifest"][0]["read_only"] = False
     value["tool_manifest"][0]["idempotency"] = "non_idempotent"
     return RunEnvelopeV2.model_validate(value)
+
+
+def _safe_digest(value: object) -> str:
+    canonical = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 async def _scenario_capabilities(factory, seen_clients, seen_databases) -> None:
@@ -290,7 +352,9 @@ async def _scenario_query_cursor(factory, seen_clients, seen_databases) -> None:
 
 
 async def _scenario_context_compaction(factory, seen_clients, seen_databases) -> None:
-    async with _isolated(factory, "normal", seen_clients, seen_databases) as runtime:
+    async with _isolated(
+        factory, "contract_inputs", seen_clients, seen_databases
+    ) as runtime:
         envelope = runtime.envelope(
             overrides={
                 "context_budget": {
@@ -310,18 +374,72 @@ async def _scenario_context_compaction(factory, seen_clients, seen_databases) ->
         assert budget.protected_prompt_section_ids == ("section-1", "section-2")
         assert budget.compaction_policy == "summarize"
         assert budget.summary_ref == "summary-1"
-        identity = canonical_envelope_identity(envelope)
-        changed = _changed_envelope(
-            envelope,
-            "context_budget.protected_message_ids",
-            ["message-1", "message-3"],
-        )
-        assert canonical_envelope_identity(changed).identity_digest != identity.identity_digest
-        with pytest.raises(ValidationError):
-            _changed_envelope(envelope, "context_budget.max_input_tokens", 0)
         events = await _collect(runtime, envelope)
-        assert events[-1].cursor == 4
+        assert [event.cursor for event in events] == [1, 2, 3, 4, 5]
         assert events[-1].payload == {"status": "completed"}
+        context_proof = map_runtime_event(events[1])[0]
+        expected_digest = _safe_digest(
+            envelope.context_budget.model_dump(mode="json")
+        )
+        assert context_proof.payload == {
+            "term_id": "term-1",
+            "cursor": 2,
+            "artifact_id": "context-proof",
+            "summary": (
+                f"context {expected_digest} input 2048 output 256 messages 2 "
+                "sections 2 policy summarize summary present"
+            ),
+            "media_type": "application/x-host-v2-context-proof",
+        }
+        public_wire = map_domain_event(context_proof)[0]
+        assert public_wire["value"] == {
+            "artifact_id": "context-proof",
+            "summary": context_proof.payload["summary"],
+            "media_type": "application/x-host-v2-context-proof",
+        }
+        serialized_events = json.dumps(
+            [event.model_dump(mode="json") for event in events]
+        )
+        for protected in ("message-1", "message-2", "section-1", "section-2", "summary-1"):
+            assert protected not in serialized_events
+
+    async with _isolated(
+        factory, "contract_inputs", seen_clients, seen_databases
+    ) as runtime:
+        invalid_budget = runtime.envelope(
+            overrides={
+                "context_budget": {
+                    "max_input_tokens": 2048,
+                    "reserved_output_tokens": 2048,
+                    "protected_message_ids": ("message-1",),
+                    "protected_prompt_section_ids": ("section-1",),
+                    "compaction_policy": "summarize",
+                    "summary_ref": "summary-1",
+                }
+            }
+        )
+        with pytest.raises(RuntimeControlError) as raised:
+            await _collect(runtime, invalid_budget)
+        assert str(raised.value) == "engine-host v2 rejected query"
+
+    async with _isolated(
+        factory, "contract_inputs", seen_clients, seen_databases
+    ) as runtime:
+        invalid_summary = runtime.envelope(
+            overrides={
+                "context_budget": {
+                    "max_input_tokens": 2048,
+                    "reserved_output_tokens": 256,
+                    "protected_message_ids": ("message-1",),
+                    "protected_prompt_section_ids": ("section-1",),
+                    "compaction_policy": "none",
+                    "summary_ref": "summary-1",
+                }
+            }
+        )
+        with pytest.raises(RuntimeControlError) as raised:
+            await _collect(runtime, invalid_summary)
+        assert str(raised.value) == "engine-host v2 rejected query"
 
 
 async def _scenario_manifest_workspace(factory, seen_clients, seen_databases) -> None:
@@ -329,24 +447,75 @@ async def _scenario_manifest_workspace(factory, seen_clients, seen_databases) ->
     os.environ["ENGINE_HOST_TEST_SECRET"] = "conformance-sentinel"
     try:
         async with _isolated(
-            factory, "environment_guard", seen_clients, seen_databases
+            factory, "contract_inputs", seen_clients, seen_databases
         ) as runtime:
-            envelope = runtime.envelope()
-            tool = envelope.tool_manifest[0]
-            assert tool.tool_id == "tool-1"
-            assert tool.read_only is True
-            assert tool.idempotency == "idempotent"
-            assert envelope.workspace_grant.readable_paths == ("/workspace/read",)
-            assert envelope.workspace_grant.writable_paths == ()
-            assert envelope.workspace_grant.command_policy == "ask"
+            envelope = runtime.envelope(
+                overrides={
+                    "tool_manifest": (
+                        {
+                            "tool_id": "tool-1",
+                            "schema": {"type": "object"},
+                            "version": "1",
+                            "read_only": True,
+                            "timeout_ms": 10,
+                            "idempotency": "idempotent",
+                        },
+                        {
+                            "tool_id": "tool-2",
+                            "schema": {"type": "object"},
+                            "version": "1",
+                            "read_only": False,
+                            "timeout_ms": 20,
+                            "idempotency": "non_idempotent",
+                        },
+                    ),
+                    "tool_manifest_digest": "7" * 64,
+                    "workspace_grant": {
+                        "grant_id": "workspace-2",
+                        "workspace_snapshot_ref": "workspace-ref-2",
+                        "readable_paths": ("/workspace/read", "/workspace/write"),
+                        "writable_paths": ("/workspace/write",),
+                        "command_policy": "supervisor_approval",
+                        "network_policy": "deny",
+                        "expires_at_ms": 2,
+                    },
+                }
+            )
+            assert len(envelope.tool_manifest) == 2
+            assert envelope.workspace_grant.command_policy == "supervisor_approval"
             assert envelope.workspace_grant.network_policy == "deny"
             serialized = json.dumps(envelope.model_dump(mode="json"), sort_keys=True)
             assert "conformance-sentinel" not in serialized
             assert "api_key" not in serialized
             assert "access_token" not in serialized
             events = await _collect(runtime, envelope)
-            assert events[-1].cursor == 4
+            assert [event.cursor for event in events] == [1, 2, 3, 4, 5]
             assert events[-1].payload == {"status": "completed"}
+            manifest_proof = map_runtime_event(events[2])[0]
+            workspace_proof = map_runtime_event(events[3])[0]
+            manifest_shape_digest = _safe_digest(
+                [item.model_dump(mode="json") for item in envelope.tool_manifest]
+            )
+            workspace_digest = _safe_digest(
+                envelope.workspace_grant.model_dump(mode="json")
+            )
+            assert manifest_proof.payload["summary"] == (
+                f"manifest pin {'7' * 64} shape {manifest_shape_digest} tools 2 "
+                "read 1 write 1"
+            )
+            assert workspace_proof.payload["summary"] == (
+                f"workspace {workspace_digest} readable 2 writable 1 command "
+                "supervisor_approval network deny"
+            )
+            public_values = [
+                map_domain_event(manifest_proof)[0]["value"],
+                map_domain_event(workspace_proof)[0]["value"],
+            ]
+            public_json = json.dumps(public_values, sort_keys=True)
+            assert "/workspace/read" not in public_json
+            assert "/workspace/write" not in public_json
+            assert "tool-1" not in public_json
+            assert "tool-2" not in public_json
     finally:
         if previous is None:
             os.environ.pop("ENGINE_HOST_TEST_SECRET", None)
@@ -363,6 +532,26 @@ async def _scenario_manifest_workspace(factory, seen_clients, seen_databases) ->
             RuntimeProtocolError, match="does not match durable tool manifest"
         ):
             await _collect(runtime)
+
+    async with _isolated(
+        factory, "contract_inputs", seen_clients, seen_databases
+    ) as runtime:
+        invalid_workspace = runtime.envelope(
+            overrides={
+                "workspace_grant": {
+                    "grant_id": "workspace-3",
+                    "workspace_snapshot_ref": "workspace-ref-3",
+                    "readable_paths": ("/workspace/read",),
+                    "writable_paths": ("/workspace/not-readable",),
+                    "command_policy": "ask",
+                    "network_policy": "deny",
+                    "expires_at_ms": 3,
+                }
+            }
+        )
+        with pytest.raises(RuntimeControlError) as raised:
+            await _collect(runtime, invalid_workspace)
+        assert str(raised.value) == "engine-host v2 rejected query"
 
 
 async def _consume_remaining(stream) -> list:
@@ -417,16 +606,84 @@ async def _scenario_intervention_cancel(factory, seen_clients, seen_databases) -
 
 
 async def _scenario_checkpoint_resume(factory, seen_clients, seen_databases) -> None:
+    source_runtime = None
+    async with _isolated(
+        factory, "checkpoint_source", seen_clients, seen_databases
+    ) as runtime:
+        source_runtime = runtime
+        source_envelope = runtime.envelope(command_id="checkpoint-command")
+        source_pin = runtime.repository.pin_command(source_envelope)
+        stream = runtime.client.run_query(source_envelope)
+        first = await asyncio.wait_for(anext(stream), timeout=1.0)
+        assert first.cursor == 1
+        assert first.payload == {"status": "running"}
+        checkpoint = await runtime.client.checkpoint("run-1")
+        assert checkpoint.checkpoint_ref.startswith("checkpoint-")
+        assert _DIGEST.fullmatch(checkpoint.checkpoint_digest)
+        assert checkpoint.cursor == 1
+        source_marker = runtime.process_marker
+        source_generation = runtime.host_generation
+        source_identity = (first.run_id, first.term_id, first.step_id)
+        await stream.aclose()
+    assert source_runtime is not None
+    assert source_runtime.client.returncode is not None
+    assert source_runtime.client.cleanup_confirmed is True
+    assert source_runtime.client.reader_tasks_done is True
+
     async with _isolated(
         factory, "checkpoint_resume", seen_clients, seen_databases
     ) as runtime:
-        envelope = runtime.envelope(overrides={"checkpoint_cursor": 7})
-        pin = runtime.repository.pin_command(envelope)
-        assert _DIGEST.fullmatch(pin.identity_digest)
-        events = await _collect(runtime, envelope)
-        assert [event.cursor for event in events] == [8, 9]
-        assert events[0].payload == {"status": "running"}
+        assert runtime.process_marker != source_marker
+        assert runtime.host_generation != source_generation
+        resume_envelope = runtime.envelope(
+            command_id="checkpoint-command",
+            overrides={
+                "checkpoint_cursor": checkpoint.cursor,
+                "extensions": {
+                    "checkpoint_ref": checkpoint.checkpoint_ref,
+                    "checkpoint_digest": checkpoint.checkpoint_digest,
+                },
+            },
+        )
+        resume_pin = runtime.repository.pin_command(resume_envelope)
+        assert _DIGEST.fullmatch(resume_pin.identity_digest)
+        assert resume_pin.identity_digest != source_pin.identity_digest
+        events = await _collect(runtime, resume_envelope)
+        assert [event.cursor for event in events] == [2, 3, 4]
+        assert [event.type for event in events] == [
+            "runtime.status",
+            "assistant.delta",
+            "runtime.status",
+        ]
+        assert all(
+            (event.run_id, event.term_id, event.step_id) == source_identity
+            for event in events
+        )
+        resumed = map_runtime_event(events[1])[0]
+        assert resumed.payload == {
+            "term_id": "term-1",
+            "cursor": 3,
+            "content": "resumed from checkpoint",
+        }
+        assert map_domain_event(resumed)[0]["delta"] == "resumed from checkpoint"
         assert events[-1].payload == {"status": "completed"}
+
+    async with _isolated(
+        factory, "checkpoint_resume", seen_clients, seen_databases
+    ) as runtime:
+        invalid_checkpoint = runtime.envelope(
+            command_id="checkpoint-command",
+            overrides={
+                "checkpoint_cursor": checkpoint.cursor,
+                "extensions": {
+                    "checkpoint_ref": checkpoint.checkpoint_ref,
+                    "checkpoint_digest": "0" * 64,
+                },
+            },
+        )
+        with pytest.raises(RuntimeControlError) as raised:
+            await _collect(runtime, invalid_checkpoint)
+        assert str(raised.value) == "engine-host v2 rejected query"
 
 
 async def _scenario_unknown_write(factory, seen_clients, seen_databases) -> None:

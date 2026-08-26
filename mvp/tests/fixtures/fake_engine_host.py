@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from queue import Empty, Queue
@@ -31,6 +32,7 @@ V2_STATE: dict[str, object] = {
     "pause_count": 0,
     "resume_count": 0,
     "grandchild": None,
+    "envelope": None,
 }
 
 
@@ -138,6 +140,137 @@ def write_v2_terminal(cursor: int, status: str = "completed", **extra: object) -
     write_v2(v2_event(cursor, "runtime.status", {"status": status, **extra}))
 
 
+def _safe_digest(value: object) -> str:
+    canonical = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _contract_input_proofs(envelope: dict[str, object]) -> tuple[str, str, str] | None:
+    """Validate applied contract inputs and return only non-reversible proof text."""
+    context = envelope.get("context_budget")
+    manifest = envelope.get("tool_manifest")
+    workspace = envelope.get("workspace_grant")
+    pinned_manifest_digest = envelope.get("tool_manifest_digest")
+    if (
+        not isinstance(context, dict)
+        or not isinstance(manifest, list)
+        or not isinstance(workspace, dict)
+        or not isinstance(pinned_manifest_digest, str)
+        or len(pinned_manifest_digest) != 64
+    ):
+        return None
+
+    max_input = context.get("max_input_tokens")
+    reserved_output = context.get("reserved_output_tokens")
+    protected_messages = context.get("protected_message_ids")
+    protected_sections = context.get("protected_prompt_section_ids")
+    policy = context.get("compaction_policy")
+    summary_ref = context.get("summary_ref")
+    if (
+        isinstance(max_input, bool)
+        or not isinstance(max_input, int)
+        or isinstance(reserved_output, bool)
+        or not isinstance(reserved_output, int)
+        or max_input <= 0
+        or reserved_output < 0
+        or reserved_output >= max_input
+        or not isinstance(protected_messages, list)
+        or not all(isinstance(item, str) and item for item in protected_messages)
+        or len(set(protected_messages)) != len(protected_messages)
+        or not isinstance(protected_sections, list)
+        or not all(isinstance(item, str) and item for item in protected_sections)
+        or len(set(protected_sections)) != len(protected_sections)
+        or policy not in {"none", "summarize"}
+        or (policy == "none" and summary_ref is not None)
+        or (summary_ref is not None and not isinstance(summary_ref, str))
+    ):
+        return None
+
+    read_only_count = 0
+    write_count = 0
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            return None
+        read_only = entry.get("read_only")
+        idempotency = entry.get("idempotency")
+        if not isinstance(read_only, bool) or idempotency not in {
+            "idempotent",
+            "non_idempotent",
+        }:
+            return None
+        if read_only:
+            read_only_count += 1
+        else:
+            write_count += 1
+
+    readable = workspace.get("readable_paths")
+    writable = workspace.get("writable_paths")
+    command_policy = workspace.get("command_policy")
+    network_policy = workspace.get("network_policy")
+    if (
+        not isinstance(readable, list)
+        or not all(isinstance(item, str) for item in readable)
+        or not isinstance(writable, list)
+        or not all(isinstance(item, str) for item in writable)
+        or not set(writable).issubset(readable)
+        or command_policy
+        not in {"allow", "deny", "ask", "supervisor_approval"}
+        or network_policy not in {"allow", "deny", "ask", "supervisor_approval"}
+    ):
+        return None
+
+    context_proof = (
+        f"context {_safe_digest(context)} input {max_input} output {reserved_output} "
+        f"messages {len(protected_messages)} sections {len(protected_sections)} "
+        f"policy {policy} summary {'present' if summary_ref is not None else 'absent'}"
+    )
+    manifest_proof = (
+        f"manifest pin {pinned_manifest_digest} shape {_safe_digest(manifest)} "
+        f"tools {len(manifest)} read {read_only_count} write {write_count}"
+    )
+    workspace_proof = (
+        f"workspace {_safe_digest(workspace)} readable {len(readable)} "
+        f"writable {len(writable)} command {command_policy} network {network_policy}"
+    )
+    return context_proof, manifest_proof, workspace_proof
+
+
+def _checkpoint_for(envelope: dict[str, object], cursor: int) -> dict[str, object] | None:
+    identity = {
+        "run_id": envelope.get("run_id"),
+        "term_id": envelope.get("term_id"),
+        "step_id": envelope.get("step_id"),
+        "cursor": cursor,
+    }
+    if not all(isinstance(identity[key], str) for key in ("run_id", "term_id", "step_id")):
+        return None
+    digest = _safe_digest(identity)
+    return {
+        "checkpoint_ref": f"checkpoint-{digest[:16]}",
+        "checkpoint_digest": digest,
+        "cursor": cursor,
+    }
+
+
+def _valid_checkpoint_resume(envelope: dict[str, object]) -> bool:
+    cursor = envelope.get("checkpoint_cursor")
+    extensions = envelope.get("extensions")
+    if (
+        isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or cursor <= 0
+        or not isinstance(extensions, dict)
+    ):
+        return False
+    expected = _checkpoint_for(envelope, cursor)
+    return expected is not None and extensions == {
+        "checkpoint_ref": expected["checkpoint_ref"],
+        "checkpoint_digest": expected["checkpoint_digest"],
+    }
+
+
 def respond_v2(command: dict[str, object], mode: str) -> bool:
     """Respond to one v2 command; return whether the fixture should exit."""
     command_type = command.get("type")
@@ -163,6 +296,15 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         envelope = payload["envelope"]
         if not isinstance(envelope, dict):
             return True
+        proofs = None
+        if mode == "contract_inputs":
+            proofs = _contract_input_proofs(envelope)
+            if proofs is None:
+                write_v2(v2_response(command, {"accepted": False}))
+                return False
+        if mode == "checkpoint_resume" and not _valid_checkpoint_resume(envelope):
+            write_v2(v2_response(command, {"accepted": False}))
+            return False
         checkpoint_cursor = envelope.get("checkpoint_cursor")
         first_cursor = (
             int(checkpoint_cursor) + 1
@@ -171,6 +313,7 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             else 1
         )
         V2_STATE["cursor"] = first_cursor
+        V2_STATE["envelope"] = envelope
         write_v2(v2_response(command, {"accepted": True}))
         running_payload: dict[str, object] = {"status": "running"}
         if mode in {"grandchild", "grandchild_ignore_term"}:
@@ -218,6 +361,7 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
 
         if mode in {
             "controls",
+            "checkpoint_source",
             "cancel",
             "cancel_crash",
             "cancel_timeout_delayed_unknown_write",
@@ -394,7 +538,38 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             write_v2_terminal(first_cursor + 1)
             return False
         if mode == "checkpoint_resume":
-            write_v2_terminal(first_cursor + 1)
+            write_v2(
+                v2_event(
+                    first_cursor + 1,
+                    "assistant.delta",
+                    {"text": "resumed from checkpoint"},
+                )
+            )
+            write_v2_terminal(first_cursor + 2)
+            return False
+        if mode == "contract_inputs":
+            assert proofs is not None
+            media_types = (
+                "application/x-host-v2-context-proof",
+                "application/x-host-v2-manifest-proof",
+                "application/x-host-v2-workspace-proof",
+            )
+            artifact_ids = ("context-proof", "proof-2", "proof-3")
+            for offset, (summary, media_type, artifact_id) in enumerate(
+                zip(proofs, media_types, artifact_ids, strict=True), start=1
+            ):
+                write_v2(
+                    v2_event(
+                        first_cursor + offset,
+                        "artifact.proposed",
+                        {
+                            "artifact_id": artifact_id,
+                            "summary": summary,
+                            "media_type": media_type,
+                        },
+                    )
+                )
+            write_v2_terminal(first_cursor + 4)
             return False
         if mode == "unknown_required_event":
             write_v2(
@@ -559,6 +734,17 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         )
         return False
     if command_type == "checkpoint.get":
+        if mode == "checkpoint_source":
+            envelope = V2_STATE.get("envelope")
+            checkpoint = (
+                _checkpoint_for(envelope, int(V2_STATE["cursor"]))
+                if isinstance(envelope, dict)
+                else None
+            )
+            if checkpoint is None:
+                return True
+            write_v2(v2_response(command, checkpoint))
+            return False
         write_v2(
             v2_response(
                 command,
@@ -640,7 +826,7 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
 
 
 def main_v2(mode: str) -> int:
-    if mode == "environment_guard" and (
+    if mode in {"environment_guard", "contract_inputs"} and (
         "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
     ):
         return 3

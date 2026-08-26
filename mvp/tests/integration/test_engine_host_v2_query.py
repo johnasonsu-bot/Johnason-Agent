@@ -121,13 +121,32 @@ async def test_duplicate_cursor_is_idempotent_only_for_same_event() -> None:
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_cursor_sets_the_first_expected_event() -> None:
-    events = await _collect_mode(
-        "checkpoint_resume",
-        run_envelope(overrides={"checkpoint_cursor": 7}),
-    )
+async def test_checkpoint_resume_uses_the_source_host_identity() -> None:
+    source = EngineHostV2Client(fake_v2_command("checkpoint_source"))
+    await source.start()
+    source_stream = source.run_query(run_envelope(command_id="checkpoint-command"))
+    try:
+        first = await asyncio.wait_for(anext(source_stream), timeout=1.0)
+        checkpoint = await source.checkpoint("run-1")
+        assert checkpoint.cursor == first.cursor == 1
+    finally:
+        await source_stream.aclose()
+        await source.aclose()
 
-    assert [event.cursor for event in events] == [8, 9]
+    resume_envelope = run_envelope(
+        command_id="checkpoint-command",
+        overrides={
+            "checkpoint_cursor": checkpoint.cursor,
+            "extensions": {
+                "checkpoint_ref": checkpoint.checkpoint_ref,
+                "checkpoint_digest": checkpoint.checkpoint_digest,
+            },
+        },
+    )
+    events = await _collect_mode("checkpoint_resume", resume_envelope)
+
+    assert [event.cursor for event in events] == [2, 3, 4]
+    assert events[1].payload == {"text": "resumed from checkpoint"}
 
 
 @pytest.mark.asyncio

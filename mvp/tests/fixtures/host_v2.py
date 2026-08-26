@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -174,6 +173,10 @@ class FakeHostV2Runtime:
     implementation: str
     runtime_id: str
     revision: str
+    host_generation: str
+    instance_nonce: str
+    process_marker: str
+    instance_root: Path
     database: Path
     client: EngineHostV2Client
     repository: RuntimeV2Repository
@@ -184,13 +187,13 @@ class FakeHostV2Runtime:
         *,
         command_id: str = "command-1",
         attempt: int = 0,
-        host_generation: str = "host-a",
+        host_generation: str | None = None,
         overrides: Mapping[str, JsonValue] | None = None,
     ) -> RunEnvelopeV2:
         return run_envelope(
             command_id=command_id,
             attempt=attempt,
-            host_generation=host_generation,
+            host_generation=host_generation or self.host_generation,
             overrides=overrides,
         )
 
@@ -198,11 +201,12 @@ class FakeHostV2Runtime:
 class FakeHostV2Factory:
     implementation = "contract_fake"
     runtime_id = "fake-v2"
-    revision = "fake-host-v2/r1"
+    revision = "fake-host-v2/r2"
     supported_modes = frozenset(
         {
             "cancel",
             "controls",
+            "contract_inputs",
             "cursor_gap",
             "cursor_regression",
             "duplicate_changed",
@@ -217,37 +221,58 @@ class FakeHostV2Factory:
             "unknown_required_event",
             "unknown_write_effect",
             "checkpoint_resume",
+            "checkpoint_source",
         }
     )
 
     def __init__(self) -> None:
-        self.root = Path(tempfile.mkdtemp(prefix="host-v2-conformance-"))
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="host-v2-conformance-"
+        )
+        self.temporary_root = Path(self._temporary_directory.name)
+
+    def cleanup(self) -> None:
+        self._temporary_directory.cleanup()
 
     @asynccontextmanager
     async def create(self, mode: str) -> AsyncIterator[FakeHostV2Runtime]:
         if mode not in self.supported_modes:
             raise ValueError(f"unsupported fake Host v2 mode: {mode}")
-        instance_root = self.root / f"{mode}-{uuid4().hex}"
-        instance_root.mkdir(parents=True)
+        instance_directory = tempfile.TemporaryDirectory(
+            prefix=f"{mode}-", dir=self.temporary_root
+        )
+        instance_root = Path(instance_directory.name)
         database = instance_root / "workbench.sqlite"
+        host_generation = f"host-{uuid4().hex}"
+        instance_nonce = f"instance-{uuid4().hex}"
         client = EngineHostV2Client(
             fake_v2_command(mode), request_timeout=0.25, shutdown_timeout=0.1
         )
-        repository = RuntimeV2Repository(database)
-        runtime = FakeHostV2Runtime(
-            implementation=self.implementation,
-            runtime_id=self.runtime_id,
-            revision=self.revision,
-            database=database,
-            client=client,
-            repository=repository,
-            registry=RuntimeRegistryV2(repository),
-        )
-        await asyncio.wait_for(client.start(), timeout=1.0)
         try:
+            repository = RuntimeV2Repository(database)
+            await asyncio.wait_for(client.start(), timeout=1.0)
+            process = client._process
+            if process is None or process.pid <= 0:
+                raise RuntimeError("fake Host v2 process marker is unavailable")
+            runtime = FakeHostV2Runtime(
+                implementation=self.implementation,
+                runtime_id=self.runtime_id,
+                revision=self.revision,
+                host_generation=host_generation,
+                instance_nonce=instance_nonce,
+                process_marker=f"process-{process.pid}",
+                instance_root=instance_root,
+                database=database,
+                client=client,
+                repository=repository,
+                registry=RuntimeRegistryV2(repository),
+            )
             yield runtime
         finally:
-            await asyncio.wait_for(client.aclose(), timeout=1.0)
+            try:
+                await asyncio.wait_for(client.aclose(), timeout=1.0)
+            finally:
+                instance_directory.cleanup()
 
 
 def fake_host_v2_factory() -> FakeHostV2Factory:
