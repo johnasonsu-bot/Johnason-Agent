@@ -181,10 +181,10 @@ def test_local_reject_context_allows_a_single_test_fixture_shape() -> None:
         path = "mvp/tests/test_safe_fixture.py"
         target = repo / path
         target.parent.mkdir(parents=True)
-        target.write_text(
-            "# credential-fixture: reject unsafe\n"
-            f"fixture = {token!r}\n",
-            encoding="utf-8",
+        target.write_bytes(
+            b"# credential-fixture: reject unsafe "
+            + token.encode("ascii")
+            + b"\n"
         )
         head = _commit(repo, "add safe fixture")
         result = _scan(repo, base, head)
@@ -192,6 +192,31 @@ def test_local_reject_context_allows_a_single_test_fixture_shape() -> None:
         assert result.returncode == 0
         assert result.stdout == "scanned_blobs=1 fixture_allowances=1 findings=0\n"
         assert result.stderr == ""
+    finally:
+        directory.cleanup()
+
+
+def test_remote_rejection_term_cannot_authorize_a_local_fixture_marker() -> None:
+    directory, repo, base = _repository_with_base()
+    try:
+        token = _synthetic_token()
+        path = "mvp/tests/test_remote_rejection.py"
+        target = repo / path
+        target.parent.mkdir(parents=True)
+        target.write_bytes(
+            b"unsafe"
+            + (b"x" * 300_000)
+            + b" credential-fixture: "
+            + token.encode("ascii")
+            + b"\n"
+        )
+        head = _commit(repo, "add remote rejection candidate")
+        result = _scan(repo, base, head)
+
+        assert result.returncode == 1
+        assert result.stdout == "scanned_blobs=1 fixture_allowances=0 findings=1\n"
+        assert result.stderr == ""
+        _assert_private_output(result, path=path, token=token)
     finally:
         directory.cleanup()
 

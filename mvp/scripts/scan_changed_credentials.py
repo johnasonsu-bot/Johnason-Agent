@@ -33,7 +33,7 @@ PRIVATE_KEY_HEADERS = tuple(
     PRIVATE_KEY_HEADER_PREFIX + kind + PRIVATE_KEY_HEADER_SUFFIX
     for kind in (b"", b"rsa ", b"ec ", b"openssh ")
 )
-REJECTION_TERMS = (b"reject", b"unsafe", b"sensitive")
+REJECTION_TERM = re.compile(rb"reject|unsafe|sensitive")
 FIXTURE_MARKER = re.compile(
     rb"(?i)(?<![a-z0-9_-])credential-fixture:(?=[ \t])"
 )
@@ -289,14 +289,47 @@ def index_fixture_lines(
                 tuple(spans[index][0] for index in overlapping_indices),
             )
         )
-        if any(term in lowered for term in REJECTION_TERMS):
-            for marker_index, marker in enumerate(FIXTURE_MARKER.finditer(lowered)):
-                if marker_index % 1024 == 0:
+        rejection_spans: list[tuple[int, int]] = []
+        for rejection_index, rejection in enumerate(REJECTION_TERM.finditer(lowered)):
+            if rejection_index % 1024 == 0:
+                check_deadline(deadline)
+            rejection_spans.append(
+                (
+                    line_start + rejection.start(),
+                    line_start + rejection.end(),
+                )
+            )
+        marker_spans: list[tuple[int, int]] = []
+        for marker_index, marker in enumerate(FIXTURE_MARKER.finditer(lowered)):
+            if marker_index % 1024 == 0:
+                check_deadline(deadline)
+            marker_spans.append(
+                (
+                    line_start + marker.start(),
+                    line_start + marker.end(),
+                )
+            )
+        rejection_position = 0
+        for marker_index, (marker_start, marker_end) in enumerate(marker_spans):
+            if marker_index % 1024 == 0:
+                check_deadline(deadline)
+            window_start = marker_start - MAX_FIXTURE_MARKER_DISTANCE_BYTES
+            window_end = marker_end + MAX_FIXTURE_MARKER_DISTANCE_BYTES
+            while (
+                rejection_position < len(rejection_spans)
+                and rejection_spans[rejection_position][1] < window_start
+            ):
+                rejection_position += 1
+                if rejection_position % 1024 == 0:
                     check_deadline(deadline)
+            if (
+                rejection_position < len(rejection_spans)
+                and rejection_spans[rejection_position][0] <= window_end
+            ):
                 markers.append(
                     (
-                        line_start + marker.start(),
-                        line_start + marker.end(),
+                        marker_start,
+                        marker_end,
                         line_index,
                     )
                 )
