@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
+from workbench.runtime.python_term import repository as repository_module
+from workbench.runtime.python_term import tool_router as tool_router_module
 from workbench.runtime.python_term.contracts import (
     PublicToolResult,
     ToolEffectRecord,
@@ -14,7 +19,6 @@ from workbench.runtime.python_term.contracts import (
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.runtime.python_term.tool_router import (
-    ExecutorBroker,
     HmacRequestDigestService,
     ToolRouteError,
     ToolRouter,
@@ -66,15 +70,19 @@ def _durable_router(
         context.to_term_record(envelope),
         (context.to_step_record(),),
     )
-    controlled_broker = ExecutorBroker(executor.execute)
-    registration = controlled_broker.register(
-        manifest,
-        executor_handle="executor-1",
-        access=access or _registration(manifest).access,
+    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+        executor.execute,
+        (
+            (
+                manifest,
+                "executor-1",
+                access or _registration(manifest).access,
+            ),
+        ),
     )
     router = ToolRouter(
         repository,
-        {manifest.tool_id: registration},
+        registrations,
         executor_broker=controlled_broker,
         request_digests=request_digests or HmacRequestDigestService(os.urandom(32)),
         clock_ms=clock_ms,
@@ -95,15 +103,19 @@ def _restart_router(
     clock_ms=lambda: 1_000,
 ):
     repository = PythonTermRepository(database)
-    controlled_broker = ExecutorBroker(executor.execute)
-    registration = controlled_broker.register(
-        manifest,
-        executor_handle="executor-1",
-        access=access or _registration(manifest).access,
+    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+        executor.execute,
+        (
+            (
+                manifest,
+                "executor-1",
+                access or _registration(manifest).access,
+            ),
+        ),
     )
     router = ToolRouter(
         repository,
-        {manifest.tool_id: registration},
+        registrations,
         executor_broker=controlled_broker,
         request_digests=request_digests,
         clock_ms=clock_ms,
@@ -937,3 +949,250 @@ def test_legacy_effect_rows_are_retired_without_corruption_or_replay(
     assert tuple(
         reopened.get_tool_effect(row["effect_id"]) for row in legacy_rows
     ) == migrated
+
+
+def test_legacy_migration_serializes_with_concurrent_legacy_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest = _tool("write-file", read_only=False)
+    executor = RecordingBroker(PublicToolResult(status="completed", summary="unused"))
+    context, _, database = _durable_router(
+        tmp_path, manifest=manifest, executor=executor
+    )
+    legacy = {
+        "effect_id": "effect-legacy-race",
+        "term_id": context.term_id,
+        "step_id": context.step_id,
+        "tool_call_id": "call-legacy-race",
+        "request_digest": canonical_digest({"legacy": "race"}),
+        "status": "reserved",
+        "result_digest": None,
+        "public_result": None,
+    }
+    with PythonTermRepository(database).connect() as connection:
+        connection.execute(
+            """INSERT INTO python_tool_effects(
+            effect_id, term_id, step_id, tool_call_id, request_digest,
+            status, result_digest, effect_json, public_result_json,
+            created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 1, 1)""",
+            (
+                legacy["effect_id"],
+                legacy["term_id"],
+                legacy["step_id"],
+                legacy["tool_call_id"],
+                legacy["request_digest"],
+                legacy["status"],
+                canonical_json(legacy),
+            ),
+        )
+
+    transforming = threading.Event()
+    release_migration = threading.Event()
+    writer_finished = threading.Event()
+    writer_committed = threading.Event()
+    writer_rejected_stale_decoder = threading.Event()
+    migration_errors: list[BaseException] = []
+    original_digest = repository_module.canonical_digest
+
+    def blocking_digest(value: object) -> str:
+        if isinstance(value, dict) and value.get("code") == "legacy_effect_retired":
+            transforming.set()
+            if not release_migration.wait(timeout=2):
+                raise AssertionError("migration test release timed out")
+        return original_digest(value)
+
+    monkeypatch.setattr(repository_module, "canonical_digest", blocking_digest)
+
+    def migrate() -> None:
+        try:
+            PythonTermRepository(database)
+        except BaseException as error:
+            migration_errors.append(error)
+
+    def legacy_writer() -> None:
+        connection = sqlite3.connect(database, timeout=2, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT effect_json FROM python_tool_effects WHERE effect_id = ?",
+                (legacy["effect_id"],),
+            ).fetchone()
+            raw = json.loads(row["effect_json"])
+            if "record_version" in raw:
+                connection.rollback()
+                writer_rejected_stale_decoder.set()
+                return
+            result = PublicToolResult(status="completed", summary="legacy winner")
+            raw.update(
+                status="committed",
+                result_digest=canonical_digest(result),
+                public_result=result.model_dump(mode="json"),
+            )
+            connection.execute(
+                """UPDATE python_tool_effects
+                SET status = ?, result_digest = ?, effect_json = ?,
+                public_result_json = ? WHERE effect_id = ?""",
+                (
+                    "committed",
+                    raw["result_digest"],
+                    canonical_json(raw),
+                    canonical_json(raw["public_result"]),
+                    legacy["effect_id"],
+                ),
+            )
+            connection.commit()
+            writer_committed.set()
+        finally:
+            connection.close()
+            writer_finished.set()
+
+    migration_thread = threading.Thread(target=migrate)
+    migration_thread.start()
+    assert transforming.wait(timeout=2)
+    writer_thread = threading.Thread(target=legacy_writer)
+    writer_thread.start()
+    writer_was_serialized = not writer_finished.wait(timeout=0.1)
+    release_migration.set()
+    migration_thread.join(timeout=2)
+    writer_thread.join(timeout=2)
+
+    assert writer_was_serialized
+    assert not migration_errors
+    assert writer_rejected_stale_decoder.is_set()
+    assert not writer_committed.is_set()
+    migrated = PythonTermRepository(database).get_tool_effect(legacy["effect_id"])
+    assert migrated is not None
+    assert migrated.record_version == 2
+    assert migrated.status == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["timeout", "cancel"])
+async def test_suppressed_cancellation_stays_supervised_until_quiescent(
+    tmp_path: Path, exit_mode: str
+) -> None:
+    manifest = _tool(
+        "write-file",
+        read_only=False,
+        timeout_ms=10 if exit_mode == "timeout" else 5_000,
+    )
+
+    class SuppressedExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.cancel_seen = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def execute(self, executor_handle, context, arguments):
+            self.calls += 1
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                await self.release.wait()
+                return PublicToolResult(status="completed", summary="late")
+
+    executor = SuppressedExecutor()
+    context, router, database = _durable_router(
+        tmp_path, manifest=manifest, executor=executor
+    )
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id=f"call-supervised-{exit_mode}",
+        )
+    )
+    await executor.started.wait()
+    if exit_mode == "cancel":
+        invocation.cancel()
+    if exit_mode == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await invocation
+    else:
+        with pytest.raises(ToolRouteError) as raised:
+            await invocation
+        assert raised.value.code == "reconciliation_required"
+    await executor.cancel_seen.wait()
+
+    broker = router.executor_broker
+    assert callable(getattr(broker, "supervised_executions", None))
+    active = broker.supervised_executions()
+    assert len(active) == 1
+    assert active[0].state == "cancelling"
+    assert len(active) <= broker.supervisor_capacity <= 64
+    before = PythonTermRepository(database).get_tool_effect(active[0].effect_id)
+    with PythonTermRepository(database).connect() as connection:
+        rows_before = connection.execute(
+            "SELECT COUNT(*) FROM python_tool_effects"
+        ).fetchone()[0]
+
+    executor.release.set()
+    assert await broker.wait_for_quiescence(timeout_ms=1_000)
+    assert broker.supervised_executions() == ()
+    with PythonTermRepository(database).connect() as connection:
+        rows_after = connection.execute(
+            "SELECT COUNT(*) FROM python_tool_effects"
+        ).fetchone()[0]
+    after = PythonTermRepository(database).get_tool_effect(before.effect_id)
+
+    assert before.status == "reconciliation_required"
+    assert after == before
+    assert rows_after == rows_before == 1
+    assert executor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_capacity_rejects_dispatch_before_start(
+    tmp_path: Path,
+) -> None:
+    manifest = _tool("write-file", read_only=False, timeout_ms=10)
+    context, _ = _runtime_context(tmp_path, tools=(manifest,))
+
+    class CapacityExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.release = asyncio.Event()
+
+        async def execute(self, executor_handle, step_context, arguments):
+            self.calls += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+                return PublicToolResult(status="completed", summary="late")
+
+    executor = CapacityExecutor()
+    broker, registrations = tool_router_module._trusted_executor_registry(
+        executor.execute,
+        ((manifest, "executor-1", _registration(manifest).access),),
+        supervisor_capacity=1,
+    )
+    registration = registrations[manifest.tool_id]
+
+    first, _ = await broker.execute_bounded(
+        registration,
+        context,
+        {},
+        effect_id="effect-capacity-first",
+        timeout_ms=10,
+    )
+    second, _ = await broker.execute_bounded(
+        registration,
+        context,
+        {},
+        effect_id="effect-capacity-second",
+        timeout_ms=10,
+    )
+
+    assert first == "timeout"
+    assert second == "execution_unavailable"
+    assert executor.calls == 1
+    assert len(broker.supervised_executions()) == broker.supervisor_capacity == 1
+    executor.release.set()
+    assert await broker.wait_for_quiescence(timeout_ms=1_000)

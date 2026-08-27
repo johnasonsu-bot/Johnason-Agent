@@ -74,59 +74,57 @@ class PythonTermRepository:
         return value
 
     def _migrate_legacy_tool_effects(self, connection: sqlite3.Connection) -> None:
-        rows = connection.execute("SELECT * FROM python_tool_effects").fetchall()
-        migrations: list[ToolEffectRecord] = []
-        for row in rows:
-            try:
-                raw = json.loads(row["effect_json"])
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(raw, dict) or "record_version" in raw:
-                continue
-            identity_matches = (
-                raw.get("effect_id") == row["effect_id"]
-                and raw.get("term_id") == row["term_id"]
-                and raw.get("step_id") == row["step_id"]
-                and raw.get("tool_call_id") == row["tool_call_id"]
-                and raw.get("request_digest") == row["request_digest"]
-                and raw.get("status") == row["status"]
-                and raw.get("result_digest") == row["result_digest"]
-                and row["public_result_json"]
-                == (
-                    None
-                    if raw.get("public_result") is None
-                    else canonical_json(raw.get("public_result"))
-                )
-            )
-            if not identity_matches:
-                continue
-            result = PublicToolResult(
-                status="failed",
-                summary="Legacy Tool Effect requires reconciliation",
-            )
-            migrated = ToolEffectRecord(
-                record_version=2,
-                effect_id=row["effect_id"],
-                effect_identity_version="legacy-unkeyed-sha256-v0",
-                term_id=row["term_id"],
-                step_id=row["step_id"],
-                tool_call_id=row["tool_call_id"],
-                request_digest=row["request_digest"],
-                request_digest_version="legacy-unkeyed-sha256-v0",
-                write_effect=True,
-                status="reconciliation_required",
-                result_digest=canonical_digest(
-                    {"code": "legacy_effect_retired", "result": result}
-                ),
-                public_result=result,
-            )
-            migrations.append(migrated)
-        if not migrations:
-            return
         connection.execute("BEGIN IMMEDIATE")
         try:
+            rows = connection.execute("SELECT * FROM python_tool_effects").fetchall()
+            migrations: list[ToolEffectRecord] = []
+            for row in rows:
+                try:
+                    raw = json.loads(row["effect_json"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(raw, dict) or "record_version" in raw:
+                    continue
+                identity_matches = (
+                    raw.get("effect_id") == row["effect_id"]
+                    and raw.get("term_id") == row["term_id"]
+                    and raw.get("step_id") == row["step_id"]
+                    and raw.get("tool_call_id") == row["tool_call_id"]
+                    and raw.get("request_digest") == row["request_digest"]
+                    and raw.get("status") == row["status"]
+                    and raw.get("result_digest") == row["result_digest"]
+                    and row["public_result_json"]
+                    == (
+                        None
+                        if raw.get("public_result") is None
+                        else canonical_json(raw.get("public_result"))
+                    )
+                )
+                if not identity_matches:
+                    continue
+                result = PublicToolResult(
+                    status="failed",
+                    summary="Legacy Tool Effect requires reconciliation",
+                )
+                migrated = ToolEffectRecord(
+                    record_version=2,
+                    effect_id=row["effect_id"],
+                    effect_identity_version="legacy-unkeyed-sha256-v0",
+                    term_id=row["term_id"],
+                    step_id=row["step_id"],
+                    tool_call_id=row["tool_call_id"],
+                    request_digest=row["request_digest"],
+                    request_digest_version="legacy-unkeyed-sha256-v0",
+                    write_effect=True,
+                    status="reconciliation_required",
+                    result_digest=canonical_digest(
+                        {"code": "legacy_effect_retired", "result": result}
+                    ),
+                    public_result=result,
+                )
+                migrations.append(migrated)
             for migrated in migrations:
-                connection.execute(
+                cursor = connection.execute(
                     """UPDATE python_tool_effects
                     SET status = ?, result_digest = ?, effect_json = ?,
                     public_result_json = ?, updated_at = unixepoch('subsec')
@@ -139,6 +137,10 @@ class PythonTermRepository:
                         migrated.effect_id,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise RepositoryConflict(
+                        "legacy Tool Effect migration lost its row fence"
+                    )
             connection.commit()
         except Exception:
             connection.rollback()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import inspect
@@ -11,7 +12,7 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast
@@ -104,64 +105,112 @@ class HmacRequestDigestService:
         return "HmacRequestDigestService(<opaque>)"
 
 
-@dataclass(frozen=True, slots=True)
 class ExecutorRegistration:
-    tool_id: str
-    version: str
-    schema_digest: str
-    capability_digest: str
-    sealed_token: str = field(repr=False)
+    """Opaque, immutable handle issued only by the trusted host factory."""
+
+    __slots__ = (
+        "__tool_id",
+        "__version",
+        "__schema_digest",
+        "__capability_digest",
+        "__access",
+    )
+
+    def __init__(
+        self,
+        *_: object,
+        _factory_authority: object | None = None,
+        tool_id: str = "",
+        version: str = "",
+        schema_digest: str = "",
+        capability_digest: str = "",
+        access: ToolAccess = ToolAccess(),
+        **__: object,
+    ) -> None:
+        if _factory_authority is not _EXECUTOR_FACTORY_AUTHORITY:
+            raise ToolRouteError(
+                "registration_rejected",
+                "Executor registration requires the trusted factory",
+            ) from None
+        self.__tool_id = tool_id
+        self.__version = version
+        self.__schema_digest = schema_digest
+        self.__capability_digest = capability_digest
+        self.__access = access
+
+    @property
+    def tool_id(self) -> str:
+        return self.__tool_id
+
+    @property
+    def version(self) -> str:
+        return self.__version
+
+    @property
+    def schema_digest(self) -> str:
+        return self.__schema_digest
+
+    @property
+    def capability_digest(self) -> str:
+        return self.__capability_digest
+
+    @property
+    def access(self) -> ToolAccess:
+        return self.__access
+
+    def __repr__(self) -> str:
+        return "ExecutorRegistration(<opaque>)"
+
+
+_EXECUTOR_FACTORY_AUTHORITY = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _ExecutorBinding:
+    manifest: ToolManifestEntryV2
     executor_handle: str
     access: ToolAccess
-
-    def __post_init__(self) -> None:
-        identifier = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$")
-        values = (self.tool_id, self.version, self.executor_handle)
-        if any(
-            not isinstance(value, str) or not identifier.fullmatch(value)
-            for value in values
-        ):
-            raise ValueError("executor registration identifiers must be opaque")
-        if type(self.access) is not ToolAccess:
-            raise TypeError("executor registration access must be ToolAccess")
-        if any(type(item) is not FileAccess for item in self.access.files):
-            raise TypeError("executor registration file access must be FileAccess")
-        if len(self.access.files) != len(
-            {(item.argument, item.mode) for item in self.access.files}
-        ):
-            raise ValueError("executor registration access contains duplicates")
-        if any(not identifier.fullmatch(item.argument) for item in self.access.files):
-            raise ValueError("executor file access argument must be opaque")
-        if not re.fullmatch(r"[0-9a-f]{64}", self.schema_digest):
-            raise ValueError("executor schema digest is invalid")
-        if not re.fullmatch(r"[0-9a-f]{64}", self.capability_digest):
-            raise ValueError("executor capability digest is invalid")
-        if not re.fullmatch(r"[0-9a-f]{64}", self.sealed_token):
-            raise ValueError("executor sealed token is invalid")
-
-    def capability_payload(self) -> Mapping[str, object]:
-        return {
-            "tool_id": self.tool_id,
-            "version": self.version,
-            "schema_digest": self.schema_digest,
-            "executor_handle": self.executor_handle,
-            "access": {
-                "files": tuple(
-                    {"argument": item.argument, "mode": item.mode}
-                    for item in self.access.files
-                ),
-                "network": self.access.network,
-                "command": self.access.command,
-            },
-        }
+    capability_digest: str
 
 
-def _unsigned_registration(
+@dataclass(frozen=True, slots=True)
+class SupervisedExecutionSnapshot:
+    execution_id: str
+    effect_id: str
+    state: Literal["running", "cancelling"]
+
+
+@dataclass(slots=True)
+class _ActiveExecution:
+    execution_id: str
+    effect_id: str
+    task: asyncio.Future[object]
+    state: Literal["running", "cancelling"] = "running"
+
+
+def _registration_metadata(
     manifest: ToolManifestEntryV2,
     *,
     executor_handle: str,
     access: ToolAccess,
-) -> ExecutorRegistration:
+) -> tuple[str, str]:
+    identifier = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$")
+    if not isinstance(executor_handle, str) or not identifier.fullmatch(
+        executor_handle
+    ):
+        raise ToolRouteError(
+            "registration_rejected", "Executor handle must be opaque"
+        ) from None
+    if type(access) is not ToolAccess:
+        raise ToolRouteError(
+            "registration_rejected", "Executor access declaration was rejected"
+        ) from None
+    if len(access.files) != len(
+        {(item.argument, item.mode) for item in access.files}
+    ):
+        raise ToolRouteError(
+            "registration_rejected", "Executor access contains duplicates"
+        ) from None
     schema_digest = canonical_digest(manifest.schema)
     payload = {
         "tool_id": manifest.tool_id,
@@ -177,15 +226,7 @@ def _unsigned_registration(
             "command": access.command,
         },
     }
-    return ExecutorRegistration(
-        tool_id=manifest.tool_id,
-        version=manifest.version,
-        schema_digest=schema_digest,
-        capability_digest=canonical_digest(payload),
-        sealed_token="0" * 64,
-        executor_handle=executor_handle,
-        access=access,
-    )
+    return schema_digest, canonical_digest(payload)
 
 
 def _contains_forbidden_executor_authority(
@@ -193,14 +234,27 @@ def _contains_forbidden_executor_authority(
 ) -> bool:
     if seen is None:
         seen = set()
-    if id(value) in seen or depth > 5:
+    if id(value) in seen:
         return False
+    if depth > 8:
+        return True
     seen.add(id(value))
     authority_name = type(value).__name__.casefold()
     if isinstance(value, (PythonTermRepository, Path)) or any(
         marker in authority_name for marker in ("repository", "vault", "workspace")
     ):
         return True
+    if isinstance(value, functools.partial):
+        return any(
+            _contains_forbidden_executor_authority(
+                item, seen=seen, depth=depth + 1
+            )
+            for item in (
+                value.func,
+                *value.args,
+                *(value.keywords or {}).values(),
+            )
+        )
     if inspect.ismethod(value):
         return _contains_forbidden_executor_authority(
             value.__self__, seen=seen, depth=depth + 1
@@ -209,11 +263,16 @@ def _contains_forbidden_executor_authority(
         )
     if inspect.isfunction(value):
         closure = value.__closure__ or ()
+        captured: list[object] = [*(value.__defaults__ or ())]
+        captured.extend((value.__kwdefaults__ or {}).values())
+        for cell in closure:
+            try:
+                captured.append(cell.cell_contents)
+            except ValueError:
+                return True
         if any(
-            _contains_forbidden_executor_authority(
-                cell.cell_contents, seen=seen, depth=depth + 1
-            )
-            for cell in closure
+            _contains_forbidden_executor_authority(item, seen=seen, depth=depth + 1)
+            for item in captured
         ):
             return True
         return any(
@@ -223,12 +282,15 @@ def _contains_forbidden_executor_authority(
             )
             for name in value.__code__.co_names
         )
+    if inspect.ismodule(value) or inspect.isclass(value):
+        return False
     if isinstance(value, Mapping):
         return any(
             _contains_forbidden_executor_authority(
                 item, seen=seen, depth=depth + 1
             )
-            for item in value.values()
+            for pair in value.items()
+            for item in pair
         )
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(
@@ -237,63 +299,67 @@ def _contains_forbidden_executor_authority(
             )
             for item in value
         )
+    captured_attributes: list[object] = []
     attributes = getattr(value, "__dict__", None)
-    return isinstance(attributes, dict) and any(
-        _contains_forbidden_executor_authority(
-            item, seen=seen, depth=depth + 1
-        )
-        for item in attributes.values()
+    if isinstance(attributes, dict):
+        captured_attributes.extend(attributes.values())
+    for value_type in type(value).__mro__:
+        slots = value_type.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot in {"__dict__", "__weakref__"}:
+                continue
+            try:
+                captured_attributes.append(getattr(value, slot))
+            except (AttributeError, TypeError):
+                continue
+    if any(
+        _contains_forbidden_executor_authority(item, seen=seen, depth=depth + 1)
+        for item in captured_attributes
+    ):
+        return True
+    call = getattr(type(value), "__call__", None)
+    return call is not None and inspect.isfunction(call) and (
+        _contains_forbidden_executor_authority(call, seen=seen, depth=depth + 1)
     )
 
 
 class ExecutorBroker:
-    __slots__ = ("__dispatcher", "__key", "__registrations")
+    __slots__ = (
+        "__dispatcher",
+        "__registrations",
+        "__active_executions",
+        "__supervisor_capacity",
+    )
 
-    def __init__(self, dispatcher: object) -> None:
-        rejected = not callable(dispatcher) or _contains_forbidden_executor_authority(
-            dispatcher
-        )
-        if rejected:
+    def __init__(
+        self,
+        *_: object,
+        _factory_authority: object | None = None,
+        dispatcher: object | None = None,
+        registrations: Mapping[ExecutorRegistration, _ExecutorBinding] | None = None,
+        supervisor_capacity: int = 64,
+        **__: object,
+    ) -> None:
+        if _factory_authority is not _EXECUTOR_FACTORY_AUTHORITY:
             raise ToolRouteError(
-                "registration_rejected", "Executor dispatcher authority was rejected"
+                "registration_rejected",
+                "Executor registry requires the trusted factory",
+            ) from None
+        if (
+            not callable(dispatcher)
+            or registrations is None
+            or type(supervisor_capacity) is not int
+            or not 1 <= supervisor_capacity <= 64
+        ):
+            raise ToolRouteError(
+                "registration_rejected", "Trusted Executor registry is invalid"
             ) from None
         self.__dispatcher = dispatcher
-        self.__key = secrets.token_bytes(32)
-        self.__registrations: dict[str, ExecutorRegistration] = {}
-
-    def register(
-        self,
-        manifest: ToolManifestEntryV2,
-        *,
-        executor_handle: str,
-        access: ToolAccess,
-    ) -> ExecutorRegistration:
-        unsealed = _unsigned_registration(
-            manifest,
-            executor_handle=executor_handle,
-            access=access,
-        )
-        token = hmac.new(
-            self.__key,
-            unsealed.capability_digest.encode("ascii"),
-            hashlib.sha256,
-        ).hexdigest()
-        registration = unsealed.__class__(
-            tool_id=unsealed.tool_id,
-            version=unsealed.version,
-            schema_digest=unsealed.schema_digest,
-            capability_digest=unsealed.capability_digest,
-            sealed_token=token,
-            executor_handle=unsealed.executor_handle,
-            access=unsealed.access,
-        )
-        existing = self.__registrations.get(executor_handle)
-        if existing is not None and existing != registration:
-            raise ToolRouteError(
-                "registration_rejected", "Executor handle binding changed"
-            )
-        self.__registrations[executor_handle] = registration
-        return registration
+        self.__registrations = MappingProxyType(dict(registrations))
+        self.__active_executions: dict[str, _ActiveExecution] = {}
+        self.__supervisor_capacity = supervisor_capacity
 
     def verifies(
         self,
@@ -302,29 +368,33 @@ class ExecutorBroker:
     ) -> bool:
         if type(registration) is not ExecutorRegistration:
             return False
-        expected = self.__registrations.get(registration.executor_handle)
-        if expected != registration:
+        binding = self.__registrations.get(registration)
+        if binding is None:
             return False
-        metadata = _unsigned_registration(
+        schema_digest, capability_digest = _registration_metadata(
             manifest,
-            executor_handle=registration.executor_handle,
-            access=registration.access,
+            executor_handle=binding.executor_handle,
+            access=binding.access,
         )
-        if metadata.capability_digest != registration.capability_digest:
-            return False
-        expected_token = hmac.new(
-            self.__key,
-            registration.capability_digest.encode("ascii"),
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(expected_token, registration.sealed_token)
+        return (
+            binding.manifest == manifest
+            and registration.tool_id == manifest.tool_id
+            and registration.version == manifest.version
+            and registration.schema_digest == schema_digest
+            and registration.capability_digest == capability_digest
+            and registration.access == binding.access
+        )
 
-    async def execute(
+    async def execute_bounded(
         self,
         registration: ExecutorRegistration,
         context: StepContext,
         arguments: Mapping[str, object],
-    ) -> object:
+        *,
+        effect_id: str,
+        timeout_ms: int,
+    ) -> tuple[str, object | None]:
+        binding = self.__registrations.get(registration)
         manifest = next(
             (
                 item
@@ -337,17 +407,188 @@ class ExecutorBroker:
             raise ToolRouteError(
                 "registration_rejected", "Executor capability verification failed"
             )
+        self._retire_completed_executions()
+        if len(self.__active_executions) >= self.__supervisor_capacity:
+            return "execution_unavailable", None
         operation = self.__dispatcher(
-            registration.executor_handle,
+            binding.executor_handle,
             context,
             arguments,
         )
         if not inspect.isawaitable(operation):
             raise TypeError("Executor dispatcher must return an awaitable")
-        return await operation
+        task = asyncio.ensure_future(operation)
+        execution_id = "execution-" + secrets.token_hex(16)
+        active = _ActiveExecution(
+            execution_id=execution_id,
+            effect_id=effect_id,
+            task=task,
+        )
+        self.__active_executions[execution_id] = active
+        task.add_done_callback(
+            lambda completed, identifier=execution_id: self._retire_execution(
+                identifier, completed
+            )
+        )
+        if timeout_ms <= 0:
+            await self._cancel_and_observe(active)
+            return "timeout", None
+        timer = asyncio.create_task(asyncio.sleep(timeout_ms / 1000))
+        caller_cancelled = False
+        try:
+            done, _ = await asyncio.wait(
+                {task, timer}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            caller_cancelled = True
+            done = set()
+        if caller_cancelled:
+            timer.cancel()
+            await self._cancel_and_observe(active)
+            return "cancelled", None
+        if timer in done:
+            await self._cancel_and_observe(active)
+            return "timeout", None
+        timer.cancel()
+        self.__active_executions.pop(execution_id, None)
+        try:
+            return "completed", task.result()
+        except asyncio.CancelledError:
+            return "execution_failed", None
+        except Exception:
+            return "execution_failed", None
+
+    @property
+    def supervisor_capacity(self) -> int:
+        return self.__supervisor_capacity
+
+    def supervised_executions(self) -> tuple[SupervisedExecutionSnapshot, ...]:
+        self._retire_completed_executions()
+        return tuple(
+            SupervisedExecutionSnapshot(
+                execution_id=active.execution_id,
+                effect_id=active.effect_id,
+                state=active.state,
+            )
+            for active in sorted(
+                self.__active_executions.values(),
+                key=lambda item: item.execution_id,
+            )
+        )
+
+    async def wait_for_quiescence(self, *, timeout_ms: int) -> bool:
+        if type(timeout_ms) is not int or timeout_ms < 0:
+            raise ValueError("quiescence timeout must be a non-negative integer")
+        self._retire_completed_executions()
+        if not self.__active_executions:
+            return True
+        tasks = {active.task for active in self.__active_executions.values()}
+        _, pending = await asyncio.wait(tasks, timeout=timeout_ms / 1000)
+        self._retire_completed_executions()
+        return not pending and not self.__active_executions
+
+    async def _cancel_and_observe(self, active: _ActiveExecution) -> None:
+        active.state = "cancelling"
+        active.task.cancel()
+
+        async def observe_grace() -> None:
+            await asyncio.wait({active.task}, timeout=0.025)
+
+        observer = asyncio.create_task(observe_grace())
+        while not observer.done():
+            try:
+                await asyncio.shield(observer)
+            except asyncio.CancelledError:
+                continue
+        observer.result()
+        self._retire_completed_executions()
+
+    def _retire_completed_executions(self) -> None:
+        for execution_id, active in tuple(self.__active_executions.items()):
+            if active.task.done():
+                self._retire_execution(execution_id, active.task)
+
+    def _retire_execution(
+        self, execution_id: str, task: asyncio.Future[object]
+    ) -> None:
+        active = self.__active_executions.get(execution_id)
+        if active is not None and active.task is task:
+            self.__active_executions.pop(execution_id, None)
+        try:
+            task.exception()
+        except BaseException:
+            pass
 
     def __repr__(self) -> str:
-        return "ExecutorBroker(<sealed>)"
+        return "ExecutorBroker(<trusted-frozen>)"
+
+
+def _trusted_executor_registry(
+    dispatcher: object,
+    bindings: tuple[tuple[ToolManifestEntryV2, str, ToolAccess], ...],
+    *,
+    supervisor_capacity: int = 64,
+) -> tuple[ExecutorBroker, Mapping[str, ExecutorRegistration]]:
+    """Control-plane-only factory for one immutable executor registry."""
+    rejected = True
+    try:
+        rejected = (
+            not callable(dispatcher)
+            or _contains_forbidden_executor_authority(dispatcher)
+            or not isinstance(bindings, tuple)
+        )
+    except Exception:
+        rejected = True
+    if rejected:
+        raise ToolRouteError(
+            "registration_rejected", "Executor dispatcher authority was rejected"
+        ) from None
+    registrations: dict[str, ExecutorRegistration] = {}
+    registry_bindings: dict[ExecutorRegistration, _ExecutorBinding] = {}
+    handles: set[str] = set()
+    for item in bindings:
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise ToolRouteError(
+                "registration_rejected", "Executor binding was rejected"
+            ) from None
+        manifest, executor_handle, access = item
+        if (
+            type(manifest) is not ToolManifestEntryV2
+            or manifest.tool_id in registrations
+            or executor_handle in handles
+        ):
+            raise ToolRouteError(
+                "registration_rejected", "Executor binding was rejected"
+            ) from None
+        schema_digest, capability_digest = _registration_metadata(
+            manifest,
+            executor_handle=executor_handle,
+            access=access,
+        )
+        registration = ExecutorRegistration(
+            _factory_authority=_EXECUTOR_FACTORY_AUTHORITY,
+            tool_id=manifest.tool_id,
+            version=manifest.version,
+            schema_digest=schema_digest,
+            capability_digest=capability_digest,
+            access=access,
+        )
+        binding = _ExecutorBinding(
+            manifest=manifest,
+            executor_handle=executor_handle,
+            access=access,
+            capability_digest=capability_digest,
+        )
+        registrations[manifest.tool_id] = registration
+        registry_bindings[registration] = binding
+        handles.add(executor_handle)
+    registry = ExecutorBroker(
+        _factory_authority=_EXECUTOR_FACTORY_AUTHORITY,
+        dispatcher=dispatcher,
+        registrations=registry_bindings,
+        supervisor_capacity=supervisor_capacity,
+    )
+    return registry, MappingProxyType(registrations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,6 +1044,7 @@ class ToolRouter:
             admitted.registration,
             context,
             normalized,
+            effect_id=reservation.effect_id,
             timeout_ms=remaining_ms,
         )
         if outcome == "cancelled":
@@ -1214,16 +1456,20 @@ class ToolRouter:
         context: StepContext,
         arguments: Mapping[str, object],
         *,
+        effect_id: str,
         timeout_ms: int,
     ) -> tuple[str, object | None]:
-        operation: object | None = None
+        outcome: tuple[str, object | None] | None = None
         failed = False
         cancelled = False
         try:
-            operation = self.executor_broker.execute(  # type: ignore[union-attr]
+            broker = cast(ExecutorBroker, self.executor_broker)
+            outcome = await broker.execute_bounded(
                 registration,
                 context,
                 arguments,
+                effect_id=effect_id,
+                timeout_ms=timeout_ms,
             )
         except asyncio.CancelledError:
             cancelled = True
@@ -1231,9 +1477,9 @@ class ToolRouter:
             failed = True
         if cancelled:
             return "cancelled", None
-        if failed or not inspect.isawaitable(operation):
+        if failed or outcome is None:
             return "execution_failed", None
-        return await self._await_operation(operation, timeout_ms=timeout_ms)
+        return outcome
 
     @staticmethod
     async def _await_operation(
@@ -1529,6 +1775,7 @@ __all__ = [
     "ExecutorRegistration",
     "FileAccess",
     "HmacRequestDigestService",
+    "SupervisedExecutionSnapshot",
     "ApprovalRequest",
     "SdkToolWrapper",
     "ToolAccess",
