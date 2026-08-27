@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import math
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from agents import (
     Agent,
     Handoff,
+    ItemHelpers,
     Model,
     RunContextWrapper,
     Runner,
@@ -39,9 +41,16 @@ class AgentsSdkBuildMetadata:
 
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze(item) for key, item in value.items()})
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("FrozenSnapshotSession message keys must be strings")
+            frozen[key] = _freeze(item)
+        return MappingProxyType(frozen)
     if isinstance(value, list | tuple):
         return tuple(_freeze(item) for item in value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("FrozenSnapshotSession does not accept non-finite floats")
     if value is None or isinstance(value, str | int | float | bool):
         return value
     raise TypeError("FrozenSnapshotSession accepts normalized JSON messages only")
@@ -55,21 +64,25 @@ def _thaw(value: object) -> object:
     return value
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class FrozenSnapshotSession:
     """SDK Session seam backed only by an immutable, normalized Host message snapshot."""
 
-    __slots__ = ("session_id", "_messages")
-
-    session_settings = None
+    session_id: str
+    _messages: tuple[Mapping[str, object], ...]
+    session_settings: ClassVar[None] = None
 
     def __init__(self, session_id: str, messages: Sequence[Mapping[str, object]]) -> None:
         if not session_id:
             raise ValueError("session_id is required")
-        self.session_id = session_id
-        self._messages = tuple(
-            cast(Mapping[str, object], _freeze(message))
-            for message in messages
-        )
+        frozen_messages: list[Mapping[str, object]] = []
+        for message in messages:
+            frozen_message = _freeze(message)
+            if not isinstance(frozen_message, Mapping):
+                raise TypeError("FrozenSnapshotSession messages must be mappings")
+            frozen_messages.append(cast(Mapping[str, object], frozen_message))
+        object.__setattr__(self, "session_id", session_id)
+        object.__setattr__(self, "_messages", tuple(frozen_messages))
 
     async def get_items(self, limit: int | None = None) -> list[Any]:
         if limit is None:
@@ -111,4 +124,11 @@ class AgentsSdkFacade:
 
     async def run(self, agent: Any, input: Any, **kwargs: Any) -> Any:
         """Execute through the pinned SDK runner; this facade is not a Runtime implementation."""
+        session = kwargs.pop("session", None)
+        if session is not None:
+            if not isinstance(session, FrozenSnapshotSession):
+                raise TypeError("AgentsSdkFacade accepts only FrozenSnapshotSession")
+            if not isinstance(input, str | list):
+                raise TypeError("FrozenSnapshotSession runs require a string or normalized item list")
+            input = [*await session.get_items(), *ItemHelpers.input_to_new_input_list(input)]
         return await Runner.run(agent, input, **kwargs)

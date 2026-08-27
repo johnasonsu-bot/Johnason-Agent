@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import ast
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -49,8 +50,33 @@ async def test_frozen_snapshot_session_reads_a_constructor_snapshot_only() -> No
     assert await session.get_items(limit=1) == [{"role": "user", "content": "frozen"}]
 
 
+def test_frozen_snapshot_session_rejects_attribute_reassignment() -> None:
+    """Reassigning a snapshot field would violate the frozen input identity of a Term."""
+    session = FrozenSnapshotSession("session-1", [{"role": "user", "content": "frozen"}])
+
+    with pytest.raises(FrozenInstanceError):
+        session.session_id = "other-session"
+    with pytest.raises(FrozenInstanceError):
+        session._messages = ()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {1: "not-a-string-key"},
+        {"value": float("nan")},
+        {"value": float("inf")},
+        {"value": float("-inf")},
+    ],
+)
+def test_frozen_snapshot_session_rejects_noncanonical_json_messages(message: object) -> None:
+    """Lossy keys and non-finite numbers cannot form a stable frozen message identity."""
+    with pytest.raises((TypeError, ValueError)):
+        FrozenSnapshotSession("session-1", [message])
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["add_items", "pop_item", "clear_session"])
+@pytest.mark.parametrize("mutation", ["add_items", "pop_item", "clear_session", "mutate"])
 async def test_frozen_snapshot_session_rejects_all_sdk_mutators(mutation: str) -> None:
     """Allowing an SDK mutator would create a second, non-authoritative Session store."""
     session = FrozenSnapshotSession("session-1", [{"role": "user", "content": "frozen"}])
@@ -60,6 +86,8 @@ async def test_frozen_snapshot_session_rejects_all_sdk_mutators(mutation: str) -
             await session.add_items([{"role": "user", "content": "new"}])
         elif mutation == "pop_item":
             await session.pop_item()
+        elif mutation == "mutate":
+            await session.mutate()
         else:
             await session.clear_session()
 
@@ -75,6 +103,29 @@ async def test_real_sdk_runner_executes_a_deterministic_model() -> None:
     assert result.final_output == "runner reached sdk"
     assert len(model.calls) == 1
     assert "runtime" not in type(model).__name__.lower()
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_runner_consumes_frozen_session_without_persisting_to_it() -> None:
+    """Passing a frozen Session through to Runner would make the SDK write a second store."""
+    snapshot = FrozenSnapshotSession("session-1", [{"role": "user", "content": "history"}])
+    model = ScriptedModel([[assistant_message("snapshot reached sdk")]])
+    facade = AgentsSdkFacade()
+    agent = facade.Agent(name="snapshot-boundary-test", model=model)
+
+    result = await facade.run(
+        agent,
+        [{"role": "user", "content": "current"}],
+        session=snapshot,
+    )
+
+    assert result.final_output == "snapshot reached sdk"
+    assert await snapshot.get_items() == [{"role": "user", "content": "history"}]
+    assert model.first_call is not None
+    assert model.first_call.input == [
+        {"role": "user", "content": "history"},
+        {"role": "user", "content": "current"},
+    ]
 
 
 def test_adapter_imports_sdk_types_instead_of_copying_them() -> None:
