@@ -8,10 +8,102 @@
 - initial split source：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`（历史 BLOCKED）
 - initial report：`e45141e4f12d1891a3f44017116996737c9f3a5e`
 - recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
-- final SOURCE_REV / source commit：`e751353577778c092797b459f62a3b7a80fa0ac6`
+- previous recovery source：`e751353577778c092797b459f62a3b7a80fa0ac6`
+- final SOURCE_REV / source commit：`e01f7441985ef58140f8c51454aab2d7283fe48c`
 - report commit：`SELF`（本文件所在的 report-only child commit；最终 SHA 在交付回复中给出）
 - full-range baseline：`d894c81e0af03b8f74cf415bc0310c71459a3d67`
 - Python：`3.13.5`；Node.js：`v22.20.0`；npm：`10.9.3`
+
+## Fix round 1：policy 结构契约与 fresh gates
+
+### TDD mutation RED / GREEN
+
+结构测试改为直接检查 policy 对象与实际命令行为，不扫描源码字符串：
+
+- happy backend argv 精确为 Python pytest、`tests/unit`、`tests/integration`、
+  `tests/acceptance`、`-q` 与 blueprint `--ignore`；frontend argv 精确为
+  `npm test`；cwd 精确为 `mvp` 与 `mvp/canvas-spike`；
+- 两条 happy `CommandPolicy` 和每个 fault 的两条 policy 均调用并通过
+  `validate_commands()`；
+- `ownership`、`remote`、`missing_evidence`、`key_error`、`exception` 两条 suite
+  均实际 exit 0；`backend` 仅 backend 非零；`electron` 仅 electron 非零；所有
+  probes 使用 argv array 和 `shell=False`。
+
+```bash
+cd mvp
+PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q \
+  tests/acceptance/test_development_graph_blueprint.py \
+  -k 'nested_backend_command'
+```
+
+- mutation RED：临时将 happy frontend cwd 改为 `mvp`；exit `1`，
+  `1 failed, 16 deselected in 0.18s`，失败精确命中应为 `mvp/canvas-spike`；
+- GREEN：恢复正确 policy 后 exit `0`，`1 passed, 16 deselected in 7.78s`；
+- 临时 mutation 未进入提交；marker 描述改为仅 happy path 运行完整外部 backend
+  与 Electron suites。
+
+### Fix round 1 SOURCE_REV 独立门禁
+
+所有 gates 均在 `e01f7441985ef58140f8c51454aab2d7283fe48c` 上 fresh 执行，
+HEAD 未变化且计数未合并。
+
+#### 1. 标准 backend
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:], timeout=1200); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' BACKEND .venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'
+```
+
+- exit：`0`
+- count：`2243 passed, 6 skipped, 8 deselected`；1 warning
+- time：wrapper 202.11 秒；pytest 200.59 秒
+
+#### 2. 单次 frontend
+
+```bash
+cd mvp/canvas-spike
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:], timeout=600); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' FRONTEND npm test
+```
+
+- exit：`0`
+- count：Vite `45 modules transformed`；Playwright `38 passed, 0 skipped`
+- time：wrapper 72.95 秒；Playwright 1.2 分钟
+
+#### 3. 独立 Development Graph meta/E2E
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:], timeout=1800); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' META_E2E .venv/bin/python -m pytest -q tests/acceptance/test_development_graph_blueprint.py -m development_graph_meta_e2e
+```
+
+- exit：`0`
+- count：`8 passed, 9 deselected, 0 skipped`
+- time：wrapper 406.66 秒；pytest 405.98 秒
+- execution：happy-path 真实运行一次 nested backend 与 `npm test`；7 个 fault
+  cases 使用确定性 Python pass/fail commands
+
+#### 4. 全范围 diff check
+
+```bash
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:]); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' DIFF_CHECK git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..e01f7441985ef58140f8c51454aab2d7283fe48c
+```
+
+- exit：`0`
+- count：0 条 whitespace 问题；无输出
+- time：0.02 秒
+
+#### 5. 固定 revision source credential scanner
+
+```bash
+/usr/bin/python3 -I -c 'import os,subprocess,sys,time; started=time.monotonic(); environment=os.environ.copy(); environment["BASE_REV"]=sys.argv[2]; environment["HEAD_REV"]=sys.argv[3]; result=subprocess.run(sys.argv[4:],env=environment); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' CREDENTIAL_SCANNER d894c81e0af03b8f74cf415bc0310c71459a3d67 e01f7441985ef58140f8c51454aab2d7283fe48c /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+- exit：`0`
+- count：`scanned_blobs=43 fixture_allowances=0 findings=0`
+- time：0.91 秒
+
+最终 report-only commit 后另对不可变 delivery HEAD 执行 fixed-base scanner；结果只写入
+ignored `task-3-delivery-scan.md`，不修改 tracked files 或 HEAD。
 
 ## BLOCKED recovery TDD
 
@@ -44,7 +136,7 @@ PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q \
 - final GREEN：focused `1 passed, 16 deselected in 0.62s`；真实 ownership case
   `1 passed in 17.38s`。
 
-### Final SOURCE_REV 独立门禁
+### Historical previous final SOURCE_REV 独立门禁
 
 所有 final gates 均在 `e751353577778c092797b459f62a3b7a80fa0ac6` 上执行，HEAD
 未变化且工作树 clean；计数未合并。

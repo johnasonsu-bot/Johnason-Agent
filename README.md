@@ -122,8 +122,8 @@ Focused orchestration/runtime/restart/acceptance: 108 passed
 Complete backend: 568 passed, 6 skipped
 ```
 
-Batch 3.4-A 的最终 split recovery gate 在同一 source revision
-`e751353577778c092797b459f62a3b7a80fa0ac6` 上全部通过：标准 backend
+Batch 3.4-A fix round 1 的最终 split recovery gate 在同一 source revision
+`e01f7441985ef58140f8c51454aab2d7283fe48c` 上全部通过：标准 backend
 `2243 passed, 6 skipped, 8 deselected`；独立 frontend `38 passed`；Development
 Graph meta/E2E `8 passed, 9 deselected`；全范围 diff 与 credential scanner 均为
 exit 0。因此合同门判定为：

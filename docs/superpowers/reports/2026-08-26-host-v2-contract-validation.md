@@ -1,7 +1,8 @@
 # Engine Host v2 合同验证报告
 
 - 日期：2026-08-26；final split recovery gate 于 2026-08-27 完成
-- Latest split-recovery source revision under test：`e751353577778c092797b459f62a3b7a80fa0ac6`
+- Latest fix-round source revision under test：`e01f7441985ef58140f8c51454aab2d7283fe48c`
+- Previous split-recovery source：`e751353577778c092797b459f62a3b7a80fa0ac6`
 - Recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
 - Initial split-gate source：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`（历史 BLOCKED）
 - Task 3 base revision：`ac435a927f8132d23ffa61685630c070944793f1`
@@ -33,7 +34,76 @@ Real runtime status: NOT_YET_EVALUATED
 Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入；真实运行时状态保持
 `NOT_YET_EVALUATED`。
 
-## Final split recovery gate：`e751353577778c092797b459f62a3b7a80fa0ac6`
+## Fix round 1 final gate：`e01f7441985ef58140f8c51454aab2d7283fe48c`
+
+结构测试现在以 policy 对象和实际命令行为精确验证：happy backend argv 包含三个
+测试目录、`-q` 与 blueprint `--ignore`，frontend argv 为 `npm test`，两个 cwd
+分别为 `mvp` 与 `mvp/canvas-spike`，两条 `CommandPolicy` 均通过
+`validate_commands()`；7 个 fault label 的两条 suite 命令均以 `shell=False`
+执行，只有 `backend` / `electron` 对应 suite 非零。
+
+TDD mutation RED 临时把 happy frontend cwd 改为 `mvp`：focused test exit `1`，
+`1 failed, 16 deselected in 0.18s`；恢复正确 policy 后 GREEN exit `0`，
+`1 passed, 16 deselected in 7.78s`。临时 mutation 未进入 source commit。pytest
+marker 描述同时收紧为仅 happy path 运行完整外部 backend/Electron suites。
+
+五条命令开始与结束时 HEAD 均为
+`e01f7441985ef58140f8c51454aab2d7283fe48c`，工作树保持 clean；结果如下。
+
+### 1. 标准 backend（排除 meta/E2E）
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:], timeout=1200); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' BACKEND .venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'
+```
+
+结果：exit `0`；`2243 passed, 6 skipped, 8 deselected`，1 条既有 Starlette
+弃用警告；wrapper 202.11 秒，pytest 200.59 秒。
+
+### 2. 单次 frontend
+
+```bash
+cd mvp/canvas-spike
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:], timeout=600); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' FRONTEND npm test
+```
+
+结果：exit `0`；Vite `45 modules transformed`；Playwright `38 passed (1.2m)`；
+wrapper 72.95 秒。存在既有 Vite config 与 `NO_COLOR` 警告。
+
+### 3. 独立 Development Graph meta/E2E
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:], timeout=1800); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' META_E2E .venv/bin/python -m pytest -q tests/acceptance/test_development_graph_blueprint.py -m development_graph_meta_e2e
+```
+
+结果：exit `0`；`8 passed, 9 deselected`；wrapper 406.66 秒，pytest 405.98 秒。
+happy-path 执行一次真实 nested backend/Electron regression；7 个 fault cases 使用
+确定性 Python pass/fail commands。
+
+### 4. 全范围 diff check
+
+```bash
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:]); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' DIFF_CHECK git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..e01f7441985ef58140f8c51454aab2d7283fe48c
+```
+
+结果：exit `0`；0 条问题，无 diff 输出；0.02 秒。
+
+### 5. 固定 revision credential scanner
+
+```bash
+/usr/bin/python3 -I -c 'import os,subprocess,sys,time; started=time.monotonic(); environment=os.environ.copy(); environment["BASE_REV"]=sys.argv[2]; environment["HEAD_REV"]=sys.argv[3]; result=subprocess.run(sys.argv[4:],env=environment); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' CREDENTIAL_SCANNER d894c81e0af03b8f74cf415bc0310c71459a3d67 e01f7441985ef58140f8c51454aab2d7283fe48c /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+结果：exit `0`；`scanned_blobs=43 fixture_allowances=0 findings=0`；0.91 秒。
+
+```text
+Decision: GO_HOST_V2_CONTRACT
+Source revision: e01f7441985ef58140f8c51454aab2d7283fe48c
+Real runtime status: NOT_YET_EVALUATED
+```
+
+## Historical previous final split recovery gate：`e751353577778c092797b459f62a3b7a80fa0ac6`
 
 五条命令开始与结束时 HEAD 均为
 `e751353577778c092797b459f62a3b7a80fa0ac6`，工作树保持 clean；后续报告提交未混入
