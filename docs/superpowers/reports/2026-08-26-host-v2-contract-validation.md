@@ -1,7 +1,8 @@
 # Engine Host v2 合同验证报告
 
-- 日期：2026-08-26；final URL tokenizer gate 于 2026-08-27 完成
-- Latest fix-round source revision under test：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
+- 日期：2026-08-26；pathless fragment remediation gate 于 2026-08-27 完成
+- Latest fix-round source revision under test：`9895aab77045b567071b11f5cb5bcd9e8dca8024`
+- Previous final URL tokenizer source：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
 - Previous fix-round source：`e01f7441985ef58140f8c51454aab2d7283fe48c`
 - Previous split-recovery source：`e751353577778c092797b459f62a3b7a80fa0ac6`
 - Recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
@@ -22,19 +23,52 @@
 
 ## 结论
 
-同一 final URL tokenizer source 上，标准 backend、单次 frontend、独立
+同一 pathless fragment remediation source 上，标准 backend、单次 frontend、独立
 Development Graph meta/E2E、全范围 diff check 与固定 revision credential scanner
 全部 exit 0。五类门禁分别计数且没有互相替代，因此发布 Host v2 合同 GO。
 
 ```text
 Decision: GO_HOST_V2_CONTRACT
-Source revision: 6a8af6e6e28b28b4102f8b93709925268e5cf957
+Source revision: 9895aab77045b567071b11f5cb5bcd9e8dca8024
 Real runtime status: NOT_YET_EVALUATED
 ```
 
 该 GO 只覆盖 Host v2 合同门。合同 Fake 的通过仍不等于真实 Python
 Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入；真实运行时状态保持
 `NOT_YET_EVALUATED`。
+
+## Pathless fragment remediation gate：`9895aab77045b567071b11f5cb5bcd9e8dca8024`
+
+authority 后直接出现 `#` 时，tail scanner 预置 fragment component 却未消费 delimiter，
+导致可信 URL span 在 `#` 前结束。修复删除入口预置，让现有循环消费首个 `?/#`；
+没有重写 tokenizer，也没有改变公共签名、production graph 或 schema。
+
+三层 pathless fragment/query 正例在生产改动前 focused RED 为 exit `1`，
+`3 failed, 62 passed, 1088 deselected in 0.18s`；失败仅为三个 pathless fragment，
+pathless query 已通过。最小修复后的首轮 GREEN 为 exit `0`，
+`65 passed, 1088 deselected in 0.12s`。加入 IPv6、port、percent-escape 既有行为
+characterization 后，最终 focused 回归 exit `0`，
+`71 passed, 1088 deselected in 0.15s`；完整三 mapper 文件 exit `0`，
+`1159 passed in 1.71s`。hostile delimiters、matrix、query 与 fragment 正例均保留。
+
+五条 final gates 均在上述不可变 SOURCE_REV fresh 执行：
+
+1. 标准 backend，1200 秒上限：exit `0`；
+   `2270 passed, 6 skipped, 8 deselected`，1 warning；pytest 188.00 秒，
+   wrapper 188.87 秒。
+2. frontend `npm test`，600 秒上限：exit `0`；Vite
+   `45 modules transformed`，Playwright `38 passed (1.2m)`；wrapper 71.87 秒。
+3. Development Graph meta/E2E，1800 秒上限：exit `0`；
+   `8 passed, 9 deselected`；pytest 396.67 秒，wrapper 397.20 秒。
+4. 全范围 diff check：exit `0`；0 条问题，无输出；0.02 秒。
+5. fixed-revision credential scanner：exit `0`；
+   `scanned_blobs=45 fixture_allowances=0 findings=0`；0.95 秒。
+
+```text
+Decision: GO_HOST_V2_CONTRACT
+Source revision: 9895aab77045b567071b11f5cb5bcd9e8dca8024
+Real runtime status: NOT_YET_EVALUATED
+```
 
 ## Final URL tokenizer gate：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
 

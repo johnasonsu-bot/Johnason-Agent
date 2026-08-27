@@ -10,10 +10,47 @@
 - recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
 - previous recovery source：`e751353577778c092797b459f62a3b7a80fa0ac6`
 - previous fix-round source：`e01f7441985ef58140f8c51454aab2d7283fe48c`
-- final SOURCE_REV / source commit：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
+- previous final URL tokenizer source：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
+- final SOURCE_REV / source commit：`9895aab77045b567071b11f5cb5bcd9e8dca8024`
 - report commit：`SELF`（本文件所在的 report-only child commit；最终 SHA 在交付回复中给出）
 - full-range baseline：`d894c81e0af03b8f74cf415bc0310c71459a3d67`
 - Python：`3.13.5`；Node.js：`v22.20.0`；npm：`10.9.3`
+
+## Pathless fragment remediation 与 fresh gates
+
+authority 后直接出现 `#` 时，URL tail 曾预置为 fragment component，却没有先消费
+delimiter；fragment 字符集不含 `#`，可信 URL span 因而在 delimiter 前结束，后续
+`/public/file` 被共享本地路径谓词拒绝。修复只删除入口处的 component 预置，让既有
+循环统一消费首个 `?/#`；tokenizer 架构、公共签名、production graph 与 schema 均
+未改变。
+
+严格 TDD focused RED 为 exit `1`，
+`3 failed, 62 passed, 1088 deselected in 0.18s`：三层 pathless fragment 正例均失败，
+三层 pathless query 保护性正例均通过。最小生产修复后的首轮 GREEN 为 exit `0`，
+`65 passed, 1088 deselected in 0.12s`。补齐既有 IPv6、port 与 percent-escape
+characterization 后，最终 focused 回归为 exit `0`，
+`71 passed, 1088 deselected in 0.15s`；完整三 mapper 文件为 exit `0`，
+`1159 passed in 1.71s`。hostile delimiters、matrix、带 path 的 query/fragment 正例
+仍在相同三层参数表中。
+
+五条门禁均在不可变 SOURCE_REV
+`9895aab77045b567071b11f5cb5bcd9e8dca8024` 上 fresh 执行：
+
+1. 标准 backend：exit `0`；`2270 passed, 6 skipped, 8 deselected`，1 warning；
+   pytest 188.00 秒，1200 秒 wrapper 188.87 秒。
+2. 单次 frontend：exit `0`；Vite `45 modules transformed`，Playwright
+   `38 passed (1.2m)`；600 秒 wrapper 71.87 秒。
+3. Development Graph meta/E2E：exit `0`；`8 passed, 9 deselected`；pytest
+   396.67 秒，1800 秒 wrapper 397.20 秒。
+4. 全范围 diff check：exit `0`；0 条问题，无输出；0.02 秒。
+5. fixed-revision credential scanner：exit `0`；
+   `scanned_blobs=45 fixture_allowances=0 findings=0`；0.95 秒。
+
+```text
+Decision: GO_HOST_V2_CONTRACT
+Source revision: 9895aab77045b567071b11f5cb5bcd9e8dca8024
+Real runtime status: NOT_YET_EVALUATED
+```
 
 ## Final unified fix：URL-aware tokenizer 与 fresh gates
 
@@ -429,6 +466,6 @@ final report-only commit 只修改：
 
 ```text
 Decision: GO_HOST_V2_CONTRACT
-Source revision: 6a8af6e6e28b28b4102f8b93709925268e5cf957
+Source revision: 9895aab77045b567071b11f5cb5bcd9e8dca8024
 Real runtime status: NOT_YET_EVALUATED
 ```
