@@ -141,7 +141,7 @@ def test_controlled_open_keeps_the_authorized_inode_after_parent_replacement(
         assert handle.read() == b"term-b"
 
 
-def test_controlled_open_rejects_area_replacement_after_grant_check(
+def test_controlled_open_keeps_authorized_area_inode_after_grant_check(
     tmp_path, monkeypatch
 ) -> None:
     store = TermStateStore(tmp_path, _grant(tmp_path))
@@ -163,11 +163,65 @@ def test_controlled_open_rejects_area_replacement_after_grant_check(
             os.symlink(term_a_work, term_b_work)
 
     monkeypatch.setattr(store, "_require_granted", replace_after_check)
-    with pytest.raises(StateBoundaryError, match="symlink|open|directory"):
+    with store.open_file(
+        "term-b", "agent-a", ref_b, "work", "value.txt", mode="rb"
+    ) as handle:
+        assert handle.read() == b"term-b"
+
+
+@pytest.mark.parametrize("replacement_level", ["term_root", "area", "parent"])
+def test_controlled_open_never_uses_a_real_directory_replacement_after_validation(
+    tmp_path, monkeypatch, replacement_level: str
+) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    ref = store.initialize("term-1", "agent-a", {"owner": "original"})
+    term_root = tmp_path / ".runtime" / "terms" / "term-1"
+    area_root = term_root / "work"
+    parent = area_root / "dir"
+    parent.mkdir()
+    (parent / "value.txt").write_bytes(b"original")
+
+    if replacement_level == "term_root":
+        replacement = term_root.with_name("term-replacement")
+        replacement_target = replacement / "work" / "dir"
+        original = term_root.with_name("term-original")
+        target = term_root
+    elif replacement_level == "area":
+        replacement = term_root / "work-replacement"
+        replacement_target = replacement / "dir"
+        original = term_root / "work-original"
+        target = area_root
+    else:
+        replacement = area_root / "dir-replacement"
+        replacement_target = replacement
+        original = area_root / "dir-original"
+        target = parent
+    replacement_target.mkdir(parents=True)
+    (replacement_target / "value.txt").write_bytes(b"replacement")
+
+    original_require_granted = store._require_granted
+    replaced = False
+
+    def replace_after_validation(path: Path, *, write: bool) -> None:
+        nonlocal replaced
+        original_require_granted(path, write=write)
+        if path.name == "value.txt" and not replaced:
+            replaced = True
+            target.rename(original)
+            replacement.rename(target)
+
+    monkeypatch.setattr(store, "_require_granted", replace_after_validation)
+    try:
         with store.open_file(
-            "term-b", "agent-a", ref_b, "work", "value.txt", mode="rb"
-        ):
-            pass
+            "term-1", "agent-a", ref, "work", "dir/value.txt", mode="rb"
+        ) as handle:
+            value = handle.read()
+    except StateBoundaryError:
+        assert replaced
+        return
+
+    assert replaced
+    assert value == b"original"
 
 
 def test_controlled_open_cannot_follow_a_link_beyond_the_workspace_grant(

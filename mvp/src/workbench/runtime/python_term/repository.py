@@ -368,10 +368,13 @@ class PythonTermRepository:
                 (validated.event_id,),
             ).fetchone()
             if existing_row is not None:
-                if (
-                    canonical_json(self._decode_transition(existing_row))
-                    == transition_json
-                ):
+                existing = self._decode_transition(existing_row)
+                if canonical_json(existing) == transition_json:
+                    self._load_owning_aggregate(
+                        connection,
+                        existing.event.term_id,
+                        existing.event.step_id,
+                    )
                     return
                 raise RepositoryConflict("event transition identity or status conflict")
             term, step = self._require_active_aggregate(
@@ -440,7 +443,10 @@ class PythonTermRepository:
                 WHERE term_id = ? ORDER BY cursor""",
                 (term_id,),
             ).fetchall()
-        return tuple(self._decode_transition(row).event for row in rows)
+            self._load_owning_aggregate(
+                connection, term_id, required=bool(rows)
+            )
+            return tuple(self._decode_transition(row).event for row in rows)
 
     def list_public_projections(
         self, term_id: str
@@ -451,9 +457,12 @@ class PythonTermRepository:
                 WHERE term_id = ? ORDER BY cursor""",
                 (term_id,),
             ).fetchall()
-        return tuple(
-            self._decode_transition(row).public_projection for row in rows
-        )
+            self._load_owning_aggregate(
+                connection, term_id, required=bool(rows)
+            )
+            return tuple(
+                self._decode_transition(row).public_projection for row in rows
+            )
 
     def save_checkpoint(self, checkpoint: StepCheckpointRecord) -> None:
         validated = self._validate_model(checkpoint, StepCheckpointRecord)
@@ -465,7 +474,11 @@ class PythonTermRepository:
                 (validated.checkpoint_ref,),
             ).fetchone()
             if existing_row is not None:
-                if canonical_json(self._decode_checkpoint(existing_row)) == encoded:
+                existing = self._decode_checkpoint(existing_row)
+                if canonical_json(existing) == encoded:
+                    self._load_owning_aggregate(
+                        connection, existing.term_id, existing.step_id
+                    )
                     return
                 raise RepositoryConflict("checkpoint reference conflict")
             term, step = self._require_active_aggregate(
@@ -520,7 +533,14 @@ class PythonTermRepository:
                 WHERE term_id = ? ORDER BY cursor DESC LIMIT 1""",
                 (term_id,),
             ).fetchone()
-        return None if row is None else self._decode_checkpoint(row)
+            checkpoint = None if row is None else self._decode_checkpoint(row)
+            self._load_owning_aggregate(
+                connection,
+                term_id,
+                None if checkpoint is None else checkpoint.step_id,
+                required=checkpoint is not None,
+            )
+            return checkpoint
 
     def save_tool_effect(self, effect: ToolEffectRecord) -> None:
         validated = self._validate_model(effect, ToolEffectRecord)
@@ -573,6 +593,9 @@ class PythonTermRepository:
                 return
             existing = self._decode_effect(row)
             if canonical_json(existing) == encoded:
+                self._load_owning_aggregate(
+                    connection, existing.term_id, existing.step_id
+                )
                 return
             self._require_active_aggregate(
                 connection, validated.term_id, validated.step_id
@@ -611,7 +634,13 @@ class PythonTermRepository:
                 "SELECT * FROM python_tool_effects WHERE effect_id = ?",
                 (effect_id,),
             ).fetchone()
-        return None if row is None else self._decode_effect(row)
+            if row is None:
+                return None
+            effect = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, effect.term_id, effect.step_id
+            )
+            return effect
 
     def _require_term(
         self, connection: sqlite3.Connection, term_id: str
@@ -674,6 +703,27 @@ class PythonTermRepository:
                 "persisted aggregate columns are internally inconsistent"
             ) from exc
         self._validate_aggregate_evidence(connection, term, steps)
+        return term, steps
+
+    def _load_owning_aggregate(
+        self,
+        connection: sqlite3.Connection,
+        term_id: str,
+        step_id: str | None = None,
+        *,
+        required: bool = True,
+    ) -> tuple[TermRecord, tuple[StepRecord, ...]] | None:
+        """Load one owning aggregate without imposing active-state semantics."""
+        term_row = connection.execute(
+            "SELECT * FROM python_terms WHERE term_id = ?", (term_id,)
+        ).fetchone()
+        if term_row is None:
+            if required:
+                raise RepositoryCorruption("durable record has no owning Term")
+            return None
+        term, steps = self._load_aggregate(connection, term_row)
+        if step_id is not None and not any(step.step_id == step_id for step in steps):
+            raise RepositoryCorruption("durable record has no owning Step")
         return term, steps
 
     def _validate_aggregate_evidence(

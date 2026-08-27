@@ -962,6 +962,61 @@ def test_event_can_atomically_finalize_step_and_term_and_replay_same_value(tmp_p
         )
 
 
+def test_exact_event_checkpoint_and_effect_replays_remain_idempotent_after_terminal(
+    tmp_path,
+) -> None:
+    repository = PythonTermRepository(tmp_path / "terminal-replays.sqlite")
+    context = _context(tmp_path)
+    _save_aggregate(repository, context, tmp_path)
+    checkpoint = StepCheckpointRecord(
+        checkpoint_ref="checkpoint-before-terminal",
+        checkpoint_digest="c" * 64,
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        public_projection=PublicStepProjection(status="running", summary="working"),
+    )
+    reserved = ToolEffectRecord(
+        effect_id="effect-before-terminal",
+        term_id="term-1",
+        step_id="step-1",
+        tool_call_id="call-before-terminal",
+        request_digest="d" * 64,
+        status="reserved",
+    )
+    committed = reserved.model_copy(
+        update={
+            "status": "committed",
+            "result_digest": "e" * 64,
+            "public_result": PublicToolResult(
+                status="completed", summary="tool completed"
+            ),
+        }
+    )
+    final_event = StepEventRecord(
+        event_id="event-after-checkpoint",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=2,
+        type="assistant.message",
+        payload={"content": "done"},
+    )
+    final_transition = _transition(
+        final_event, step_status="completed", term_status="completed"
+    )
+
+    repository.save_checkpoint(checkpoint)
+    repository.save_tool_effect(reserved)
+    repository.save_tool_effect(committed)
+    repository.append_event(final_transition)
+
+    repository.append_event(final_transition)
+    repository.save_checkpoint(checkpoint)
+    repository.save_tool_effect(committed)
+    assert repository.get_term("term-1").status == "completed"
+
+
 def test_row_decoders_fail_closed_for_record_identity_and_projection_tampering(
     tmp_path,
 ) -> None:
@@ -1009,6 +1064,10 @@ def test_row_decoders_fail_closed_for_record_identity_and_projection_tampering(
             "UPDATE python_terms SET record_json = ? WHERE term_id = 'term-1'",
             (stored_term,),
         )
+        stored_step = connection.execute(
+            """SELECT record_json FROM python_steps
+            WHERE term_id = 'term-1' AND step_id = 'step-1'"""
+        ).fetchone()[0]
         changed = step.model_copy(update={"cursor": 99})
         connection.execute(
             """UPDATE python_steps SET record_json = ?
@@ -1019,6 +1078,11 @@ def test_row_decoders_fail_closed_for_record_identity_and_projection_tampering(
         repository.get_step("term-1", "step-1")
 
     with sqlite3.connect(database) as connection:
+        connection.execute(
+            """UPDATE python_steps SET record_json = ?
+            WHERE term_id = 'term-1' AND step_id = 'step-1'""",
+            (stored_step,),
+        )
         connection.execute(
             """UPDATE python_step_events SET public_projection_json = '{}'
             WHERE event_id = 'event-1'"""
@@ -1067,3 +1131,92 @@ def test_checkpoint_and_effect_decoders_reject_digest_and_projection_tampering(
         repository.latest_checkpoint("term-1")
     with pytest.raises(RepositoryCorruption, match="projection|result"):
         repository.get_tool_effect("effect-1")
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "event_replay",
+        "checkpoint_replay",
+        "effect_replay",
+        "list_events",
+        "list_public_projections",
+        "latest_checkpoint",
+        "get_tool_effect",
+    ],
+)
+def test_replays_and_public_reads_validate_the_owning_aggregate_evidence(
+    tmp_path, operation: str
+) -> None:
+    database = tmp_path / f"owning-aggregate-{operation}.sqlite"
+    repository = PythonTermRepository(database)
+    context = _context(tmp_path)
+    initial_term, initial_step = _save_aggregate(repository, context, tmp_path)
+    effect = ToolEffectRecord(
+        effect_id="effect-1",
+        term_id="term-1",
+        step_id="step-1",
+        tool_call_id="call-1",
+        request_digest="d" * 64,
+        status="reserved",
+    )
+    event = StepEventRecord(
+        event_id="event-1",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": "working"},
+    )
+    transition = _transition(event, step_status="running", term_status="running")
+    checkpoint = StepCheckpointRecord(
+        checkpoint_ref="checkpoint-1",
+        checkpoint_digest="c" * 64,
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        public_projection=PublicStepProjection(status="running", summary="working"),
+    )
+    repository.save_tool_effect(effect)
+    repository.append_event(transition)
+    repository.save_checkpoint(checkpoint)
+
+    # Keep the redundant aggregate columns internally consistent while removing
+    # the state proved by the still-present Event and Checkpoint evidence.
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """UPDATE python_terms SET status = ?, cursor = ?, record_json = ?
+            WHERE term_id = ?""",
+            (
+                initial_term.status,
+                initial_term.cursor,
+                canonical_json(initial_term),
+                initial_term.term_id,
+            ),
+        )
+        connection.execute(
+            """UPDATE python_steps SET status = ?, cursor = ?, record_json = ?
+            WHERE term_id = ? AND step_id = ?""",
+            (
+                initial_step.status,
+                initial_step.cursor,
+                canonical_json(initial_step),
+                initial_step.term_id,
+                initial_step.step_id,
+            ),
+        )
+
+    operations = {
+        "event_replay": lambda: repository.append_event(transition),
+        "checkpoint_replay": lambda: repository.save_checkpoint(checkpoint),
+        "effect_replay": lambda: repository.save_tool_effect(effect),
+        "list_events": lambda: repository.list_events("term-1"),
+        "list_public_projections": lambda: repository.list_public_projections(
+            "term-1"
+        ),
+        "latest_checkpoint": lambda: repository.latest_checkpoint("term-1"),
+        "get_tool_effect": lambda: repository.get_tool_effect("effect-1"),
+    }
+    with pytest.raises(RepositoryCorruption, match="evidence"):
+        operations[operation]()

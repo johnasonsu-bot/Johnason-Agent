@@ -136,46 +136,33 @@ class TermStateStore:
     ) -> Iterator[BinaryIO]:
         """Open a Term-local regular file through no-follow directory handles."""
         write = mode != "rb"
-        term_root, segments = self._validate_access(
-            term_id, agent_id, reference, area, relative_path, write=write
-        )
-        candidate = term_root / area
-        candidate = candidate.joinpath(*segments)
-        self._require_granted(candidate, write=write)
-
-        descriptors: list[int] = []
         file_descriptor: int | None = None
-        directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
-            term_descriptor = self._open_term_root_descriptor(term_id)
-            descriptors.append(term_descriptor)
-            area_descriptor = os.open(area, directory_flags, dir_fd=term_descriptor)
-            descriptors.append(area_descriptor)
-            parent_descriptor = area_descriptor
-            for segment in segments[:-1]:
-                parent_descriptor = os.open(
-                    segment, directory_flags, dir_fd=parent_descriptor
+            with self._validated_parent_descriptor(
+                term_id,
+                agent_id,
+                reference,
+                area,
+                relative_path,
+                write=write,
+            ) as (parent_descriptor, filename):
+                file_flags = {
+                    "rb": os.O_RDONLY,
+                    "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                    "xb": os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                }[mode] | getattr(os, "O_NOFOLLOW", 0)
+                file_descriptor = os.open(
+                    filename, file_flags, 0o600, dir_fd=parent_descriptor
                 )
-                descriptors.append(parent_descriptor)
-            file_flags = {
-                "rb": os.O_RDONLY,
-                "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                "xb": os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            }[mode] | getattr(os, "O_NOFOLLOW", 0)
-            file_descriptor = os.open(
-                segments[-1], file_flags, 0o600, dir_fd=parent_descriptor
-            )
-            metadata = os.fstat(file_descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise StateBoundaryError("Term-local target must be a regular file")
-            with os.fdopen(file_descriptor, mode) as handle:
-                file_descriptor = None
-                yield handle
+                metadata = os.fstat(file_descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise StateBoundaryError(
+                        "Term-local target must be a regular file"
+                    )
+                with os.fdopen(file_descriptor, mode) as handle:
+                    file_descriptor = None
+                    yield handle
         except StateBoundaryError:
             raise
         except OSError as exc:
@@ -185,6 +172,53 @@ class TermStateStore:
         finally:
             if file_descriptor is not None:
                 os.close(file_descriptor)
+
+    @contextmanager
+    def _validated_parent_descriptor(
+        self,
+        term_id: str,
+        agent_id: str,
+        reference: TermWorkStateRef,
+        area: Literal["work", "outputs", "logs"],
+        relative_path: str,
+        *,
+        write: bool,
+    ) -> Iterator[tuple[int, str]]:
+        """Keep the validated Term and parent directory chain open for one access."""
+        term_root, segments = self._validate_access_request(
+            term_id, agent_id, reference, area, relative_path
+        )
+        descriptors: list[int] = []
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            term_descriptor = self._open_term_root_descriptor(term_id)
+            descriptors.append(term_descriptor)
+            self._require_granted(term_root / "runtime.json", write=False)
+            self._read_runtime_record_from_descriptor(term_descriptor, reference)
+
+            area_descriptor = os.open(area, directory_flags, dir_fd=term_descriptor)
+            descriptors.append(area_descriptor)
+            parent_descriptor = area_descriptor
+            for segment in segments[:-1]:
+                parent_descriptor = os.open(
+                    segment, directory_flags, dir_fd=parent_descriptor
+                )
+                descriptors.append(parent_descriptor)
+
+            candidate = term_root.joinpath(area, *segments)
+            self._require_granted(candidate, write=write)
+            yield parent_descriptor, segments[-1]
+        except StateBoundaryError:
+            raise
+        except OSError as exc:
+            raise StateBoundaryError(
+                "Term-local directory cannot be opened without following links"
+            ) from exc
+        finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
@@ -197,6 +231,21 @@ class TermStateStore:
         relative_path: str,
         *,
         write: bool,
+    ) -> tuple[Path, tuple[str, ...]]:
+        expected_root, segments = self._validate_access_request(
+            term_id, agent_id, reference, area, relative_path
+        )
+        self._read_runtime_record(expected_root, reference)
+        self._require_granted(expected_root.joinpath(area, *segments), write=write)
+        return expected_root, segments
+
+    def _validate_access_request(
+        self,
+        term_id: str,
+        agent_id: str,
+        reference: TermWorkStateRef,
+        area: Literal["work", "outputs", "logs"],
+        relative_path: str,
     ) -> tuple[Path, tuple[str, ...]]:
         if area not in self._AREAS:
             raise StateBoundaryError("unknown Term-local state area")
@@ -212,7 +261,6 @@ class TermStateStore:
         referenced_root = self.workspace_root / reference.root_ref
         if referenced_root != expected_root:
             raise StateBoundaryError("cross-Term Work State reference")
-        self._read_runtime_record(expected_root, reference)
         segments = tuple(relative_path.split("/"))
         if (
             not relative_path
@@ -220,7 +268,6 @@ class TermStateStore:
             or any(part in {"", ".", ".."} for part in segments)
         ):
             raise StateBoundaryError("Term-local path must be a canonical relative path")
-        self._require_granted(expected_root.joinpath(area, *segments), write=write)
         return expected_root, segments
 
     def _term_root(self, term_id: str) -> Path:
@@ -286,13 +333,24 @@ class TermStateStore:
         runtime_file = term_root / "runtime.json"
         self._require_granted(runtime_file, write=False)
         root_descriptor: int | None = None
-        runtime_descriptor: int | None = None
         try:
             root_descriptor = self._open_term_root_descriptor(reference.term_id)
+            return self._read_runtime_record_from_descriptor(
+                root_descriptor, reference
+            )
+        finally:
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+
+    def _read_runtime_record_from_descriptor(
+        self, term_descriptor: int, reference: TermWorkStateRef
+    ) -> dict[str, object]:
+        runtime_descriptor: int | None = None
+        try:
             runtime_descriptor = os.open(
                 "runtime.json",
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=root_descriptor,
+                dir_fd=term_descriptor,
             )
             metadata = os.fstat(runtime_descriptor)
             if not stat.S_ISREG(metadata.st_mode):
@@ -307,8 +365,6 @@ class TermStateStore:
         finally:
             if runtime_descriptor is not None:
                 os.close(runtime_descriptor)
-            if root_descriptor is not None:
-                os.close(root_descriptor)
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
