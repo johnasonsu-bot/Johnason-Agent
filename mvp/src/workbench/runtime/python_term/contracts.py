@@ -913,6 +913,23 @@ class StepEventTransitionRecord(FrozenModel):
         return self.event.public_projection
 
 
+class RuntimeCheckpointEvidence(FrozenModel):
+    """Frozen execution evidence required to resume one Step safely."""
+
+    runtime_id: Identifier
+    runtime_build_id: Identifier
+    command_identity_digest: Digest
+    context_digest: Digest
+    manifest_digest: Digest
+    workspace_grant_digest: Digest
+    permission_policy_digest: Digest
+    effect_digest: Digest
+    effect_record_digests: tuple[Digest, ...] = ()
+    term_id: Identifier
+    step_id: Identifier
+    cursor: StrictInt = Field(ge=0)
+
+
 class StepCheckpointRecord(_SafePayloadRecord):
     checkpoint_ref: Reference
     checkpoint_digest: Digest
@@ -920,6 +937,21 @@ class StepCheckpointRecord(_SafePayloadRecord):
     step_id: Identifier
     cursor: StrictInt = Field(ge=0)
     public_projection: PublicStepProjection
+    evidence: RuntimeCheckpointEvidence | None = None
+
+    @model_validator(mode="after")
+    def evidence_matches_checkpoint(self) -> Self:
+        if self.evidence is None:
+            return self
+        if (
+            self.evidence.term_id != self.term_id
+            or self.evidence.step_id != self.step_id
+            or self.evidence.cursor != self.cursor
+        ):
+            raise ValueError("checkpoint evidence identity does not match its Step")
+        if self.checkpoint_digest != canonical_digest(self.evidence):
+            raise ValueError("checkpoint digest does not match its frozen evidence")
+        return self
 
 
 class ToolEffectRecord(_SafePayloadRecord):

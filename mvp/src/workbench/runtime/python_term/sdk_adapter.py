@@ -10,6 +10,7 @@ from typing import Any, ClassVar, cast
 
 from agents import (
     Agent,
+    FunctionTool,
     Handoff,
     ItemHelpers,
     Model,
@@ -18,6 +19,7 @@ from agents import (
     Session,
     Tool,
     __version__ as AGENTS_SDK_VERSION,
+    handoff as sdk_handoff,
 )
 
 
@@ -112,10 +114,13 @@ class AgentsSdkFacade:
     Runner = Runner
     RunContext = RunContextWrapper
     Agent = Agent
+    FunctionTool = FunctionTool
     Model = Model
     Tool = Tool
     Handoff = Handoff
     Session = Session
+    ItemHelpers = ItemHelpers
+    handoff = staticmethod(sdk_handoff)
     build_metadata = AgentsSdkBuildMetadata(
         package="openai-agents-python",
         revision=PINNED_AGENTS_SDK_REVISION,
@@ -132,3 +137,19 @@ class AgentsSdkFacade:
                 raise TypeError("FrozenSnapshotSession runs require a string or normalized item list")
             input = [*await session.get_items(), *ItemHelpers.input_to_new_input_list(input)]
         return await Runner.run(agent, input, **kwargs)
+
+    async def run_streamed(self, agent: Any, input: Any, **kwargs: Any) -> Any:
+        """Start the real SDK streaming runner from one frozen Host snapshot."""
+        session = kwargs.pop("session", None)
+        if session is not None:
+            if not isinstance(session, FrozenSnapshotSession):
+                raise TypeError("AgentsSdkFacade accepts only FrozenSnapshotSession")
+            if not isinstance(input, str | list):
+                raise TypeError(
+                    "FrozenSnapshotSession runs require a string or normalized item list"
+                )
+            input = [
+                *await session.get_items(),
+                *ItemHelpers.input_to_new_input_list(input),
+            ]
+        return Runner.run_streamed(agent, input, **kwargs)

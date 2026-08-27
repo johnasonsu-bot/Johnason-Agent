@@ -522,6 +522,149 @@ class PythonTermRepository:
             self._write_step(connection, next_step)
             self._write_term(connection, next_term)
 
+    def commit_runtime_boundary(
+        self,
+        transition: StepEventTransitionRecord,
+        checkpoint: StepCheckpointRecord,
+    ) -> None:
+        """Atomically persist one Event, its public projection, and checkpoint hint."""
+        validated_transition = self._validate_model(
+            transition, StepEventTransitionRecord
+        )
+        validated_event = validated_transition.event
+        validated_checkpoint = self._validate_model(
+            checkpoint, StepCheckpointRecord
+        )
+        if (
+            validated_checkpoint.term_id != validated_event.term_id
+            or validated_checkpoint.step_id != validated_event.step_id
+            or validated_checkpoint.cursor != validated_event.cursor
+            or validated_checkpoint.public_projection.status
+            != validated_transition.step_status
+        ):
+            raise RepositoryConflict(
+                "runtime boundary Event and checkpoint must describe one Step transition"
+            )
+
+        transition_json = canonical_json(validated_transition)
+        event_json = canonical_json(validated_event)
+        checkpoint_json = canonical_json(validated_checkpoint)
+        event_projection = validated_transition.public_projection
+        checkpoint_projection = validated_checkpoint.public_projection
+        with self._transaction() as connection:
+            event_row = connection.execute(
+                "SELECT * FROM python_step_events WHERE event_id = ?",
+                (validated_event.event_id,),
+            ).fetchone()
+            checkpoint_row = connection.execute(
+                """SELECT * FROM python_step_checkpoints
+                WHERE checkpoint_ref = ?""",
+                (validated_checkpoint.checkpoint_ref,),
+            ).fetchone()
+            if event_row is not None or checkpoint_row is not None:
+                if event_row is None or checkpoint_row is None:
+                    raise RepositoryConflict(
+                        "runtime boundary evidence is only partially persisted"
+                    )
+                existing_transition = self._decode_transition(event_row)
+                existing_checkpoint = self._decode_checkpoint(checkpoint_row)
+                if (
+                    canonical_json(existing_transition) == transition_json
+                    and canonical_json(existing_checkpoint) == checkpoint_json
+                ):
+                    self._load_owning_aggregate(
+                        connection,
+                        validated_event.term_id,
+                        validated_event.step_id,
+                    )
+                    return
+                raise RepositoryConflict("runtime boundary evidence conflict")
+
+            term, step = self._require_active_aggregate(
+                connection, validated_event.term_id, validated_event.step_id
+            )
+            if validated_event.run_id != term.envelope.run_id:
+                raise RepositoryConflict("event Run does not match the Term")
+            if (
+                validated_event.cursor != term.cursor + 1
+                or validated_event.cursor <= step.cursor
+            ):
+                raise RepositoryConflict("event cursor must advance the aggregate")
+
+            next_step = step.model_copy(
+                update={
+                    "cursor": validated_event.cursor,
+                    "status": validated_transition.step_status,
+                    "checkpoint_ref": validated_checkpoint.checkpoint_ref,
+                    "checkpoint_digest": validated_checkpoint.checkpoint_digest,
+                    "public_projection": checkpoint_projection,
+                }
+            )
+            aggregate_steps = list(self._load_steps(connection, term.term_id))
+            aggregate_steps[step.ordinal] = next_step
+            derived_term_status = self._derive_term_status(aggregate_steps)
+            if validated_transition.term_status != derived_term_status:
+                raise RepositoryConflict(
+                    "event Term status does not match ordered Step status rollup"
+                )
+            next_term = term.model_copy(
+                update={
+                    "cursor": validated_event.cursor,
+                    "status": derived_term_status,
+                    "checkpoint_ref": validated_checkpoint.checkpoint_ref,
+                    "checkpoint_digest": validated_checkpoint.checkpoint_digest,
+                    "public_projection": checkpoint_projection,
+                }
+            )
+            self._validate_execution_update(step, next_step, kind="Step")
+            self._validate_execution_update(term, next_term, kind="Term")
+            self._validate_aggregate_snapshot(next_term, aggregate_steps)
+            try:
+                connection.execute(
+                    """INSERT INTO python_step_events(
+                    event_id, term_id, step_id, cursor, event_type, event_digest,
+                    transition_digest, transition_json, step_status, term_status,
+                    event_json, public_projection_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        validated_event.event_id,
+                        validated_event.term_id,
+                        validated_event.step_id,
+                        validated_event.cursor,
+                        validated_event.type,
+                        canonical_digest(validated_event),
+                        canonical_digest(validated_transition),
+                        transition_json,
+                        validated_transition.step_status,
+                        validated_transition.term_status,
+                        event_json,
+                        canonical_json(event_projection),
+                        time.time(),
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO python_step_checkpoints(
+                    checkpoint_ref, checkpoint_digest, term_id, step_id, cursor,
+                    checkpoint_json, public_projection_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        validated_checkpoint.checkpoint_ref,
+                        validated_checkpoint.checkpoint_digest,
+                        validated_checkpoint.term_id,
+                        validated_checkpoint.step_id,
+                        validated_checkpoint.cursor,
+                        checkpoint_json,
+                        canonical_json(checkpoint_projection),
+                        time.time(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RepositoryConflict(
+                    "runtime boundary cursor or identity conflict"
+                ) from exc
+            self._write_step(connection, next_step)
+            self._write_term(connection, next_term)
+
     def list_events(self, term_id: str) -> tuple[StepEventRecord, ...]:
         with self._read_snapshot() as connection:
             rows = connection.execute(
@@ -971,6 +1114,34 @@ class PythonTermRepository:
             )
             return effect
 
+    def list_tool_effects(
+        self, term_id: str, step_id: str | None = None
+    ) -> tuple[ToolEffectRecord, ...]:
+        """Return validated Effect evidence in stable identity order."""
+        with self._read_snapshot() as connection:
+            if step_id is None:
+                rows = connection.execute(
+                    """SELECT * FROM python_tool_effects
+                    WHERE term_id = ? ORDER BY step_id, tool_call_id, effect_id""",
+                    (term_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM python_tool_effects
+                    WHERE term_id = ? AND step_id = ?
+                    ORDER BY tool_call_id, effect_id""",
+                    (term_id, step_id),
+                ).fetchall()
+            owning = self._load_owning_aggregate(
+                connection,
+                term_id,
+                step_id,
+                required=bool(rows),
+            )
+            if owning is None:
+                return ()
+            return tuple(self._decode_effect(row) for row in rows)
+
     def _require_term(
         self, connection: sqlite3.Connection, term_id: str
     ) -> TermRecord:
@@ -1154,6 +1325,9 @@ class PythonTermRepository:
                     if (
                         replayed_term.status in _EXECUTION_TERMINAL
                         or target.status in _EXECUTION_TERMINAL
+                    ) and not (
+                        checkpoint.cursor == replayed_term.cursor == target.cursor
+                        and checkpoint.public_projection.status == target.status
                     ):
                         raise ValueError("checkpoint follows terminal state")
                     next_step = target.model_copy(
