@@ -606,6 +606,7 @@ class PythonTermRepository:
                 or existing.step_id != validated.step_id
                 or existing.tool_call_id != validated.tool_call_id
                 or existing.request_digest != validated.request_digest
+                or existing.write_effect != validated.write_effect
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
             if existing.status in _EFFECT_TERMINAL:
@@ -665,6 +666,7 @@ class PythonTermRepository:
                     or existing.step_id != validated.step_id
                     or existing.tool_call_id != validated.tool_call_id
                     or existing.request_digest != validated.request_digest
+                    or existing.write_effect != validated.write_effect
                 ):
                     raise RepositoryConflict("Tool Effect request conflict")
                 return existing, False
@@ -695,6 +697,57 @@ class PythonTermRepository:
                 )
             except sqlite3.IntegrityError as exc:
                 raise RepositoryConflict("Tool Effect identity conflict") from exc
+            return validated, True
+
+    def takeover_expired_tool_effect(
+        self,
+        replacement: ToolEffectRecord,
+        *,
+        expected_owner_id: str | None,
+        now_ms: int,
+    ) -> tuple[ToolEffectRecord, bool]:
+        """Fence an expired reservation to one replacement execution owner."""
+        validated = self._validate_model(replacement, ToolEffectRecord)
+        if (
+            validated.status != "reserved"
+            or validated.execution_owner_id is None
+            or validated.lease_expires_at_ms is None
+        ):
+            raise RepositoryConflict("takeover requires an owned Tool Effect reservation")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (validated.effect_id,),
+            ).fetchone()
+            if row is None:
+                raise RepositoryConflict("Tool Effect takeover requires a reservation")
+            existing = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, existing.term_id, existing.step_id
+            )
+            if (
+                existing.term_id != validated.term_id
+                or existing.step_id != validated.step_id
+                or existing.tool_call_id != validated.tool_call_id
+                or existing.request_digest != validated.request_digest
+                or existing.write_effect != validated.write_effect
+            ):
+                raise RepositoryConflict("Tool Effect request conflict")
+            if existing.status != "reserved":
+                return existing, False
+            if (
+                existing.execution_owner_id != expected_owner_id
+                or (
+                    existing.lease_expires_at_ms is not None
+                    and existing.lease_expires_at_ms > now_ms
+                )
+            ):
+                return existing, False
+            connection.execute(
+                """UPDATE python_tool_effects
+                SET effect_json = ?, updated_at = ? WHERE effect_id = ?""",
+                (canonical_json(validated), time.time(), validated.effect_id),
+            )
             return validated, True
 
     def get_tool_effect(self, effect_id: str) -> ToolEffectRecord | None:

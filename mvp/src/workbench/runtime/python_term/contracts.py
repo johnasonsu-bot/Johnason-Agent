@@ -928,12 +928,19 @@ class ToolEffectRecord(_SafePayloadRecord):
     step_id: Identifier
     tool_call_id: Identifier
     request_digest: Digest
+    write_effect: StrictBool = False
+    execution_owner_id: Identifier | None = None
+    lease_expires_at_ms: StrictInt | None = Field(default=None, gt=0)
     status: EffectStatus
     result_digest: Digest | None = None
     public_result: PublicToolResult | None = None
 
     @model_validator(mode="after")
     def terminal_result_is_coherent(self) -> Self:
+        if (self.execution_owner_id is None) != (self.lease_expires_at_ms is None):
+            raise ValueError("Tool Effect execution owner and lease must be atomic")
+        if self.status != "reserved" and self.execution_owner_id is not None:
+            raise ValueError("terminal Tool Effect cannot retain an execution owner")
         if self.status == "committed" and (
             self.result_digest is None or self.public_result is None
         ):
