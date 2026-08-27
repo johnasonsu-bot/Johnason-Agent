@@ -103,6 +103,17 @@ def _router(
     return context, router, repository
 
 
+def _only_effect(repository: PythonTermRepository):
+    with repository.connect() as connection:
+        row = connection.execute(
+            "SELECT effect_id FROM python_tool_effects"
+        ).fetchone()
+    assert row is not None
+    effect = repository.get_tool_effect(row[0])
+    assert effect is not None
+    return effect
+
+
 @pytest.mark.asyncio
 async def test_command_deny_and_ask_are_decided_before_pty_spawn(
     tmp_path: Path,
@@ -203,6 +214,64 @@ print("isolated child")
         )
     effect = repository.get_tool_effect(effect_id)
     assert effect is not None and effect.status == "committed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("nonzero_exit", "output_limit", "cleanup_incomplete"),
+)
+async def test_pty_execution_failure_never_commits_write_effect(
+    tmp_path: Path,
+    failure_mode: str,
+) -> None:
+    worker_type = _worker_type()
+    root = tmp_path / failure_mode
+    root.mkdir()
+
+    if failure_mode == "cleanup_incomplete":
+        class IncompleteCleanupWorker(worker_type):
+            async def _cleanup_group(self, process, pgid):
+                await super()._cleanup_group(process, pgid)
+                return False
+
+        worker = IncompleteCleanupWorker(
+            canonical_cwd=root.resolve(),
+            termination_grace_ms=25,
+        )
+        program = "pass"
+    elif failure_mode == "output_limit":
+        worker = worker_type(
+            canonical_cwd=root.resolve(),
+            output_limit_bytes=64,
+        )
+        program = "print('x' * 10000)"
+    else:
+        worker = worker_type(canonical_cwd=root.resolve())
+        program = "raise SystemExit(17)"
+    context, router, repository = _router(
+        root,
+        worker,
+        command_policy="allow",
+    )
+
+    with pytest.raises(ToolRouteError) as raised:
+        await router.invoke(
+            context,
+            "python-term-pty",
+            {
+                "argv": [sys.executable, "-c", program],
+                "cwd": str(root.resolve()),
+            },
+            tool_call_id=f"pty-failure-{failure_mode}",
+        )
+
+    assert raised.value.code == "reconciliation_required"
+    assert worker.last_snapshot is not None
+    effect = _only_effect(repository)
+    assert effect.status == "reconciliation_required"
+    assert effect.public_result is not None
+    assert effect.public_result.status == "failed"
 
 
 @pytest.mark.asyncio
