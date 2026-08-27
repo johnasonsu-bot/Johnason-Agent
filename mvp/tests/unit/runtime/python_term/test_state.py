@@ -80,7 +80,10 @@ def test_reinitialization_is_idempotent_but_cannot_replace_metadata(tmp_path) ->
     assert payload["metadata"] == {"value": 1}
 
 
-@pytest.mark.parametrize("relative", ["../other/file", "/tmp/file", "work/../../file"])
+@pytest.mark.parametrize(
+    "relative",
+    ["../other/file", "/tmp/file", "work/../../file", "dir/./file", "dir/."],
+)
 def test_rejects_traversal_and_ungrantable_absolute_paths(tmp_path, relative) -> None:
     store = TermStateStore(tmp_path, _grant(tmp_path))
     ref = store.initialize("term-1", "agent-a", {"ok": True})
@@ -100,6 +103,19 @@ def test_resolves_symlinks_before_workspace_grant_check(tmp_path) -> None:
         store.resolve(
             "term-1", "agent-a", ref, "work", "escape/file.txt", write=True
         )
+
+
+def test_rejects_area_root_symlink_alias_to_another_term(tmp_path) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    store.initialize("term-a", "agent-a", {"owner": "a"})
+    ref_b = store.initialize("term-b", "agent-a", {"owner": "b"})
+    term_a_work = tmp_path / ".runtime" / "terms" / "term-a" / "work"
+    term_b_work = tmp_path / ".runtime" / "terms" / "term-b" / "work"
+    term_b_work.rename(term_b_work.with_name("work-original"))
+    os.symlink(term_a_work, term_b_work)
+
+    with pytest.raises(StateBoundaryError, match="symlink|canonical"):
+        store.resolve("term-b", "agent-a", ref_b, "work", "file.txt", write=True)
 
 
 def test_rejects_cross_term_reference(tmp_path) -> None:

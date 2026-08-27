@@ -120,18 +120,19 @@ class TermStateStore:
         if referenced_root != expected_root:
             raise StateBoundaryError("cross-Term Work State reference")
         self._read_runtime_record(expected_root, reference)
-        relative = Path(relative_path)
+        segments = relative_path.split("/")
         if (
             not relative_path
             or "\\" in relative_path
-            or "//" in relative_path
-            or relative_path.endswith("/")
-            or relative.is_absolute()
-            or any(part in {"", ".", ".."} for part in relative.parts)
+            or any(part in {"", ".", ".."} for part in segments)
         ):
             raise StateBoundaryError("Term-local path must be a canonical relative path")
-        area_root = (expected_root / area).resolve(strict=False)
-        candidate = (area_root / relative).resolve(strict=False)
+        area_root = expected_root / area
+        lexical_candidate = area_root.joinpath(*segments)
+        self._require_no_follow_chain(area_root, lexical_candidate)
+        candidate = lexical_candidate.resolve(strict=False)
+        if area_root.resolve(strict=False) != area_root or candidate != lexical_candidate:
+            raise StateBoundaryError("Term-local path contains a symlink or alias")
         if not candidate.is_relative_to(area_root):
             raise StateBoundaryError("path escapes the Term-local state area")
         self._require_granted(candidate, write=write)
@@ -156,6 +157,42 @@ class TermStateStore:
             current = current / part
             if current.is_symlink():
                 raise StateBoundaryError("Term state parent chain contains a symlink")
+
+    def _require_no_follow_chain(self, area_root: Path, candidate: Path) -> None:
+        try:
+            relative = candidate.relative_to(area_root)
+        except ValueError as exc:
+            raise StateBoundaryError("path escapes the Term-local state area") from exc
+        paths = [area_root]
+        current = area_root
+        for part in relative.parts:
+            current = current / part
+            paths.append(current)
+        for index, current in enumerate(paths):
+            try:
+                metadata = current.lstat()
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                raise StateBoundaryError("Term-local path cannot be inspected") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise StateBoundaryError("Term-local path contains a symlink")
+            if current.resolve(strict=False) != current:
+                raise StateBoundaryError("Term-local path is not canonical")
+            is_parent = index < len(paths) - 1
+            if is_parent and not stat.S_ISDIR(metadata.st_mode):
+                raise StateBoundaryError("Term-local parent must be a directory")
+            if stat.S_ISDIR(metadata.st_mode):
+                flags = os.O_RDONLY
+                flags |= getattr(os, "O_DIRECTORY", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(current, flags)
+                except OSError as exc:
+                    raise StateBoundaryError(
+                        "Term-local directory cannot be opened without following links"
+                    ) from exc
+                os.close(descriptor)
 
     def _read_runtime_record(
         self, term_root: Path, reference: TermWorkStateRef

@@ -91,15 +91,40 @@ class PythonTermRepository:
             != tuple(range(len(validated_term.step_ids)))
         ):
             raise RepositoryConflict("Step membership and ordinal must match the Term")
+        self._validate_aggregate_snapshot(validated_term, validated_steps)
         with self._transaction() as connection:
+            existing_row = connection.execute(
+                "SELECT * FROM python_terms WHERE term_id = ? OR command_id = ?",
+                (validated_term.term_id, validated_term.command_id),
+            ).fetchone()
+            if existing_row is None:
+                self._validate_initial_admission(validated_term, validated_steps)
+            else:
+                existing_term = self._decode_term(existing_row)
+                existing_steps = self._load_steps(connection, existing_term.term_id)
+                self._validate_aggregate_snapshot(existing_term, existing_steps)
+                self._validate_retry_transition(
+                    existing_term,
+                    existing_steps,
+                    validated_term,
+                    validated_steps,
+                )
             self._save_term(connection, validated_term)
             for step in validated_steps:
-                self._save_step(connection, step)
+                self._save_step(connection, step, aggregate_transition=True)
 
     def save_term(self, record: TermRecord) -> None:
         validated = self._validate_model(record, TermRecord)
         with self._transaction() as connection:
-            self._save_term(connection, validated)
+            row = connection.execute(
+                "SELECT * FROM python_terms WHERE term_id = ? OR command_id = ?",
+                (validated.term_id, validated.command_id),
+            ).fetchone()
+            if row is None:
+                raise RepositoryConflict("Term admission requires save_aggregate")
+            existing = self._decode_term(row)
+            if canonical_json(existing) != canonical_json(validated):
+                raise RepositoryConflict("Term transition requires an aggregate API")
 
     def _save_term(self, connection: sqlite3.Connection, record: TermRecord) -> None:
         encoded = canonical_json(record)
@@ -168,9 +193,24 @@ class PythonTermRepository:
     def save_step(self, record: StepRecord) -> None:
         validated = self._validate_model(record, StepRecord)
         with self._transaction() as connection:
-            self._save_step(connection, validated)
+            row = connection.execute(
+                """SELECT * FROM python_steps
+                WHERE (term_id = ? AND step_id = ?) OR command_id = ?""",
+                (validated.term_id, validated.step_id, validated.command_id),
+            ).fetchone()
+            if row is None:
+                raise RepositoryConflict("Step admission requires save_aggregate")
+            existing = self._decode_step(row)
+            if canonical_json(existing) != canonical_json(validated):
+                raise RepositoryConflict("Step transition requires an aggregate API")
 
-    def _save_step(self, connection: sqlite3.Connection, record: StepRecord) -> None:
+    def _save_step(
+        self,
+        connection: sqlite3.Connection,
+        record: StepRecord,
+        *,
+        aggregate_transition: bool = False,
+    ) -> None:
         term = self._require_term(connection, record.term_id)
         self._validate_membership(term, record)
         encoded = canonical_json(record)
@@ -183,12 +223,12 @@ class PythonTermRepository:
             existing = self._decode_step(row)
             if canonical_json(existing) == encoded:
                 return
-            if term.status in _EXECUTION_TERMINAL:
+            if term.status in _EXECUTION_TERMINAL and not aggregate_transition:
                 raise RepositoryConflict("terminal Term cannot change a Step")
             self._validate_execution_update(existing, record, kind="Step")
             self._write_step(connection, record)
             return
-        if term.status in _EXECUTION_TERMINAL:
+        if term.status in _EXECUTION_TERMINAL and not aggregate_transition:
             raise RepositoryConflict("terminal Term cannot add a Step")
         now = time.time()
         try:
@@ -265,12 +305,12 @@ class PythonTermRepository:
             record.immutable_identity
         ):
             raise RepositoryConflict(f"{kind} immutable identity conflict")
+        if existing.status in _EXECUTION_TERMINAL:
+            raise RepositoryConflict(f"{kind} terminal state cannot change")
         if record.attempt < existing.attempt:
             raise RepositoryConflict(f"{kind} attempt cannot move backwards")
         if record.cursor < existing.cursor:
             raise RepositoryConflict(f"{kind} cursor cannot move backwards")
-        if existing.status in _EXECUTION_TERMINAL:
-            raise RepositoryConflict(f"{kind} terminal state cannot change")
 
     def append_event(
         self,
@@ -305,15 +345,19 @@ class PythonTermRepository:
                     "public_projection": projection,
                 }
             )
+            aggregate_steps = list(self._load_steps(connection, term.term_id))
+            aggregate_steps[step.ordinal] = next_step
             next_term = term.model_copy(
                 update={
                     "cursor": validated.cursor,
-                    "status": term_status or term.status,
+                    "status": term_status
+                    or self._rollup_term_status(term.status, aggregate_steps),
                     "public_projection": projection,
                 }
             )
             self._validate_execution_update(step, next_step, kind="Step")
             self._validate_execution_update(term, next_term, kind="Term")
+            self._validate_aggregate_snapshot(next_term, aggregate_steps)
             try:
                 connection.execute(
                     """INSERT INTO python_step_events(
@@ -375,17 +419,24 @@ class PythonTermRepository:
             )
             if validated.cursor < term.cursor or validated.cursor < step.cursor:
                 raise RepositoryConflict("checkpoint cursor cannot move backwards")
-            updates = {
+            step_updates = {
                 "cursor": validated.cursor,
                 "status": validated.public_projection.status,
                 "checkpoint_ref": validated.checkpoint_ref,
                 "checkpoint_digest": validated.checkpoint_digest,
                 "public_projection": validated.public_projection,
             }
-            next_step = step.model_copy(update=updates)
-            next_term = term.model_copy(update=updates)
+            next_step = step.model_copy(update=step_updates)
+            aggregate_steps = list(self._load_steps(connection, term.term_id))
+            aggregate_steps[step.ordinal] = next_step
+            term_updates = {
+                **step_updates,
+                "status": self._rollup_term_status(term.status, aggregate_steps),
+            }
+            next_term = term.model_copy(update=term_updates)
             self._validate_execution_update(step, next_step, kind="Step")
             self._validate_execution_update(term, next_term, kind="Term")
+            self._validate_aggregate_snapshot(next_term, aggregate_steps)
             try:
                 connection.execute(
                     """INSERT INTO python_step_checkpoints(
@@ -531,9 +582,135 @@ class PythonTermRepository:
             raise RepositoryConflict("aggregate write requires an existing Step")
         step = self._decode_step(row)
         self._validate_membership(term, step)
+        self._validate_aggregate_snapshot(term, self._load_steps(connection, term_id))
         if term.status in _EXECUTION_TERMINAL or step.status in _EXECUTION_TERMINAL:
             raise RepositoryConflict("terminal Term or Step rejects new aggregate writes")
         return term, step
+
+    @staticmethod
+    def _rollup_term_status(
+        current: ExecutionStatus, steps: Sequence[StepRecord]
+    ) -> ExecutionStatus:
+        if not all(step.status in _EXECUTION_TERMINAL for step in steps):
+            return current
+        if all(step.status == "completed" for step in steps):
+            return "completed"
+        if any(step.status == "failed" for step in steps):
+            return "failed"
+        return "cancelled"
+
+    def _load_steps(
+        self, connection: sqlite3.Connection, term_id: str
+    ) -> tuple[StepRecord, ...]:
+        rows = connection.execute(
+            """SELECT * FROM python_steps
+            WHERE term_id = ? ORDER BY ordinal""",
+            (term_id,),
+        ).fetchall()
+        return tuple(self._decode_step(row) for row in rows)
+
+    def _validate_aggregate_snapshot(
+        self, term: TermRecord, steps: Sequence[StepRecord]
+    ) -> None:
+        if (
+            tuple(step.step_id for step in steps) != term.step_ids
+            or tuple(step.ordinal for step in steps) != tuple(range(len(term.step_ids)))
+        ):
+            raise RepositoryConflict("Step membership and ordinal must match the Term")
+        for step in steps:
+            self._validate_membership(term, step)
+
+        terminal_steps = tuple(
+            step.status in _EXECUTION_TERMINAL for step in steps
+        )
+        if term.status in _EXECUTION_TERMINAL and not all(terminal_steps):
+            raise RepositoryConflict("terminal Term requires terminal member Steps")
+        if all(terminal_steps) and term.status not in _EXECUTION_TERMINAL:
+            raise RepositoryConflict("terminal member Steps require a terminal Term")
+        if term.status == "completed" and any(
+            step.status != "completed" for step in steps
+        ):
+            raise RepositoryConflict("completed Term requires completed member Steps")
+
+        maximum_cursor = max(step.cursor for step in steps)
+        if term.cursor != maximum_cursor:
+            raise RepositoryConflict("Term-global cursor must equal the latest Step cursor")
+        latest = tuple(step for step in steps if step.cursor == maximum_cursor)
+        if term.cursor == 0:
+            if term.public_projection is not None or any(
+                step.public_projection is not None for step in steps
+            ):
+                raise RepositoryConflict("initial aggregate cannot have a projection")
+        elif len(latest) != 1 or term.public_projection is None:
+            raise RepositoryConflict(
+                "advanced aggregate requires one latest Step and a projection"
+            )
+        elif canonical_json(term.public_projection) != canonical_json(
+            latest[0].public_projection
+        ):
+            raise RepositoryConflict("Term and latest Step projection disagree")
+
+        checkpoint_steps = tuple(
+            step
+            for step in steps
+            if step.checkpoint_ref is not None and step.checkpoint_digest is not None
+        )
+        if term.checkpoint_ref is None:
+            if checkpoint_steps:
+                raise RepositoryConflict("Term checkpoint is missing from the aggregate")
+        elif not any(
+            step.checkpoint_ref == term.checkpoint_ref
+            and step.checkpoint_digest == term.checkpoint_digest
+            for step in checkpoint_steps
+        ):
+            raise RepositoryConflict("Term and Step checkpoint disagree")
+
+    @staticmethod
+    def _validate_initial_admission(
+        term: TermRecord, steps: Sequence[StepRecord]
+    ) -> None:
+        records: tuple[TermRecord | StepRecord, ...] = (term, *steps)
+        if any(
+            record.status != "pending"
+            or record.cursor != 0
+            or record.checkpoint_ref is not None
+            or record.checkpoint_digest is not None
+            or record.public_projection is not None
+            for record in records
+        ):
+            raise RepositoryConflict(
+                "aggregate admission must start pending without runtime evidence"
+            )
+
+    def _validate_retry_transition(
+        self,
+        existing_term: TermRecord,
+        existing_steps: Sequence[StepRecord],
+        term: TermRecord,
+        steps: Sequence[StepRecord],
+    ) -> None:
+        if len(existing_steps) != len(steps):
+            raise RepositoryConflict("aggregate retry cannot change Step membership")
+        pairs = ((existing_term, term), *zip(existing_steps, steps, strict=True))
+        for existing, record in pairs:
+            if canonical_json(existing) == canonical_json(record):
+                continue
+            self._validate_execution_update(
+                existing,
+                record,
+                kind="Term" if isinstance(record, TermRecord) else "Step",
+            )
+            if (
+                existing.status != record.status
+                or existing.cursor != record.cursor
+                or existing.checkpoint_ref != record.checkpoint_ref
+                or existing.checkpoint_digest != record.checkpoint_digest
+                or canonical_json(existing.public_projection)
+                != canonical_json(record.public_projection)
+            ):
+                raise RepositoryConflict(
+                    "runtime state transition requires Event or Checkpoint aggregate API"
+                )
 
     @staticmethod
     def _validate_membership(term: TermRecord, step: StepRecord) -> None:
@@ -545,6 +722,19 @@ class PythonTermRepository:
             raise RepositoryConflict("Step ordinal does not match Term membership")
         if step.agent_id != term.envelope.agent_id:
             raise RepositoryConflict("Step Agent does not match Term identity")
+        if expected_ordinal == 0 and (
+            step.command_id != term.envelope.command_id
+            or step.attempt != term.attempt
+            or canonical_json(step.command_identity)
+            != canonical_json(term.command_identity)
+        ):
+            raise RepositoryConflict(
+                "first Step command identity and attempt must match the Term envelope"
+            )
+        if canonical_json(step.command_identity.shared_term_snapshot) != canonical_json(
+            term.command_identity.shared_term_snapshot
+        ):
+            raise RepositoryConflict("Step command identity diverges from Term snapshot")
 
     @staticmethod
     def _validate_model(record: _RecordT, model: type[_RecordT]) -> _RecordT:

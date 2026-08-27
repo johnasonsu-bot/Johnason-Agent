@@ -217,6 +217,103 @@ class PromptSectionPin(FrozenModel):
     digest: Digest
 
 
+class FrozenCommandIdentity(FrozenModel):
+    """Complete immutable command snapshot, excluding only retry/generation data."""
+
+    protocol_version: Literal["2.0"] = "2.0"
+    runtime_id: Identifier
+    runtime_build_id: Identifier
+    runtime_config_digest: Digest
+    session_id: Identifier
+    run_id: Identifier
+    term_id: Identifier
+    step_id: Identifier
+    command_id: Identifier
+    agent_id: Identifier
+    agent_role: Identifier
+    provider_ref: Reference
+    model: Identifier
+    model_options_digest: Digest
+    message_snapshot_digest: Digest
+    conversation_context: ConversationContextRef
+    project_context: ProjectContextRef
+    work_state: TermWorkStateRef
+    tool_manifest: tuple[ToolManifestEntryV2, ...]
+    tool_manifest_digest: Digest
+    skill_pins: tuple[SkillPinV2, ...]
+    skill_manifest_digest: Digest
+    plugin_pins: tuple[PluginPinV2, ...]
+    plugin_manifest_digest: Digest
+    prompt_sections: tuple[PromptSectionPin, ...] = ()
+    prompt_manifest_digest: Digest
+    permission_policy: PermissionPolicy
+    permission_policy_digest: Digest
+    workspace_grant: WorkspaceGrantV2
+    workspace_grant_digest: Digest
+    checkpoint_cursor: StrictInt = Field(ge=0)
+    deadline_ms: StrictInt = Field(gt=0)
+    traceparent: Identifier
+    extensions_digest: Digest
+    environment_allowlist: tuple[Identifier, ...]
+    context_budget: ContextBudgetV2
+    effect_scope: EffectScope
+
+    @field_validator("environment_allowlist")
+    @classmethod
+    def validate_environment_allowlist(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("environment allowlist contains duplicates")
+        if any(not re.fullmatch(r"[A-Z_][A-Z0-9_]*", item) for item in value):
+            raise ValueError("environment allowlist names must be canonical")
+        return value
+
+    @model_validator(mode="after")
+    def validate_complete_snapshot(self) -> Self:
+        expected = {
+            "Tool manifest": (
+                self.tool_manifest_digest,
+                canonical_digest(self.tool_manifest),
+            ),
+            "Skill manifest": (
+                self.skill_manifest_digest,
+                canonical_digest(self.skill_pins),
+            ),
+            "plugin manifest": (
+                self.plugin_manifest_digest,
+                canonical_digest(self.plugin_pins),
+            ),
+            "PromptSection manifest": (
+                self.prompt_manifest_digest,
+                canonical_digest(self.prompt_sections),
+            ),
+            "permission policy": (
+                self.permission_policy_digest,
+                self.permission_policy.digest,
+            ),
+            "Workspace Grant": (
+                self.workspace_grant_digest,
+                canonical_digest(self.workspace_grant),
+            ),
+        }
+        for name, (actual, calculated) in expected.items():
+            if actual != calculated:
+                raise ValueError(f"{name} digest does not match frozen value")
+        if self.conversation_context.session_id != self.session_id:
+            raise ValueError("Conversation Context belongs to another Session")
+        if self.work_state.term_id != self.term_id:
+            raise ValueError("Work State belongs to another Term")
+        if self.work_state.agent_id != self.agent_id:
+            raise ValueError("Agent-private Work State belongs to another agent")
+        return self
+
+    @property
+    def shared_term_snapshot(self) -> Mapping[str, JsonValue]:
+        values = self.model_dump(mode="json")
+        values.pop("step_id")
+        values.pop("command_id")
+        return cast(Mapping[str, JsonValue], _freeze_json(values))
+
+
 def _validate_public_mapping(value: object) -> JsonValue:
     if isinstance(value, Mapping):
         projected: dict[str, JsonValue] = {}
@@ -478,12 +575,12 @@ class StepContext(FrozenModel):
         )
 
     @property
-    def command_identity(self) -> Mapping[str, JsonValue]:
+    def command_identity(self) -> FrozenCommandIdentity:
         identity = self.model_dump(mode="json")
         identity.pop("attempt")
         identity.pop("host_generation")
         identity.pop("model_messages")
-        return cast(Mapping[str, JsonValue], _freeze_json(identity))
+        return FrozenCommandIdentity.model_validate(identity)
 
     @property
     def identity_digest(self) -> str:
@@ -512,7 +609,7 @@ class StepContext(FrozenModel):
 
 class TermRecord(FrozenModel):
     envelope: RunEnvelopeV2
-    command_identity: Mapping[str, JsonValue]
+    command_identity: FrozenCommandIdentity
     conversation_context: ConversationContextRef
     project_context: ProjectContextRef
     work_state: TermWorkStateRef
@@ -528,31 +625,14 @@ class TermRecord(FrozenModel):
     status: ExecutionStatus = "pending"
     cursor: StrictInt = Field(ge=0)
 
-    @field_validator("command_identity", mode="before")
-    @classmethod
-    def validate_command_identity(cls, value: object) -> object:
-        normalized = _normalized_json(value)
-        if not isinstance(normalized, dict):
-            raise ValueError("Term command identity must be a JSON object")
-        return normalized
-
-    @field_validator("command_identity")
-    @classmethod
-    def freeze_command_identity(
-        cls, value: Mapping[str, JsonValue]
-    ) -> Mapping[str, JsonValue]:
-        return cast(Mapping[str, JsonValue], _freeze_json(value))
-
-    @field_serializer("command_identity")
-    def serialize_command_identity(self, value: Mapping[str, JsonValue]) -> JsonValue:
-        return _thaw_json(value)
-
     @model_validator(mode="after")
     def checkpoint_fields_are_atomic(self) -> Self:
         if (self.checkpoint_ref is None) != (self.checkpoint_digest is None):
             raise ValueError("Term checkpoint reference and digest must be stored together")
         if not self.step_ids or len(self.step_ids) != len(set(self.step_ids)):
             raise ValueError("Term ordered Steps must be non-empty and unique")
+        if self.step_ids[0] != self.envelope.step_id:
+            raise ValueError("Term first Step must match its RunEnvelope")
         if canonical_json(self.command_identity) != canonical_json(
             _term_command_identity(self)
         ):
@@ -644,51 +724,48 @@ class TermRecord(FrozenModel):
         )
 
 
-def _term_command_identity(record: TermRecord) -> Mapping[str, JsonValue]:
+def _term_command_identity(record: TermRecord) -> FrozenCommandIdentity:
     envelope = record.envelope
-    return cast(
-        Mapping[str, JsonValue],
-        _freeze_json(
-            {
-                "protocol_version": envelope.protocol_version,
-                "runtime_id": envelope.runtime.runtime_id,
-                "runtime_build_id": envelope.runtime.build_id,
-                "runtime_config_digest": envelope.runtime.config_digest,
-                "session_id": envelope.session_id,
-                "run_id": envelope.run_id,
-                "term_id": envelope.term_id,
-                "step_id": envelope.step_id,
-                "command_id": envelope.command_id,
-                "agent_id": envelope.agent_id,
-                "agent_role": envelope.agent_role,
-                "provider_ref": envelope.provider_ref,
-                "model": envelope.model,
-                "model_options_digest": envelope.model_options_digest,
-                "message_snapshot_digest": envelope.message_snapshot_digest,
-                "conversation_context": record.conversation_context,
-                "project_context": record.project_context,
-                "work_state": record.work_state,
-                "tool_manifest": envelope.tool_manifest,
-                "tool_manifest_digest": envelope.tool_manifest_digest,
-                "skill_pins": envelope.skill_pins,
-                "skill_manifest_digest": envelope.skill_manifest_digest,
-                "plugin_pins": envelope.plugin_pins,
-                "plugin_manifest_digest": envelope.plugin_manifest_digest,
-                "prompt_sections": record.prompt_sections,
-                "prompt_manifest_digest": record.prompt_manifest_digest,
-                "permission_policy": record.permission_policy,
-                "permission_policy_digest": envelope.permission_policy_digest,
-                "workspace_grant": envelope.workspace_grant,
-                "workspace_grant_digest": canonical_digest(envelope.workspace_grant),
-                "checkpoint_cursor": envelope.checkpoint_cursor,
-                "deadline_ms": envelope.deadline_ms,
-                "traceparent": envelope.traceparent,
-                "extensions_digest": canonical_digest(envelope.extensions),
-                "environment_allowlist": record.environment_allowlist,
-                "context_budget": envelope.context_budget,
-                "effect_scope": record.effect_scope,
-            }
-        ),
+    return FrozenCommandIdentity.model_validate(
+        {
+            "protocol_version": envelope.protocol_version,
+            "runtime_id": envelope.runtime.runtime_id,
+            "runtime_build_id": envelope.runtime.build_id,
+            "runtime_config_digest": envelope.runtime.config_digest,
+            "session_id": envelope.session_id,
+            "run_id": envelope.run_id,
+            "term_id": envelope.term_id,
+            "step_id": envelope.step_id,
+            "command_id": envelope.command_id,
+            "agent_id": envelope.agent_id,
+            "agent_role": envelope.agent_role,
+            "provider_ref": envelope.provider_ref,
+            "model": envelope.model,
+            "model_options_digest": envelope.model_options_digest,
+            "message_snapshot_digest": envelope.message_snapshot_digest,
+            "conversation_context": record.conversation_context,
+            "project_context": record.project_context,
+            "work_state": record.work_state,
+            "tool_manifest": envelope.tool_manifest,
+            "tool_manifest_digest": envelope.tool_manifest_digest,
+            "skill_pins": envelope.skill_pins,
+            "skill_manifest_digest": envelope.skill_manifest_digest,
+            "plugin_pins": envelope.plugin_pins,
+            "plugin_manifest_digest": envelope.plugin_manifest_digest,
+            "prompt_sections": record.prompt_sections,
+            "prompt_manifest_digest": record.prompt_manifest_digest,
+            "permission_policy": record.permission_policy,
+            "permission_policy_digest": envelope.permission_policy_digest,
+            "workspace_grant": envelope.workspace_grant,
+            "workspace_grant_digest": canonical_digest(envelope.workspace_grant),
+            "checkpoint_cursor": envelope.checkpoint_cursor,
+            "deadline_ms": envelope.deadline_ms,
+            "traceparent": envelope.traceparent,
+            "extensions_digest": canonical_digest(envelope.extensions),
+            "environment_allowlist": record.environment_allowlist,
+            "context_budget": envelope.context_budget,
+            "effect_scope": record.effect_scope,
+        },
     )
 
 
@@ -699,40 +776,21 @@ class StepRecord(FrozenModel):
     command_id: Identifier
     attempt: StrictInt = Field(ge=0)
     agent_id: Identifier
-    command_identity: Mapping[str, JsonValue]
+    command_identity: FrozenCommandIdentity
     checkpoint_ref: Reference | None = None
     checkpoint_digest: Digest | None = None
     public_projection: "PublicEventProjection | PublicStepProjection | None" = None
     status: ExecutionStatus = "pending"
     cursor: StrictInt = Field(ge=0)
 
-    @field_validator("command_identity", mode="before")
-    @classmethod
-    def validate_command_identity(cls, value: object) -> object:
-        normalized = _normalized_json(value)
-        if not isinstance(normalized, dict):
-            raise ValueError("Step command identity must be a JSON object")
-        return normalized
-
-    @field_validator("command_identity")
-    @classmethod
-    def freeze_command_identity(
-        cls, value: Mapping[str, JsonValue]
-    ) -> Mapping[str, JsonValue]:
-        return cast(Mapping[str, JsonValue], _freeze_json(value))
-
-    @field_serializer("command_identity")
-    def serialize_command_identity(self, value: Mapping[str, JsonValue]) -> JsonValue:
-        return _thaw_json(value)
-
     @model_validator(mode="after")
     def validate_step_identity(self) -> Self:
         identity = self.command_identity
         if (
-            identity.get("term_id") != self.term_id
-            or identity.get("step_id") != self.step_id
-            or identity.get("command_id") != self.command_id
-            or identity.get("agent_id") != self.agent_id
+            identity.term_id != self.term_id
+            or identity.step_id != self.step_id
+            or identity.command_id != self.command_id
+            or identity.agent_id != self.agent_id
         ):
             raise ValueError("Step command identity does not match immutable fields")
         if (self.checkpoint_ref is None) != (self.checkpoint_digest is None):

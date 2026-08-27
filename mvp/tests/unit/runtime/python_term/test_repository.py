@@ -13,6 +13,7 @@ from workbench.runtime.python_term.contracts import (
     StepEventRecord,
     StepRecord,
     ToolEffectRecord,
+    canonical_digest,
     canonical_json,
 )
 from workbench.runtime.python_term.repository import (
@@ -90,6 +91,235 @@ def test_migration_is_idempotent_and_preserves_legacy_data(tmp_path: Path) -> No
     assert "identity_json" in step_columns
 
 
+def test_legacy_python_rows_are_preserved_but_fail_closed_on_read_or_save(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-python.sqlite"
+    context = _context(tmp_path)
+    term = context.to_term_record(_envelope_for(context, tmp_path))
+    step = context.to_step_record()
+    old_term = {
+        key: value
+        for key, value in term.model_dump(mode="json").items()
+        if key
+        in {
+            "envelope",
+            "conversation_context",
+            "project_context",
+            "work_state",
+            "step_ids",
+            "checkpoint_ref",
+            "checkpoint_digest",
+            "status",
+            "cursor",
+        }
+    }
+    old_term["identity_digest"] = context.identity_digest
+    old_step = {
+        key: value
+        for key, value in step.model_dump(mode="json").items()
+        if key
+        in {
+            "term_id",
+            "step_id",
+            "ordinal",
+            "command_id",
+            "attempt",
+            "agent_id",
+            "status",
+            "cursor",
+        }
+    }
+    old_step["identity_digest"] = context.identity_digest
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE python_terms (
+                term_id TEXT PRIMARY KEY, command_id TEXT NOT NULL UNIQUE,
+                identity_digest TEXT NOT NULL, attempt INTEGER NOT NULL,
+                status TEXT NOT NULL, cursor INTEGER NOT NULL,
+                record_json TEXT NOT NULL, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE python_steps (
+                term_id TEXT NOT NULL, step_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL, command_id TEXT NOT NULL UNIQUE,
+                agent_id TEXT NOT NULL, identity_digest TEXT NOT NULL,
+                attempt INTEGER NOT NULL, status TEXT NOT NULL,
+                cursor INTEGER NOT NULL, record_json TEXT NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                PRIMARY KEY (term_id, step_id), UNIQUE (term_id, ordinal),
+                FOREIGN KEY (term_id) REFERENCES python_terms(term_id)
+            );
+            """
+        )
+        migrate_phase1(connection)
+        connection.execute(
+            """INSERT INTO python_terms(
+            term_id, command_id, identity_digest, attempt, status, cursor,
+            record_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)""",
+            (
+                term.term_id,
+                term.command_id,
+                context.identity_digest,
+                term.attempt,
+                term.status,
+                term.cursor,
+                json.dumps(old_term, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        connection.execute(
+            """INSERT INTO python_steps(
+            term_id, step_id, ordinal, command_id, agent_id, identity_digest,
+            attempt, status, cursor, record_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)""",
+            (
+                step.term_id,
+                step.step_id,
+                step.ordinal,
+                step.command_id,
+                step.agent_id,
+                context.identity_digest,
+                step.attempt,
+                step.status,
+                step.cursor,
+                json.dumps(old_step, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
+    repository = PythonTermRepository(database)
+    with pytest.raises(RepositoryCorruption):
+        repository.get_term(term.term_id)
+    with pytest.raises(RepositoryCorruption):
+        repository.get_step(step.term_id, step.step_id)
+    with pytest.raises(RepositoryCorruption):
+        repository.save_term(term)
+    with pytest.raises(RepositoryCorruption):
+        repository.save_step(step)
+
+
+@pytest.mark.parametrize("changed_field", ["workspace", "project", "work_state"])
+def test_step_admission_rejects_identity_that_diverges_from_term_snapshot(
+    tmp_path, changed_field: str
+) -> None:
+    repository = PythonTermRepository(tmp_path / f"{changed_field}.sqlite")
+    context = _context(tmp_path)
+    term = context.to_term_record(_envelope_for(context, tmp_path))
+    step = context.to_step_record()
+    identity = step.model_dump(mode="python")["command_identity"]
+    if changed_field == "workspace":
+        identity["workspace_grant"]["workspace_snapshot_ref"] = "other-snapshot"
+        identity["workspace_grant_digest"] = canonical_digest(
+            identity["workspace_grant"]
+        )
+    elif changed_field == "project":
+        identity["project_context"]["version"] = 99
+    else:
+        identity["work_state"]["metadata_digest"] = "e" * 64
+    forged = step.model_copy(update={"command_identity": identity})
+
+    with pytest.raises(RepositoryConflict, match="snapshot|identity"):
+        repository.save_aggregate(term, (forged,))
+
+
+def test_first_step_attempt_must_match_the_term_envelope(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "attempt.sqlite")
+    initial = _context(tmp_path, attempt=0)
+    retry = _context(tmp_path, attempt=1)
+
+    with pytest.raises(RepositoryConflict, match="attempt|identity"):
+        repository.save_aggregate(
+            initial.to_term_record(_envelope_for(initial, tmp_path)),
+            (retry.to_step_record(),),
+        )
+
+
+def test_single_record_apis_only_allow_identical_replay(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "runtime.sqlite")
+    context = _context(tmp_path)
+    term = context.to_term_record(_envelope_for(context, tmp_path))
+    step = context.to_step_record()
+
+    with pytest.raises(RepositoryConflict, match="aggregate"):
+        repository.save_term(term)
+    repository.save_aggregate(term, (step,))
+    repository.save_term(term)
+    repository.save_step(step)
+
+    checkpoint_update = {
+        "cursor": 1,
+        "status": "completed",
+        "checkpoint_ref": "checkpoint-bypass",
+        "checkpoint_digest": "c" * 64,
+        "public_projection": PublicStepProjection(status="completed"),
+    }
+    with pytest.raises(RepositoryConflict, match="aggregate"):
+        repository.save_term(term.model_copy(update=checkpoint_update))
+    with pytest.raises(RepositoryConflict, match="aggregate"):
+        repository.save_step(step.model_copy(update=checkpoint_update))
+
+
+@pytest.mark.parametrize(
+    ("term_update", "step_update"),
+    [
+        ({"cursor": 1}, {}),
+        ({"status": "completed"}, {}),
+        (
+            {
+                "checkpoint_ref": "checkpoint-1",
+                "checkpoint_digest": "c" * 64,
+            },
+            {},
+        ),
+        (
+            {
+                "cursor": 1,
+                "public_projection": PublicStepProjection(status="running"),
+            },
+            {"cursor": 1},
+        ),
+        (
+            {
+                "cursor": 1,
+                "public_projection": PublicStepProjection(status="running"),
+            },
+            {
+                "cursor": 1,
+                "public_projection": PublicStepProjection(status="running"),
+            },
+        ),
+        (
+            {
+                "checkpoint_ref": "checkpoint-1",
+                "checkpoint_digest": "c" * 64,
+            },
+            {
+                "checkpoint_ref": "checkpoint-1",
+                "checkpoint_digest": "c" * 64,
+            },
+        ),
+        ({"status": "running"}, {"status": "running"}),
+    ],
+)
+def test_aggregate_admission_rejects_inconsistent_state_projection_or_terminal(
+    tmp_path, term_update: dict, step_update: dict
+) -> None:
+    repository = PythonTermRepository(tmp_path / "runtime.sqlite")
+    context = _context(tmp_path)
+    term = context.to_term_record(_envelope_for(context, tmp_path)).model_copy(
+        update=term_update
+    )
+    step = context.to_step_record().model_copy(update=step_update)
+
+    with pytest.raises(
+        RepositoryConflict,
+        match="aggregate|cursor|terminal|checkpoint|projection",
+    ):
+        repository.save_aggregate(term, (step,))
+
+
 def test_term_and_step_round_trip_and_identical_writes_are_idempotent(tmp_path) -> None:
     context = _context(tmp_path)
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
@@ -106,7 +336,7 @@ def test_term_and_step_round_trip_and_identical_writes_are_idempotent(tmp_path) 
 def test_same_command_rejects_changed_frozen_identity(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     original = _context(tmp_path)
-    repository.save_term(original.to_term_record(_envelope_for(original, tmp_path)))
+    _save_aggregate(repository, original, tmp_path)
 
     changed = original.model_copy(
         update={
@@ -116,30 +346,46 @@ def test_same_command_rejects_changed_frozen_identity(tmp_path) -> None:
         }
     )
     with pytest.raises(RepositoryConflict, match="identity"):
-        repository.save_term(changed.to_term_record(_envelope_for(changed, tmp_path)))
+        repository.save_aggregate(
+            changed.to_term_record(_envelope_for(changed, tmp_path)),
+            (changed.to_step_record(),),
+        )
 
 
 def test_same_command_rejects_changed_deadline(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     envelope = _envelope(tmp_path)
     original = _context(tmp_path, envelope=envelope)
-    repository.save_term(original.to_term_record(envelope))
+    repository.save_aggregate(
+        original.to_term_record(envelope), (original.to_step_record(),)
+    )
     changed_envelope = envelope.model_copy(update={"deadline_ms": 20_000})
     changed = _context(tmp_path, envelope=changed_envelope)
 
     with pytest.raises(RepositoryConflict, match="identity"):
-        repository.save_term(changed.to_term_record(changed_envelope))
+        repository.save_aggregate(
+            changed.to_term_record(changed_envelope), (changed.to_step_record(),)
+        )
 
 
 def test_step_attempt_cannot_move_backwards(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     initial = _context(tmp_path, attempt=0)
     retry = _context(tmp_path, attempt=1)
-    term = initial.to_term_record(_envelope_for(initial, tmp_path))
-    repository.save_aggregate(term, (retry.to_step_record(),))
+    repository.save_aggregate(
+        initial.to_term_record(_envelope_for(initial, tmp_path)),
+        (initial.to_step_record(),),
+    )
+    repository.save_aggregate(
+        retry.to_term_record(_envelope_for(retry, tmp_path)),
+        (retry.to_step_record(),),
+    )
 
     with pytest.raises(RepositoryConflict, match="attempt"):
-        repository.save_step(initial.to_step_record())
+        repository.save_aggregate(
+            initial.to_term_record(_envelope_for(initial, tmp_path)),
+            (initial.to_step_record(),),
+        )
 
 
 def test_steps_are_loaded_in_explicit_term_order(tmp_path) -> None:
@@ -165,14 +411,27 @@ def test_steps_are_loaded_in_explicit_term_order(tmp_path) -> None:
 def test_terminal_step_cannot_return_to_running(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     context = _context(tmp_path)
-    repository.save_term(context.to_term_record(_envelope_for(context, tmp_path)))
-    running = context.to_step_record(status="running")
-    completed = running.model_copy(update={"status": "completed", "cursor": 1})
-    repository.save_step(running)
-    repository.save_step(completed)
+    _save_aggregate(repository, context, tmp_path)
+    event = StepEventRecord(
+        event_id="event-terminal-step",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": "done"},
+    )
+    repository.append_event(
+        event, step_status="completed", term_status="completed"
+    )
+    completed_term = repository.get_term("term-1")
+    completed = repository.get_step("term-1", "step-1")
 
     with pytest.raises(RepositoryConflict, match="terminal"):
-        repository.save_step(running.model_copy(update={"cursor": 2}))
+        repository.save_aggregate(
+            completed_term.model_copy(update={"status": "running"}),
+            (completed.model_copy(update={"status": "running"}),),
+        )
 
 
 def test_events_have_monotonic_cursor_and_public_projection(tmp_path) -> None:
@@ -292,31 +551,44 @@ def test_step_membership_and_ordinal_are_bound_to_term(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     context = _context(tmp_path)
     term = context.to_term_record(_envelope_for(context, tmp_path))
-    repository.save_term(term)
 
     non_member_envelope = _envelope_for(context, tmp_path).model_copy(
         update={"step_id": "step-2", "command_id": "command-2"}
     )
     with pytest.raises(RepositoryConflict, match="member|ordinal"):
-        repository.save_step(
-            _context(tmp_path, envelope=non_member_envelope).to_step_record()
+        repository.save_aggregate(
+            term,
+            (_context(tmp_path, envelope=non_member_envelope).to_step_record(),),
         )
     with pytest.raises(RepositoryConflict, match="ordinal"):
-        repository.save_step(context.to_step_record().model_copy(update={"ordinal": 1}))
+        repository.save_aggregate(
+            term, (context.to_step_record().model_copy(update={"ordinal": 1}),)
+        )
 
 
 def test_terminal_aggregate_rejects_new_step_event_checkpoint_and_effect(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     context = _context(tmp_path)
     term, step = _save_aggregate(repository, context, tmp_path)
-    repository.save_step(step.model_copy(update={"status": "completed"}))
+    final_event = StepEventRecord(
+        event_id="event-finalize",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": "done"},
+    )
+    repository.append_event(
+        final_event, step_status="completed", term_status="completed"
+    )
 
     event = StepEventRecord(
         event_id="event-terminal",
         run_id="run-1",
         term_id="term-1",
         step_id="step-1",
-        cursor=1,
+        cursor=2,
         type="assistant.message",
         payload={"content": "late"},
     )
@@ -325,7 +597,7 @@ def test_terminal_aggregate_rejects_new_step_event_checkpoint_and_effect(tmp_pat
         checkpoint_digest="c" * 64,
         term_id="term-1",
         step_id="step-1",
-        cursor=1,
+        cursor=2,
         public_projection=PublicStepProjection(status="completed"),
     )
     effect = ToolEffectRecord(
@@ -344,10 +616,13 @@ def test_terminal_aggregate_rejects_new_step_event_checkpoint_and_effect(tmp_pat
         with pytest.raises(RepositoryConflict, match="terminal"):
             write()
 
-    terminal_term = term.model_copy(update={"status": "completed"})
-    repository.save_term(terminal_term)
     with pytest.raises(RepositoryConflict, match="terminal"):
-        repository.save_step(step.model_copy(update={"attempt": 1}))
+        repository.save_aggregate(
+            term.model_copy(
+                update={"envelope": term.envelope.model_copy(update={"attempt": 1})}
+            ),
+            (step.model_copy(update={"attempt": 1}),),
+        )
 
 
 def test_event_can_atomically_finalize_step_and_term_and_replay_same_value(tmp_path) -> None:

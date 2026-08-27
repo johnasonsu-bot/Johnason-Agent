@@ -383,6 +383,33 @@ def test_term_record_recomputes_identity_instead_of_trusting_a_digest(tmp_path) 
         TermRecord.model_validate({**term.model_dump(mode="python"), "identity_digest": "0" * 64})
 
 
+def test_step_identity_requires_the_complete_closed_command_snapshot(tmp_path) -> None:
+    step = _context(tmp_path).to_step_record()
+    values = step.model_dump(mode="python")
+    values["command_identity"] = {
+        "term_id": step.term_id,
+        "step_id": step.step_id,
+        "command_id": step.command_id,
+        "agent_id": step.agent_id,
+    }
+
+    with pytest.raises(ValidationError, match="Field required|identity"):
+        StepRecord.model_validate(values)
+
+    full_identity = step.model_dump(mode="python")["command_identity"]
+    full_identity["unexpected"] = "value"
+    with pytest.raises(ValidationError, match="extra"):
+        StepRecord.model_validate({**values, "command_identity": full_identity})
+
+
+def test_term_ordered_steps_start_with_the_envelope_step(tmp_path) -> None:
+    context = _context(tmp_path)
+    term = context.to_term_record(_envelope(tmp_path))
+
+    with pytest.raises(ValidationError, match="envelope|first"):
+        term.model_copy(update={"step_ids": ("step-other",)})
+
+
 def test_nested_contract_values_are_deeply_frozen_and_detached(tmp_path) -> None:
     messages = [{"role": "user", "content": {"parts": ["hello"]}}]
     tool_schema = {
