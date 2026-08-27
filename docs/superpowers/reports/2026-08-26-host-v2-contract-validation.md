@@ -1,32 +1,119 @@
 # Engine Host v2 合同验证报告
 
-- 日期：2026-08-26；final unified fix gate 于 2026-08-27 完成
-- Final unified source revision under test：`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`
+- 日期：2026-08-26；split release gate 于 2026-08-27 完成
+- Latest split-gate source revision under test：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`
+- Task 3 base revision：`ac435a927f8132d23ffa61685630c070944793f1`
+- Full-range baseline：`d894c81e0af03b8f74cf415bc0310c71459a3d67`
+- 历史 final unified source：`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`
 - 历史 remediation source：`5ca52d2db3256f94cabfaddc69377304970effcf`
 - 历史 Source C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
 - 代码提交 A：`cd95147db24fb1547afd63a3374a1e3ebef868a0`
 - 终态封口修复 A2：`652954f5740b68183c97603174c4b660956fff65`
 - malformed seal 测试提交 C：`c803de37c6328330fda214ab0b4d9ecffdcd9ab9`
 - C 的历史包含 A/A2/B，报告 D 是 C 的 child，均保持可达。
-- Report revision：本文件所在的 documentation-only commit F；F 的历史包含
-  Source C，最终 SHA 在交付记录中给出，未 amend 任何既有提交。
+- Report revision：本文件所在的 report-only child commit；最终 SHA 在交付记录中
+  给出，未 amend source commit。
 - Python：`3.13.5`；Node.js：`v22.20.0`；npm：`10.9.3`
 - Fake Host revision：`fake-host-v2/r2`
 
 ## 结论
 
-final unified source 上 Host v2 专项、前端、全范围 diff check 与逐命中凭证扫描
-通过；完整 backend 被必需的 1200 秒 wrapper 超时终止，未产生 pytest 最终计数。
-因此五类门禁并非全部 exit 0，不能发布 GO。
+同一 split-gate source 上，标准 backend、单次 frontend、全范围 diff check 与固定
+revision credential scanner 通过；独立 Development Graph meta/E2E 在 `remote`
+fault 场景失败。因此五类门禁并非全部 exit 0，不能发布 GO；标准 backend 的通过
+不得替代失败的 meta/E2E 门。
 
 ```text
 Decision: BLOCKED
 Real runtime status: NOT_YET_EVALUATED
 ```
 
-唯一发布阻塞判据为完整 backend gate exit 1（wrapper `TimeoutExpired`）。合同
-Fake 的通过也不等于真实 Python Codex-Compatible、Goose Query 或 DSH Plugin
-Runtime 已接入。
+当前唯一非零门为 Development Graph meta/E2E exit 1：`remote` fault 结果的
+`completed_stages` 为空，未满足应包含 `main_graph` 的合同。合同 Fake 的通过也不
+等于真实 Python Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入。
+
+## Split release gate：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`
+
+五条命令开始与结束时 HEAD 均为
+`327f157678f796a9fba4b3e5ec3973a1ce4512b1`，工作树保持 clean；后续报告提交未混入
+SOURCE_REV。测试计数按标准 backend、frontend 与 meta/E2E 分开记录。
+
+### 1. 标准 backend（排除 meta/E2E）
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); code=124; label=sys.argv[1]; timeout=float(sys.argv[2]); command=sys.argv[3:];
+try:
+ result=subprocess.run(command,timeout=timeout); code=result.returncode
+except subprocess.TimeoutExpired:
+ print(f"{label}_TIMEOUT={timeout}",flush=True)
+finally:
+ print(f"{label}_EXIT={code}",flush=True); print(f"{label}_SECONDS={time.monotonic()-started:.2f}",flush=True)
+raise SystemExit(code)' STANDARD_BACKEND 1200 .venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'
+```
+
+结果：exit `0`；`2243 passed, 6 skipped, 8 deselected`，1 条既有 Starlette
+弃用警告；wrapper 194.18 秒，pytest 192.62 秒。
+
+### 2. 单次 frontend
+
+```bash
+cd mvp/canvas-spike
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); code=124; label=sys.argv[1]; timeout=float(sys.argv[2]); command=sys.argv[3:];
+try:
+ result=subprocess.run(command,timeout=timeout); code=result.returncode
+except subprocess.TimeoutExpired:
+ print(f"{label}_TIMEOUT={timeout}",flush=True)
+finally:
+ print(f"{label}_EXIT={code}",flush=True); print(f"{label}_SECONDS={time.monotonic()-started:.2f}",flush=True)
+raise SystemExit(code)' FRONTEND 600 npm test
+```
+
+结果：exit `0`；Vite `45 modules transformed`；Playwright `38 passed (1.2m)`；
+wrapper 72.79 秒。存在既有 Vite config 与 `NO_COLOR` 警告。
+
+### 3. 独立 Development Graph meta/E2E
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); code=124; label=sys.argv[1]; timeout=float(sys.argv[2]); command=sys.argv[3:];
+try:
+ result=subprocess.run(command,timeout=timeout); code=result.returncode
+except subprocess.TimeoutExpired:
+ print(f"{label}_TIMEOUT={timeout}",flush=True)
+finally:
+ print(f"{label}_EXIT={code}",flush=True); print(f"{label}_SECONDS={time.monotonic()-started:.2f}",flush=True)
+raise SystemExit(code)' META_E2E 4800 .venv/bin/python -m pytest -q tests/acceptance/test_development_graph_blueprint.py -m development_graph_meta_e2e
+```
+
+结果：exit `1`；`1 failed, 7 passed, 9 deselected`；wrapper 1986.63 秒，pytest
+1986.02 秒。唯一失败为
+`test_fault_injections_write_metadata_only_blocked_result[remote]`：结果保持
+`BLOCKED`，但 `completed_stages=[]`，断言要求包含 `main_graph`。
+
+### 4. 全范围 diff check
+
+```bash
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:]); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' DIFF_CHECK git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..327f157678f796a9fba4b3e5ec3973a1ce4512b1
+```
+
+结果：exit `0`；0 条问题，无 diff 输出；0.02 秒。
+
+### 5. 固定 revision credential scanner
+
+```bash
+/usr/bin/python3 -I -c 'import os,subprocess,sys,time; started=time.monotonic(); environment=os.environ.copy(); environment["BASE_REV"]=sys.argv[2]; environment["HEAD_REV"]=sys.argv[3]; result=subprocess.run(sys.argv[4:],env=environment); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' CREDENTIAL_SCANNER d894c81e0af03b8f74cf415bc0310c71459a3d67 327f157678f796a9fba4b3e5ec3973a1ce4512b1 /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+结果：exit `0`；`scanned_blobs=41 fixture_allowances=0 findings=0`；0.90 秒。
+
+```text
+Decision: BLOCKED
+GO_HOST_V2_CONTRACT: NOT_ISSUED
+Source revision: 327f157678f796a9fba4b3e5ec3973a1ce4512b1
+Implementation commit: 327f157678f796a9fba4b3e5ec3973a1ce4512b1
+Real runtime status: NOT_YET_EVALUATED
+```
 
 ## Final unified fix gate：`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`
 
@@ -85,7 +172,7 @@ Real runtime status: NOT_YET_EVALUATED
 
 ## Remediation gate：`5ca52d2db3256f94cabfaddc69377304970effcf`
 
-本节是当前交付判定；下方 Source C 内容保留为历史证据。所有必需命令开始与
+本节保留历史 remediation 判定；下方 Source C 内容同样为历史证据。所有必需命令开始与
 结束时 HEAD 均为 `5ca52d2db3256f94cabfaddc69377304970effcf`，工作树在写报告前
 保持 clean。起始 BASE 亦为该 SHA。
 
@@ -160,7 +247,7 @@ BASE_REV=d894c81e0af03b8f74cf415bc0310c71459a3d67 HEAD_REV=$(git rev-parse HEAD)
 测试 2 项；七项所在行及相邻行均没有合规 fixture marker，故 allowance 均为 0。
 报告未记录任何匹配值，Task 4 未修改这些测试。
 
-### 5. 当前交付判定
+### 5. 历史交付判定
 
 ```text
 Decision: BLOCKED
