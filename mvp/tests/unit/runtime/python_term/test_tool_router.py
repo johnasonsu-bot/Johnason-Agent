@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import fields
+from dataclasses import dataclass, fields
 import os
 from pathlib import Path
 import traceback
@@ -17,7 +17,7 @@ from workbench.runtime.python_term.contracts import (
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.runtime.python_term.tool_router import (
-    ExecutorRegistration,
+    ExecutorBroker,
     FileAccess,
     HmacRequestDigestService,
     ToolAccess,
@@ -38,14 +38,20 @@ class RecordingBroker:
         return self.result
 
 
+@dataclass(frozen=True)
+class _RegistrationSpec:
+    executor_handle: str
+    access: ToolAccess
+
+
 def _registration(
     manifest: ToolManifestEntryV2,
     *,
     access: ToolAccess = ToolAccess(),
     executor_handle: str = "executor-1",
-) -> ExecutorRegistration:
-    return ExecutorRegistration.from_manifest(
-        manifest,
+) -> _RegistrationSpec:
+    _ = manifest
+    return _RegistrationSpec(
         executor_handle=executor_handle,
         access=access,
     )
@@ -79,6 +85,7 @@ def _runtime_context(
     network_policy: str = "deny",
     write_effects: bool = True,
     deadline_ms: int = 10_000,
+    workspace_expires_at_ms: int | None = None,
 ):
     tools = tools or (_tool(),)
     policy = PermissionPolicy(
@@ -95,6 +102,11 @@ def _runtime_context(
                 update={
                     "command_policy": command_policy,
                     "network_policy": network_policy,
+                    **(
+                        {"expires_at_ms": workspace_expires_at_ms}
+                        if workspace_expires_at_ms is not None
+                        else {}
+                    ),
                 }
             ),
         }
@@ -132,10 +144,21 @@ def _router(
         context.to_term_record(envelope),
         (context.to_step_record(),),
     )
+    controlled_broker = ExecutorBroker(broker.execute)
+    sealed_registrations = {
+        tool_id: controlled_broker.register(
+            next(
+                item for item in context.tool_manifest if item.tool_id == tool_id
+            ),
+            executor_handle=registration.executor_handle,
+            access=registration.access,
+        )
+        for tool_id, registration in registrations.items()
+    }
     router = ToolRouter(
         repository,
-        registrations,
-        executor_broker=broker,
+        sealed_registrations,
+        executor_broker=controlled_broker,
         request_digests=request_digests or HmacRequestDigestService(os.urandom(32)),
         clock_ms=clock_ms,
         monotonic_ms=monotonic_ms,
@@ -413,10 +436,17 @@ def test_manifest_admission_rejects_unsafe_or_excessive_schema(
         "urllib.request.urlopen",
         lambda value, *args, **kwargs: network_attempts.append(str(value)),
     )
+    controlled_broker = ExecutorBroker(broker.execute)
     router = ToolRouter(
         repository,
-        {manifest.tool_id: _registration(manifest)},
-        executor_broker=broker,
+        {
+            manifest.tool_id: controlled_broker.register(
+                manifest,
+                executor_handle="executor-1",
+                access=ToolAccess(),
+            )
+        },
+        executor_broker=controlled_broker,
         request_digests=HmacRequestDigestService(os.urandom(32)),
     )
 
@@ -427,6 +457,67 @@ def test_manifest_admission_rejects_unsafe_or_excessive_schema(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert network_attempts == []
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/node"}},
+                }
+            },
+            "$ref": "#/$defs/node",
+        },
+        {
+            "$defs": {
+                **{
+                    f"level{index}": {
+                        "anyOf": [
+                            {"$ref": f"#/$defs/level{index + 1}"},
+                            {"$ref": f"#/$defs/level{index + 1}"},
+                        ]
+                    }
+                    for index in range(10)
+                },
+                "level10": {"type": "string"},
+            },
+            "$ref": "#/$defs/level0",
+        },
+    ],
+)
+def test_manifest_admission_rejects_recursive_or_exponential_local_refs(
+    tmp_path: Path, schema: dict[str, object]
+) -> None:
+    manifest = _tool(schema=schema)
+    context, envelope = _runtime_context(tmp_path, tools=(manifest,))
+    repository = PythonTermRepository(tmp_path / "local-ref.sqlite")
+    repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
+    )
+    broker = RecordingBroker(PublicToolResult(status="completed", summary="ok"))
+    controlled_broker = ExecutorBroker(broker.execute)
+    router = ToolRouter(
+        repository,
+        {
+            manifest.tool_id: controlled_broker.register(
+                manifest,
+                executor_handle="executor-1",
+                access=ToolAccess(),
+            )
+        },
+        executor_broker=controlled_broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+    )
+
+    with pytest.raises(ToolRouteError) as raised:
+        router.admit(context)
+
+    assert raised.value.code == "schema_rejected"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -596,6 +687,97 @@ def test_executor_registration_rejects_callable_authority(tmp_path: Path) -> Non
         assert raised.value.__context__ is None
 
 
+def test_access_contracts_reject_mutable_or_invalid_runtime_values() -> None:
+    with pytest.raises(ValueError, match="mode"):
+        FileAccess(argument="path", mode="delete")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="argument"):
+        FileAccess(argument="../path", mode="read")
+    with pytest.raises(TypeError, match="tuple"):
+        ToolAccess(files=[FileAccess(argument="path", mode="read")])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="boolean"):
+        ToolAccess(network=1)  # type: ignore[arg-type]
+
+
+def test_router_rejects_duck_broker_and_caller_self_issued_capability(
+    tmp_path: Path,
+) -> None:
+    context, _ = _runtime_context(tmp_path)
+    repository = PythonTermRepository(tmp_path / "unsealed.sqlite")
+    duck_broker = RecordingBroker(
+        PublicToolResult(status="completed", summary="unsafe")
+    )
+    attacker_broker = ExecutorBroker(duck_broker.execute)
+    self_issued = attacker_broker.register(
+        context.tool_manifest[0],
+        executor_handle="caller-selected",
+        access=ToolAccess(),
+    )
+
+    with pytest.raises(ToolRouteError) as raised:
+        ToolRouter(
+            repository,
+            {context.tool_manifest[0].tool_id: self_issued},
+            executor_broker=duck_broker,
+            request_digests=HmacRequestDigestService(os.urandom(32)),
+        )
+
+    assert raised.value.code == "registration_rejected"
+
+
+def test_sealed_broker_rejects_forged_capability_and_forbidden_authority(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    repository = PythonTermRepository(tmp_path / "sealed.sqlite")
+    repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
+    )
+
+    with pytest.raises(ToolRouteError, match="authority"):
+        ExecutorBroker(repository.get_tool_effect)
+
+    class VaultService:
+        pass
+
+    vault = VaultService()
+
+    async def captured_dispatcher(handle, step_context, arguments):
+        assert vault is not None
+        return PublicToolResult(status="completed", summary="unsafe")
+
+    with pytest.raises(ToolRouteError, match="authority"):
+        ExecutorBroker(captured_dispatcher)
+
+    dispatcher = RecordingBroker(
+        PublicToolResult(status="completed", summary="safe")
+    )
+    controlled_broker = ExecutorBroker(dispatcher.execute)
+    sealed = controlled_broker.register(
+        context.tool_manifest[0],
+        executor_handle="sealed-executor",
+        access=ToolAccess(),
+    )
+    assert sealed.sealed_token not in repr(sealed)
+    attacker_broker = ExecutorBroker(dispatcher.execute)
+    self_issued = attacker_broker.register(
+        context.tool_manifest[0],
+        executor_handle="caller-selected",
+        access=ToolAccess(),
+    )
+    router = ToolRouter(
+        repository,
+        {context.tool_manifest[0].tool_id: self_issued},
+        executor_broker=controlled_broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+    )
+
+    with pytest.raises(ToolRouteError) as raised:
+        router.admit(context)
+
+    assert raised.value.code == "registration_rejected"
+    assert dispatcher.calls == 0
+
+
 @pytest.mark.asyncio
 async def test_untrusted_executor_error_has_no_exception_context(tmp_path: Path) -> None:
     forbidden = "untrusted-" + ("x" * 40)
@@ -666,3 +848,68 @@ async def test_synchronous_broker_error_is_safely_reconciled(tmp_path: Path) -> 
     assert forbidden not in rendered
     assert effect is not None
     assert effect.status == "reconciliation_required"
+
+
+@pytest.mark.asyncio
+async def test_path_and_reservation_exceptions_are_safely_normalized(
+    tmp_path: Path, monkeypatch
+) -> None:
+    forbidden = "untrusted-storage-path-" + ("x" * 40)
+    manifest = _tool(
+        schema={
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": False,
+        }
+    )
+    context, envelope = _runtime_context(tmp_path, tools=(manifest,))
+    broker = RecordingBroker(PublicToolResult(status="completed", summary="ok"))
+    router, _ = _router(
+        tmp_path,
+        context,
+        envelope,
+        broker,
+        {
+            manifest.tool_id: _registration(
+                manifest,
+                access=ToolAccess(files=(FileAccess("path", "read"),)),
+            )
+        },
+    )
+
+    def fail_resolve(self, strict=False):
+        raise RuntimeError(forbidden)
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    with pytest.raises(ToolRouteError) as path_error:
+        await router.invoke(
+            context,
+            manifest.tool_id,
+            {"path": str(tmp_path / "input.txt")},
+            tool_call_id="call-path-error",
+        )
+    rendered = "".join(traceback.format_exception(path_error.value))
+    assert path_error.value.code == "workspace_denied"
+    assert path_error.value.__cause__ is None
+    assert path_error.value.__context__ is None
+    assert forbidden not in rendered
+
+    monkeypatch.undo()
+
+    def fail_reserve(*args, **kwargs):
+        raise RuntimeError(forbidden)
+
+    monkeypatch.setattr(router.repository, "reserve_tool_effect", fail_reserve)
+    with pytest.raises(ToolRouteError) as reserve_error:
+        await router.invoke(
+            context,
+            manifest.tool_id,
+            {"path": str(tmp_path.resolve() / "input.txt")},
+            tool_call_id="call-reserve-error",
+        )
+    rendered = "".join(traceback.format_exception(reserve_error.value))
+    assert reserve_error.value.code == "effect_reservation_failed"
+    assert reserve_error.value.__cause__ is None
+    assert reserve_error.value.__context__ is None
+    assert forbidden not in rendered

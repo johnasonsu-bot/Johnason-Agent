@@ -923,22 +923,38 @@ class StepCheckpointRecord(_SafePayloadRecord):
 
 
 class ToolEffectRecord(_SafePayloadRecord):
+    record_version: Literal[2] = 2
     effect_id: Identifier
+    effect_identity_version: Literal[
+        "opaque-v1", "hmac-sha256-v1", "legacy-unkeyed-sha256-v0"
+    ] = "opaque-v1"
     term_id: Identifier
     step_id: Identifier
     tool_call_id: Identifier
     request_digest: Digest
+    request_digest_version: Literal[
+        "opaque-v1", "hmac-sha256-v1", "legacy-unkeyed-sha256-v0"
+    ] = "opaque-v1"
     write_effect: StrictBool = False
     execution_owner_id: Identifier | None = None
     lease_expires_at_ms: StrictInt | None = Field(default=None, gt=0)
+    fence_id: Identifier | None = None
+    fence_generation: StrictInt = Field(default=0, ge=0)
     status: EffectStatus
     result_digest: Digest | None = None
+    result_digest_version: Literal["canonical-sha256-v1"] = "canonical-sha256-v1"
     public_result: PublicToolResult | None = None
 
     @model_validator(mode="after")
     def terminal_result_is_coherent(self) -> Self:
         if (self.execution_owner_id is None) != (self.lease_expires_at_ms is None):
             raise ValueError("Tool Effect execution owner and lease must be atomic")
+        if self.execution_owner_id is not None and self.fence_id is None:
+            raise ValueError("owned Tool Effect requires a fence token")
+        if self.fence_id is not None and self.fence_generation < 1:
+            raise ValueError("owned Tool Effect requires a positive fence generation")
+        if self.fence_id is None and self.fence_generation != 0:
+            raise ValueError("unfenced Tool Effect cannot retain a generation")
         if self.status != "reserved" and self.execution_owner_id is not None:
             raise ValueError("terminal Tool Effect cannot retain an execution owner")
         if self.status == "committed" and (
@@ -950,3 +966,8 @@ class ToolEffectRecord(_SafePayloadRecord):
         ):
             raise ValueError("reserved Tool Effect cannot contain a result")
         return self
+
+    @property
+    def fence_token(self) -> str | None:
+        """Opaque durable fencing token, serialized as a non-secret fence ID."""
+        return self.fence_id

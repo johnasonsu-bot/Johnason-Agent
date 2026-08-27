@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import secrets
 import sqlite3
 import time
 from collections.abc import Iterator, Sequence
@@ -16,6 +18,7 @@ from workbench.workflow.schema import migrate_phase1
 from .contracts import (
     ExecutionStatus,
     PublicEventProjection,
+    PublicToolResult,
     StepCheckpointRecord,
     StepEventRecord,
     StepEventTransitionRecord,
@@ -57,8 +60,89 @@ class PythonTermRepository:
         connection = self.connect()
         try:
             migrate_phase1(connection)
+            self._migrate_legacy_tool_effects(connection)
         finally:
             connection.close()
+
+    @staticmethod
+    def _database_now_ms(connection: sqlite3.Connection) -> int:
+        value = connection.execute(
+            "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)"
+        ).fetchone()[0]
+        if not isinstance(value, int) or value <= 0:
+            raise RepositoryCorruption("SQLite trusted clock is unavailable")
+        return value
+
+    def _migrate_legacy_tool_effects(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("SELECT * FROM python_tool_effects").fetchall()
+        migrations: list[ToolEffectRecord] = []
+        for row in rows:
+            try:
+                raw = json.loads(row["effect_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(raw, dict) or "record_version" in raw:
+                continue
+            identity_matches = (
+                raw.get("effect_id") == row["effect_id"]
+                and raw.get("term_id") == row["term_id"]
+                and raw.get("step_id") == row["step_id"]
+                and raw.get("tool_call_id") == row["tool_call_id"]
+                and raw.get("request_digest") == row["request_digest"]
+                and raw.get("status") == row["status"]
+                and raw.get("result_digest") == row["result_digest"]
+                and row["public_result_json"]
+                == (
+                    None
+                    if raw.get("public_result") is None
+                    else canonical_json(raw.get("public_result"))
+                )
+            )
+            if not identity_matches:
+                continue
+            result = PublicToolResult(
+                status="failed",
+                summary="Legacy Tool Effect requires reconciliation",
+            )
+            migrated = ToolEffectRecord(
+                record_version=2,
+                effect_id=row["effect_id"],
+                effect_identity_version="legacy-unkeyed-sha256-v0",
+                term_id=row["term_id"],
+                step_id=row["step_id"],
+                tool_call_id=row["tool_call_id"],
+                request_digest=row["request_digest"],
+                request_digest_version="legacy-unkeyed-sha256-v0",
+                write_effect=True,
+                status="reconciliation_required",
+                result_digest=canonical_digest(
+                    {"code": "legacy_effect_retired", "result": result}
+                ),
+                public_result=result,
+            )
+            migrations.append(migrated)
+        if not migrations:
+            return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for migrated in migrations:
+                connection.execute(
+                    """UPDATE python_tool_effects
+                    SET status = ?, result_digest = ?, effect_json = ?,
+                    public_result_json = ?, updated_at = unixepoch('subsec')
+                    WHERE effect_id = ?""",
+                    (
+                        migrated.status,
+                        migrated.result_digest,
+                        canonical_json(migrated),
+                        canonical_json(migrated.public_result),
+                        migrated.effect_id,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -606,6 +690,9 @@ class PythonTermRepository:
                 or existing.step_id != validated.step_id
                 or existing.tool_call_id != validated.tool_call_id
                 or existing.request_digest != validated.request_digest
+                or existing.request_digest_version != validated.request_digest_version
+                or existing.effect_identity_version
+                != validated.effect_identity_version
                 or existing.write_effect != validated.write_effect
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
@@ -615,6 +702,10 @@ class PythonTermRepository:
                 raise RepositoryConflict("Tool Effect terminal state cannot change")
             if validated.status == "reserved":
                 raise RepositoryConflict("Tool Effect reserved write conflict")
+            if existing.execution_owner_id is not None:
+                raise RepositoryConflict(
+                    "owned Tool Effect requires fenced terminal persistence"
+                )
             connection.execute(
                 """UPDATE python_tool_effects SET status = ?, result_digest = ?,
                 effect_json = ?, public_result_json = ?, updated_at = ?
@@ -630,7 +721,11 @@ class PythonTermRepository:
             )
 
     def reserve_tool_effect(
-        self, effect: ToolEffectRecord
+        self,
+        effect: ToolEffectRecord,
+        *,
+        execution_owner_id: str,
+        lease_duration_ms: int,
     ) -> tuple[ToolEffectRecord, bool]:
         """Atomically reserve an Effect identity and report who won admission.
 
@@ -639,9 +734,15 @@ class PythonTermRepository:
         before replay decisions can be made by the Tool Router.
         """
         validated = self._validate_model(effect, ToolEffectRecord)
-        if validated.status != "reserved":
+        if (
+            validated.status != "reserved"
+            or validated.execution_owner_id is not None
+            or validated.fence_token is not None
+            or validated.fence_generation != 0
+            or type(lease_duration_ms) is not int
+            or not 1 <= lease_duration_ms <= 86_400_000
+        ):
             raise RepositoryConflict("Tool Effect reservation must be reserved")
-        encoded = canonical_json(validated)
         now = time.time()
         with self._transaction() as connection:
             row = connection.execute(
@@ -666,6 +767,10 @@ class PythonTermRepository:
                     or existing.step_id != validated.step_id
                     or existing.tool_call_id != validated.tool_call_id
                     or existing.request_digest != validated.request_digest
+                    or existing.request_digest_version
+                    != validated.request_digest_version
+                    or existing.effect_identity_version
+                    != validated.effect_identity_version
                     or existing.write_effect != validated.write_effect
                 ):
                     raise RepositoryConflict("Tool Effect request conflict")
@@ -674,6 +779,18 @@ class PythonTermRepository:
             self._require_active_aggregate(
                 connection, validated.term_id, validated.step_id
             )
+            owned = validated.model_copy(
+                update={
+                    "execution_owner_id": execution_owner_id,
+                    "lease_expires_at_ms": (
+                        self._database_now_ms(connection) + lease_duration_ms
+                    ),
+                    "fence_id": "fence-" + secrets.token_hex(16),
+                    "fence_generation": 1,
+                }
+            )
+            owned = self._validate_model(owned, ToolEffectRecord)
+            encoded = canonical_json(owned)
             try:
                 connection.execute(
                     """INSERT INTO python_tool_effects(
@@ -697,23 +814,29 @@ class PythonTermRepository:
                 )
             except sqlite3.IntegrityError as exc:
                 raise RepositoryConflict("Tool Effect identity conflict") from exc
-            return validated, True
+            return owned, True
 
     def takeover_expired_tool_effect(
         self,
-        replacement: ToolEffectRecord,
+        proposal: ToolEffectRecord,
         *,
-        expected_owner_id: str | None,
-        now_ms: int,
+        expected_owner_id: str,
+        expected_fence_token: str,
+        expected_fence_generation: int,
+        execution_owner_id: str,
+        lease_duration_ms: int,
     ) -> tuple[ToolEffectRecord, bool]:
         """Fence an expired reservation to one replacement execution owner."""
-        validated = self._validate_model(replacement, ToolEffectRecord)
+        validated = self._validate_model(proposal, ToolEffectRecord)
         if (
             validated.status != "reserved"
-            or validated.execution_owner_id is None
-            or validated.lease_expires_at_ms is None
+            or validated.execution_owner_id is not None
+            or validated.fence_token is not None
+            or validated.fence_generation != 0
+            or type(lease_duration_ms) is not int
+            or not 1 <= lease_duration_ms <= 86_400_000
         ):
-            raise RepositoryConflict("takeover requires an owned Tool Effect reservation")
+            raise RepositoryConflict("takeover requires an unowned Effect proposal")
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM python_tool_effects WHERE effect_id = ?",
@@ -730,23 +853,105 @@ class PythonTermRepository:
                 or existing.step_id != validated.step_id
                 or existing.tool_call_id != validated.tool_call_id
                 or existing.request_digest != validated.request_digest
+                or existing.request_digest_version != validated.request_digest_version
+                or existing.effect_identity_version
+                != validated.effect_identity_version
                 or existing.write_effect != validated.write_effect
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
             if existing.status != "reserved":
                 return existing, False
+            now_ms = self._database_now_ms(connection)
             if (
                 existing.execution_owner_id != expected_owner_id
-                or (
-                    existing.lease_expires_at_ms is not None
-                    and existing.lease_expires_at_ms > now_ms
-                )
+                or existing.fence_token != expected_fence_token
+                or existing.fence_generation != expected_fence_generation
+                or existing.lease_expires_at_ms is None
+                or existing.lease_expires_at_ms > now_ms
             ):
                 return existing, False
+            replacement = validated.model_copy(
+                update={
+                    "execution_owner_id": execution_owner_id,
+                    "lease_expires_at_ms": now_ms + lease_duration_ms,
+                    "fence_id": "fence-" + secrets.token_hex(16),
+                    "fence_generation": existing.fence_generation + 1,
+                }
+            )
+            replacement = self._validate_model(replacement, ToolEffectRecord)
             connection.execute(
                 """UPDATE python_tool_effects
                 SET effect_json = ?, updated_at = ? WHERE effect_id = ?""",
-                (canonical_json(validated), time.time(), validated.effect_id),
+                (canonical_json(replacement), time.time(), validated.effect_id),
+            )
+            return replacement, True
+
+    def finish_tool_effect(
+        self,
+        terminal: ToolEffectRecord,
+        *,
+        expected_owner_id: str,
+        expected_fence_token: str,
+        expected_fence_generation: int,
+    ) -> tuple[ToolEffectRecord, bool]:
+        """Persist a terminal Effect only for the current fenced execution owner."""
+        validated = self._validate_model(terminal, ToolEffectRecord)
+        if validated.status not in _EFFECT_TERMINAL:
+            raise RepositoryConflict("fenced Effect completion must be terminal")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (validated.effect_id,),
+            ).fetchone()
+            if row is None:
+                raise RepositoryConflict("fenced Effect completion requires reservation")
+            existing = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, existing.term_id, existing.step_id
+            )
+            if existing.status != "reserved":
+                return existing, canonical_json(existing) == canonical_json(validated)
+            immutable_matches = (
+                existing.term_id == validated.term_id
+                and existing.step_id == validated.step_id
+                and existing.tool_call_id == validated.tool_call_id
+                and existing.request_digest == validated.request_digest
+                and existing.request_digest_version
+                == validated.request_digest_version
+                and existing.effect_identity_version
+                == validated.effect_identity_version
+                and existing.write_effect == validated.write_effect
+            )
+            fence_matches = (
+                existing.execution_owner_id == expected_owner_id
+                and existing.fence_token == expected_fence_token
+                and existing.fence_generation == expected_fence_generation
+                and validated.execution_owner_id is None
+                and validated.lease_expires_at_ms is None
+                and validated.fence_token == existing.fence_token
+                and validated.fence_generation == existing.fence_generation
+            )
+            if not immutable_matches:
+                raise RepositoryConflict("Tool Effect request conflict")
+            if not fence_matches:
+                return existing, False
+            public_result = (
+                None
+                if validated.public_result is None
+                else canonical_json(validated.public_result)
+            )
+            connection.execute(
+                """UPDATE python_tool_effects SET status = ?, result_digest = ?,
+                effect_json = ?, public_result_json = ?, updated_at = ?
+                WHERE effect_id = ?""",
+                (
+                    validated.status,
+                    validated.result_digest,
+                    canonical_json(validated),
+                    public_result,
+                    time.time(),
+                    validated.effect_id,
+                ),
             )
             return validated, True
 

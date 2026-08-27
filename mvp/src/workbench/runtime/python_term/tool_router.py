@@ -11,14 +11,13 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast
 
 from jsonschema import FormatChecker
 from jsonschema.validators import validator_for
-from pydantic import ValidationError as PydanticValidationError
 
 from workbench.runtime.engine_host.v2 import ToolManifestEntryV2
 
@@ -27,6 +26,7 @@ from .contracts import (
     StepContext,
     ToolEffectRecord,
     canonical_digest,
+    canonical_json,
     validate_safe_json,
 )
 from .repository import PythonTermRepository
@@ -37,12 +37,29 @@ class FileAccess:
     argument: str
     mode: Literal["read", "write"]
 
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.argument, str)
+            or not re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$", self.argument)
+        ):
+            raise ValueError("file access argument must be an opaque identifier")
+        if self.mode not in {"read", "write"}:
+            raise ValueError("file access mode must be read or write")
+
 
 @dataclass(frozen=True, slots=True)
 class ToolAccess:
     files: tuple[FileAccess, ...] = ()
     network: bool = False
     command: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.files, tuple):
+            raise TypeError("tool access files must be a tuple")
+        if any(type(item) is not FileAccess for item in self.files):
+            raise TypeError("tool access files must contain FileAccess values")
+        if type(self.network) is not bool or type(self.command) is not bool:
+            raise TypeError("tool access flags must be boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +110,7 @@ class ExecutorRegistration:
     version: str
     schema_digest: str
     capability_digest: str
+    sealed_token: str = field(repr=False)
     executor_handle: str
     access: ToolAccess
 
@@ -114,48 +132,222 @@ class ExecutorRegistration:
             raise ValueError("executor registration access contains duplicates")
         if any(not identifier.fullmatch(item.argument) for item in self.access.files):
             raise ValueError("executor file access argument must be opaque")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.schema_digest):
+            raise ValueError("executor schema digest is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.capability_digest):
+            raise ValueError("executor capability digest is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.sealed_token):
+            raise ValueError("executor sealed token is invalid")
 
-    @classmethod
-    def from_manifest(
-        cls,
+    def capability_payload(self) -> Mapping[str, object]:
+        return {
+            "tool_id": self.tool_id,
+            "version": self.version,
+            "schema_digest": self.schema_digest,
+            "executor_handle": self.executor_handle,
+            "access": {
+                "files": tuple(
+                    {"argument": item.argument, "mode": item.mode}
+                    for item in self.access.files
+                ),
+                "network": self.access.network,
+                "command": self.access.command,
+            },
+        }
+
+
+def _unsigned_registration(
+    manifest: ToolManifestEntryV2,
+    *,
+    executor_handle: str,
+    access: ToolAccess,
+) -> ExecutorRegistration:
+    schema_digest = canonical_digest(manifest.schema)
+    payload = {
+        "tool_id": manifest.tool_id,
+        "version": manifest.version,
+        "schema_digest": schema_digest,
+        "executor_handle": executor_handle,
+        "access": {
+            "files": tuple(
+                {"argument": item.argument, "mode": item.mode}
+                for item in access.files
+            ),
+            "network": access.network,
+            "command": access.command,
+        },
+    }
+    return ExecutorRegistration(
+        tool_id=manifest.tool_id,
+        version=manifest.version,
+        schema_digest=schema_digest,
+        capability_digest=canonical_digest(payload),
+        sealed_token="0" * 64,
+        executor_handle=executor_handle,
+        access=access,
+    )
+
+
+def _contains_forbidden_executor_authority(
+    value: object, *, seen: set[int] | None = None, depth: int = 0
+) -> bool:
+    if seen is None:
+        seen = set()
+    if id(value) in seen or depth > 5:
+        return False
+    seen.add(id(value))
+    authority_name = type(value).__name__.casefold()
+    if isinstance(value, (PythonTermRepository, Path)) or any(
+        marker in authority_name for marker in ("repository", "vault", "workspace")
+    ):
+        return True
+    if inspect.ismethod(value):
+        return _contains_forbidden_executor_authority(
+            value.__self__, seen=seen, depth=depth + 1
+        ) or _contains_forbidden_executor_authority(
+            value.__func__, seen=seen, depth=depth + 1
+        )
+    if inspect.isfunction(value):
+        closure = value.__closure__ or ()
+        if any(
+            _contains_forbidden_executor_authority(
+                cell.cell_contents, seen=seen, depth=depth + 1
+            )
+            for cell in closure
+        ):
+            return True
+        return any(
+            name in value.__globals__
+            and _contains_forbidden_executor_authority(
+                value.__globals__[name], seen=seen, depth=depth + 1
+            )
+            for name in value.__code__.co_names
+        )
+    if isinstance(value, Mapping):
+        return any(
+            _contains_forbidden_executor_authority(
+                item, seen=seen, depth=depth + 1
+            )
+            for item in value.values()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(
+            _contains_forbidden_executor_authority(
+                item, seen=seen, depth=depth + 1
+            )
+            for item in value
+        )
+    attributes = getattr(value, "__dict__", None)
+    return isinstance(attributes, dict) and any(
+        _contains_forbidden_executor_authority(
+            item, seen=seen, depth=depth + 1
+        )
+        for item in attributes.values()
+    )
+
+
+class ExecutorBroker:
+    __slots__ = ("__dispatcher", "__key", "__registrations")
+
+    def __init__(self, dispatcher: object) -> None:
+        rejected = not callable(dispatcher) or _contains_forbidden_executor_authority(
+            dispatcher
+        )
+        if rejected:
+            raise ToolRouteError(
+                "registration_rejected", "Executor dispatcher authority was rejected"
+            ) from None
+        self.__dispatcher = dispatcher
+        self.__key = secrets.token_bytes(32)
+        self.__registrations: dict[str, ExecutorRegistration] = {}
+
+    def register(
+        self,
         manifest: ToolManifestEntryV2,
         *,
         executor_handle: str,
         access: ToolAccess,
-    ) -> "ExecutorRegistration":
-        schema_digest = canonical_digest(manifest.schema)
-        capability_digest = canonical_digest(
-            {
-                "tool_id": manifest.tool_id,
-                "version": manifest.version,
-                "schema_digest": schema_digest,
-                "executor_handle": executor_handle,
-                "access": {
-                    "files": [
-                        {"argument": item.argument, "mode": item.mode}
-                        for item in access.files
-                    ],
-                    "network": access.network,
-                    "command": access.command,
-                },
-            }
-        )
-        return cls(
-            tool_id=manifest.tool_id,
-            version=manifest.version,
-            schema_digest=schema_digest,
-            capability_digest=capability_digest,
+    ) -> ExecutorRegistration:
+        unsealed = _unsigned_registration(
+            manifest,
             executor_handle=executor_handle,
             access=access,
         )
-
-    def matches(self, manifest: ToolManifestEntryV2) -> bool:
-        expected = type(self).from_manifest(
-            manifest,
-            executor_handle=self.executor_handle,
-            access=self.access,
+        token = hmac.new(
+            self.__key,
+            unsealed.capability_digest.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        registration = unsealed.__class__(
+            tool_id=unsealed.tool_id,
+            version=unsealed.version,
+            schema_digest=unsealed.schema_digest,
+            capability_digest=unsealed.capability_digest,
+            sealed_token=token,
+            executor_handle=unsealed.executor_handle,
+            access=unsealed.access,
         )
-        return expected == self
+        existing = self.__registrations.get(executor_handle)
+        if existing is not None and existing != registration:
+            raise ToolRouteError(
+                "registration_rejected", "Executor handle binding changed"
+            )
+        self.__registrations[executor_handle] = registration
+        return registration
+
+    def verifies(
+        self,
+        registration: ExecutorRegistration,
+        manifest: ToolManifestEntryV2,
+    ) -> bool:
+        if type(registration) is not ExecutorRegistration:
+            return False
+        expected = self.__registrations.get(registration.executor_handle)
+        if expected != registration:
+            return False
+        metadata = _unsigned_registration(
+            manifest,
+            executor_handle=registration.executor_handle,
+            access=registration.access,
+        )
+        if metadata.capability_digest != registration.capability_digest:
+            return False
+        expected_token = hmac.new(
+            self.__key,
+            registration.capability_digest.encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected_token, registration.sealed_token)
+
+    async def execute(
+        self,
+        registration: ExecutorRegistration,
+        context: StepContext,
+        arguments: Mapping[str, object],
+    ) -> object:
+        manifest = next(
+            (
+                item
+                for item in context.tool_manifest
+                if item.tool_id == registration.tool_id
+            ),
+            None,
+        )
+        if manifest is None or not self.verifies(registration, manifest):
+            raise ToolRouteError(
+                "registration_rejected", "Executor capability verification failed"
+            )
+        operation = self.__dispatcher(
+            registration.executor_handle,
+            context,
+            arguments,
+        )
+        if not inspect.isawaitable(operation):
+            raise TypeError("Executor dispatcher must return an awaitable")
+        return await operation
+
+    def __repr__(self) -> str:
+        return "ExecutorBroker(<sealed>)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +414,10 @@ _MAX_SCHEMA_NODES = 256
 _MAX_SCHEMA_CONTAINER_ITEMS = 128
 _MAX_PATTERN_LENGTH = 256
 _MAX_ARGUMENT_BYTES = 65_536
-_LEASE_GRACE_MS = 1_000
+_MAX_LOCAL_REF_EDGES = 64
+_MAX_LOCAL_REF_EXPANSION_DEPTH = 12
+_MAX_LOCAL_REF_EXPANDED_NODES = 512
+_LEASE_GRACE_MS = 25
 _WAIT_POLL_SECONDS = 0.01
 
 
@@ -242,24 +437,95 @@ def _safe_pattern(pattern: str) -> bool:
     return True
 
 
-def _resolve_local_ref(schema: object, reference: str) -> bool:
+def _resolve_local_ref(
+    schema: object, reference: str
+) -> tuple[tuple[str, ...], object] | None:
     if reference == "#":
-        return True
+        return (), schema
     if not reference.startswith("#/") or len(reference) > 512:
-        return False
+        return None
     target = schema
+    pointer: list[str] = []
     for raw_segment in reference[2:].split("/"):
         segment = raw_segment.replace("~1", "/").replace("~0", "~")
+        pointer.append(segment)
         if isinstance(target, Mapping) and segment in target:
             target = target[segment]
         elif isinstance(target, (list, tuple)) and segment.isdecimal():
             index = int(segment)
             if index >= len(target):
-                return False
+                return None
             target = target[index]
         else:
+            return None
+    if not isinstance(target, Mapping):
+        return None
+    return tuple(pointer), target
+
+
+def _local_ref_expansion_is_bounded(schema: object) -> bool:
+    expanded_nodes = 0
+
+    def visit(
+        value: object,
+        *,
+        ref_depth: int,
+        active_targets: frozenset[tuple[str, ...]],
+    ) -> bool:
+        nonlocal expanded_nodes
+        expanded_nodes += 1
+        if expanded_nodes > _MAX_LOCAL_REF_EXPANDED_NODES:
             return False
-    return True
+        if isinstance(value, Mapping):
+            reference = value.get("$ref")
+            if reference is not None:
+                if not isinstance(reference, str):
+                    return False
+                resolved = _resolve_local_ref(schema, reference)
+                if resolved is None:
+                    return False
+                target_pointer, target = resolved
+                if (
+                    target_pointer in active_targets
+                    or ref_depth >= _MAX_LOCAL_REF_EXPANSION_DEPTH
+                ):
+                    return False
+                target_is_bounded = visit(
+                    target,
+                    ref_depth=ref_depth + 1,
+                    active_targets=active_targets | {target_pointer},
+                )
+                siblings_are_bounded = all(
+                    visit(
+                        nested,
+                        ref_depth=ref_depth,
+                        active_targets=active_targets,
+                    )
+                    for key, nested in value.items()
+                    if key not in {"$ref", "$defs", "definitions"}
+                )
+                return target_is_bounded and siblings_are_bounded
+            return all(
+                visit(
+                    nested,
+                    ref_depth=ref_depth,
+                    active_targets=active_targets,
+                )
+                for key, nested in value.items()
+                if key not in {"$defs", "definitions"}
+            )
+        if isinstance(value, (list, tuple)):
+            return all(
+                visit(
+                    item,
+                    ref_depth=ref_depth,
+                    active_targets=active_targets,
+                )
+                for item in value
+            )
+        return True
+
+    return visit(schema, ref_depth=0, active_targets=frozenset())
 
 
 def _schema_is_bounded(schema: object) -> bool:
@@ -272,6 +538,7 @@ def _schema_is_bounded(schema: object) -> bool:
     if len(encoded) > _MAX_SCHEMA_BYTES:
         return False
     nodes = 0
+    local_ref_edges = 0
     stack: list[tuple[object, int]] = [(schema, 0)]
     while stack:
         value, depth = stack.pop()
@@ -285,8 +552,13 @@ def _schema_is_bounded(schema: object) -> bool:
                 if key in {"$id", "$anchor", "$dynamicAnchor", "$recursiveAnchor"}:
                     return False
                 if key in {"$ref", "$dynamicRef", "$recursiveRef"}:
-                    if not isinstance(nested, str) or not _resolve_local_ref(
-                        schema, nested
+                    if key != "$ref":
+                        return False
+                    local_ref_edges += 1
+                    if (
+                        local_ref_edges > _MAX_LOCAL_REF_EDGES
+                        or not isinstance(nested, str)
+                        or _resolve_local_ref(schema, nested) is None
                     ):
                         return False
                 if key == "pattern" and (
@@ -304,7 +576,7 @@ def _schema_is_bounded(schema: object) -> bool:
             if len(value) > _MAX_SCHEMA_CONTAINER_ITEMS:
                 return False
             stack.extend((item, depth + 1) for item in value)
-    return True
+    return _local_ref_expansion_is_bounded(schema)
 
 
 class ToolRouter:
@@ -323,9 +595,7 @@ class ToolRouter:
             or key != registration.tool_id
             for key, registration in executors.items()
         )
-        invalid_broker = executor_broker is None or not callable(
-            getattr(executor_broker, "execute", None)
-        )
+        invalid_broker = type(executor_broker) is not ExecutorBroker
         invalid_digest_service = type(request_digests) is not HmacRequestDigestService
         if invalid_registration or invalid_broker or invalid_digest_service:
             raise ToolRouteError(
@@ -371,7 +641,9 @@ class ToolRouter:
             registration = self.registrations.get(manifest.tool_id)
             if registration is None:
                 continue
-            if not registration.matches(manifest):
+            if not cast(ExecutorBroker, self.executor_broker).verifies(
+                registration, manifest
+            ):
                 failed_code = "registration_rejected"
                 break
             admitted[manifest.tool_id] = _AdmittedTool(
@@ -479,21 +751,21 @@ class ToolRouter:
             }
         )
         reservation = ToolEffectRecord(
+            record_version=2,
             effect_id=effect_id,
+            effect_identity_version="hmac-sha256-v1",
             term_id=context.term_id,
             step_id=context.step_id,
             tool_call_id=tool_call_id,
             request_digest=request_digest,
+            request_digest_version="hmac-sha256-v1",
             write_effect=write_effect,
-            execution_owner_id=owner_id,
-            lease_expires_at_ms=(
-                self.clock_ms() + admitted.manifest.timeout_ms + _LEASE_GRACE_MS
-            ),
             status="reserved",
         )
-        owned, replay = await self._reserve_or_replay(
+        owned, replay, waited_for_ownership = await self._reserve_or_replay(
             admitted.manifest,
             reservation,
+            owner_id=owner_id,
             deadline_at_ms=deadline_at_ms,
         )
         if replay is not None:
@@ -504,6 +776,20 @@ class ToolRouter:
                 effect_id=effect_id,
             )
         reservation = owned
+
+        await self._reauthorize_owned_effect(
+            context,
+            admitted.manifest,
+            access,
+            request_digest=request_digest,
+            access_digest=access_digest,
+            decision=decision,
+            approval=approval,
+            tool_call_id=tool_call_id,
+            deadline_at_ms=deadline_at_ms,
+            reservation=reservation,
+            reacquire_approval=waited_for_ownership,
+        )
 
         remaining_ms = min(
             admitted.manifest.timeout_ms,
@@ -525,7 +811,7 @@ class ToolRouter:
                 status=("reconciliation_required" if write_effect else "rejected"),
                 code="cancelled",
             )
-            await self._persist_terminal(terminal)
+            await self._persist_terminal_or_raise(terminal, reservation)
             raise asyncio.CancelledError()
         if outcome != "completed":
             await self._finish_failed_execution(
@@ -539,7 +825,7 @@ class ToolRouter:
             if candidate.status != "completed":
                 raise ValueError("non-completed result")
             result = candidate
-        except (PydanticValidationError, TypeError, ValueError):
+        except Exception:
             result_invalid = True
         if result_invalid or result is None:
             terminal = self._terminal_effect(
@@ -547,7 +833,7 @@ class ToolRouter:
                 status=("reconciliation_required" if write_effect else "rejected"),
                 code="result_rejected",
             )
-            await self._persist_terminal(terminal)
+            await self._persist_terminal_or_raise(terminal, reservation)
             raise ToolRouteError(
                 "reconciliation_required" if write_effect else "result_rejected",
                 "Tool result failed the public result boundary",
@@ -563,8 +849,8 @@ class ToolRouter:
                 "public_result": result,
             }
         )
-        persisted = await self._persist_terminal(committed)
-        if persisted:
+        persisted = await self._persist_terminal(committed, reservation)
+        if persisted is not None:
             return result
         durable = self._safe_get_effect(effect_id)
         if (
@@ -580,7 +866,13 @@ class ToolRouter:
                 status="reconciliation_required",
                 code="commit_persistence_failed",
             )
-            await self._persist_terminal(reconciliation)
+            reconciled = await self._persist_terminal(reconciliation, reservation)
+            if reconciled is None:
+                raise ToolRouteError(
+                    "persistence_failure",
+                    "Tool Effect terminal persistence failed",
+                    effect_id=effect_id,
+                ) from None
             raise ToolRouteError(
                 "reconciliation_required",
                 "Tool Effect requires reconciliation",
@@ -780,16 +1072,22 @@ class ToolRouter:
 
     @staticmethod
     def _path_is_granted(path: str, roots: tuple[str, ...]) -> bool:
-        candidate = Path(path)
-        if not candidate.is_absolute() or ".." in candidate.parts:
-            return False
-        canonical = candidate.resolve(strict=False)
-        if str(canonical) != path:
-            return False
-        return any(
-            canonical == root or canonical.is_relative_to(root)
-            for root in (Path(value).resolve(strict=False) for value in roots)
-        )
+        granted = False
+        failed = False
+        try:
+            candidate = Path(path)
+            if candidate.is_absolute() and ".." not in candidate.parts:
+                canonical = candidate.resolve(strict=False)
+                if str(canonical) == path:
+                    granted = any(
+                        canonical == root or canonical.is_relative_to(root)
+                        for root in (
+                            Path(value).resolve(strict=False) for value in roots
+                        )
+                    )
+        except Exception:
+            failed = True
+        return granted and not failed
 
     async def _approve_bounded(
         self,
@@ -834,6 +1132,82 @@ class ToolRouter:
                 "approval_denied", "Tool approval was denied"
             ) from None
 
+    async def _reauthorize_owned_effect(
+        self,
+        context: StepContext,
+        manifest: ToolManifestEntryV2,
+        access: _ResolvedAccess,
+        *,
+        request_digest: str,
+        access_digest: str,
+        decision: _AuthorizationDecision,
+        approval: ApprovalCallback | None,
+        tool_call_id: str,
+        deadline_at_ms: int,
+        reservation: ToolEffectRecord,
+        reacquire_approval: bool,
+    ) -> None:
+        failure_code: str | None = None
+        cancelled = False
+        try:
+            rechecked = self._authorize_frozen(
+                context,
+                manifest,
+                access,
+                access_digest=access_digest,
+                request_digest=request_digest,
+                deadline_at_ms=deadline_at_ms,
+            )
+            if rechecked.decision_digest != decision.decision_digest:
+                raise ToolRouteError(
+                    "authorization_changed",
+                    "Tool authorization changed before execution",
+                )
+            if reacquire_approval and decision.reasons:
+                await self._approve_bounded(
+                    context,
+                    manifest.tool_id,
+                    tool_call_id,
+                    request_digest,
+                    rechecked,
+                    approval,
+                    deadline_at_ms=deadline_at_ms,
+                )
+                final = self._authorize_frozen(
+                    context,
+                    manifest,
+                    access,
+                    access_digest=access_digest,
+                    request_digest=request_digest,
+                    deadline_at_ms=deadline_at_ms,
+                )
+                if final.decision_digest != decision.decision_digest:
+                    raise ToolRouteError(
+                        "authorization_changed",
+                        "Tool authorization changed after approval",
+                    )
+        except asyncio.CancelledError:
+            cancelled = True
+        except ToolRouteError as error:
+            failure_code = error.code
+        except Exception:
+            failure_code = "authorization_failed"
+        if not cancelled and failure_code is None:
+            return
+        rejected = self._terminal_effect(
+            reservation,
+            status="rejected",
+            code="cancelled" if cancelled else failure_code or "authorization_failed",
+        )
+        await self._persist_terminal_or_raise(rejected, reservation)
+        if cancelled:
+            raise asyncio.CancelledError()
+        raise ToolRouteError(
+            failure_code or "authorization_failed",
+            "Tool authorization failed before execution",
+            effect_id=reservation.effect_id,
+        ) from None
+
     async def _execute_bounded(
         self,
         registration: ExecutorRegistration,
@@ -847,7 +1221,7 @@ class ToolRouter:
         cancelled = False
         try:
             operation = self.executor_broker.execute(  # type: ignore[union-attr]
-                registration.executor_handle,
+                registration,
                 context,
                 arguments,
             )
@@ -911,84 +1285,100 @@ class ToolRouter:
         manifest: ToolManifestEntryV2,
         reservation: ToolEffectRecord,
         *,
+        owner_id: str,
         deadline_at_ms: int,
-    ) -> tuple[ToolEffectRecord | None, PublicToolResult | None]:
-        effect, created = self.repository.reserve_tool_effect(reservation)
+    ) -> tuple[ToolEffectRecord | None, PublicToolResult | None, bool]:
+        reserve_failed = False
+        effect: ToolEffectRecord | None = None
+        created = False
+        try:
+            effect, created = self.repository.reserve_tool_effect(
+                reservation,
+                execution_owner_id=owner_id,
+                lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
+            )
+        except Exception:
+            reserve_failed = True
+        if reserve_failed or effect is None:
+            raise ToolRouteError(
+                "effect_reservation_failed",
+                "Tool Effect reservation failed",
+                effect_id=reservation.effect_id,
+            ) from None
         if created:
-            return reservation, None
+            return effect, None, False
         while True:
             replay = self._terminal_replay(manifest, effect, reservation.write_effect)
             if replay is not None:
-                return None, replay
+                return None, replay, False
             if effect.status != "reserved":
                 self._raise_terminal(effect)
-            if effect.execution_owner_id == reservation.execution_owner_id:
-                return effect, None
-            now_ms = self.clock_ms()
             if (
-                effect.lease_expires_at_ms is not None
-                and effect.lease_expires_at_ms > now_ms
+                effect.execution_owner_id is None
+                or effect.fence_token is None
+                or effect.fence_generation < 1
             ):
-                if self._remaining_ms(deadline_at_ms) <= 0:
-                    raise ToolRouteError(
-                        "deadline_exceeded", "Tool Step deadline elapsed",
-                        effect_id=effect.effect_id,
-                    )
-                await asyncio.sleep(
-                    min(_WAIT_POLL_SECONDS, self._remaining_ms(deadline_at_ms) / 1000)
+                raise ToolRouteError(
+                    "effect_corrupt", "Reserved Tool Effect has no execution fence",
+                    effect_id=effect.effect_id,
                 )
-                refreshed = self._safe_get_effect(effect.effect_id)
-                if refreshed is None:
-                    raise ToolRouteError(
-                        "effect_unavailable", "Tool Effect disappeared",
-                        effect_id=effect.effect_id,
-                    )
-                effect = refreshed
-                continue
-            if reservation.write_effect:
+            takeover_failed = False
+            replacement: ToolEffectRecord | None = None
+            won = False
+            try:
+                replacement, won = self.repository.takeover_expired_tool_effect(
+                    reservation,
+                    expected_owner_id=effect.execution_owner_id,
+                    expected_fence_token=effect.fence_token,
+                    expected_fence_generation=effect.fence_generation,
+                    execution_owner_id=owner_id,
+                    lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
+                )
+            except Exception:
+                takeover_failed = True
+            if takeover_failed or replacement is None:
+                raise ToolRouteError(
+                    "effect_takeover_failed",
+                    "Tool Effect recovery ownership failed",
+                    effect_id=effect.effect_id,
+                ) from None
+            if won and reservation.write_effect:
                 terminal = self._terminal_effect(
-                    effect,
+                    replacement,
                     status="reconciliation_required",
                     code="write_outcome_unknown",
                 )
-                if await self._persist_terminal(terminal):
+                if await self._persist_terminal(terminal, replacement) is not None:
                     raise ToolRouteError(
                         "reconciliation_required",
                         "Tool Effect requires reconciliation",
-                        effect_id=effect.effect_id,
+                        effect_id=replacement.effect_id,
                     )
-                refreshed = self._safe_get_effect(effect.effect_id)
-                if refreshed is not None and refreshed != effect:
-                    effect = refreshed
-                    continue
                 raise ToolRouteError(
-                    "persistence_unavailable", "Tool Effect persistence is unavailable",
-                    effect_id=effect.effect_id,
+                    "persistence_failure", "Tool Effect persistence is unavailable",
+                    effect_id=replacement.effect_id,
                 )
-            if manifest.idempotency != "idempotent":
+            if won and manifest.idempotency != "idempotent":
                 terminal = self._terminal_effect(
-                    effect, status="rejected", code="replay_not_allowed"
+                    replacement, status="rejected", code="replay_not_allowed"
                 )
-                await self._persist_terminal(terminal)
+                await self._persist_terminal_or_raise(terminal, replacement)
                 raise ToolRouteError(
                     "replay_not_allowed",
                     "Manifest does not permit replay of this read Tool",
+                    effect_id=replacement.effect_id,
+                )
+            if won:
+                return replacement, None, True
+            effect = replacement
+            if self._remaining_ms(deadline_at_ms) <= 0:
+                raise ToolRouteError(
+                    "deadline_exceeded", "Tool Step deadline elapsed",
                     effect_id=effect.effect_id,
                 )
-            replacement = reservation.model_copy(
-                update={
-                    "lease_expires_at_ms": (
-                        now_ms + manifest.timeout_ms + _LEASE_GRACE_MS
-                    )
-                }
+            await asyncio.sleep(
+                min(_WAIT_POLL_SECONDS, self._remaining_ms(deadline_at_ms) / 1000)
             )
-            effect, won = self.repository.takeover_expired_tool_effect(
-                replacement,
-                expected_owner_id=effect.execution_owner_id,
-                now_ms=now_ms,
-            )
-            if won:
-                return replacement, None
 
     @staticmethod
     def _terminal_replay(
@@ -1043,32 +1433,62 @@ class ToolRouter:
             status=("reconciliation_required" if write_effect else "rejected"),
             code=code,
         )
-        await self._persist_terminal(terminal)
+        await self._persist_terminal_or_raise(terminal, reservation)
         raise ToolRouteError(
             "reconciliation_required" if write_effect else code,
             "Tool execution did not produce a reusable result",
             effect_id=reservation.effect_id,
         ) from None
 
-    async def _persist_terminal(self, effect: ToolEffectRecord) -> bool:
-        async def persist() -> bool:
-            failed = False
+    async def _persist_terminal(
+        self,
+        effect: ToolEffectRecord,
+        reservation: ToolEffectRecord,
+    ) -> ToolEffectRecord | None:
+        async def persist() -> ToolEffectRecord | None:
+            durable: ToolEffectRecord | None = None
             try:
-                self.repository.save_tool_effect(effect)
+                current, finished = self.repository.finish_tool_effect(
+                    effect,
+                    expected_owner_id=reservation.execution_owner_id or "",
+                    expected_fence_token=reservation.fence_token or "",
+                    expected_fence_generation=reservation.fence_generation,
+                )
             except Exception:
-                failed = True
-            return not failed
+                return None
+            if finished and canonical_json(current) == canonical_json(effect):
+                durable = current
+            return durable
 
         task = asyncio.create_task(persist())
+        cancelled = False
         try:
-            return await asyncio.shield(task)
+            result = await asyncio.shield(task)
         except asyncio.CancelledError:
-            if task.done():
-                return task.result()
-            try:
-                return await asyncio.shield(task)
-            except (asyncio.CancelledError, Exception):
-                return False
+            cancelled = True
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            result = task.result()
+        if cancelled:
+            raise asyncio.CancelledError()
+        return result
+
+    async def _persist_terminal_or_raise(
+        self,
+        effect: ToolEffectRecord,
+        reservation: ToolEffectRecord,
+    ) -> ToolEffectRecord:
+        durable = await self._persist_terminal(effect, reservation)
+        if durable is None:
+            raise ToolRouteError(
+                "persistence_failure",
+                "Tool Effect terminal persistence failed",
+                effect_id=effect.effect_id,
+            ) from None
+        return durable
 
     def _safe_get_effect(self, effect_id: str) -> ToolEffectRecord | None:
         failed = False
@@ -1105,6 +1525,7 @@ class ToolRouter:
         )
 
 __all__ = [
+    "ExecutorBroker",
     "ExecutorRegistration",
     "FileAccess",
     "HmacRequestDigestService",
