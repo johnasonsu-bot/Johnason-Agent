@@ -145,15 +145,24 @@ cd mvp
   tests/acceptance/test_langgraph_single_source.py -q
 ```
 
-运行完整后端和 Electron 验证：
+运行标准后端、独立 Development Graph meta/E2E 和单次 Electron 验证：
 
 ```bash
 cd mvp
-.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q
+.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q \
+  -m "not development_graph_meta_e2e"
+
+.venv/bin/python -m pytest -q \
+  tests/acceptance/test_development_graph_blueprint.py \
+  -m development_graph_meta_e2e
 
 cd canvas-spike
 npm test
 ```
+
+标准后端保留轻量 CLI 安全测试；独立 meta/E2E 只包含会在内部再次运行 backend
+与 Electron regression 的 happy-path 和 fault-injection 场景。两类 pytest 计数必须
+分别记录，不能合并为一次完整后端结果。
 
 外部 LM Studio、DeepSeek 或 Data Platform 测试需要相应本地服务/凭据，未配置时相关测试会跳过或报告 blocked；这不等同于外部链路已在当前机器验证。
 

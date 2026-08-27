@@ -246,15 +246,30 @@ cd mvp
 .venv/bin/python -m pytest tests/unit -q
 ```
 
-### 10.2 完整后端测试
+### 10.2 标准后端测试
 
 ```bash
-.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q
+.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q \
+  -m "not development_graph_meta_e2e"
 ```
 
-Batch 3.0 已记录结果：`568 passed, 6 skipped`。该数字是对应提交的验收证据；修改代码后必须重新运行，不能复用旧结果声明当前 HEAD 通过。
+该门排除会在内部再次运行完整 backend 与 Electron regression 的 Development
+Graph meta/E2E 场景，避免递归和重复执行。Batch 3.0 的
+`568 passed, 6 skipped` 只是对应历史提交的验收证据；修改代码后必须重新运行，
+不能复用旧结果声明当前 HEAD 通过。
 
-### 10.3 LangGraph 运行门
+### 10.3 Development Graph meta/E2E
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/acceptance/test_development_graph_blueprint.py \
+  -m development_graph_meta_e2e
+```
+
+该门单独运行 happy-path 与 fault-injection 场景。场景内部 backend regression
+继续忽略当前 blueprint 文件，禁止递归；轻量 CLI 安全测试仍属于标准后端门。
+
+### 10.4 LangGraph 运行门
 
 ```bash
 .venv/bin/python scripts/run_langgraph_runtime_gate.py
@@ -268,14 +283,14 @@ GO_LANGGRAPH_RUNTIME
 
 运行门覆盖：用户批准前无 Worker 副作用、四分支并发、局部拒绝与返工、Merge/Global Verifier 各一次、真实进程终止后从 SQLite 恢复、同线程并发 Fence、安全投影和固定拒绝文件。
 
-### 10.4 Electron/Playwright
+### 10.5 Electron/Playwright
 
 ```bash
 cd canvas-spike
 npm test
 ```
 
-### 10.5 真实 LM Studio
+### 10.6 真实 LM Studio
 
 ```bash
 cd mvp
@@ -284,7 +299,7 @@ LMSTUDIO_MODEL="<loaded-model-id>" \
 .venv/bin/python -m pytest tests/integration/test_lmstudio_tool_calling.py -v
 ```
 
-### 10.6 Data Platform 验收
+### 10.7 Data Platform 验收
 
 在当前 shell 中提供本地 Data Platform 连接信息，不要写入仓库：
 

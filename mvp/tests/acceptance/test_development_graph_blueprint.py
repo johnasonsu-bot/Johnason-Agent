@@ -5,7 +5,10 @@ import sys
 
 import pytest
 
-from scripts.run_development_graph_acceptance import run_development_graph_acceptance
+from scripts.run_development_graph_acceptance import (
+    _integration_regression_policy,
+    run_development_graph_acceptance,
+)
 
 
 def test_invalid_cli_overwrites_explicit_output_with_blocked_metadata(tmp_path: Path) -> None:
@@ -169,16 +172,47 @@ def test_abbreviated_output_is_rejected_without_touching_its_value(
 
 
 def test_nested_backend_command_ignores_only_this_gate_file() -> None:
-    script = Path(__file__).parents[2] / "scripts/run_development_graph_acceptance.py"
-    source = script.read_text(encoding="utf-8")
+    policy = _integration_regression_policy(None)
+    assert policy.backend.tests == policy.backend.allowed_commands
+    (backend_command,) = policy.backend.tests
+    assert "--ignore=tests/acceptance/test_development_graph_blueprint.py" in backend_command
 
-    assert "pytest.mark.development_graph_gate" not in source
-    marker_assignment = "pytest" + "mark ="
-    assert marker_assignment not in Path(__file__).read_text(encoding="utf-8")
-    assert "--ignore=tests/acceptance/test_development_graph_blueprint.py" in source
-    assert '"-m", "not development_graph_gate"' not in source
+    collected = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "tests/acceptance/test_development_graph_blueprint.py",
+            "-m",
+            "development_graph_meta_e2e",
+            "--strict-markers",
+        ),
+        cwd=Path(__file__).parents[2],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    node_ids = tuple(
+        line
+        for line in collected.stdout.splitlines()
+        if line.startswith("tests/acceptance/test_development_graph_blueprint.py::")
+    )
+    assert len(node_ids) == 8
+    assert sum(
+        "::test_three_workers_merge_to_temporary_branch_and_stop" in node
+        for node in node_ids
+    ) == 1
+    assert sum(
+        "::test_fault_injections_write_metadata_only_blocked_result" in node
+        for node in node_ids
+    ) == 7
 
 
+@pytest.mark.development_graph_meta_e2e
 @pytest.mark.asyncio
 async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) -> None:
     result = await run_development_graph_acceptance(tmp_path)
@@ -218,6 +252,7 @@ async def test_three_workers_merge_to_temporary_branch_and_stop(tmp_path: Path) 
     assert result["decision"] == "GO_RELEASE_APPROVAL"
 
 
+@pytest.mark.development_graph_meta_e2e
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault",
