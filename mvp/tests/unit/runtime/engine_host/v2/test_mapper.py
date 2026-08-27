@@ -603,10 +603,15 @@ def test_runtime_public_boundary_rejects_local_paths_at_label_and_punctuation_bo
         map_runtime_event(runtime_event("assistant.delta", payload={"text": local_path}))
 
 
-def test_runtime_public_boundary_rejects_local_path_after_quoted_http_url() -> None:
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        r'https://example.com";artifact=C:\private\state.json',
+        "https://example.com;artifact=C:/private/state.json",
+    ],
+)
+def test_runtime_public_boundary_rejects_local_path_after_http_url(hostile: str) -> None:
     """Catches a local path hidden by an overbroad HTTP URL span."""
-    hostile = r'https://example.com";artifact=C:\private\state.json'
-
     with pytest.raises(ValueError, match="sensitive value|public text"):
         map_runtime_event(runtime_event("assistant.delta", payload={"text": hostile}))
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from workbench.agui.mapper import map_domain_event
 from workbench.protocol.events import DomainEvent
 
@@ -85,8 +87,14 @@ def test_development_projections_reject_absolute_windows_and_traversal_values() 
         assert map_domain_event(event) == []
 
 
-def test_development_projection_rejects_local_path_after_quoted_http_url() -> None:
-    hostile = r'https://example.com";artifact=C:\private\state.json'
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        r'https://example.com";artifact=C:\private\state.json',
+        "https://example.com;artifact=C:/private/state.json",
+    ],
+)
+def test_development_projection_rejects_local_path_after_http_url(hostile: str) -> None:
     event = DomainEvent.new("development.branch.progress", "test", {
         "graph_run_id": "development-run.1", "branch_id": "backend", "attempt": 1,
         "worktree_display_name": hostile, "worker_branch": "graph/development-run.1/backend",

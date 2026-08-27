@@ -361,9 +361,15 @@ def test_v2_development_boundary_rejects_local_paths_at_label_and_punctuation_bo
     assert map_domain_event(event) == []
 
 
-def test_v2_persisted_boundary_rejects_local_path_after_quoted_http_url() -> None:
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        r'https://example.com";artifact=C:\private\state.json',
+        "https://example.com;artifact=C:/private/state.json",
+    ],
+)
+def test_v2_persisted_boundary_rejects_local_path_after_http_url(hostile: str) -> None:
     """Catches persisted public text hiding a local path inside a URL span."""
-    hostile = r'https://example.com";artifact=C:\private\state.json'
     event = DomainEvent.new(
         "agent.message.delta",
         "engine_host.v2",
