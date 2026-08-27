@@ -42,7 +42,7 @@ _DIGEST_VALUE = re.compile(
     r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{40})(?![0-9a-f])",
     re.IGNORECASE,
 )
-_HTTP_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+_HTTP_URL = re.compile(r'''https?://[^\s"'<>\\]+''', re.IGNORECASE)
 _TRAVERSAL_PATH = re.compile(r"(?<![A-Za-z0-9_.-])\.\.(?:[\\/]|$)")
 _PATH_BOUNDARY_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./\\-"

@@ -85,8 +85,24 @@ def test_development_projections_reject_absolute_windows_and_traversal_values() 
         assert map_domain_event(event) == []
 
 
+def test_development_projection_rejects_local_path_after_quoted_http_url() -> None:
+    hostile = r'https://example.com";artifact=C:\private\state.json'
+    event = DomainEvent.new("development.branch.progress", "test", {
+        "graph_run_id": "development-run.1", "branch_id": "backend", "attempt": 1,
+        "worktree_display_name": hostile, "worker_branch": "graph/development-run.1/backend",
+        "base_sha": "a" * 40, "commit_sha": "b" * 40, "owned_path_summary": ["src/backend.py"],
+        "test_label": "tests", "test_result": "passed",
+    }, run_id="session-1")
+
+    assert map_domain_event(event) == []
+
+
 def test_development_projection_allows_public_url_and_relative_path_text() -> None:
-    for safe in ("https://example.com/public/worktree", "backend/current/worktree"):
+    for safe in (
+        "https://example.com/public/worktree",
+        "https://example.com/docs/a;b?x=1#ok",
+        "backend/current/worktree",
+    ):
         event = DomainEvent.new("development.branch.progress", "test", {
             "graph_run_id": "development-run.1", "branch_id": "backend", "attempt": 1,
             "worktree_display_name": safe, "worker_branch": "graph/development-run.1/backend",
