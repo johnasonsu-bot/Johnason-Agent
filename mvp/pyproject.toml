@@ -32,5 +32,5 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "--import-mode=importlib"
 markers = [
-  "development_graph_meta_e2e: runs nested backend and Electron regression once per acceptance scenario",
+  "development_graph_meta_e2e: runs full external backend and Electron suites only on the happy path",
 ]

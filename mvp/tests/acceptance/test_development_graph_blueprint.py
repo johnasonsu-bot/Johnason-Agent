@@ -172,11 +172,27 @@ def test_abbreviated_output_is_rejected_without_touching_its_value(
 
 
 def test_nested_backend_command_ignores_only_this_gate_file() -> None:
+    repository_root = Path(__file__).parents[3]
     policy = _integration_regression_policy(None)
-    assert policy.backend.tests == policy.backend.allowed_commands
-    (backend_command,) = policy.backend.tests
-    assert "--ignore=tests/acceptance/test_development_graph_blueprint.py" in backend_command
-    assert policy.electron_playwright.tests == (("npm", "test"),)
+    backend_command = (
+        sys.executable,
+        "-m",
+        "pytest",
+        "tests/unit",
+        "tests/integration",
+        "tests/acceptance",
+        "-q",
+        "--ignore=tests/acceptance/test_development_graph_blueprint.py",
+    )
+    frontend_command = ("npm", "test")
+    assert policy.backend.tests == (backend_command,)
+    assert policy.backend.allowed_commands == (backend_command,)
+    assert policy.electron_playwright.tests == (frontend_command,)
+    assert policy.electron_playwright.allowed_commands == (frontend_command,)
+    assert policy.backend_working_directory == "mvp"
+    assert policy.electron_playwright_working_directory == "mvp/canvas-spike"
+    policy.backend.validate_commands(repository_root=repository_root)
+    policy.electron_playwright.validate_commands(repository_root=repository_root)
 
     passing_command = (
         sys.executable,
@@ -201,15 +217,16 @@ def test_nested_backend_command_ignores_only_this_gate_file() -> None:
             "-q",
         ),
     }
-    for fault in (
-        "ownership",
-        "backend",
-        "electron",
-        "remote",
-        "missing_evidence",
-        "key_error",
-        "exception",
-    ):
+    expected_statuses = {
+        "ownership": (0, 0),
+        "backend": (1, 0),
+        "electron": (0, 1),
+        "remote": (0, 0),
+        "missing_evidence": (0, 0),
+        "key_error": (0, 0),
+        "exception": (0, 0),
+    }
+    for fault, expected_status in expected_statuses.items():
         fault_policy = _integration_regression_policy(fault)
         expected_backend = (
             failing_commands["backend"] if fault == "backend" else passing_command
@@ -223,10 +240,29 @@ def test_nested_backend_command_ignores_only_this_gate_file() -> None:
         assert fault_policy.electron_playwright.allowed_commands == (expected_electron,)
         assert fault_policy.backend_working_directory == "mvp"
         assert fault_policy.electron_playwright_working_directory == "mvp"
-        fault_policy.backend.validate_commands(repository_root=Path(__file__).parents[3])
+        fault_policy.backend.validate_commands(repository_root=repository_root)
         fault_policy.electron_playwright.validate_commands(
-            repository_root=Path(__file__).parents[3]
+            repository_root=repository_root
         )
+        actual_status = tuple(
+            subprocess.run(
+                command_policy.tests[0],
+                cwd=repository_root / working_directory,
+                capture_output=True,
+                check=False,
+                shell=False,
+            ).returncode
+            for command_policy, working_directory in (
+                (fault_policy.backend, fault_policy.backend_working_directory),
+                (
+                    fault_policy.electron_playwright,
+                    fault_policy.electron_playwright_working_directory,
+                ),
+            )
+        )
+        assert tuple(status != 0 for status in actual_status) == tuple(
+            status != 0 for status in expected_status
+        ), fault
 
     collected = subprocess.run(
         (
