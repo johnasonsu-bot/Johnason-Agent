@@ -178,7 +178,13 @@ def test_nested_backend_command_ignores_only_this_gate_file() -> None:
     assert "--ignore=tests/acceptance/test_development_graph_blueprint.py" in backend_command
     assert policy.electron_playwright.tests == (("npm", "test"),)
 
-    passing_command = (sys.executable, "-m", "pytest", "--version")
+    passing_command = (
+        sys.executable,
+        "-m",
+        "pytest",
+        "tests/unit/validation/test_runner.py::test_all_required_pass_returns_zero",
+        "-q",
+    )
     failing_commands = {
         "backend": (
             sys.executable,
@@ -215,6 +221,12 @@ def test_nested_backend_command_ignores_only_this_gate_file() -> None:
         assert fault_policy.backend.allowed_commands == (expected_backend,)
         assert fault_policy.electron_playwright.tests == (expected_electron,)
         assert fault_policy.electron_playwright.allowed_commands == (expected_electron,)
+        assert fault_policy.backend_working_directory == "mvp"
+        assert fault_policy.electron_playwright_working_directory == "mvp"
+        fault_policy.backend.validate_commands(repository_root=Path(__file__).parents[3])
+        fault_policy.electron_playwright.validate_commands(
+            repository_root=Path(__file__).parents[3]
+        )
 
     collected = subprocess.run(
         (

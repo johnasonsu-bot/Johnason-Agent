@@ -224,7 +224,13 @@ def _integration_regression_policy(inject: str | None) -> IntegrationRegressionP
         "--ignore=tests/acceptance/test_development_graph_blueprint.py",
     )
     full_electron_command = ("npm", "test")
-    passing_command = (sys.executable, "-m", "pytest", "--version")
+    passing_command = (
+        sys.executable,
+        "-m",
+        "pytest",
+        "tests/unit/validation/test_runner.py::test_all_required_pass_returns_zero",
+        "-q",
+    )
     backend_command = full_backend_command if inject is None else passing_command
     electron_command = full_electron_command if inject is None else passing_command
     if inject == "backend":
@@ -251,7 +257,9 @@ def _integration_regression_policy(inject: str | None) -> IntegrationRegressionP
             allowed_commands=(electron_command,), tests=(electron_command,), timeout_seconds=420
         ),
         backend_working_directory="mvp",
-        electron_playwright_working_directory="mvp/canvas-spike",
+        electron_playwright_working_directory=(
+            "mvp/canvas-spike" if inject is None else "mvp"
+        ),
     )
 
 
