@@ -34,6 +34,12 @@ from workbench.runtime.engine_host.v2.contracts import (
 from workbench.runtime.engine_host.v2.security import (
     contains_high_confidence_credential_value,
 )
+from workbench.runtime.engine_host.v2.mapper import (
+    is_opaque_identifier,
+    map_runtime_event,
+    validate_public_text,
+)
+from workbench.runtime.engine_host.v2.contracts import RuntimeEventV2
 
 
 Identifier = Annotated[
@@ -209,6 +215,78 @@ class PromptSectionPin(FrozenModel):
     section_id: Identifier
     version: Identifier
     digest: Digest
+
+
+def _validate_public_mapping(value: object) -> JsonValue:
+    if isinstance(value, Mapping):
+        projected: dict[str, JsonValue] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str) or not is_opaque_identifier(key):
+                raise ValueError("public projection key is not allowlisted")
+            projected[key] = _validate_public_mapping(nested)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [_validate_public_mapping(item) for item in value]
+    if isinstance(value, str):
+        return validate_public_text(value, maximum=4096)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise ValueError("public projection must contain bounded public JSON")
+
+
+class PublicEventProjection(FrozenModel):
+    event_type: Identifier
+    payload: Mapping[str, JsonValue]
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def validate_payload(cls, value: object) -> object:
+        normalized = _validate_public_mapping(value)
+        if not isinstance(normalized, dict):
+            raise ValueError("public event payload must be an object")
+        return normalized
+
+    @field_validator("payload")
+    @classmethod
+    def freeze_payload(
+        cls, value: Mapping[str, JsonValue]
+    ) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], _freeze_json(value))
+
+    @field_serializer("payload")
+    def serialize_payload(self, value: Mapping[str, JsonValue]) -> JsonValue:
+        return _thaw_json(value)
+
+
+class PublicStepProjection(FrozenModel):
+    status: ExecutionStatus
+    summary: str | None = None
+    token_count: StrictInt | None = Field(default=None, ge=0)
+
+    @field_validator("summary")
+    @classmethod
+    def validate_summary(cls, value: str | None) -> str | None:
+        return None if value is None else validate_public_text(value, maximum=280)
+
+
+class PublicToolResult(FrozenModel):
+    status: Literal["completed", "failed"]
+    summary: str | None = None
+    artifact_ref: Identifier | None = None
+
+    @field_validator("summary")
+    @classmethod
+    def validate_summary(cls, value: str | None) -> str | None:
+        return None if value is None else validate_public_text(value, maximum=4096)
+
+    @field_validator("artifact_ref")
+    @classmethod
+    def validate_artifact_ref(cls, value: str | None) -> str | None:
+        if value is not None and not is_opaque_identifier(value):
+            raise ValueError("artifact_ref must be a public opaque identifier")
+        return value
 
 
 class StepContext(FrozenModel):
@@ -400,11 +478,16 @@ class StepContext(FrozenModel):
         )
 
     @property
-    def identity_digest(self) -> str:
+    def command_identity(self) -> Mapping[str, JsonValue]:
         identity = self.model_dump(mode="json")
         identity.pop("attempt")
         identity.pop("host_generation")
-        return canonical_digest(identity)
+        identity.pop("model_messages")
+        return cast(Mapping[str, JsonValue], _freeze_json(identity))
+
+    @property
+    def identity_digest(self) -> str:
+        return canonical_digest(self.command_identity)
 
     def to_term_record(
         self,
@@ -416,22 +499,53 @@ class StepContext(FrozenModel):
         return TermRecord.from_context(self, envelope, status=status, cursor=cursor)
 
     def to_step_record(
-        self, *, status: ExecutionStatus = "pending", cursor: int = 0
+        self,
+        *,
+        ordinal: int = 0,
+        status: ExecutionStatus = "pending",
+        cursor: int = 0,
     ) -> "StepRecord":
-        return StepRecord.from_context(self, status=status, cursor=cursor)
+        return StepRecord.from_context(
+            self, ordinal=ordinal, status=status, cursor=cursor
+        )
 
 
 class TermRecord(FrozenModel):
     envelope: RunEnvelopeV2
-    identity_digest: Digest
+    command_identity: Mapping[str, JsonValue]
     conversation_context: ConversationContextRef
     project_context: ProjectContextRef
     work_state: TermWorkStateRef
+    permission_policy: PermissionPolicy
+    environment_allowlist: tuple[Identifier, ...]
+    effect_scope: EffectScope
+    prompt_sections: tuple[PromptSectionPin, ...] = ()
+    prompt_manifest_digest: Digest
     step_ids: tuple[Identifier, ...]
     checkpoint_ref: Reference | None = None
     checkpoint_digest: Digest | None = None
+    public_projection: "PublicEventProjection | PublicStepProjection | None" = None
     status: ExecutionStatus = "pending"
     cursor: StrictInt = Field(ge=0)
+
+    @field_validator("command_identity", mode="before")
+    @classmethod
+    def validate_command_identity(cls, value: object) -> object:
+        normalized = _normalized_json(value)
+        if not isinstance(normalized, dict):
+            raise ValueError("Term command identity must be a JSON object")
+        return normalized
+
+    @field_validator("command_identity")
+    @classmethod
+    def freeze_command_identity(
+        cls, value: Mapping[str, JsonValue]
+    ) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], _freeze_json(value))
+
+    @field_serializer("command_identity")
+    def serialize_command_identity(self, value: Mapping[str, JsonValue]) -> JsonValue:
+        return _thaw_json(value)
 
     @model_validator(mode="after")
     def checkpoint_fields_are_atomic(self) -> Self:
@@ -439,7 +553,27 @@ class TermRecord(FrozenModel):
             raise ValueError("Term checkpoint reference and digest must be stored together")
         if not self.step_ids or len(self.step_ids) != len(set(self.step_ids)):
             raise ValueError("Term ordered Steps must be non-empty and unique")
+        if canonical_json(self.command_identity) != canonical_json(
+            _term_command_identity(self)
+        ):
+            raise ValueError("Term command identity does not match immutable fields")
         return self
+
+    @property
+    def immutable_identity(self) -> Mapping[str, JsonValue]:
+        return cast(
+            Mapping[str, JsonValue],
+            _freeze_json(
+                {
+                    "command": self.command_identity,
+                    "step_ids": self.step_ids,
+                }
+            ),
+        )
+
+    @property
+    def identity_digest(self) -> str:
+        return canonical_digest(self.immutable_identity)
 
     @property
     def term_id(self) -> str:
@@ -495,14 +629,67 @@ class TermRecord(FrozenModel):
             raise ValueError("Term RunEnvelope Workspace Grant does not match StepContext")
         return cls(
             envelope=envelope,
-            identity_digest=context.identity_digest,
+            command_identity=context.command_identity,
             conversation_context=context.conversation_context,
             project_context=context.project_context,
             work_state=context.work_state,
+            permission_policy=context.permission_policy,
+            environment_allowlist=context.environment_allowlist,
+            effect_scope=context.effect_scope,
+            prompt_sections=context.prompt_sections,
+            prompt_manifest_digest=context.prompt_manifest_digest,
             step_ids=(context.step_id,),
             status=status,
             cursor=cursor,
         )
+
+
+def _term_command_identity(record: TermRecord) -> Mapping[str, JsonValue]:
+    envelope = record.envelope
+    return cast(
+        Mapping[str, JsonValue],
+        _freeze_json(
+            {
+                "protocol_version": envelope.protocol_version,
+                "runtime_id": envelope.runtime.runtime_id,
+                "runtime_build_id": envelope.runtime.build_id,
+                "runtime_config_digest": envelope.runtime.config_digest,
+                "session_id": envelope.session_id,
+                "run_id": envelope.run_id,
+                "term_id": envelope.term_id,
+                "step_id": envelope.step_id,
+                "command_id": envelope.command_id,
+                "agent_id": envelope.agent_id,
+                "agent_role": envelope.agent_role,
+                "provider_ref": envelope.provider_ref,
+                "model": envelope.model,
+                "model_options_digest": envelope.model_options_digest,
+                "message_snapshot_digest": envelope.message_snapshot_digest,
+                "conversation_context": record.conversation_context,
+                "project_context": record.project_context,
+                "work_state": record.work_state,
+                "tool_manifest": envelope.tool_manifest,
+                "tool_manifest_digest": envelope.tool_manifest_digest,
+                "skill_pins": envelope.skill_pins,
+                "skill_manifest_digest": envelope.skill_manifest_digest,
+                "plugin_pins": envelope.plugin_pins,
+                "plugin_manifest_digest": envelope.plugin_manifest_digest,
+                "prompt_sections": record.prompt_sections,
+                "prompt_manifest_digest": record.prompt_manifest_digest,
+                "permission_policy": record.permission_policy,
+                "permission_policy_digest": envelope.permission_policy_digest,
+                "workspace_grant": envelope.workspace_grant,
+                "workspace_grant_digest": canonical_digest(envelope.workspace_grant),
+                "checkpoint_cursor": envelope.checkpoint_cursor,
+                "deadline_ms": envelope.deadline_ms,
+                "traceparent": envelope.traceparent,
+                "extensions_digest": canonical_digest(envelope.extensions),
+                "environment_allowlist": record.environment_allowlist,
+                "context_budget": envelope.context_budget,
+                "effect_scope": record.effect_scope,
+            }
+        ),
+    )
 
 
 class StepRecord(FrozenModel):
@@ -512,9 +699,65 @@ class StepRecord(FrozenModel):
     command_id: Identifier
     attempt: StrictInt = Field(ge=0)
     agent_id: Identifier
-    identity_digest: Digest
+    command_identity: Mapping[str, JsonValue]
+    checkpoint_ref: Reference | None = None
+    checkpoint_digest: Digest | None = None
+    public_projection: "PublicEventProjection | PublicStepProjection | None" = None
     status: ExecutionStatus = "pending"
     cursor: StrictInt = Field(ge=0)
+
+    @field_validator("command_identity", mode="before")
+    @classmethod
+    def validate_command_identity(cls, value: object) -> object:
+        normalized = _normalized_json(value)
+        if not isinstance(normalized, dict):
+            raise ValueError("Step command identity must be a JSON object")
+        return normalized
+
+    @field_validator("command_identity")
+    @classmethod
+    def freeze_command_identity(
+        cls, value: Mapping[str, JsonValue]
+    ) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], _freeze_json(value))
+
+    @field_serializer("command_identity")
+    def serialize_command_identity(self, value: Mapping[str, JsonValue]) -> JsonValue:
+        return _thaw_json(value)
+
+    @model_validator(mode="after")
+    def validate_step_identity(self) -> Self:
+        identity = self.command_identity
+        if (
+            identity.get("term_id") != self.term_id
+            or identity.get("step_id") != self.step_id
+            or identity.get("command_id") != self.command_id
+            or identity.get("agent_id") != self.agent_id
+        ):
+            raise ValueError("Step command identity does not match immutable fields")
+        if (self.checkpoint_ref is None) != (self.checkpoint_digest is None):
+            raise ValueError("Step checkpoint reference and digest must be stored together")
+        return self
+
+    @property
+    def immutable_identity(self) -> Mapping[str, JsonValue]:
+        return cast(
+            Mapping[str, JsonValue],
+            _freeze_json(
+                {
+                    "term_id": self.term_id,
+                    "step_id": self.step_id,
+                    "ordinal": self.ordinal,
+                    "command_id": self.command_id,
+                    "agent_id": self.agent_id,
+                    "command": self.command_identity,
+                }
+            ),
+        )
+
+    @property
+    def identity_digest(self) -> str:
+        return canonical_digest(self.immutable_identity)
 
     @classmethod
     def from_context(
@@ -532,7 +775,7 @@ class StepRecord(FrozenModel):
             command_id=context.command_id,
             attempt=context.attempt,
             agent_id=context.agent_id,
-            identity_digest=context.identity_digest,
+            command_identity=context.command_identity,
             status=status,
             cursor=cursor,
         )
@@ -551,23 +794,40 @@ class _SafePayloadRecord(FrozenModel):
 
 class StepEventRecord(_SafePayloadRecord):
     event_id: Identifier
+    run_id: Identifier
     term_id: Identifier
     step_id: Identifier
     cursor: StrictInt = Field(gt=0)
     type: Identifier
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
-    public_projection: Mapping[str, JsonValue] = Field(default_factory=dict)
 
-    _before = field_validator("payload", "public_projection", mode="before")(
+    _before = field_validator("payload", mode="before")(
         _SafePayloadRecord._validate_payload
     )
-    _after = field_validator("payload", "public_projection")(
+    _after = field_validator("payload")(
         _SafePayloadRecord._freeze_payload
     )
 
-    @field_serializer("payload", "public_projection")
+    @field_serializer("payload")
     def serialize_payload(self, value: Mapping[str, JsonValue]) -> JsonValue:
         return _thaw_json(value)
+
+    @property
+    def public_projection(self) -> PublicEventProjection:
+        runtime_event = RuntimeEventV2(
+            event_id=self.event_id,
+            run_id=self.run_id,
+            term_id=self.term_id,
+            step_id=self.step_id,
+            cursor=self.cursor,
+            type=self.type,
+            payload=self.payload,
+        )
+        projected = map_runtime_event(runtime_event)[0]
+        return PublicEventProjection(
+            event_type=projected.event_type,
+            payload=projected.payload,
+        )
 
 
 class StepCheckpointRecord(_SafePayloadRecord):
@@ -576,16 +836,7 @@ class StepCheckpointRecord(_SafePayloadRecord):
     term_id: Identifier
     step_id: Identifier
     cursor: StrictInt = Field(ge=0)
-    public_projection: Mapping[str, JsonValue] = Field(default_factory=dict)
-
-    _before = field_validator("public_projection", mode="before")(
-        _SafePayloadRecord._validate_payload
-    )
-    _after = field_validator("public_projection")(_SafePayloadRecord._freeze_payload)
-
-    @field_serializer("public_projection")
-    def serialize_projection(self, value: Mapping[str, JsonValue]) -> JsonValue:
-        return _thaw_json(value)
+    public_projection: PublicStepProjection
 
 
 class ToolEffectRecord(_SafePayloadRecord):
@@ -596,22 +847,7 @@ class ToolEffectRecord(_SafePayloadRecord):
     request_digest: Digest
     status: EffectStatus
     result_digest: Digest | None = None
-    public_result: Mapping[str, JsonValue] | None = None
-
-    _before = field_validator("public_result", mode="before")(
-        _SafePayloadRecord._validate_payload
-    )
-
-    @field_validator("public_result")
-    @classmethod
-    def freeze_optional_result(
-        cls, value: Mapping[str, JsonValue] | None
-    ) -> Mapping[str, JsonValue] | None:
-        return None if value is None else cls._freeze_payload(value)
-
-    @field_serializer("public_result")
-    def serialize_result(self, value: Mapping[str, JsonValue] | None) -> JsonValue:
-        return None if value is None else _thaw_json(value)
+    public_result: PublicToolResult | None = None
 
     @model_validator(mode="after")
     def terminal_result_is_coherent(self) -> Self:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,7 @@ def test_rejects_traversal_and_ungrantable_absolute_paths(tmp_path, relative) ->
     ref = store.initialize("term-1", "agent-a", {"ok": True})
 
     with pytest.raises(StateBoundaryError):
-        store.resolve("term-1", ref, "work", relative, write=True)
+        store.resolve("term-1", "agent-a", ref, "work", relative, write=True)
 
 
 def test_resolves_symlinks_before_workspace_grant_check(tmp_path) -> None:
@@ -96,11 +97,83 @@ def test_resolves_symlinks_before_workspace_grant_check(tmp_path) -> None:
     os.symlink(outside, tmp_path / ".runtime" / "terms" / "term-1" / "work" / "escape")
 
     with pytest.raises(StateBoundaryError):
-        store.resolve("term-1", ref, "work", "escape/file.txt", write=True)
+        store.resolve(
+            "term-1", "agent-a", ref, "work", "escape/file.txt", write=True
+        )
 
 
 def test_rejects_cross_term_reference(tmp_path) -> None:
     store = TermStateStore(tmp_path, _grant(tmp_path))
     ref = store.initialize("term-1", "agent-a", {"ok": True})
     with pytest.raises(StateBoundaryError, match="Term"):
-        store.resolve("term-2", ref, "work", "file.txt", write=True)
+        store.resolve("term-2", "agent-a", ref, "work", "file.txt", write=True)
+
+
+def test_resolve_rejects_forged_agent_and_runtime_metadata(tmp_path) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    ref = store.initialize("term-1", "agent-a", {"ok": True})
+
+    with pytest.raises(StateBoundaryError, match="Agent"):
+        store.resolve("term-1", "agent-b", ref, "work", "file.txt", write=True)
+
+    runtime_file = tmp_path / ".runtime" / "terms" / "term-1" / "runtime.json"
+    record = json.loads(runtime_file.read_text())
+    record["metadata"]["ok"] = False
+    runtime_file.write_text(json.dumps(record))
+    with pytest.raises(StateBoundaryError, match="metadata|digest"):
+        store.resolve("term-1", "agent-a", ref, "work", "file.txt", write=True)
+
+
+def test_rejects_term_root_symlink_alias_to_another_term(tmp_path) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    original = store.initialize("term-a", "agent-a", {"ok": True})
+    term_a = tmp_path / ".runtime" / "terms" / "term-a"
+    term_b = tmp_path / ".runtime" / "terms" / "term-b"
+    os.symlink(term_a, term_b)
+    forged = original.model_copy(
+        update={"term_id": "term-b", "root_ref": ".runtime/terms/term-b"}
+    )
+
+    with pytest.raises(StateBoundaryError, match="symlink|canonical"):
+        store.resolve("term-b", "agent-a", forged, "work", "file.txt", write=True)
+
+
+def test_concurrent_initialization_commits_one_canonical_record(tmp_path) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+
+    def initialize(value: int):
+        try:
+            return store.initialize("term-1", "agent-a", {"value": value})
+        except StateBoundaryError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(initialize, (1, 2)))
+
+    references = [item for item in results if not isinstance(item, Exception)]
+    conflicts = [item for item in results if isinstance(item, StateBoundaryError)]
+    payload = json.loads(
+        (tmp_path / ".runtime" / "terms" / "term-1" / "runtime.json").read_text()
+    )
+    assert len(references) == 1
+    assert len(conflicts) == 1
+    assert payload["metadata"] in ({"value": 1}, {"value": 2})
+    assert payload["digest"] == canonical_digest(payload["metadata"])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        same_results = tuple(
+            executor.map(
+                lambda _: store.initialize("term-same", "agent-a", {"value": 3}),
+                range(2),
+            )
+        )
+    assert same_results[0] == same_results[1]
+
+
+def test_invalid_agent_is_rejected_before_state_directories_are_created(tmp_path) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+
+    with pytest.raises((StateBoundaryError, ValueError)):
+        store.initialize("term-1", "bad agent id", {"ok": True})
+
+    assert not (tmp_path / ".runtime" / "terms" / "term-1").exists()

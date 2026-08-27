@@ -17,6 +17,9 @@ from workbench.runtime.python_term.contracts import (
     EffectScope,
     PermissionPolicy,
     ProjectContextRef,
+    PublicStepProjection,
+    PublicToolResult,
+    StepEventRecord,
     StepContext,
     StepRecord,
     TermRecord,
@@ -364,3 +367,140 @@ def test_envelope_context_reference_must_match_conversation_reference(tmp_path) 
             environment_allowlist=("PATH",),
             effect_scope=EffectScope(scope_id="scope-1", write_effects=False),
         )
+
+
+def test_term_record_recomputes_identity_instead_of_trusting_a_digest(tmp_path) -> None:
+    context = _context(tmp_path)
+    envelope = _envelope(tmp_path)
+    term = context.to_term_record(envelope)
+    values = term.model_dump(mode="python")
+    values["envelope"] = envelope.model_copy(update={"deadline_ms": 20_000})
+
+    with pytest.raises(ValidationError, match="identity"):
+        TermRecord.model_validate(values)
+
+    with pytest.raises(ValidationError, match="extra"):
+        TermRecord.model_validate({**term.model_dump(mode="python"), "identity_digest": "0" * 64})
+
+
+def test_nested_contract_values_are_deeply_frozen_and_detached(tmp_path) -> None:
+    messages = [{"role": "user", "content": {"parts": ["hello"]}}]
+    tool_schema = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+    }
+    tool = ToolManifestEntryV2(
+        tool_id="echo",
+        schema=tool_schema,
+        version="v1",
+        read_only=True,
+        timeout_ms=1000,
+        idempotency="idempotent",
+    )
+    envelope = _envelope(tmp_path).model_copy(
+        update={
+            "message_snapshot_digest": canonical_digest(messages),
+            "tool_manifest": (tool,),
+            "tool_manifest_digest": canonical_digest((tool,)),
+        }
+    )
+    context = StepContext.from_envelope(
+        envelope,
+        model_messages=messages,
+        conversation_context=ConversationContextRef(
+            session_id="session-1",
+            snapshot_ref="context-1",
+            snapshot_digest="5" * 64,
+            version=1,
+        ),
+        project_context=ProjectContextRef(
+            project_id="project-1", version=3, snapshot_digest="7" * 64
+        ),
+        work_state=TermWorkStateRef(
+            term_id="term-1",
+            agent_id="agent-a",
+            root_ref=".runtime/terms/term-1",
+            metadata_digest="8" * 64,
+        ),
+        permission_policy=PermissionPolicy(
+            tool_policy="allow", filesystem_policy="allow"
+        ),
+        environment_allowlist=("PATH",),
+        effect_scope=EffectScope(scope_id="scope-1", write_effects=False),
+    )
+    messages[0]["content"]["parts"].append("changed")
+    tool_schema["properties"]["value"]["type"] = "integer"
+    nested = context.model_messages[0]["content"]
+
+    assert nested["parts"] == ("hello",)
+    assert context.tool_manifest[0].schema["properties"]["value"]["type"] == "string"
+    with pytest.raises(TypeError):
+        nested["parts"] += ("changed",)
+    with pytest.raises(TypeError):
+        context.tool_manifest[0].schema["properties"]["value"]["type"] = "integer"
+
+    event_input = {"diagnostic": {"items": ["one"]}}
+    event = StepEventRecord(
+        event_id="event-extension",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="optional.extension",
+        payload=event_input,
+    )
+    event_input["diagnostic"]["items"].append("two")
+    assert event.payload["diagnostic"]["items"] == ("one",)
+    with pytest.raises(TypeError):
+        event.payload["diagnostic"]["items"] += ("two",)
+
+    step_projection = PublicStepProjection(status="running", summary="working")
+    tool_result = PublicToolResult(status="completed", summary="finished")
+    with pytest.raises(ValidationError):
+        step_projection.status = "completed"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        tool_result.summary = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "/Users/alice/project/private.txt",
+        "0" * 64,
+        "private history proof",
+        "api_key=not-public",
+    ],
+)
+def test_event_public_projection_reuses_host_v2_public_boundary(
+    tmp_path, content: str
+) -> None:
+    event = StepEventRecord(
+        event_id="event-public",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": content},
+    )
+
+    with pytest.raises(ValueError, match="public|sensitive|path"):
+        _ = event.public_projection
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda value: PublicStepProjection(status="running", summary=value),
+        lambda value: PublicToolResult(status="completed", summary=value),
+    ],
+)
+def test_checkpoint_and_effect_public_values_reject_private_text(factory) -> None:
+    for private in (
+        "/tmp/private.txt",
+        "a" * 64,
+        "private history proof",
+        "token=not-public",
+    ):
+        with pytest.raises(ValidationError, match="public"):
+            factory(private)
