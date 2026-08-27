@@ -628,6 +628,75 @@ class PythonTermRepository:
                 ),
             )
 
+    def reserve_tool_effect(
+        self, effect: ToolEffectRecord
+    ) -> tuple[ToolEffectRecord, bool]:
+        """Atomically reserve an Effect identity and report who won admission.
+
+        The returned boolean is true only for the transaction that inserted the
+        reservation. Existing records are decoded through their owning aggregate
+        before replay decisions can be made by the Tool Router.
+        """
+        validated = self._validate_model(effect, ToolEffectRecord)
+        if validated.status != "reserved":
+            raise RepositoryConflict("Tool Effect reservation must be reserved")
+        encoded = canonical_json(validated)
+        now = time.time()
+        with self._transaction() as connection:
+            row = connection.execute(
+                """SELECT * FROM python_tool_effects
+                WHERE effect_id = ? OR
+                (term_id = ? AND step_id = ? AND tool_call_id = ?)""",
+                (
+                    validated.effect_id,
+                    validated.term_id,
+                    validated.step_id,
+                    validated.tool_call_id,
+                ),
+            ).fetchone()
+            if row is not None:
+                existing = self._decode_effect(row)
+                self._load_owning_aggregate(
+                    connection, existing.term_id, existing.step_id
+                )
+                if (
+                    existing.effect_id != validated.effect_id
+                    or existing.term_id != validated.term_id
+                    or existing.step_id != validated.step_id
+                    or existing.tool_call_id != validated.tool_call_id
+                    or existing.request_digest != validated.request_digest
+                ):
+                    raise RepositoryConflict("Tool Effect request conflict")
+                return existing, False
+
+            self._require_active_aggregate(
+                connection, validated.term_id, validated.step_id
+            )
+            try:
+                connection.execute(
+                    """INSERT INTO python_tool_effects(
+                    effect_id, term_id, step_id, tool_call_id, request_digest,
+                    status, result_digest, effect_json, public_result_json,
+                    created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        validated.effect_id,
+                        validated.term_id,
+                        validated.step_id,
+                        validated.tool_call_id,
+                        validated.request_digest,
+                        validated.status,
+                        None,
+                        encoded,
+                        None,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RepositoryConflict("Tool Effect identity conflict") from exc
+            return validated, True
+
     def get_tool_effect(self, effect_id: str) -> ToolEffectRecord | None:
         with self._read_snapshot() as connection:
             row = connection.execute(
