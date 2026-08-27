@@ -8,17 +8,25 @@ the broker/registration object graph and revalidated at every use.
 
 from __future__ import annotations
 
+import asyncio
+import builtins
 import functools
 import inspect
 import threading
 import weakref
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType, MethodType, ModuleType
 
 from workbench.runtime.engine_host.v2.contracts import ToolManifestEntryV2
-from workbench.runtime.python_term.contracts import StepContext
+from workbench.runtime.engine_host.v2.registry import (
+    RegisteredRuntimeHostV2,
+    RuntimeRegistryIntegrityError,
+    RuntimeRegistryV2,
+)
+from workbench.runtime.python_term.contracts import PublicToolResult, StepContext
 from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.runtime.python_term.tool_router import (
     ExecutorBroker,
@@ -54,51 +62,22 @@ class ApprovedExecutorHandleDeclaration:
         return "ApprovedExecutorHandleDeclaration(<opaque>)"
 
 
-class BoundPythonTermHostDispatcher:
-    """One fixed dispatcher identity used to build one frozen registry."""
-
-    __slots__ = ("__weakref__",)
-
-    def __init__(self, *_: object, **__: object) -> None:
-        raise ToolRouteError(
-            "registration_rejected",
-            "Host dispatcher binding requires the control-plane composition seam",
-        ) from None
-
-    def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("Bound Host dispatcher is immutable")
-
-    def approve_executor(
-        self,
-        manifest: ToolManifestEntryV2,
-        *,
-        executor_handle: str,
-        access: ToolAccess,
-    ) -> ApprovedExecutorHandleDeclaration:
-        return _approve_executor(self, manifest, executor_handle, access)
-
-    def build_registry(
-        self,
-        declarations: tuple[ApprovedExecutorHandleDeclaration, ...],
-        *,
-        supervisor_capacity: int = 64,
-    ) -> tuple[ExecutorBroker, Mapping[str, ExecutorRegistration]]:
-        return _build_registry(self, declarations, supervisor_capacity)
-
-    def __repr__(self) -> str:
-        return "BoundPythonTermHostDispatcher(<opaque>)"
-
-
 @dataclass(slots=True)
-class _HostRecord:
-    dispatcher: HostDispatcher
+class _HostComposition:
     declarations: dict[str, ApprovedExecutorHandleDeclaration]
+    declaration_records: dict[
+        ApprovedExecutorHandleDeclaration, "_DeclarationRecord"
+    ]
+    registrations: weakref.WeakKeyDictionary[
+        ExecutorRegistration, "_RegistrationRecord"
+    ]
+    registries: weakref.WeakKeyDictionary[ExecutorBroker, "_RegistryRecord"]
+    routers: weakref.WeakKeyDictionary[object, "_RouterRecord"]
     built: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class _DeclarationRecord:
-    host: BoundPythonTermHostDispatcher
     manifest: ToolManifestEntryV2
     executor_handle: str
     access: ToolAccess
@@ -122,8 +101,9 @@ class _RegistrationRecord:
 
 @dataclass(frozen=True, slots=True)
 class _RegistryRecord:
-    host: BoundPythonTermHostDispatcher
-    dispatcher: HostDispatcher
+    runtime_registry: RuntimeRegistryV2
+    runtime_id: str
+    host_generation: int
     provenance_id: object
     registrations: Mapping[ExecutorRegistration, _ExecutorBinding]
     public_registrations: Mapping[str, ExecutorRegistration]
@@ -138,19 +118,6 @@ class _RouterRecord:
 
 
 _LOCK = threading.RLock()
-_HOSTS: weakref.WeakKeyDictionary[BoundPythonTermHostDispatcher, _HostRecord] = (
-    weakref.WeakKeyDictionary()
-)
-_DECLARATIONS: weakref.WeakKeyDictionary[
-    ApprovedExecutorHandleDeclaration, _DeclarationRecord
-] = weakref.WeakKeyDictionary()
-_REGISTRATIONS: weakref.WeakKeyDictionary[
-    ExecutorRegistration, _RegistrationRecord
-] = weakref.WeakKeyDictionary()
-_REGISTRIES: weakref.WeakKeyDictionary[ExecutorBroker, _RegistryRecord] = (
-    weakref.WeakKeyDictionary()
-)
-_ROUTERS: weakref.WeakKeyDictionary[object, _RouterRecord] = weakref.WeakKeyDictionary()
 
 
 def _manifest_snapshot(manifest: ToolManifestEntryV2) -> str:
@@ -169,26 +136,219 @@ def _access_snapshot(
     )
 
 
+_AUTHORITY_MARKERS = ("repository", "vault", "workspace")
+_MAX_AUTHORITY_SCAN_DEPTH = 12
+_MAX_AUTHORITY_SCAN_NODES = 512
+_SAFE_BUILTIN_CLASSES = tuple(
+    item for item in vars(builtins).values() if isinstance(item, type)
+)
+_HOST_EXTENSION_NAMESPACE = "python-term-executor-registry-v1"
+
+
+def _container_integrity_snapshot(
+    value: object,
+    *,
+    seen: dict[int, int],
+    nodes: list[int],
+    depth: int,
+) -> object:
+    nodes[0] += 1
+    if nodes[0] > 16_384 or depth > 64:
+        raise ValueError("integrity snapshot budget exceeded")
+    value_type = type(value)
+    if value is None or value_type in {bool, int, float, str, bytes}:
+        return (value_type.__name__, repr(value))
+    if value_type not in {
+        dict,
+        MappingProxyType,
+        list,
+        tuple,
+        set,
+        frozenset,
+        deque,
+    }:
+        return ("identity", id(value))
+    identity = id(value)
+    if identity in seen:
+        return ("reference", seen[identity])
+    seen[identity] = len(seen)
+    if value_type in {dict, MappingProxyType}:
+        return (
+            value_type.__name__,
+            identity,
+            tuple(
+                (
+                    _container_integrity_snapshot(
+                        key, seen=seen, nodes=nodes, depth=depth + 1
+                    ),
+                    _container_integrity_snapshot(
+                        item, seen=seen, nodes=nodes, depth=depth + 1
+                    ),
+                )
+                for key, item in value.items()
+            ),
+        )
+    snapshots = tuple(
+        _container_integrity_snapshot(
+            item, seen=seen, nodes=nodes, depth=depth + 1
+        )
+        for item in value
+    )
+    if value_type in {set, frozenset}:
+        snapshots = tuple(sorted(snapshots, key=repr))
+    return value_type.__name__, identity, snapshots
+
+
+def _public_tool_result_namespace_snapshot() -> object | None:
+    try:
+        seen: dict[int, int] = {}
+        nodes = [0]
+        return tuple(
+            (
+                name,
+                _container_integrity_snapshot(
+                    item,
+                    seen=seen,
+                    nodes=nodes,
+                    depth=0,
+                ),
+            )
+            for name, item in sorted(vars(PublicToolResult).items())
+        )
+    except Exception:
+        return None
+
+
+_PUBLIC_TOOL_RESULT_NAMESPACE_SNAPSHOT = (
+    _public_tool_result_namespace_snapshot()
+)
+
+
+@dataclass(slots=True)
+class _AuthorityScanState:
+    seen: set[int]
+    nodes: int = 0
+
+
+def _public_tool_result_class_is_intact() -> bool:
+    return (
+        _PUBLIC_TOOL_RESULT_NAMESPACE_SNAPSHOT is not None
+        and _public_tool_result_namespace_snapshot()
+        == _PUBLIC_TOOL_RESULT_NAMESPACE_SNAPSHOT
+    )
+
+
+def _authority_type_is_forbidden(value_type: type[object]) -> bool:
+    try:
+        if issubclass(value_type, (PythonTermRepository, Path)):
+            return True
+    except TypeError:
+        return True
+    name = value_type.__name__.casefold()
+    return any(marker in name for marker in _AUTHORITY_MARKERS)
+
+
+def _slot_storage_name(owner: type[object], slot: str) -> str:
+    if slot.startswith("__") and not slot.endswith("__"):
+        return f"_{owner.__name__.lstrip('_')}{slot}"
+    return slot
+
+
+def _class_attributes(value: type[object]) -> tuple[object, ...] | None:
+    attributes: list[object] = []
+    try:
+        hierarchy = value.__mro__
+    except Exception:
+        return None
+    for owner in hierarchy:
+        if owner is object:
+            continue
+        try:
+            namespace = vars(owner)
+        except Exception:
+            return None
+        for name, item in namespace.items():
+            if name in {
+                "__dict__",
+                "__weakref__",
+                "__module__",
+                "__doc__",
+                "__annotations__",
+            }:
+                continue
+            if isinstance(item, (staticmethod, classmethod)):
+                attributes.append(item.__func__)
+            elif isinstance(item, property):
+                attributes.extend(
+                    part for part in (item.fget, item.fset, item.fdel) if part is not None
+                )
+            elif inspect.ismethoddescriptor(item) or inspect.isdatadescriptor(item):
+                continue
+            else:
+                attributes.append(item)
+    return tuple(attributes)
+
+
+def _class_data_attributes(value: type[object]) -> tuple[object, ...] | None:
+    attributes: list[object] = []
+    try:
+        hierarchy = value.__mro__
+    except Exception:
+        return None
+    for owner in hierarchy:
+        if owner is object:
+            continue
+        try:
+            namespace = vars(owner)
+        except Exception:
+            return None
+        for name, item in namespace.items():
+            if name in {
+                "__dict__",
+                "__weakref__",
+                "__module__",
+                "__doc__",
+                "__annotations__",
+            }:
+                continue
+            if isinstance(item, (staticmethod, classmethod, property)):
+                continue
+            if inspect.isroutine(item) or inspect.isdatadescriptor(item):
+                continue
+            attributes.append(item)
+    return tuple(attributes)
+
+
 def _dispatcher_transfers_forbidden_authority(
-    value: object, *, seen: set[int] | None = None, depth: int = 0
+    value: object,
+    *,
+    state: _AuthorityScanState | None = None,
+    depth: int = 0,
 ) -> bool:
-    """Deny obvious authority transfer; provenance, not this scan, establishes trust."""
-    if seen is None:
-        seen = set()
-    if id(value) in seen:
+    """Recursively deny authority transfer with one fail-closed scan budget."""
+    if state is None:
+        state = _AuthorityScanState(seen=set())
+    state.nodes += 1
+    if state.nodes > _MAX_AUTHORITY_SCAN_NODES or depth > _MAX_AUTHORITY_SCAN_DEPTH:
+        return True
+    identity = id(value)
+    if identity in state.seen:
         return False
-    if depth > 8:
+    state.seen.add(identity)
+    value_type = type(value)
+    if _authority_type_is_forbidden(value_type):
         return True
-    seen.add(id(value))
-    authority_name = type(value).__name__.casefold()
-    if isinstance(value, (PythonTermRepository, Path)) or any(
-        marker in authority_name for marker in ("repository", "vault", "workspace")
+    if (
+        value is None
+        or value_type in {bool, int, float, str, bytes}
     ):
-        return True
-    if isinstance(value, functools.partial):
+        return False
+    if value_type is PublicToolResult:
+        return not _public_tool_result_class_is_intact()
+    if value_type is functools.partial:
         return any(
             _dispatcher_transfers_forbidden_authority(
-                item, seen=seen, depth=depth + 1
+                item, state=state, depth=depth + 1
             )
             for item in (
                 value.func,
@@ -196,111 +356,243 @@ def _dispatcher_transfers_forbidden_authority(
                 *(value.keywords or {}).values(),
             )
         )
-    if inspect.ismethod(value):
+    if value_type is MethodType:
         return _dispatcher_transfers_forbidden_authority(
-            value.__self__, seen=seen, depth=depth + 1
+            value.__self__, state=state, depth=depth + 1
         ) or _dispatcher_transfers_forbidden_authority(
-            value.__func__, seen=seen, depth=depth + 1
+            value.__func__, state=state, depth=depth + 1
         )
-    if inspect.isfunction(value):
+    if value_type is FunctionType:
         captures: list[object] = [*(value.__defaults__ or ())]
         captures.extend((value.__kwdefaults__ or {}).values())
         for cell in value.__closure__ or ():
             try:
                 captures.append(cell.cell_contents)
-            except ValueError:
+            except (AttributeError, ValueError):
                 return True
-        captures.extend(
-            value.__globals__[name]
-            for name in value.__code__.co_names
-            if name in value.__globals__
-        )
-        return any(
-            _dispatcher_transfers_forbidden_authority(
-                item, seen=seen, depth=depth + 1
-            )
-            for item in captures
-        )
-    if inspect.ismodule(value) or inspect.isclass(value):
         try:
-            attributes = tuple(vars(value).values())
+            captures.extend(
+                value.__globals__[name]
+                for name in value.__code__.co_names
+                if name in value.__globals__
+            )
         except Exception:
             return True
         return any(
-            isinstance(item, (PythonTermRepository, Path))
-            or any(
-                marker in type(item).__name__.casefold()
-                for marker in ("repository", "vault", "workspace")
+            _dispatcher_transfers_forbidden_authority(
+                item, state=state, depth=depth + 1
+            )
+            for item in captures
+        )
+    if value_type is ModuleType:
+        return True
+    if isinstance(value, type):
+        if any(value is allowed for allowed in _SAFE_BUILTIN_CLASSES):
+            return False
+        if value is PublicToolResult:
+            return not _public_tool_result_class_is_intact()
+        attributes = _class_attributes(value)
+        if attributes is None:
+            return True
+        return any(
+            _dispatcher_transfers_forbidden_authority(
+                item, state=state, depth=depth + 1
             )
             for item in attributes
         )
-    if isinstance(value, Mapping):
+    if value_type in {dict, MappingProxyType}:
+        try:
+            items = tuple(value.items())
+        except Exception:
+            return True
         return any(
             _dispatcher_transfers_forbidden_authority(
-                item, seen=seen, depth=depth + 1
+                item, state=state, depth=depth + 1
             )
-            for pair in value.items()
+            for pair in items
             for item in pair
         )
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if value_type in {list, tuple, set, frozenset}:
         return any(
             _dispatcher_transfers_forbidden_authority(
-                item, seen=seen, depth=depth + 1
+                item, state=state, depth=depth + 1
             )
             for item in value
         )
+    if value_type is deque:
+        try:
+            items = tuple(value)
+        except Exception:
+            return True
+        return any(
+            _dispatcher_transfers_forbidden_authority(
+                item, state=state, depth=depth + 1
+            )
+            for item in items
+        )
+    if value_type is asyncio.Event:
+        try:
+            event_attributes = object.__getattribute__(value, "__dict__")
+        except Exception:
+            return True
+        if type(event_attributes) is not dict:
+            return True
+        try:
+            event_value = event_attributes["_value"]
+            waiters = event_attributes["_waiters"]
+            loop = event_attributes.get("_loop")
+        except Exception:
+            return True
+        if (
+            type(event_value) is not bool
+            or type(waiters) is not deque
+            or (
+                loop is not None
+                and not isinstance(loop, asyncio.AbstractEventLoop)
+            )
+            or any(type(waiter) is not asyncio.Future for waiter in waiters)
+        ):
+            return True
+        extras = (
+            item
+            for name, item in event_attributes.items()
+            if name not in {"_loop", "_value", "_waiters"}
+        )
+        return any(
+            _dispatcher_transfers_forbidden_authority(
+                item, state=state, depth=depth + 1
+            )
+            for item in extras
+        )
+
     captured_attributes: list[object] = []
-    attributes = getattr(value, "__dict__", None)
-    if isinstance(attributes, dict):
+    for owner in value_type.__mro__:
+        custom_getattribute = vars(owner).get("__getattribute__")
+        if (
+            custom_getattribute is not None
+            and custom_getattribute is not object.__getattribute__
+        ):
+            return True
+    try:
+        attributes = object.__getattribute__(value, "__dict__")
+    except AttributeError:
+        attributes = None
+    except Exception:
+        return True
+    if attributes is not None:
+        if type(attributes) is not dict:
+            return True
         captured_attributes.extend(attributes.values())
-    for value_type in type(value).__mro__:
-        slots = value_type.__dict__.get("__slots__", ())
+    class_data = _class_data_attributes(value_type)
+    if class_data is None:
+        return True
+    captured_attributes.extend(class_data)
+    for owner in value_type.__mro__:
+        try:
+            slots = vars(owner).get("__slots__", ())
+        except Exception:
+            return True
         if isinstance(slots, str):
             slots = (slots,)
+        if not isinstance(slots, tuple | list):
+            return True
         for slot in slots:
+            if not isinstance(slot, str):
+                return True
             if slot in {"__dict__", "__weakref__"}:
                 continue
             try:
-                captured_attributes.append(getattr(value, slot))
-            except (AttributeError, TypeError):
+                captured_attributes.append(
+                    object.__getattribute__(value, _slot_storage_name(owner, slot))
+                )
+            except AttributeError:
                 continue
+            except Exception:
+                return True
+    call = next(
+        (vars(owner).get("__call__") for owner in value_type.__mro__ if "__call__" in vars(owner)),
+        None,
+    )
+    if call is not None:
+        if isinstance(call, (staticmethod, classmethod)):
+            call = call.__func__
+        captured_attributes.append(call)
     return any(
         _dispatcher_transfers_forbidden_authority(
-            item, seen=seen, depth=depth + 1
+            item, state=state, depth=depth + 1
         )
         for item in captured_attributes
     )
 
 
-def bind_python_term_host_dispatcher(
-    dispatcher: HostDispatcher,
-) -> BoundPythonTermHostDispatcher:
-    """Bind the unique Host dispatcher at the trusted application composition root."""
-    if (
-        not callable(dispatcher)
-        or inspect.ismodule(dispatcher)
-        or inspect.isclass(dispatcher)
-        or _dispatcher_transfers_forbidden_authority(dispatcher)
-    ):
+def _is_proven_async_callable(value: object) -> bool:
+    if type(value) is functools.partial:
+        return _is_proven_async_callable(value.func)
+    if type(value) in {FunctionType, MethodType}:
+        return inspect.iscoroutinefunction(value)
+    value_type = type(value)
+    call = next(
+        (vars(owner).get("__call__") for owner in value_type.__mro__ if "__call__" in vars(owner)),
+        None,
+    )
+    if isinstance(call, (staticmethod, classmethod)):
+        call = call.__func__
+    return call is not None and inspect.iscoroutinefunction(call)
+
+
+def _host_dispatcher_is_admissible(dispatcher: object) -> bool:
+    try:
+        return _is_proven_async_callable(
+            dispatcher
+        ) and not _dispatcher_transfers_forbidden_authority(dispatcher)
+    except (Exception, RecursionError):
+        return False
+
+
+def _host_composition(
+    host: object,
+) -> tuple[RuntimeRegistryV2, _HostComposition]:
+    if type(host) is not RegisteredRuntimeHostV2:
         raise ToolRouteError(
-            "registration_rejected", "Host dispatcher binding was rejected"
+            "registration_rejected", "Host dispatcher provenance was rejected"
         ) from None
-    host = object.__new__(BoundPythonTermHostDispatcher)
-    with _LOCK:
-        _HOSTS[host] = _HostRecord(dispatcher=dispatcher, declarations={})
-    return host
+    try:
+        registry = object.__getattribute__(
+            host, "_RegisteredRuntimeHostV2__registry"
+        )
+        if type(registry) is not RuntimeRegistryV2 or not registry._verifies_in_process_host(
+            host
+        ):
+            raise RuntimeRegistryIntegrityError("invalid Host")
+        composition = registry._in_process_host_extension(
+            host,
+            _HOST_EXTENSION_NAMESPACE,
+            lambda: _HostComposition(
+                declarations={},
+                declaration_records={},
+                registrations=weakref.WeakKeyDictionary(),
+                registries=weakref.WeakKeyDictionary(),
+                routers=weakref.WeakKeyDictionary(),
+            ),
+        )
+    except Exception:
+        raise ToolRouteError(
+            "registration_rejected", "Host dispatcher provenance was rejected"
+        ) from None
+    if type(composition) is not _HostComposition:
+        raise ToolRouteError(
+            "registration_rejected", "Host dispatcher provenance was rejected"
+        ) from None
+    return registry, composition
 
 
 def _approve_executor(
-    host: BoundPythonTermHostDispatcher,
+    host: RegisteredRuntimeHostV2,
     manifest: ToolManifestEntryV2,
     executor_handle: str,
     access: ToolAccess,
 ) -> ApprovedExecutorHandleDeclaration:
-    if type(host) is not BoundPythonTermHostDispatcher:
-        raise ToolRouteError(
-            "registration_rejected", "Host dispatcher provenance was rejected"
-        ) from None
+    _, host_record = _host_composition(host)
     if type(manifest) is not ToolManifestEntryV2 or type(access) is not ToolAccess:
         raise ToolRouteError(
             "registration_rejected", "Executor declaration was rejected"
@@ -311,10 +603,8 @@ def _approve_executor(
         access=access,
     )
     with _LOCK:
-        host_record = _HOSTS.get(host)
         if (
-            host_record is None
-            or host_record.built
+            host_record.built
             or executor_handle in host_record.declarations
         ):
             raise ToolRouteError(
@@ -322,8 +612,7 @@ def _approve_executor(
             ) from None
         declaration = object.__new__(ApprovedExecutorHandleDeclaration)
         host_record.declarations[executor_handle] = declaration
-        _DECLARATIONS[declaration] = _DeclarationRecord(
-            host=host,
+        host_record.declaration_records[declaration] = _DeclarationRecord(
             manifest=manifest,
             executor_handle=executor_handle,
             access=access,
@@ -334,12 +623,12 @@ def _approve_executor(
 
 
 def _build_registry(
-    host: BoundPythonTermHostDispatcher,
+    host: RegisteredRuntimeHostV2,
     declarations: tuple[ApprovedExecutorHandleDeclaration, ...],
     supervisor_capacity: int,
 ) -> tuple[ExecutorBroker, Mapping[str, ExecutorRegistration]]:
     if (
-        type(host) is not BoundPythonTermHostDispatcher
+        type(host) is not RegisteredRuntimeHostV2
         or type(declarations) is not tuple
         or type(supervisor_capacity) is not int
         or not 1 <= supervisor_capacity <= 64
@@ -347,10 +636,16 @@ def _build_registry(
         raise ToolRouteError(
             "registration_rejected", "Executor registry declaration was rejected"
         ) from None
+    runtime_registry, host_record = _host_composition(host)
+    snapshot = runtime_registry._in_process_host_snapshot(host)
+    if snapshot is None:
+        raise ToolRouteError(
+            "registration_rejected", "Host dispatcher provenance was rejected"
+        ) from None
+    runtime_id, host_generation = snapshot
     with _LOCK:
-        host_record = _HOSTS.get(host)
         declaration_records: list[_DeclarationRecord] = []
-        if host_record is None or host_record.built:
+        if host_record.built:
             raise ToolRouteError(
                 "registration_rejected", "Host dispatcher provenance was rejected"
             ) from None
@@ -360,8 +655,8 @@ def _build_registry(
                     "registration_rejected",
                     "Only approved opaque Executor declarations are accepted",
                 ) from None
-            record = _DECLARATIONS.get(declaration)
-            if record is None or record.host is not host:
+            record = host_record.declaration_records.get(declaration)
+            if record is None:
                 raise ToolRouteError(
                     "registration_rejected", "Executor declaration provenance was rejected"
                 ) from None
@@ -435,18 +730,26 @@ def _build_registry(
         object.__setattr__(
             broker, "_ExecutorBroker__supervisor_capacity", supervisor_capacity
         )
+        object.__setattr__(
+            broker, "_ExecutorBroker__runtime_registry", runtime_registry
+        )
+        object.__setattr__(broker, "_ExecutorBroker__runtime_id", runtime_id)
+        object.__setattr__(
+            broker, "_ExecutorBroker__host_generation", host_generation
+        )
         registry_record = _RegistryRecord(
-            host=host,
-            dispatcher=host_record.dispatcher,
+            runtime_registry=runtime_registry,
+            runtime_id=runtime_id,
+            host_generation=host_generation,
             provenance_id=provenance_id,
             registrations=frozen_bindings,
             public_registrations=frozen_registrations,
             active_executions=active_executions,
             supervisor_capacity=supervisor_capacity,
         )
-        _REGISTRIES[broker] = registry_record
+        host_record.registries[broker] = registry_record
         for registration, binding, registration_provenance in pending_registration_records:
-            _REGISTRATIONS[registration] = _RegistrationRecord(
+            host_record.registrations[registration] = _RegistrationRecord(
                 broker=broker,
                 binding=binding,
                 manifest=binding.manifest,
@@ -462,11 +765,52 @@ def _build_registry(
     return broker, frozen_registrations
 
 
+def _host_composition_for_snapshot(
+    runtime_registry: object,
+    runtime_id: object,
+    host_generation: object,
+) -> _HostComposition | None:
+    if (
+        type(runtime_registry) is not RuntimeRegistryV2
+        or type(runtime_id) is not str
+        or type(host_generation) is not int
+    ):
+        return None
+    try:
+        composition = runtime_registry._in_process_host_extension_for_snapshot(
+            runtime_id,
+            host_generation,
+            _HOST_EXTENSION_NAMESPACE,
+        )
+    except (AttributeError, TypeError, RuntimeRegistryIntegrityError):
+        return None
+    return composition if type(composition) is _HostComposition else None
+
+
 def _broker_record(broker: object) -> _RegistryRecord | None:
     if type(broker) is not ExecutorBroker:
         return None
     with _LOCK:
-        record = _REGISTRIES.get(broker)
+        try:
+            runtime_registry = object.__getattribute__(
+                broker, "_ExecutorBroker__runtime_registry"
+            )
+            runtime_id = object.__getattribute__(
+                broker, "_ExecutorBroker__runtime_id"
+            )
+            host_generation = object.__getattribute__(
+                broker, "_ExecutorBroker__host_generation"
+            )
+        except (AttributeError, TypeError):
+            return None
+        composition = _host_composition_for_snapshot(
+            runtime_registry,
+            runtime_id,
+            host_generation,
+        )
+        if composition is None:
+            return None
+        record = composition.registries.get(broker)
         if record is None:
             return None
         try:
@@ -487,8 +831,14 @@ def _broker_record(broker: object) -> _RegistryRecord | None:
                     broker, "_ExecutorBroker__supervisor_capacity"
                 )
                 == record.supervisor_capacity
+                and runtime_registry is record.runtime_registry
+                and runtime_id == record.runtime_id
+                and host_generation == record.host_generation
+                and record.runtime_registry._verifies_in_process_host_snapshot(
+                    record.runtime_id, record.host_generation
+                )
             )
-        except (AttributeError, TypeError):
+        except (AttributeError, TypeError, RuntimeRegistryIntegrityError):
             return None
         return record if valid else None
 
@@ -499,7 +849,17 @@ def _registration_record(
     if type(registration) is not ExecutorRegistration:
         return None
     with _LOCK:
-        record = _REGISTRATIONS.get(registration)
+        registry_record = _broker_record(broker)
+        if registry_record is None:
+            return None
+        composition = _host_composition_for_snapshot(
+            registry_record.runtime_registry,
+            registry_record.runtime_id,
+            registry_record.host_generation,
+        )
+        if composition is None:
+            return None
+        record = composition.registrations.get(registration)
         if record is None or record.broker is not broker:
             return None
         binding = record.binding
@@ -560,12 +920,12 @@ def _broker_runtime_state(
     return record.active_executions, record.supervisor_capacity
 
 
-def _dispatch_registered_executor(
+async def _dispatch_registered_executor(
     broker: ExecutorBroker,
     registration: ExecutorRegistration,
     context: StepContext,
     arguments: Mapping[str, object],
-) -> Awaitable[object]:
+) -> object:
     registry = _broker_record(broker)
     registration_record = _registration_record(broker, registration)
     if registry is None or registration_record is None:
@@ -576,8 +936,12 @@ def _dispatch_registered_executor(
         raise ToolRouteError(
             "registration_rejected", "Executor capability provenance was rejected"
         ) from None
-    return registry.dispatcher(
-        registration_record.executor_handle, context, arguments
+    return await registry.runtime_registry._dispatch_in_process_host(
+        registry.runtime_id,
+        registry.host_generation,
+        registration_record.executor_handle,
+        context,
+        arguments,
     )
 
 
@@ -597,7 +961,14 @@ def _bind_tool_router_registry(
     ):
         return False
     with _LOCK:
-        _ROUTERS[router] = _RouterRecord(
+        composition = _host_composition_for_snapshot(
+            registry.runtime_registry,
+            registry.runtime_id,
+            registry.host_generation,
+        )
+        if composition is None:
+            return False
+        composition.routers[router] = _RouterRecord(
             broker=broker,
             registrations=registrations,
         )
@@ -609,20 +980,27 @@ def _tool_router_registry_valid(
     broker: object,
     registrations: object,
 ) -> bool:
+    registry = _broker_record(broker)
+    if registry is None:
+        return False
     with _LOCK:
-        record = _ROUTERS.get(router)
+        composition = _host_composition_for_snapshot(
+            registry.runtime_registry,
+            registry.runtime_id,
+            registry.host_generation,
+        )
+        if composition is None:
+            return False
+        record = composition.routers.get(router)
     if (
         record is None
         or broker is not record.broker
         or registrations is not record.registrations
     ):
         return False
-    registry = _broker_record(broker)
-    return registry is not None and registrations is registry.public_registrations
+    return registrations is registry.public_registrations
 
 
 __all__ = [
     "ApprovedExecutorHandleDeclaration",
-    "BoundPythonTermHostDispatcher",
-    "bind_python_term_host_dispatcher",
 ]

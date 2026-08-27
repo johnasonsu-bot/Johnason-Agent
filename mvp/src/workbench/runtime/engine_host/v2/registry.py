@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 import sqlite3
 import threading
 import time
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import ConfigDict, StrictBool
 
@@ -51,6 +52,38 @@ class RuntimeRegistryIntegrityError(RuntimeError):
     """A persisted registration is malformed or disagrees with live capability data."""
 
 
+class RegisteredRuntimeHostV2:
+    """Opaque live Host identity issued by one authoritative Runtime Registry."""
+
+    __slots__ = (
+        "__registry",
+        "__registry_identity",
+        "__runtime_id",
+        "__generation",
+        "__identity",
+        "__weakref__",
+    )
+
+    def __init__(self, *_: object, **__: object) -> None:
+        raise RuntimeRegistryIntegrityError(
+            "runtime Host identity requires the control-plane composition authority"
+        ) from None
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("runtime Host identity is immutable")
+
+    @property
+    def runtime_id(self) -> str:
+        return self.__runtime_id
+
+    @property
+    def generation(self) -> int:
+        return self.__generation
+
+    def __repr__(self) -> str:
+        return "RegisteredRuntimeHostV2(<opaque>)"
+
+
 class RuntimeRequirementsV2(FrozenModel):
     """The complete set of capability flags required before command acceptance."""
 
@@ -92,15 +125,252 @@ class _Registration:
     state: Literal["ready", "disabled", "unavailable"]
 
 
+@dataclass(slots=True)
+class _InProcessHostRegistration:
+    identity: RegisteredRuntimeHostV2
+    dispatcher: Callable[[str, object, Mapping[str, object]], Awaitable[object]]
+    runtime_id: str
+    generation: int
+    registry_identity: object
+    identity_marker: object
+    extensions: dict[str, object]
+
+
 class RuntimeRegistryV2:
     """Select only live, persisted v2 capabilities and pin accepted commands."""
 
-    def __init__(self, repository: RuntimeV2Repository) -> None:
+    def __init__(
+        self,
+        repository: RuntimeV2Repository,
+        *,
+        composition_authority: object | None = None,
+    ) -> None:
         if not isinstance(repository, RuntimeV2Repository):
             raise TypeError("repository must be a RuntimeV2Repository")
+        if composition_authority is not None and type(composition_authority) is not object:
+            raise TypeError("composition authority must be an exact opaque object")
         self.repository = repository
         self._lock = threading.RLock()
         self._advertised: dict[str, RuntimeCapabilitiesV2] = {}
+        self.__composition_authority = composition_authority
+        self.__registry_identity = object()
+        self.__in_process_hosts: dict[
+            RegisteredRuntimeHostV2, _InProcessHostRegistration
+        ] = {}
+        self.__in_process_hosts_by_runtime: dict[
+            str, _InProcessHostRegistration
+        ] = {}
+
+    def _register_in_process_host(
+        self,
+        composition_authority: object,
+        *,
+        runtime_id: str,
+        dispatcher: object,
+    ) -> RegisteredRuntimeHostV2:
+        """Composition-root seam; exact authority is required despite discoverability."""
+        if (
+            self.__composition_authority is None
+            or composition_authority is not self.__composition_authority
+            or type(composition_authority) is not object
+        ):
+            raise RuntimeRegistryIntegrityError(
+                "runtime Host composition authority was rejected"
+            ) from None
+        if (
+            not isinstance(runtime_id, str)
+            or not runtime_id
+            or len(runtime_id) > 128
+        ):
+            raise RuntimeRegistryIntegrityError(
+                "runtime Host identity is invalid"
+            ) from None
+        from workbench.runtime.engine_host.v2.python_term_control_plane import (
+            _host_dispatcher_is_admissible,
+        )
+
+        if not _host_dispatcher_is_admissible(dispatcher):
+            raise RuntimeRegistryIntegrityError(
+                "runtime Host dispatcher binding was rejected"
+            ) from None
+        with self._lock:
+            if runtime_id in self.__in_process_hosts_by_runtime:
+                raise RuntimeRegistryIntegrityError(
+                    "runtime Host identity is already registered"
+                ) from None
+            generation = 1
+            identity_marker = object()
+            host = object.__new__(RegisteredRuntimeHostV2)
+            object.__setattr__(host, "_RegisteredRuntimeHostV2__registry", self)
+            object.__setattr__(
+                host,
+                "_RegisteredRuntimeHostV2__registry_identity",
+                self.__registry_identity,
+            )
+            object.__setattr__(
+                host, "_RegisteredRuntimeHostV2__runtime_id", runtime_id
+            )
+            object.__setattr__(
+                host, "_RegisteredRuntimeHostV2__generation", generation
+            )
+            object.__setattr__(
+                host, "_RegisteredRuntimeHostV2__identity", identity_marker
+            )
+            record = _InProcessHostRegistration(
+                identity=host,
+                dispatcher=cast(
+                    Callable[
+                        [str, object, Mapping[str, object]], Awaitable[object]
+                    ],
+                    dispatcher,
+                ),
+                runtime_id=runtime_id,
+                generation=generation,
+                registry_identity=self.__registry_identity,
+                identity_marker=identity_marker,
+                extensions={},
+            )
+            self.__in_process_hosts[host] = record
+            self.__in_process_hosts_by_runtime[runtime_id] = record
+            self.__composition_authority = None
+        return host
+
+    def _in_process_host_record(
+        self, host: object
+    ) -> _InProcessHostRegistration | None:
+        if type(host) is not RegisteredRuntimeHostV2:
+            return None
+        with self._lock:
+            record = self.__in_process_hosts.get(host)
+            if record is None:
+                return None
+            try:
+                valid = (
+                    object.__getattribute__(
+                        host, "_RegisteredRuntimeHostV2__registry"
+                    )
+                    is self
+                    and object.__getattribute__(
+                        host, "_RegisteredRuntimeHostV2__registry_identity"
+                    )
+                    is record.registry_identity
+                    and record.registry_identity is self.__registry_identity
+                    and object.__getattribute__(
+                        host, "_RegisteredRuntimeHostV2__runtime_id"
+                    )
+                    == record.runtime_id
+                    and object.__getattribute__(
+                        host, "_RegisteredRuntimeHostV2__generation"
+                    )
+                    == record.generation
+                    and object.__getattribute__(
+                        host, "_RegisteredRuntimeHostV2__identity"
+                    )
+                    is record.identity_marker
+                    and self.__in_process_hosts_by_runtime.get(record.runtime_id)
+                    is record
+                )
+            except (AttributeError, TypeError):
+                return None
+        if not valid:
+            return None
+        from workbench.runtime.engine_host.v2.python_term_control_plane import (
+            _host_dispatcher_is_admissible,
+        )
+
+        return record if _host_dispatcher_is_admissible(record.dispatcher) else None
+
+    def _verifies_in_process_host(self, host: object) -> bool:
+        return self._in_process_host_record(host) is not None
+
+    def _in_process_host_snapshot(
+        self, host: object
+    ) -> tuple[str, int] | None:
+        record = self._in_process_host_record(host)
+        if record is None:
+            return None
+        return record.runtime_id, record.generation
+
+    def _verifies_in_process_host_snapshot(
+        self, runtime_id: str, generation: int
+    ) -> bool:
+        with self._lock:
+            record = self.__in_process_hosts_by_runtime.get(runtime_id)
+        return (
+            record is not None
+            and record.generation == generation
+            and self._in_process_host_record(record.identity) is record
+        )
+
+    def _in_process_host_extension(
+        self,
+        host: object,
+        namespace: str,
+        factory: Callable[[], object],
+    ) -> object:
+        if not isinstance(namespace, str) or not namespace:
+            raise RuntimeRegistryIntegrityError(
+                "runtime Host extension namespace is invalid"
+            ) from None
+        record = self._in_process_host_record(host)
+        if record is None:
+            raise RuntimeRegistryIntegrityError(
+                "runtime Host identity was rejected"
+            ) from None
+        with self._lock:
+            extension = record.extensions.get(namespace)
+            if extension is None:
+                extension = factory()
+                record.extensions[namespace] = extension
+            return extension
+
+    def _in_process_host_extension_for_snapshot(
+        self,
+        runtime_id: str,
+        generation: int,
+        namespace: str,
+    ) -> object | None:
+        """Return an existing Host extension only after live Host revalidation."""
+        if (
+            not isinstance(runtime_id, str)
+            or not runtime_id
+            or type(generation) is not int
+            or not isinstance(namespace, str)
+            or not namespace
+        ):
+            return None
+        with self._lock:
+            record = self.__in_process_hosts_by_runtime.get(runtime_id)
+        if (
+            record is None
+            or record.generation != generation
+            or self._in_process_host_record(record.identity) is not record
+        ):
+            return None
+        with self._lock:
+            return record.extensions.get(namespace)
+
+    async def _dispatch_in_process_host(
+        self,
+        runtime_id: str,
+        generation: int,
+        executor_handle: str,
+        context: object,
+        arguments: Mapping[str, object],
+    ) -> object:
+        """Invoke only from a supervisor-owned task after live identity revalidation."""
+        with self._lock:
+            record = self.__in_process_hosts_by_runtime.get(runtime_id)
+        if (
+            record is None
+            or record.generation != generation
+            or self._in_process_host_record(record.identity) is not record
+        ):
+            raise RuntimeRegistryIntegrityError(
+                "runtime Host identity was rejected"
+            ) from None
+        operation = record.dispatcher(executor_handle, context, arguments)
+        return await operation
 
     def register(
         self,

@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import threading
+from asyncio import CancelledError
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,7 @@ def _durable_router(
         (context.to_step_record(),),
     )
     controlled_broker, registrations = _executor_registry(
+        tmp_path,
         executor.execute,
         (
             (
@@ -104,6 +106,7 @@ def _restart_router(
 ):
     repository = PythonTermRepository(database)
     controlled_broker, registrations = _executor_registry(
+        database.parent,
         executor.execute,
         (
             (
@@ -271,10 +274,11 @@ async def test_write_timeout_is_unknown_and_never_automatically_retried(
     class SlowWrite:
         def __init__(self) -> None:
             self.calls = 0
+            self.never = asyncio.Event()
 
         async def execute(self, executor_handle, context, arguments):
             self.calls += 1
-            await asyncio.sleep(1)
+            await self.never.wait()
             return PublicToolResult(status="completed", summary="late")
 
     executor = SlowWrite()
@@ -732,13 +736,14 @@ async def test_external_cancellation_persists_unknown_write_and_reraises(
         def __init__(self) -> None:
             self.calls = 0
             self.started = asyncio.Event()
+            self.never = asyncio.Event()
 
         async def execute(self, executor_handle, context, arguments):
             self.calls += 1
             self.started.set()
             try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
+                await self.never.wait()
+            except CancelledError:
                 if suppress_cancellation:
                     return PublicToolResult(status="completed", summary="late")
                 raise
@@ -1085,13 +1090,14 @@ async def test_suppressed_cancellation_stays_supervised_until_quiescent(
             self.started = asyncio.Event()
             self.cancel_seen = asyncio.Event()
             self.release = asyncio.Event()
+            self.never = asyncio.Event()
 
         async def execute(self, executor_handle, context, arguments):
             self.calls += 1
             self.started.set()
             try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
+                await self.never.wait()
+            except CancelledError:
                 self.cancel_seen.set()
                 await self.release.wait()
                 return PublicToolResult(status="completed", summary="late")
@@ -1156,17 +1162,19 @@ async def test_supervisor_capacity_rejects_dispatch_before_start(
         def __init__(self) -> None:
             self.calls = 0
             self.release = asyncio.Event()
+            self.never = asyncio.Event()
 
         async def execute(self, executor_handle, step_context, arguments):
             self.calls += 1
             try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
+                await self.never.wait()
+            except CancelledError:
                 await self.release.wait()
                 return PublicToolResult(status="completed", summary="late")
 
     executor = CapacityExecutor()
     broker, registrations = _executor_registry(
+        tmp_path,
         executor.execute,
         ((manifest, "executor-1", _registration(manifest).access),),
         supervisor_capacity=1,

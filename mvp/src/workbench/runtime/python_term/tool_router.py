@@ -220,6 +220,9 @@ class ExecutorBroker:
         "__registrations",
         "__active_executions",
         "__supervisor_capacity",
+        "__runtime_registry",
+        "__runtime_id",
+        "__host_generation",
         "__weakref__",
     )
 
