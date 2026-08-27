@@ -204,10 +204,6 @@ def _percent_escape_end(value: str, index: int) -> int | None:
 
 def _scan_url_tail(value: str, index: int) -> int:
     component = "path"
-    if value[index] == "?":
-        component = "query"
-    elif value[index] == "#":
-        component = "fragment"
 
     while index < len(value):
         character = value[index]

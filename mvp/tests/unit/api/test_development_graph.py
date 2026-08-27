@@ -116,6 +116,11 @@ def test_development_projection_allows_public_url_and_relative_path_text() -> No
         "https://example.com/docs;path=/public/file",
         "https://example.com/search?path=/public/file",
         "https://example.com/docs#path=/public/file",
+        "https://example.com?path=/public/file",
+        "https://example.com#path=/public/file",
+        "https://[2001:db8::1]:8443/public/file",
+        "https://example.com:8443/public/file",
+        "https://example.com/%70ublic/%66ile?path=%2Fpublic%2Ffile#ok",
         "backend/current/worktree",
     ):
         event = DomainEvent.new("development.branch.progress", "test", {

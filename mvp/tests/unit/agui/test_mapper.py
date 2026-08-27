@@ -395,6 +395,11 @@ def test_v2_persisted_boundary_rejects_local_path_after_http_url(hostile: str) -
         "https://example.com/docs;path=/public/file",
         "https://example.com/search?path=/public/file",
         "https://example.com/docs#path=/public/file",
+        "https://example.com?path=/public/file",
+        "https://example.com#path=/public/file",
+        "https://[2001:db8::1]:8443/public/file",
+        "https://example.com:8443/public/file",
+        "https://example.com/%70ublic/%66ile?path=%2Fpublic%2Ffile#ok",
     ],
 )
 def test_v2_development_boundary_allows_http_urls_with_path_segments(url: str) -> None:
