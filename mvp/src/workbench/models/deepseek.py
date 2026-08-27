@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from collections.abc import AsyncIterator
 from typing import Any
@@ -23,6 +24,9 @@ from workbench.models.profiles import (
     SecretResolver,
     validate_provider_headers,
 )
+
+
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 class DeepSeekProvider:
@@ -206,8 +210,8 @@ def _validate_profile(request: ModelRequest, profile: ProviderProfileRecord) -> 
     if not profile.thinking_enabled:
         raise ValueError("DeepSeek adapter requires thinking to be enabled")
     model = profile.model_aliases.get(request.model, request.model)
-    if model != "deepseek-v4-flash":
-        raise ValueError("DeepSeek adapter requires model deepseek-v4-flash")
+    if _MODEL_ID.fullmatch(model) is None:
+        raise ValueError("DeepSeek adapter requires a safe model identifier")
     return model
 
 

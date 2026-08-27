@@ -152,8 +152,17 @@ def _error_code(error: Exception) -> tuple[str, str]:
     if isinstance(error, KeyError):
         return ("missing", "credential_missing")
     if isinstance(error, httpx.HTTPStatusError):
-        if error.response.status_code in {401, 403}:
+        status_code = error.response.status_code
+        if status_code in {401, 403}:
             return ("authentication_failed", "authentication_failed")
+        if status_code == 400:
+            return ("error", "request_rejected")
+        if status_code == 404:
+            return ("error", "model_not_found")
+        if status_code == 429:
+            return ("error", "rate_limited")
+        if status_code >= 500:
+            return ("error", "provider_unavailable")
         return ("error", "provider_error")
     if isinstance(error, (httpx.RequestError, ProviderUnavailable)):
         return ("offline", "offline")

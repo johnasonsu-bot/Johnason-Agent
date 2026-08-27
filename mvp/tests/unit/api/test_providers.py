@@ -63,6 +63,24 @@ class UnauthorizedProvider(AvailableProvider):
         raise httpx.HTTPStatusError("unauthorized secret-value", request=request, response=response)
 
 
+class RejectedProvider(AvailableProvider):
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    async def complete(self, request: ModelRequest, profile: object) -> ModelResponse:
+        upstream_request = httpx.Request("POST", "https://api.deepseek.test/chat/completions")
+        response = httpx.Response(
+            self.status_code,
+            request=upstream_request,
+            text="upstream detail and secret-value must remain private",
+        )
+        raise httpx.HTTPStatusError(
+            "upstream request failed",
+            request=upstream_request,
+            response=response,
+        )
+
+
 def _client(
     database: Path, vault: CredentialVault, gateway: ModelGateway | None = None
 ) -> TestClient:
@@ -406,6 +424,35 @@ def test_connection_errors_are_redacted_to_normalized_codes(tmp_path: Path) -> N
     assert unauthorized.json()["status"] == "authentication_failed"
     assert unauthorized.json()["error_code"] == "authentication_failed"
     assert "secret-value" not in offline.text + unauthorized.text
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_code"),
+    [
+        (400, "request_rejected"),
+        (404, "model_not_found"),
+        (429, "rate_limited"),
+        (503, "provider_unavailable"),
+    ],
+)
+def test_provider_http_failures_keep_actionable_redacted_codes(
+    tmp_path: Path, status_code: int, error_code: str
+) -> None:
+    """The UI needs a safe model/rate/service diagnosis instead of provider_error."""
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    client = _client(
+        tmp_path / "workflow.sqlite",
+        vault,
+        ModelGateway({"deepseek": RejectedProvider(status_code)}),
+    )
+    client.post("/api/providers", json=deepseek_payload())
+
+    response = client.post("/api/providers/deepseek-primary/test")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "error"
+    assert response.json()["error_code"] == error_code
+    assert "secret-value" not in response.text
 
 
 def test_lm_studio_connection_failure_is_normalized_as_offline(tmp_path: Path) -> None:

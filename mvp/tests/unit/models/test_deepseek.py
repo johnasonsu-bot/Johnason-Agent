@@ -243,9 +243,45 @@ async def test_http_error_never_includes_vault_secret() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "model",
+    ["deepseek-v4-pro", "deepseek-v4-flash-vision-exp"],
+)
+async def test_discovered_v4_models_use_the_selected_chat_completion_model(
+    model: str,
+) -> None:
+    """A discovered V4 model must reach the provider instead of the Flash-only guard."""
+    recorder = RequestRecorder(
+        lambda request: httpx.Response(
+            200,
+            request=request,
+            json={"choices": [{"message": {"content": "ready"}}]},
+        )
+    )
+    provider = DeepSeekProvider(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(recorder)),
+        vault=InMemoryVault({"provider/deepseek-primary": "secret-value"}),
+    )
+    profile = deepseek_profile(model_aliases={"default": model})
+
+    response = await provider.complete(
+        ModelRequest(model="default", messages=[{"role": "user", "content": "hello"}]),
+        profile,
+    )
+
+    assert response.text == "ready"
+    assert len(recorder.requests) == 1
+    sent = json.loads(recorder.requests[0].content)
+    assert sent["model"] == model
+    assert sent["thinking"] == {"type": "enabled"}
+    assert sent["reasoning_effort"] == "high"
+    await provider.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("request_model", "profile_changes", "error"),
     [
-        ("different-model", {}, "deepseek-v4-flash"),
+        ("unsafe model\n", {}, "model"),
         ("deepseek-v4-flash", {"protocol": "openai_chat"}, "protocol"),
         ("deepseek-v4-flash", {"thinking_enabled": False}, "thinking"),
     ],
@@ -253,7 +289,7 @@ async def test_http_error_never_includes_vault_secret() -> None:
 async def test_incompatible_profile_is_rejected_before_a_deepseek_request(
     request_model: str, profile_changes: dict[str, object], error: str
 ) -> None:
-    """Sending a non-V4-flash thinking request can produce an incompatible turn."""
+    """Malformed model metadata and incompatible profiles fail before network I/O."""
     recorder = RequestRecorder(
         lambda _request: httpx.Response(
             200, json={"choices": [{"message": {"content": "unexpected"}}]}
