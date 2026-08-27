@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import importlib
 import os
 import traceback
 from dataclasses import dataclass, fields
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from workbench.runtime.engine_host.v2 import ToolManifestEntryV2
+from workbench.runtime.engine_host.v2.python_term_control_plane import (
+    bind_python_term_host_dispatcher,
+)
 from workbench.runtime.python_term.contracts import (
     EffectScope,
     PermissionPolicy,
@@ -57,6 +62,27 @@ def _registration(
     return _RegistrationSpec(
         executor_handle=executor_handle,
         access=access,
+    )
+
+
+def _executor_registry(
+    dispatcher,
+    bindings: tuple[tuple[ToolManifestEntryV2, str, ToolAccess], ...],
+    *,
+    supervisor_capacity: int = 64,
+):
+    host = bind_python_term_host_dispatcher(dispatcher)
+    declarations = tuple(
+        host.approve_executor(
+            manifest,
+            executor_handle=executor_handle,
+            access=access,
+        )
+        for manifest, executor_handle, access in bindings
+    )
+    return host.build_registry(
+        declarations,
+        supervisor_capacity=supervisor_capacity,
     )
 
 
@@ -148,7 +174,7 @@ def _router(
         (context.to_step_record(),),
     )
     controlled_broker, sealed_registrations = (
-        tool_router_module._trusted_executor_registry(
+        _executor_registry(
             broker.execute,
             tuple(
                 (
@@ -445,7 +471,7 @@ def test_manifest_admission_rejects_unsafe_or_excessive_schema(
         "urllib.request.urlopen",
         lambda value, *args, **kwargs: network_attempts.append(str(value)),
     )
-    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+    controlled_broker, registrations = _executor_registry(
         broker.execute,
         ((manifest, "executor-1", ToolAccess()),),
     )
@@ -504,7 +530,7 @@ def test_manifest_admission_rejects_recursive_or_exponential_local_refs(
         context.to_term_record(envelope), (context.to_step_record(),)
     )
     broker = RecordingBroker(PublicToolResult(status="completed", summary="ok"))
-    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+    controlled_broker, registrations = _executor_registry(
         broker.execute,
         ((manifest, "executor-1", ToolAccess()),),
     )
@@ -709,7 +735,7 @@ def test_router_rejects_duck_broker_and_caller_self_issued_capability(
     duck_broker = RecordingBroker(
         PublicToolResult(status="completed", summary="unsafe")
     )
-    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+    controlled_broker, registrations = _executor_registry(
         duck_broker.execute,
         ((context.tool_manifest[0], "executor-1", ToolAccess()),),
     )
@@ -734,51 +760,28 @@ def test_sealed_broker_rejects_forged_capability_and_forbidden_authority(
         context.to_term_record(envelope), (context.to_step_record(),)
     )
 
-    with pytest.raises(ToolRouteError, match="authority"):
-        tool_router_module._trusted_executor_registry(
-            repository.get_tool_effect,
-            ((context.tool_manifest[0], "executor-1", ToolAccess()),),
-        )
-
-    class VaultService:
-        pass
-
-    vault = VaultService()
-
-    async def captured_dispatcher(handle, step_context, arguments):
-        assert vault is not None
-        return PublicToolResult(status="completed", summary="unsafe")
-
-    with pytest.raises(ToolRouteError, match="authority"):
-        tool_router_module._trusted_executor_registry(
-            captured_dispatcher,
-            ((context.tool_manifest[0], "executor-1", ToolAccess()),),
-        )
-
     dispatcher = RecordingBroker(
         PublicToolResult(status="completed", summary="safe")
     )
     controlled_broker, controlled_registrations = (
-        tool_router_module._trusted_executor_registry(
+        _executor_registry(
             dispatcher.execute,
             ((context.tool_manifest[0], "sealed-executor", ToolAccess()),),
         )
     )
     sealed = controlled_registrations[context.tool_manifest[0].tool_id]
     assert repr(sealed) == "ExecutorRegistration(<opaque>)"
-    _, foreign_registrations = tool_router_module._trusted_executor_registry(
+    _, foreign_registrations = _executor_registry(
         dispatcher.execute,
         ((context.tool_manifest[0], "caller-selected", ToolAccess()),),
     )
-    router = ToolRouter(
-        repository,
-        foreign_registrations,
-        executor_broker=controlled_broker,
-        request_digests=HmacRequestDigestService(os.urandom(32)),
-    )
-
     with pytest.raises(ToolRouteError) as raised:
-        router.admit(context)
+        ToolRouter(
+            repository,
+            foreign_registrations,
+            executor_broker=controlled_broker,
+            request_digests=HmacRequestDigestService(os.urandom(32)),
+        )
 
     assert raised.value.code == "registration_rejected"
     assert dispatcher.calls == 0
@@ -792,9 +795,9 @@ def test_executor_registry_can_only_be_created_by_trusted_frozen_factory(
         PublicToolResult(status="completed", summary="safe")
     )
 
-    with pytest.raises(ToolRouteError, match="trusted factory"):
+    with pytest.raises(ToolRouteError, match="control-plane"):
         ExecutorBroker(dispatcher.execute)
-    with pytest.raises(ToolRouteError, match="trusted factory"):
+    with pytest.raises(ToolRouteError, match="control-plane"):
         ExecutorRegistration(
             tool_id=context.tool_manifest[0].tool_id,
             version=context.tool_manifest[0].version,
@@ -805,7 +808,7 @@ def test_executor_registry_can_only_be_created_by_trusted_frozen_factory(
             access=ToolAccess(),
         )
 
-    registry, registrations = tool_router_module._trusted_executor_registry(
+    registry, registrations = _executor_registry(
         dispatcher.execute,
         (
             (
@@ -827,13 +830,12 @@ def test_executor_registry_can_only_be_created_by_trusted_frozen_factory(
     )
 
 
-def test_trusted_executor_factory_rejects_hidden_authority_capture(
+def test_control_plane_binding_rejects_hidden_callable_authority(
     tmp_path: Path,
 ) -> None:
     context, _ = _runtime_context(tmp_path)
     repository = PythonTermRepository(tmp_path / "hidden-authority.sqlite")
     manifest = context.tool_manifest[0]
-    binding = ((manifest, "executor-1", ToolAccess()),)
 
     async def default_capture(handle, step_context, arguments, owner=repository):
         return owner.get_tool_effect("effect")
@@ -864,8 +866,192 @@ def test_trusted_executor_factory_rejects_hidden_authority_capture(
         CallableDispatcher(repository),
     )
     for dispatcher in dispatchers:
-        with pytest.raises(ToolRouteError, match="authority"):
-            tool_router_module._trusted_executor_registry(dispatcher, binding)
+        with pytest.raises(ToolRouteError, match="binding"):
+            bind_python_term_host_dispatcher(dispatcher)
+
+
+def test_executor_composition_rejects_module_global_and_class_authority(
+    tmp_path: Path,
+) -> None:
+    context, _ = _runtime_context(tmp_path)
+    repository = PythonTermRepository(tmp_path / "module-class-authority.sqlite")
+    manifest = context.tool_manifest[0]
+    authority_module = ModuleType("captured_authority")
+    authority_module.repository = repository
+    captured_repository = repository
+
+    class AuthorityClass:
+        repository = captured_repository
+
+    async def module_dispatcher(handle, step_context, arguments):
+        return authority_module.repository
+
+    async def class_dispatcher(handle, step_context, arguments):
+        return AuthorityClass.repository
+
+    for dispatcher in (module_dispatcher, class_dispatcher):
+        with pytest.raises(ToolRouteError, match="binding"):
+            bind_python_term_host_dispatcher(dispatcher)
+
+
+def test_tool_router_exposes_no_registry_construction_authority() -> None:
+    assert not hasattr(tool_router_module, "_EXECUTOR_FACTORY_AUTHORITY")
+    assert not callable(
+        getattr(tool_router_module, "_trusted_executor_registry", None)
+    )
+    control_plane = importlib.import_module(
+        "workbench.runtime.engine_host.v2.python_term_control_plane"
+    )
+    assert callable(control_plane.bind_python_term_host_dispatcher)
+
+
+def test_recovered_factory_authority_cannot_self_issue_registry(
+    tmp_path: Path,
+) -> None:
+    context, _ = _runtime_context(tmp_path)
+    manifest = context.tool_manifest[0]
+    dispatcher = RecordingBroker(
+        PublicToolResult(status="completed", summary="unsafe")
+    )
+    legitimate_broker, registrations = _executor_registry(
+        dispatcher.execute,
+        ((manifest, "executor-1", ToolAccess()),),
+    )
+    registration = registrations[manifest.tool_id]
+    with pytest.raises(ToolRouteError, match="control-plane"):
+        ExecutorRegistration(
+            tool_id=registration.tool_id,
+            version=registration.version,
+            schema_digest=registration.schema_digest,
+            capability_digest=registration.capability_digest,
+            access=registration.access,
+        )
+    with pytest.raises(ToolRouteError, match="control-plane"):
+        ExecutorBroker(
+            dispatcher=dispatcher.execute,
+            registrations={},
+        )
+    forged = object.__new__(ExecutorRegistration)
+    for name, value in (
+        ("tool_id", registration.tool_id),
+        ("version", registration.version),
+        ("schema_digest", registration.schema_digest),
+        ("capability_digest", registration.capability_digest),
+        ("access", registration.access),
+        ("provenance_id", object()),
+    ):
+        object.__setattr__(forged, f"_ExecutorRegistration__{name}", value)
+    assert not legitimate_broker.verifies(forged, manifest)
+
+
+@pytest.mark.asyncio
+async def test_post_admission_broker_or_registration_mutation_fails_before_effect(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    repository = PythonTermRepository(tmp_path / "post-admission-mutation.sqlite")
+    repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
+    )
+    original = RecordingBroker(PublicToolResult(status="completed", summary="safe"))
+    malicious = RecordingBroker(
+        PublicToolResult(status="completed", summary="unsafe")
+    )
+    broker, registrations = _executor_registry(
+        original.execute,
+        ((context.tool_manifest[0], "executor-1", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    router.admit(context)
+    registration = registrations[context.tool_manifest[0].tool_id]
+    object.__setattr__(
+        registration,
+        "_ExecutorRegistration__capability_digest",
+        "0" * 64,
+    )
+    with pytest.raises(AttributeError):
+        object.__setattr__(
+            broker,
+            "_ExecutorBroker__dispatcher",
+            malicious.execute,
+        )
+    object.__setattr__(broker, "_ExecutorBroker__registrations", {})
+
+    with pytest.raises(ToolRouteError) as raised:
+        await router.invoke(
+            context,
+            context.tool_manifest[0].tool_id,
+            {},
+            tool_call_id="call-mutated-registry",
+        )
+
+    assert raised.value.code == "registration_rejected"
+    assert original.calls == malicious.calls == 0
+    with repository.connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM python_tool_effects"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_post_admission_router_broker_replacement_fails_before_effect(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    repository = PythonTermRepository(tmp_path / "router-broker-replacement.sqlite")
+    repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
+    )
+    original = RecordingBroker(PublicToolResult(status="completed", summary="safe"))
+    broker, registrations = _executor_registry(
+        original.execute,
+        ((context.tool_manifest[0], "executor-1", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    router.admit(context)
+
+    class ReplacementBroker:
+        calls = 0
+
+        async def execute_bounded(self, *args, **kwargs):
+            self.calls += 1
+            return "completed", PublicToolResult(
+                status="completed", summary="unsafe"
+            )
+
+    replacement = ReplacementBroker()
+    with pytest.raises(AttributeError):
+        router.executor_broker = replacement
+    object.__setattr__(
+        router, "_ToolRouter__executor_broker", replacement
+    )
+
+    with pytest.raises(ToolRouteError) as raised:
+        await router.invoke(
+            context,
+            context.tool_manifest[0].tool_id,
+            {},
+            tool_call_id="call-replaced-router-broker",
+        )
+
+    assert raised.value.code == "registration_rejected"
+    assert original.calls == replacement.calls == 0
+    with repository.connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM python_tool_effects"
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.asyncio

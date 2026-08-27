@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from workbench.runtime.python_term import repository as repository_module
-from workbench.runtime.python_term import tool_router as tool_router_module
 from workbench.runtime.python_term.contracts import (
     PublicToolResult,
     ToolEffectRecord,
@@ -26,6 +25,7 @@ from workbench.runtime.python_term.tool_router import (
 
 from tests.unit.runtime.python_term.test_tool_router import (
     RecordingBroker,
+    _executor_registry,
     _registration,
     _runtime_context,
     _tool,
@@ -70,7 +70,7 @@ def _durable_router(
         context.to_term_record(envelope),
         (context.to_step_record(),),
     )
-    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+    controlled_broker, registrations = _executor_registry(
         executor.execute,
         (
             (
@@ -103,7 +103,7 @@ def _restart_router(
     clock_ms=lambda: 1_000,
 ):
     repository = PythonTermRepository(database)
-    controlled_broker, registrations = tool_router_module._trusted_executor_registry(
+    controlled_broker, registrations = _executor_registry(
         executor.execute,
         (
             (
@@ -1120,12 +1120,10 @@ async def test_suppressed_cancellation_stays_supervised_until_quiescent(
         assert raised.value.code == "reconciliation_required"
     await executor.cancel_seen.wait()
 
-    broker = router.executor_broker
-    assert callable(getattr(broker, "supervised_executions", None))
-    active = broker.supervised_executions()
+    active = router.supervised_executions()
     assert len(active) == 1
     assert active[0].state == "cancelling"
-    assert len(active) <= broker.supervisor_capacity <= 64
+    assert len(active) <= router.supervisor_capacity <= 64
     before = PythonTermRepository(database).get_tool_effect(active[0].effect_id)
     with PythonTermRepository(database).connect() as connection:
         rows_before = connection.execute(
@@ -1133,8 +1131,8 @@ async def test_suppressed_cancellation_stays_supervised_until_quiescent(
         ).fetchone()[0]
 
     executor.release.set()
-    assert await broker.wait_for_quiescence(timeout_ms=1_000)
-    assert broker.supervised_executions() == ()
+    assert await router.wait_for_executor_quiescence(timeout_ms=1_000)
+    assert router.supervised_executions() == ()
     with PythonTermRepository(database).connect() as connection:
         rows_after = connection.execute(
             "SELECT COUNT(*) FROM python_tool_effects"
@@ -1168,7 +1166,7 @@ async def test_supervisor_capacity_rejects_dispatch_before_start(
                 return PublicToolResult(status="completed", summary="late")
 
     executor = CapacityExecutor()
-    broker, registrations = tool_router_module._trusted_executor_registry(
+    broker, registrations = _executor_registry(
         executor.execute,
         ((manifest, "executor-1", _registration(manifest).access),),
         supervisor_capacity=1,
