@@ -1,29 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import functools
+import copy
 import importlib
 import inspect
 import os
 import traceback
-from collections import deque
-from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
 from workbench.runtime.engine_host.v2 import ToolManifestEntryV2
-from workbench.runtime.engine_host.v2.registry import (
-    RuntimeRegistryIntegrityError,
-    RuntimeRegistryV2,
-)
+from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
-from workbench.runtime.engine_host.v2.python_term_control_plane import (
-    _approve_executor,
-    _build_registry,
-)
+from workbench.runtime.engine_host.v2 import python_term_control_plane as control_plane
 from workbench.runtime.python_term.contracts import (
     EffectScope,
     PermissionPolicy,
@@ -81,43 +72,37 @@ def _executor_registry(
     *,
     supervisor_capacity: int = 64,
 ):
-    authority = object()
     runtime_registry = RuntimeRegistryV2(
         RuntimeV2Repository(tmp_path / "executor-host-registry.sqlite"),
-        composition_authority=authority,
     )
-    host = runtime_registry._register_in_process_host(
-        authority,
-        runtime_id="python-term",
-        dispatcher=dispatcher,
-    )
-    declarations = tuple(
-        _approve_executor(
-            host,
+    declare = getattr(control_plane, "_declare_executor", None)
+    build = getattr(control_plane, "_build_registry", None)
+    assert callable(declare), "fixed Host descriptor composition is missing"
+    assert callable(build), "fixed Host registry composition is missing"
+    descriptors = tuple(
+        declare(
+            runtime_registry,
+            "python-term",
             manifest,
             executor_handle,
             access,
+            dispatcher,
         )
         for manifest, executor_handle, access in bindings
     )
-    return _build_registry(
-        host,
-        declarations,
+    return build(
+        runtime_registry,
+        descriptors,
         supervisor_capacity,
     )
 
 
 def _register_test_host(tmp_path: Path, dispatcher):
-    authority = object()
-    runtime_registry = RuntimeRegistryV2(
-        RuntimeV2Repository(tmp_path / "admission-host-registry.sqlite"),
-        composition_authority=authority,
-    )
-    return runtime_registry._register_in_process_host(
-        authority,
-        runtime_id="python-term",
-        dispatcher=dispatcher,
-    )
+    with pytest.raises(TypeError):
+        RuntimeRegistryV2(
+            RuntimeV2Repository(tmp_path / "admission-host-registry.sqlite"),
+            dispatcher=dispatcher,  # type: ignore[call-arg]
+        )
 
 
 def _tool(
@@ -253,7 +238,6 @@ async def test_unlisted_tools_are_not_exposed_or_directly_invocable(tmp_path: Pa
 
     assert tuple(wrapper.tool_id for wrapper in wrappers) == ("read-file",)
     assert {field.name for field in fields(wrappers[0])} == {
-        "context",
         "manifest",
         "registration",
     }
@@ -731,6 +715,201 @@ async def test_approval_wait_is_bounded_by_step_deadline(tmp_path: Path) -> None
     assert broker.calls == 0
 
 
+def _declare_test_executor(
+    tmp_path: Path,
+    implementation,
+    *,
+    database_name: str = "declarative-host.sqlite",
+    manifest: ToolManifestEntryV2 | None = None,
+    executor_handle: str = "executor-1",
+    access: ToolAccess = ToolAccess(),
+):
+    runtime_registry = RuntimeRegistryV2(
+        RuntimeV2Repository(tmp_path / database_name)
+    )
+    declare = getattr(control_plane, "_declare_executor", None)
+    assert callable(declare), "fixed Host descriptor composition is missing"
+    descriptor = declare(
+        runtime_registry,
+        "python-term",
+        manifest or _tool(),
+        executor_handle,
+        access,
+        implementation,
+    )
+    return runtime_registry, descriptor
+
+
+def test_runtime_registry_has_no_caller_selected_authority_or_dispatcher(
+    tmp_path: Path,
+) -> None:
+    repository = RuntimeV2Repository(tmp_path / "caller-selected-host.sqlite")
+
+    with pytest.raises(TypeError):
+        RuntimeRegistryV2(repository, composition_authority=object())
+    with pytest.raises(TypeError):
+        RuntimeRegistryV2(repository, dispatcher=lambda *_: None)  # type: ignore[call-arg]
+
+
+def test_fixed_host_issues_only_immutable_declarative_executor_descriptors(
+    tmp_path: Path,
+) -> None:
+    implementation = RecordingBroker(
+        PublicToolResult(status="completed", summary="safe")
+    )
+    _, descriptor = _declare_test_executor(tmp_path, implementation.execute)
+
+    assert type(descriptor).__name__ == "ExecutorDescriptorV2"
+    assert is_dataclass(descriptor)
+    assert {field.name for field in fields(descriptor)} == {
+        "descriptor_id",
+        "runtime_id",
+        "host_generation",
+        "executor_handle",
+        "manifest",
+        "access",
+        "schema_digest",
+        "capability_digest",
+    }
+    assert isinstance(descriptor.descriptor_id, str)
+    assert descriptor.runtime_id == "python-term"
+    assert type(descriptor.host_generation) is int
+    assert descriptor.executor_handle == "executor-1"
+    assert type(descriptor.manifest) is ToolManifestEntryV2
+    assert type(descriptor.access) is ToolAccess
+    assert isinstance(descriptor.schema_digest, str)
+    assert isinstance(descriptor.capability_digest, str)
+    assert all(
+        not callable(getattr(descriptor, field.name))
+        for field in fields(descriptor)
+    )
+    with pytest.raises((AttributeError, TypeError)):
+        descriptor.executor_handle = "replacement"  # type: ignore[misc]
+
+
+def test_executor_descriptor_copy_cross_registry_tamper_and_replay_are_rejected(
+    tmp_path: Path,
+) -> None:
+    implementation = RecordingBroker(
+        PublicToolResult(status="completed", summary="safe")
+    )
+    registry, descriptor = _declare_test_executor(
+        tmp_path,
+        implementation.execute,
+        database_name="descriptor-owner.sqlite",
+    )
+    foreign_registry = RuntimeRegistryV2(
+        RuntimeV2Repository(tmp_path / "descriptor-foreign.sqlite")
+    )
+    build = getattr(control_plane, "_build_registry", None)
+    assert callable(build), "fixed Host registry composition is missing"
+
+    with pytest.raises(ToolRouteError, match="descriptor|registration"):
+        build(registry, (copy.copy(descriptor),), 1)
+    with pytest.raises(ToolRouteError, match="descriptor|registration"):
+        build(foreign_registry, (descriptor,), 1)
+
+    registry, descriptor = _declare_test_executor(
+        tmp_path,
+        implementation.execute,
+        database_name="descriptor-tamper.sqlite",
+    )
+    object.__setattr__(descriptor, "executor_handle", "tampered")
+    with pytest.raises(ToolRouteError, match="descriptor|registration"):
+        build(registry, (descriptor,), 1)
+
+    registry, descriptor = _declare_test_executor(
+        tmp_path,
+        implementation.execute,
+        database_name="descriptor-replay.sqlite",
+    )
+    build(registry, (descriptor,), 1)
+    with pytest.raises(ToolRouteError, match="descriptor|registration"):
+        build(registry, (descriptor,), 1)
+
+
+def test_registration_and_sdk_wrapper_hold_no_execution_authority_or_workspace(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    implementation = RecordingBroker(
+        PublicToolResult(status="completed", summary="safe")
+    )
+    router, _ = _router(
+        tmp_path,
+        context,
+        envelope,
+        implementation,
+        {context.tool_manifest[0].tool_id: _registration(context.tool_manifest[0])},
+    )
+
+    wrapper = router.exposed_tools(context)[0]
+    assert {field.name for field in fields(wrapper)} == {"manifest", "registration"}
+    assert {slot.removeprefix("__") for slot in wrapper.registration.__slots__ if slot != "__weakref__"} == {
+        "descriptor_id",
+        "tool_id",
+        "version",
+        "schema_digest",
+        "capability_digest",
+        "access",
+    }
+    assert all(
+        not callable(getattr(wrapper.registration, name))
+        for name in (
+            "descriptor_id",
+            "tool_id",
+            "version",
+            "schema_digest",
+            "capability_digest",
+            "access",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixed_dispatcher_cannot_be_replaced_after_composition(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    safe = RecordingBroker(PublicToolResult(status="completed", summary="safe"))
+    malicious = RecordingBroker(
+        PublicToolResult(status="completed", summary="unsafe")
+    )
+    runtime_registry, descriptor = _declare_test_executor(
+        tmp_path,
+        safe.execute,
+        database_name="fixed-dispatcher.sqlite",
+        manifest=context.tool_manifest[0],
+    )
+    build = getattr(control_plane, "_build_registry", None)
+    assert callable(build)
+    broker, registrations = build(runtime_registry, (descriptor,), 1)
+    runtime_registry.dispatcher = malicious.execute  # type: ignore[attr-defined]
+    repository = PythonTermRepository(tmp_path / "fixed-dispatcher-runtime.sqlite")
+    repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    router.admit(context)
+
+    result = await router.invoke(
+        context,
+        context.tool_manifest[0].tool_id,
+        {},
+        tool_call_id="fixed-dispatcher-call",
+    )
+
+    assert result.summary == "safe"
+    assert safe.calls == 1
+    assert malicious.calls == 0
+
+
 def test_executor_registration_rejects_callable_authority(tmp_path: Path) -> None:
     context, _ = _runtime_context(tmp_path)
     repository = PythonTermRepository(tmp_path / "authority.sqlite")
@@ -871,136 +1050,6 @@ def test_executor_registry_can_only_be_created_by_trusted_frozen_factory(
     )
 
 
-def test_control_plane_binding_rejects_hidden_callable_authority(
-    tmp_path: Path,
-) -> None:
-    context, _ = _runtime_context(tmp_path)
-    repository = PythonTermRepository(tmp_path / "hidden-authority.sqlite")
-    manifest = context.tool_manifest[0]
-
-    async def default_capture(handle, step_context, arguments, owner=repository):
-        return owner.get_tool_effect("effect")
-
-    async def partial_target(handle, step_context, arguments, *, owner=None):
-        return owner
-
-    class SlotsDispatcher:
-        __slots__ = ("owner",)
-
-        def __init__(self, owner) -> None:
-            self.owner = owner
-
-        async def __call__(self, handle, step_context, arguments):
-            return self.owner
-
-    class CallableDispatcher:
-        def __init__(self, owner) -> None:
-            self.owner = owner
-
-        async def __call__(self, handle, step_context, arguments):
-            return self.owner
-
-    dispatchers = (
-        default_capture,
-        functools.partial(partial_target, owner=repository),
-        SlotsDispatcher(repository),
-        CallableDispatcher(repository),
-    )
-    for dispatcher in dispatchers:
-        with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-            _register_test_host(tmp_path, dispatcher)
-
-
-def test_executor_composition_rejects_module_global_and_class_authority(
-    tmp_path: Path,
-) -> None:
-    context, _ = _runtime_context(tmp_path)
-    repository = PythonTermRepository(tmp_path / "module-class-authority.sqlite")
-    manifest = context.tool_manifest[0]
-    authority_module = ModuleType("captured_authority")
-    authority_module.repository = repository
-    captured_repository = repository
-
-    class AuthorityClass:
-        repository = captured_repository
-
-    async def module_dispatcher(handle, step_context, arguments):
-        return authority_module.repository
-
-    async def class_dispatcher(handle, step_context, arguments):
-        return AuthorityClass.repository
-
-    for dispatcher in (module_dispatcher, class_dispatcher):
-        with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-            _register_test_host(tmp_path, dispatcher)
-
-
-def test_dispatcher_scanner_does_not_trust_mutable_allowlisted_modules(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = PythonTermRepository(tmp_path / "mutable-module.sqlite")
-    monkeypatch.setattr(
-        asyncio,
-        "captured_wrapper",
-        {"nested": {"owner": repository}},
-        raising=False,
-    )
-
-    async def dispatcher(handle, step_context, arguments):
-        return asyncio.captured_wrapper  # type: ignore[attr-defined]
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-        _register_test_host(tmp_path, dispatcher)
-
-
-def test_dispatcher_scanner_revalidates_allowlisted_class_namespace(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = PythonTermRepository(tmp_path / "mutable-class.sqlite")
-    monkeypatch.setattr(
-        PublicToolResult,
-        "captured_wrapper",
-        {"nested": {"owner": repository}},
-        raising=False,
-    )
-
-    async def dispatcher(handle, step_context, arguments):
-        return PublicToolResult.captured_wrapper  # type: ignore[attr-defined]
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-        _register_test_host(tmp_path, dispatcher)
-
-    class ResultHolder:
-        def __init__(self) -> None:
-            self.result = PublicToolResult(status="completed", summary="safe")
-
-        async def __call__(self, handle, step_context, arguments):
-            return self.result.captured_wrapper  # type: ignore[attr-defined]
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-        _register_test_host(tmp_path, ResultHolder())
-
-
-def test_dispatcher_scanner_revalidates_nested_allowlisted_class_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = PythonTermRepository(tmp_path / "nested-mutable-class.sqlite")
-    monkeypatch.setitem(
-        PublicToolResult.model_config,
-        "captured_nested",
-        {"owner": repository},
-    )
-
-    async def dispatcher(handle, step_context, arguments):
-        return PublicToolResult.model_config["captured_nested"]
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-        _register_test_host(tmp_path, dispatcher)
-
-
 def test_tool_router_exposes_no_registry_construction_authority() -> None:
     assert not hasattr(tool_router_module, "_EXECUTOR_FACTORY_AUTHORITY")
     assert not callable(
@@ -1046,345 +1095,6 @@ def test_public_runtime_modules_expose_no_dispatcher_trust_minting_api() -> None
     assert tuple(offenders) == ()
 
 
-def test_only_existing_control_plane_host_identity_can_register_dispatcher(
-    tmp_path: Path,
-) -> None:
-    authority = object()
-    registry = RuntimeRegistryV2(
-        RuntimeV2Repository(tmp_path / "authoritative-runtime.sqlite"),
-        composition_authority=authority,
-    )
-    dispatcher = RecordingBroker(
-        PublicToolResult(status="completed", summary="safe")
-    )
-
-    with pytest.raises(ToolRouteError, match="Host dispatcher provenance"):
-        _approve_executor(
-            dispatcher.execute,  # type: ignore[arg-type]
-            _tool(),
-            "caller-selected",
-            ToolAccess(),
-        )
-    with pytest.raises(ToolRouteError, match="registry declaration"):
-        _build_registry(dispatcher.execute, (), 1)  # type: ignore[arg-type]
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="authority"):
-        registry._register_in_process_host(  # type: ignore[attr-defined]
-            object(),
-            runtime_id="python-term",
-            dispatcher=dispatcher.execute,
-        )
-
-    host_identity = registry._register_in_process_host(  # type: ignore[attr-defined]
-        authority,
-        runtime_id="python-term",
-        dispatcher=dispatcher.execute,
-    )
-    assert registry._verifies_in_process_host(host_identity)  # type: ignore[attr-defined]
-    with pytest.raises(RuntimeRegistryIntegrityError, match="authority"):
-        registry._register_in_process_host(  # type: ignore[attr-defined]
-            authority,
-            runtime_id="caller-selected-runtime",
-            dispatcher=dispatcher.execute,
-        )
-
-
-def test_host_identity_and_declarations_cannot_cross_runtime_registries(
-    tmp_path: Path,
-) -> None:
-    dispatcher = RecordingBroker(
-        PublicToolResult(status="completed", summary="safe")
-    )
-    registries: list[RuntimeRegistryV2] = []
-    hosts = []
-    for suffix in ("a", "b"):
-        authority = object()
-        registry = RuntimeRegistryV2(
-            RuntimeV2Repository(tmp_path / f"cross-registry-{suffix}.sqlite"),
-            composition_authority=authority,
-        )
-        registries.append(registry)
-        hosts.append(
-            registry._register_in_process_host(
-                authority,
-                runtime_id="python-term",
-                dispatcher=dispatcher.execute,
-            )
-        )
-
-    declaration = _approve_executor(
-        hosts[0],
-        _tool(),
-        "executor-1",
-        ToolAccess(),
-    )
-    assert not registries[1]._verifies_in_process_host(hosts[0])
-    with pytest.raises(ToolRouteError, match="provenance"):
-        _build_registry(hosts[1], (declaration,), 1)
-
-    broker, registrations = _build_registry(hosts[0], (declaration,), 1)
-    assert broker.verifies(registrations["read-file"], _tool())
-
-
-def test_control_plane_module_state_does_not_publish_live_host_capabilities(
-    tmp_path: Path,
-) -> None:
-    authority = object()
-    runtime_registry = RuntimeRegistryV2(
-        RuntimeV2Repository(tmp_path / "nonambient-runtime.sqlite"),
-        composition_authority=authority,
-    )
-    dispatcher = RecordingBroker(
-        PublicToolResult(status="completed", summary="safe")
-    )
-    host = runtime_registry._register_in_process_host(
-        authority,
-        runtime_id="python-term",
-        dispatcher=dispatcher.execute,
-    )
-    manifest = _tool()
-    declaration = _approve_executor(host, manifest, "executor-1", ToolAccess())
-    broker, _ = _build_registry(host, (declaration,), 1)
-    control_plane = importlib.import_module(
-        "workbench.runtime.engine_host.v2.python_term_control_plane"
-    )
-
-    def contains_identity(
-        value: object,
-        target: object,
-        *,
-        seen: set[int],
-        budget: list[int],
-    ) -> bool:
-        budget[0] -= 1
-        if budget[0] < 0:
-            return False
-        if value is target:
-            return True
-        if id(value) in seen:
-            return False
-        seen.add(id(value))
-        if isinstance(value, Mapping):
-            return any(
-                contains_identity(item, target, seen=seen, budget=budget)
-                for pair in value.items()
-                for item in pair
-            )
-        if isinstance(value, (tuple, list, set, frozenset)):
-            return any(
-                contains_identity(item, target, seen=seen, budget=budget)
-                for item in value
-            )
-        if is_dataclass(value) and not isinstance(value, type):
-            return any(
-                contains_identity(
-                    getattr(value, field.name), target, seen=seen, budget=budget
-                )
-                for field in fields(value)
-            )
-        return False
-
-    module_state = {
-        name: value
-        for name, value in vars(control_plane).items()
-        if not callable(value) and not isinstance(value, ModuleType)
-    }
-    assert not contains_identity(
-        module_state,
-        runtime_registry,
-        seen=set(),
-        budget=[1_024],
-    )
-    assert not contains_identity(
-        module_state,
-        host,
-        seen=set(),
-        budget=[1_024],
-    )
-    assert broker is not None
-
-
-def test_dispatcher_scanner_rejects_nested_and_callable_type_authority(
-    tmp_path: Path,
-) -> None:
-    repository = PythonTermRepository(tmp_path / "nested-authority.sqlite")
-    authority_module = ModuleType("nested_captured_authority")
-    authority_module.wrapper = {"nested": {"owner": repository}}
-    captured_repository = repository
-
-    class AuthorityClass:
-        wrapper = {"nested": {"owner": captured_repository}}
-
-    class ForgedBuiltinClass:
-        __module__ = "builtins"
-        wrapper = {"nested": {"owner": captured_repository}}
-
-    async def module_dispatcher(handle, step_context, arguments):
-        return authority_module.wrapper
-
-    async def class_dispatcher(handle, step_context, arguments):
-        return AuthorityClass.wrapper
-
-    async def forged_builtin_dispatcher(handle, step_context, arguments):
-        return ForgedBuiltinClass.wrapper
-
-    class StatelessCallable:
-        __slots__ = ()
-
-        async def __call__(self, handle, step_context, arguments):
-            return captured_repository.get_tool_effect("effect")
-
-    class ClassAuthorityCallable:
-        __slots__ = ()
-        owner = captured_repository
-
-        async def __call__(self, handle, step_context, arguments):
-            return self.owner.get_tool_effect("effect")
-
-    class HiddenSlotCallable:
-        __slots__ = ("__owner",)
-
-        def __init__(self, owner) -> None:
-            object.__setattr__(self, "_HiddenSlotCallable__owner", owner)
-
-        def __getattribute__(self, name: str):
-            if name in {"__dict__", "__owner"}:
-                raise RuntimeError("introspection denied")
-            return object.__getattribute__(self, name)
-
-        async def __call__(self, handle, step_context, arguments):
-            return object.__getattribute__(self, "_HiddenSlotCallable__owner")
-
-    class HiddenMapping(dict):
-        def __init__(self, owner) -> None:
-            super().__init__()
-            self.owner = owner
-
-    class MappingCallable:
-        def __init__(self, wrapper: Mapping[object, object]) -> None:
-            self.wrapper = wrapper
-
-        async def __call__(self, handle, step_context, arguments):
-            return self.wrapper
-
-    for dispatcher in (
-        module_dispatcher,
-        class_dispatcher,
-        forged_builtin_dispatcher,
-        StatelessCallable(),
-        ClassAuthorityCallable(),
-        HiddenSlotCallable(repository),
-        MappingCallable(HiddenMapping(repository)),
-    ):
-        with pytest.raises(RuntimeRegistryIntegrityError, match="binding") as raised:
-            _register_test_host(tmp_path, dispatcher)
-        assert raised.value.__cause__ is None
-        assert raised.value.__context__ is None
-
-
-def test_dispatcher_scanner_introspection_exception_fails_closed(
-    tmp_path: Path,
-) -> None:
-    class IntrospectionTrap:
-        __slots__ = ()
-
-        def __getattribute__(self, name: str):
-            raise RuntimeError("untrusted introspection failure")
-
-        async def __call__(self, handle, step_context, arguments):
-            return PublicToolResult(status="completed", summary="unsafe")
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="binding") as raised:
-        _register_test_host(tmp_path, IntrospectionTrap())
-
-    assert raised.value.__cause__ is None
-    assert raised.value.__context__ is None
-
-
-@pytest.mark.parametrize("attribute", ("_loop", "_waiters"))
-def test_dispatcher_scanner_rejects_authority_hidden_in_event_internals(
-    tmp_path: Path,
-    attribute: str,
-) -> None:
-    repository = PythonTermRepository(tmp_path / f"event-{attribute}.sqlite")
-    gate = asyncio.Event()
-    gate.__dict__[attribute] = (
-        repository if attribute == "_loop" else deque((repository,))
-    )
-
-    class EventDispatcher:
-        def __init__(self, event: asyncio.Event) -> None:
-            self.event = event
-
-        async def __call__(self, handle, step_context, arguments):
-            await self.event.wait()
-            return PublicToolResult(status="completed", summary="unsafe")
-
-    with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-        _register_test_host(tmp_path, EventDispatcher(gate))
-
-
-def test_sync_dispatcher_shapes_are_rejected_without_execution(tmp_path: Path) -> None:
-    calls = 0
-
-    async def completed():
-        return PublicToolResult(status="completed", summary="unsafe")
-
-    def sync_function(handle, step_context, arguments):
-        nonlocal calls
-        calls += 1
-        return completed()
-
-    class SyncMethod:
-        def dispatch(self, handle, step_context, arguments):
-            nonlocal calls
-            calls += 1
-            return completed()
-
-    class SyncCallable:
-        def __call__(self, handle, step_context, arguments):
-            nonlocal calls
-            calls += 1
-            return completed()
-
-    for dispatcher in (
-        sync_function,
-        SyncMethod().dispatch,
-        functools.partial(sync_function),
-        SyncCallable(),
-    ):
-        with pytest.raises(RuntimeRegistryIntegrityError, match="binding"):
-            _register_test_host(tmp_path, dispatcher)
-
-    assert calls == 0
-
-
-def test_proven_async_dispatcher_shapes_are_admitted(tmp_path: Path) -> None:
-    async def async_function(handle, step_context, arguments):
-        return PublicToolResult(status="completed", summary="safe")
-
-    class AsyncMethod:
-        async def dispatch(self, handle, step_context, arguments):
-            return PublicToolResult(status="completed", summary="safe")
-
-    class AsyncCallable:
-        __slots__ = ()
-
-        async def __call__(self, handle, step_context, arguments):
-            return PublicToolResult(status="completed", summary="safe")
-
-    dispatchers = (
-        async_function,
-        AsyncMethod().dispatch,
-        functools.partial(async_function),
-        AsyncCallable(),
-    )
-
-    for dispatcher in dispatchers:
-        host = _register_test_host(tmp_path, dispatcher)
-        assert host.runtime_id == "python-term"
-
-
 def test_recovered_factory_authority_cannot_self_issue_registry(
     tmp_path: Path,
 ) -> None:
@@ -1414,15 +1124,46 @@ def test_recovered_factory_authority_cannot_self_issue_registry(
         )
     forged = object.__new__(ExecutorRegistration)
     for name, value in (
+        ("descriptor_id", registration.descriptor_id),
         ("tool_id", registration.tool_id),
         ("version", registration.version),
         ("schema_digest", registration.schema_digest),
         ("capability_digest", registration.capability_digest),
         ("access", registration.access),
-        ("provenance_id", object()),
     ):
         object.__setattr__(forged, f"_ExecutorRegistration__{name}", value)
     assert not legitimate_broker.verifies(forged, manifest)
+
+
+def test_registration_copy_and_router_replay_are_rejected(tmp_path: Path) -> None:
+    manifest = _tool()
+    implementation = RecordingBroker(
+        PublicToolResult(status="completed", summary="safe")
+    )
+    broker, registrations = _executor_registry(
+        tmp_path,
+        implementation.execute,
+        ((manifest, "executor-1", ToolAccess()),),
+    )
+    registration = registrations[manifest.tool_id]
+
+    with pytest.raises(AttributeError, match="immutable"):
+        copy.copy(registration)
+    first = ToolRouter(
+        PythonTermRepository(tmp_path / "registration-replay-a.sqlite"),
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+    )
+    assert first is not None
+    with pytest.raises(ToolRouteError) as raised:
+        ToolRouter(
+            PythonTermRepository(tmp_path / "registration-replay-b.sqlite"),
+            registrations,
+            executor_broker=broker,
+            request_digests=HmacRequestDigestService(os.urandom(32)),
+        )
+    assert raised.value.code == "registration_rejected"
 
 
 @pytest.mark.asyncio
@@ -1463,7 +1204,6 @@ async def test_post_admission_broker_or_registration_mutation_fails_before_effec
             "_ExecutorBroker__dispatcher",
             malicious.execute,
         )
-    object.__setattr__(broker, "_ExecutorBroker__registrations", {})
 
     with pytest.raises(ToolRouteError) as raised:
         await router.invoke(
@@ -1585,7 +1325,7 @@ def test_synchronous_broker_is_rejected_before_effect_or_execution(
 
     manifest = _tool(tool_id="write-file", read_only=False)
     context, envelope = _runtime_context(tmp_path, tools=(manifest,))
-    with pytest.raises(RuntimeRegistryIntegrityError, match="dispatcher") as raised:
+    with pytest.raises(ToolRouteError, match="descriptor") as raised:
         _router(
             tmp_path,
             context,

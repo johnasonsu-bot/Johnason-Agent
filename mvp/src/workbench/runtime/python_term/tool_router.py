@@ -20,6 +20,10 @@ from jsonschema import FormatChecker
 from jsonschema.validators import validator_for
 
 from workbench.runtime.engine_host.v2 import ToolManifestEntryV2
+from workbench.runtime.engine_host.v2.registry import (
+    ExecutorAccessV2 as ToolAccess,
+    ExecutorFileAccessV2 as FileAccess,
+)
 
 from .contracts import (
     PublicToolResult,
@@ -30,36 +34,6 @@ from .contracts import (
     validate_safe_json,
 )
 from .repository import PythonTermRepository
-
-
-@dataclass(frozen=True, slots=True)
-class FileAccess:
-    argument: str
-    mode: Literal["read", "write"]
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.argument, str)
-            or not re.fullmatch(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$", self.argument)
-        ):
-            raise ValueError("file access argument must be an opaque identifier")
-        if self.mode not in {"read", "write"}:
-            raise ValueError("file access mode must be read or write")
-
-
-@dataclass(frozen=True, slots=True)
-class ToolAccess:
-    files: tuple[FileAccess, ...] = ()
-    network: bool = False
-    command: bool = False
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.files, tuple):
-            raise TypeError("tool access files must be a tuple")
-        if any(type(item) is not FileAccess for item in self.files):
-            raise TypeError("tool access files must contain FileAccess values")
-        if type(self.network) is not bool or type(self.command) is not bool:
-            raise TypeError("tool access flags must be boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,12 +82,12 @@ class ExecutorRegistration:
     """Opaque handle whose provenance is owned by the Host control plane."""
 
     __slots__ = (
+        "__descriptor_id",
         "__tool_id",
         "__version",
         "__schema_digest",
         "__capability_digest",
         "__access",
-        "__provenance_id",
         "__weakref__",
     )
 
@@ -125,6 +99,10 @@ class ExecutorRegistration:
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("Executor registration is immutable")
+
+    @property
+    def descriptor_id(self) -> str:
+        return self.__descriptor_id
 
     @property
     def tool_id(self) -> str:
@@ -215,16 +193,7 @@ def _registration_metadata(
 
 
 class ExecutorBroker:
-    __slots__ = (
-        "__provenance_id",
-        "__registrations",
-        "__active_executions",
-        "__supervisor_capacity",
-        "__runtime_registry",
-        "__runtime_id",
-        "__host_generation",
-        "__weakref__",
-    )
+    __slots__ = ("__weakref__",)
 
     def __init__(self, *_: object, **__: object) -> None:
         raise ToolRouteError(
@@ -409,7 +378,6 @@ class _AdmittedTool:
 
 @dataclass(frozen=True, slots=True)
 class SdkToolWrapper:
-    context: StepContext
     manifest: ToolManifestEntryV2
     registration: ExecutorRegistration
 
@@ -755,7 +723,6 @@ class ToolRouter:
                 ) from None
             wrappers.append(
                 SdkToolWrapper(
-                    context=context,
                     manifest=manifest,
                     registration=admitted.registration,
                 )

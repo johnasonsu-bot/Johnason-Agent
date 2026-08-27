@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+import json
+import re
 import sqlite3
 import threading
 import time
-from typing import Literal, cast
+from typing import Literal
 
 from pydantic import ConfigDict, StrictBool
 
@@ -15,6 +16,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     FrozenModel,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
+    ToolManifestEntryV2,
 )
 from workbench.runtime.engine_host.v2.repository import (
     RuntimeV2Repository,
@@ -52,36 +54,86 @@ class RuntimeRegistryIntegrityError(RuntimeError):
     """A persisted registration is malformed or disagrees with live capability data."""
 
 
-class RegisteredRuntimeHostV2:
-    """Opaque live Host identity issued by one authoritative Runtime Registry."""
+@dataclass(frozen=True, slots=True)
+class ExecutorFileAccessV2:
+    """One declarative filesystem argument required by an executor."""
 
-    __slots__ = (
-        "__registry",
-        "__registry_identity",
-        "__runtime_id",
-        "__generation",
-        "__identity",
-        "__weakref__",
+    argument: str
+    mode: Literal["read", "write"]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.argument, str)
+            or not re.fullmatch(
+                r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$", self.argument
+            )
+        ):
+            raise ValueError("file access argument must be an opaque identifier")
+        if self.mode not in {"read", "write"}:
+            raise ValueError("file access mode must be read or write")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorAccessV2:
+    """Frozen declarative authority consumed by the Tool Router."""
+
+    files: tuple[ExecutorFileAccessV2, ...] = ()
+    network: bool = False
+    command: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.files, tuple):
+            raise TypeError("tool access files must be a tuple")
+        if any(type(item) is not ExecutorFileAccessV2 for item in self.files):
+            raise TypeError("tool access files must contain FileAccess values")
+        if type(self.network) is not bool or type(self.command) is not bool:
+            raise TypeError("tool access flags must be boolean")
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ExecutorDescriptorV2:
+    """Immutable declarative descriptor; never carries an implementation object."""
+
+    descriptor_id: str
+    runtime_id: str
+    host_generation: int
+    executor_handle: str
+    manifest: ToolManifestEntryV2
+    access: ExecutorAccessV2
+    schema_digest: str
+    capability_digest: str
+
+
+@dataclass(slots=True)
+class _ExecutorDescriptorRegistration:
+    descriptor: ExecutorDescriptorV2
+    snapshot: str
+    consumed: bool = False
+
+
+def _executor_descriptor_snapshot(descriptor: ExecutorDescriptorV2) -> str:
+    return json.dumps(
+        {
+            "descriptor_id": descriptor.descriptor_id,
+            "runtime_id": descriptor.runtime_id,
+            "host_generation": descriptor.host_generation,
+            "executor_handle": descriptor.executor_handle,
+            "manifest": descriptor.manifest.model_dump(mode="json"),
+            "access": {
+                "files": tuple(
+                    {"argument": item.argument, "mode": item.mode}
+                    for item in descriptor.access.files
+                ),
+                "network": descriptor.access.network,
+                "command": descriptor.access.command,
+            },
+            "schema_digest": descriptor.schema_digest,
+            "capability_digest": descriptor.capability_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
-
-    def __init__(self, *_: object, **__: object) -> None:
-        raise RuntimeRegistryIntegrityError(
-            "runtime Host identity requires the control-plane composition authority"
-        ) from None
-
-    def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("runtime Host identity is immutable")
-
-    @property
-    def runtime_id(self) -> str:
-        return self.__runtime_id
-
-    @property
-    def generation(self) -> int:
-        return self.__generation
-
-    def __repr__(self) -> str:
-        return "RegisteredRuntimeHostV2(<opaque>)"
 
 
 class RuntimeRequirementsV2(FrozenModel):
@@ -125,252 +177,160 @@ class _Registration:
     state: Literal["ready", "disabled", "unavailable"]
 
 
-@dataclass(slots=True)
-class _InProcessHostRegistration:
-    identity: RegisteredRuntimeHostV2
-    dispatcher: Callable[[str, object, Mapping[str, object]], Awaitable[object]]
-    runtime_id: str
-    generation: int
-    registry_identity: object
-    identity_marker: object
-    extensions: dict[str, object]
-
-
 class RuntimeRegistryV2:
     """Select only live, persisted v2 capabilities and pin accepted commands."""
 
-    def __init__(
-        self,
-        repository: RuntimeV2Repository,
-        *,
-        composition_authority: object | None = None,
-    ) -> None:
+    def __init__(self, repository: RuntimeV2Repository) -> None:
         if not isinstance(repository, RuntimeV2Repository):
             raise TypeError("repository must be a RuntimeV2Repository")
-        if composition_authority is not None and type(composition_authority) is not object:
-            raise TypeError("composition authority must be an exact opaque object")
         self.repository = repository
         self._lock = threading.RLock()
         self._advertised: dict[str, RuntimeCapabilitiesV2] = {}
-        self.__composition_authority = composition_authority
-        self.__registry_identity = object()
-        self.__in_process_hosts: dict[
-            RegisteredRuntimeHostV2, _InProcessHostRegistration
-        ] = {}
-        self.__in_process_hosts_by_runtime: dict[
-            str, _InProcessHostRegistration
+        self.__executor_runtime_id: str | None = None
+        self.__executor_host_generation = 1
+        self.__executor_descriptors: dict[
+            int, _ExecutorDescriptorRegistration
         ] = {}
 
-    def _register_in_process_host(
-        self,
-        composition_authority: object,
-        *,
-        runtime_id: str,
-        dispatcher: object,
-    ) -> RegisteredRuntimeHostV2:
-        """Composition-root seam; exact authority is required despite discoverability."""
-        if (
-            self.__composition_authority is None
-            or composition_authority is not self.__composition_authority
-            or type(composition_authority) is not object
-        ):
+    def _register_executor_descriptor(
+        self, descriptor: ExecutorDescriptorV2
+    ) -> None:
+        """Register declarative executor identity without receiving implementation code."""
+        if type(descriptor) is not ExecutorDescriptorV2:
             raise RuntimeRegistryIntegrityError(
-                "runtime Host composition authority was rejected"
+                "executor descriptor type was rejected"
             ) from None
-        if (
-            not isinstance(runtime_id, str)
-            or not runtime_id
-            or len(runtime_id) > 128
-        ):
+        try:
+            valid = (
+                isinstance(descriptor.descriptor_id, str)
+                and re.fullmatch(
+                    r"executor-descriptor-[0-9a-f]{32}", descriptor.descriptor_id
+                )
+                is not None
+                and isinstance(descriptor.runtime_id, str)
+                and re.fullmatch(
+                    r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,127}$",
+                    descriptor.runtime_id,
+                )
+                is not None
+                and type(descriptor.host_generation) is int
+                and descriptor.host_generation == 1
+                and isinstance(descriptor.executor_handle, str)
+                and re.fullmatch(
+                    r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}$",
+                    descriptor.executor_handle,
+                )
+                is not None
+                and type(descriptor.manifest) is ToolManifestEntryV2
+                and type(descriptor.access) is ExecutorAccessV2
+                and re.fullmatch(r"[0-9a-f]{64}", descriptor.schema_digest)
+                is not None
+                and re.fullmatch(r"[0-9a-f]{64}", descriptor.capability_digest)
+                is not None
+            )
+            snapshot = _executor_descriptor_snapshot(descriptor)
+        except (AttributeError, TypeError, ValueError):
+            valid = False
+            snapshot = ""
+        if not valid:
             raise RuntimeRegistryIntegrityError(
-                "runtime Host identity is invalid"
-            ) from None
-        from workbench.runtime.engine_host.v2.python_term_control_plane import (
-            _host_dispatcher_is_admissible,
-        )
-
-        if not _host_dispatcher_is_admissible(dispatcher):
-            raise RuntimeRegistryIntegrityError(
-                "runtime Host dispatcher binding was rejected"
+                "executor descriptor declaration was rejected"
             ) from None
         with self._lock:
-            if runtime_id in self.__in_process_hosts_by_runtime:
+            if (
+                self.__executor_runtime_id is not None
+                and self.__executor_runtime_id != descriptor.runtime_id
+            ):
                 raise RuntimeRegistryIntegrityError(
-                    "runtime Host identity is already registered"
+                    "executor descriptor runtime was rejected"
                 ) from None
-            generation = 1
-            identity_marker = object()
-            host = object.__new__(RegisteredRuntimeHostV2)
-            object.__setattr__(host, "_RegisteredRuntimeHostV2__registry", self)
-            object.__setattr__(
-                host,
-                "_RegisteredRuntimeHostV2__registry_identity",
-                self.__registry_identity,
+            if any(
+                record.descriptor.descriptor_id == descriptor.descriptor_id
+                or record.descriptor.executor_handle == descriptor.executor_handle
+                or record.descriptor.manifest.tool_id == descriptor.manifest.tool_id
+                for record in self.__executor_descriptors.values()
+            ):
+                raise RuntimeRegistryIntegrityError(
+                    "executor descriptor identity is already registered"
+                ) from None
+            self.__executor_runtime_id = descriptor.runtime_id
+            self.__executor_descriptors[id(descriptor)] = (
+                _ExecutorDescriptorRegistration(
+                    descriptor=descriptor,
+                    snapshot=snapshot,
+                )
             )
-            object.__setattr__(
-                host, "_RegisteredRuntimeHostV2__runtime_id", runtime_id
-            )
-            object.__setattr__(
-                host, "_RegisteredRuntimeHostV2__generation", generation
-            )
-            object.__setattr__(
-                host, "_RegisteredRuntimeHostV2__identity", identity_marker
-            )
-            record = _InProcessHostRegistration(
-                identity=host,
-                dispatcher=cast(
-                    Callable[
-                        [str, object, Mapping[str, object]], Awaitable[object]
-                    ],
-                    dispatcher,
-                ),
-                runtime_id=runtime_id,
-                generation=generation,
-                registry_identity=self.__registry_identity,
-                identity_marker=identity_marker,
-                extensions={},
-            )
-            self.__in_process_hosts[host] = record
-            self.__in_process_hosts_by_runtime[runtime_id] = record
-            self.__composition_authority = None
-        return host
 
-    def _in_process_host_record(
-        self, host: object
-    ) -> _InProcessHostRegistration | None:
-        if type(host) is not RegisteredRuntimeHostV2:
+    def _executor_descriptor_record(
+        self, descriptor: object
+    ) -> _ExecutorDescriptorRegistration | None:
+        if type(descriptor) is not ExecutorDescriptorV2:
             return None
         with self._lock:
-            record = self.__in_process_hosts.get(host)
-            if record is None:
+            record = self.__executor_descriptors.get(id(descriptor))
+            if record is None or record.descriptor is not descriptor:
                 return None
             try:
                 valid = (
-                    object.__getattribute__(
-                        host, "_RegisteredRuntimeHostV2__registry"
-                    )
-                    is self
-                    and object.__getattribute__(
-                        host, "_RegisteredRuntimeHostV2__registry_identity"
-                    )
-                    is record.registry_identity
-                    and record.registry_identity is self.__registry_identity
-                    and object.__getattribute__(
-                        host, "_RegisteredRuntimeHostV2__runtime_id"
-                    )
-                    == record.runtime_id
-                    and object.__getattribute__(
-                        host, "_RegisteredRuntimeHostV2__generation"
-                    )
-                    == record.generation
-                    and object.__getattribute__(
-                        host, "_RegisteredRuntimeHostV2__identity"
-                    )
-                    is record.identity_marker
-                    and self.__in_process_hosts_by_runtime.get(record.runtime_id)
-                    is record
+                    descriptor.runtime_id == self.__executor_runtime_id
+                    and descriptor.host_generation
+                    == self.__executor_host_generation
+                    and _executor_descriptor_snapshot(descriptor)
+                    == record.snapshot
                 )
-            except (AttributeError, TypeError):
+            except (AttributeError, TypeError, ValueError):
                 return None
-        if not valid:
-            return None
-        from workbench.runtime.engine_host.v2.python_term_control_plane import (
-            _host_dispatcher_is_admissible,
-        )
+            return record if valid else None
 
-        return record if _host_dispatcher_is_admissible(record.dispatcher) else None
-
-    def _verifies_in_process_host(self, host: object) -> bool:
-        return self._in_process_host_record(host) is not None
-
-    def _in_process_host_snapshot(
-        self, host: object
-    ) -> tuple[str, int] | None:
-        record = self._in_process_host_record(host)
-        if record is None:
-            return None
-        return record.runtime_id, record.generation
-
-    def _verifies_in_process_host_snapshot(
-        self, runtime_id: str, generation: int
+    def _verifies_executor_descriptor(
+        self,
+        descriptor: object,
+        *,
+        consumed: bool | None = None,
     ) -> bool:
-        with self._lock:
-            record = self.__in_process_hosts_by_runtime.get(runtime_id)
+        record = self._executor_descriptor_record(descriptor)
         return (
             record is not None
-            and record.generation == generation
-            and self._in_process_host_record(record.identity) is record
+            and (consumed is None or record.consumed is consumed)
         )
 
-    def _in_process_host_extension(
-        self,
-        host: object,
-        namespace: str,
-        factory: Callable[[], object],
-    ) -> object:
-        if not isinstance(namespace, str) or not namespace:
+    def _consume_executor_descriptors(
+        self, descriptors: tuple[ExecutorDescriptorV2, ...]
+    ) -> tuple[str, int, tuple[ExecutorDescriptorV2, ...]]:
+        if type(descriptors) is not tuple or not descriptors:
             raise RuntimeRegistryIntegrityError(
-                "runtime Host extension namespace is invalid"
-            ) from None
-        record = self._in_process_host_record(host)
-        if record is None:
-            raise RuntimeRegistryIntegrityError(
-                "runtime Host identity was rejected"
+                "executor descriptor registration was rejected"
             ) from None
         with self._lock:
-            extension = record.extensions.get(namespace)
-            if extension is None:
-                extension = factory()
-                record.extensions[namespace] = extension
-            return extension
-
-    def _in_process_host_extension_for_snapshot(
-        self,
-        runtime_id: str,
-        generation: int,
-        namespace: str,
-    ) -> object | None:
-        """Return an existing Host extension only after live Host revalidation."""
-        if (
-            not isinstance(runtime_id, str)
-            or not runtime_id
-            or type(generation) is not int
-            or not isinstance(namespace, str)
-            or not namespace
-        ):
-            return None
-        with self._lock:
-            record = self.__in_process_hosts_by_runtime.get(runtime_id)
-        if (
-            record is None
-            or record.generation != generation
-            or self._in_process_host_record(record.identity) is not record
-        ):
-            return None
-        with self._lock:
-            return record.extensions.get(namespace)
-
-    async def _dispatch_in_process_host(
-        self,
-        runtime_id: str,
-        generation: int,
-        executor_handle: str,
-        context: object,
-        arguments: Mapping[str, object],
-    ) -> object:
-        """Invoke only from a supervisor-owned task after live identity revalidation."""
-        with self._lock:
-            record = self.__in_process_hosts_by_runtime.get(runtime_id)
-        if (
-            record is None
-            or record.generation != generation
-            or self._in_process_host_record(record.identity) is not record
-        ):
-            raise RuntimeRegistryIntegrityError(
-                "runtime Host identity was rejected"
-            ) from None
-        operation = record.dispatcher(executor_handle, context, arguments)
-        return await operation
+            records = tuple(
+                self._executor_descriptor_record(descriptor)
+                for descriptor in descriptors
+            )
+            if (
+                any(record is None or record.consumed for record in records)
+                or len({id(descriptor) for descriptor in descriptors})
+                != len(descriptors)
+                or len({descriptor.descriptor_id for descriptor in descriptors})
+                != len(descriptors)
+                or len({descriptor.executor_handle for descriptor in descriptors})
+                != len(descriptors)
+                or len({descriptor.manifest.tool_id for descriptor in descriptors})
+                != len(descriptors)
+                or len({descriptor.runtime_id for descriptor in descriptors}) != 1
+                or len(
+                    {descriptor.host_generation for descriptor in descriptors}
+                )
+                != 1
+            ):
+                raise RuntimeRegistryIntegrityError(
+                    "executor descriptor registration was rejected"
+                ) from None
+            for record in records:
+                assert record is not None
+                record.consumed = True
+            runtime_id = descriptors[0].runtime_id
+            generation = descriptors[0].host_generation
+        return runtime_id, generation, descriptors
 
     def register(
         self,
