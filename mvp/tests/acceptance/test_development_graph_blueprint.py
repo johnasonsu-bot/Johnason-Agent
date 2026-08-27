@@ -176,6 +176,45 @@ def test_nested_backend_command_ignores_only_this_gate_file() -> None:
     assert policy.backend.tests == policy.backend.allowed_commands
     (backend_command,) = policy.backend.tests
     assert "--ignore=tests/acceptance/test_development_graph_blueprint.py" in backend_command
+    assert policy.electron_playwright.tests == (("npm", "test"),)
+
+    passing_command = (sys.executable, "-m", "pytest", "--version")
+    failing_commands = {
+        "backend": (
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/__forced_missing__.py",
+            "-q",
+        ),
+        "electron": (
+            sys.executable,
+            "-m",
+            "pytest",
+            "tests/__forced_missing_electron__.py",
+            "-q",
+        ),
+    }
+    for fault in (
+        "ownership",
+        "backend",
+        "electron",
+        "remote",
+        "missing_evidence",
+        "key_error",
+        "exception",
+    ):
+        fault_policy = _integration_regression_policy(fault)
+        expected_backend = (
+            failing_commands["backend"] if fault == "backend" else passing_command
+        )
+        expected_electron = (
+            failing_commands["electron"] if fault == "electron" else passing_command
+        )
+        assert fault_policy.backend.tests == (expected_backend,)
+        assert fault_policy.backend.allowed_commands == (expected_backend,)
+        assert fault_policy.electron_playwright.tests == (expected_electron,)
+        assert fault_policy.electron_playwright.allowed_commands == (expected_electron,)
 
     collected = subprocess.run(
         (

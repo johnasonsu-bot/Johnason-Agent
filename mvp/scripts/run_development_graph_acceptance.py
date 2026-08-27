@@ -213,7 +213,7 @@ def _node(
 
 
 def _integration_regression_policy(inject: str | None) -> IntegrationRegressionPolicy:
-    backend_command = (
+    full_backend_command = (
         sys.executable,
         "-m",
         "pytest",
@@ -223,7 +223,10 @@ def _integration_regression_policy(inject: str | None) -> IntegrationRegressionP
         "-q",
         "--ignore=tests/acceptance/test_development_graph_blueprint.py",
     )
-    electron_command = ("npm", "test")
+    full_electron_command = ("npm", "test")
+    passing_command = (sys.executable, "-m", "pytest", "--version")
+    backend_command = full_backend_command if inject is None else passing_command
+    electron_command = full_electron_command if inject is None else passing_command
     if inject == "backend":
         backend_command = (
             sys.executable,

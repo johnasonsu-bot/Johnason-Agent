@@ -160,9 +160,10 @@ cd canvas-spike
 npm test
 ```
 
-标准后端保留轻量 CLI 安全测试；独立 meta/E2E 只包含会在内部再次运行 backend
-与 Electron regression 的 happy-path 和 fault-injection 场景。两类 pytest 计数必须
-分别记录，不能合并为一次完整后端结果。
+标准后端保留轻量 CLI 安全测试。独立 meta/E2E 的 happy-path 在内部真实运行一次
+完整 backend 与 `npm test`；fault-injection 使用确定性 Python pass/fail commands，
+不重复外部套件。独立 frontend gate 仍只执行上方一次 `npm test`。两类 pytest
+计数必须分别记录，不能合并为一次完整后端结果。
 
 外部 LM Studio、DeepSeek 或 Data Platform 测试需要相应本地服务/凭据，未配置时相关测试会跳过或报告 blocked；这不等同于外部链路已在当前机器验证。
 

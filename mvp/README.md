@@ -253,8 +253,9 @@ cd mvp
   -m "not development_graph_meta_e2e"
 ```
 
-该门排除会在内部再次运行完整 backend 与 Electron regression 的 Development
-Graph meta/E2E 场景，避免递归和重复执行。Batch 3.0 的
+该门排除 Development Graph meta/E2E，避免递归和重复执行。meta/E2E 只有
+happy-path 会在内部真实运行一次完整 backend 与 `npm test`；fault cases 使用
+确定性 Python pass/fail commands 验证路由和证据。Batch 3.0 的
 `568 passed, 6 skipped` 只是对应历史提交的验收证据；修改代码后必须重新运行，
 不能复用旧结果声明当前 HEAD 通过。
 
@@ -266,8 +267,9 @@ Graph meta/E2E 场景，避免递归和重复执行。Batch 3.0 的
   -m development_graph_meta_e2e
 ```
 
-该门单独运行 happy-path 与 fault-injection 场景。场景内部 backend regression
-继续忽略当前 blueprint 文件，禁止递归；轻量 CLI 安全测试仍属于标准后端门。
+该门单独运行 happy-path 与 fault-injection 场景。happy-path 内部 backend
+regression 继续忽略当前 blueprint 文件，禁止递归，并与 Electron regression 各
+执行一次；fault cases 不重复外部套件。轻量 CLI 安全测试仍属于标准后端门。
 
 ### 10.4 LangGraph 运行门
 
