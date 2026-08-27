@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import errno
 import hashlib
 import json
@@ -13,9 +12,11 @@ import re
 import signal
 import socket
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -37,19 +38,58 @@ _SENSITIVE_ENVIRONMENT_NAME = re.compile(
 )
 _MAX_ARGV_ITEMS = 64
 _MAX_ARGV_BYTES = 32 * 1024
-_CONTROL_SOCKET_BYTES = 512 * 1024
+_MAX_CONTROL_PAYLOAD_BYTES = 256 * 1024
+_CONTROL_TRANSFER_MS = 1_000
 _READ_CHUNK_BYTES = 4096
 _POLL_SECONDS = 0.005
 _OUTPUT_DRAIN_MS = 250
+_SANDBOX_EXECUTABLE = Path("/usr/bin/sandbox-exec")
+_CODESIGN_EXECUTABLE = Path("/usr/bin/codesign")
+_SINGLE_PROCESS_SANDBOX_PROFILE = (
+    "(version 1) (allow default) (deny process-fork)"
+)
 _EXEC_WRAPPER_SOURCE = r"""
-import json
 import os
-import struct
 import sys
 
 try:
     control_fd = int(sys.argv[1])
     cwd_fd = int(sys.argv[2])
+    sandbox_executable = sys.argv[3]
+    sandbox_profile = sys.argv[4]
+    sandboxed_wrapper = sys.argv[5]
+    os.fchdir(cwd_fd)
+    os.close(cwd_fd)
+    os.execve(
+        sandbox_executable,
+        (
+            sandbox_executable,
+            "-p",
+            sandbox_profile,
+            sys.executable,
+            "-I",
+            "-c",
+            sandboxed_wrapper,
+            str(control_fd),
+        ),
+        os.environ,
+    )
+except BaseException:
+    try:
+        os.write(2, b"PTY exec wrapper failed\n")
+    finally:
+        os._exit(126)
+""".strip()
+_SANDBOXED_EXEC_WRAPPER_SOURCE = r"""
+import errno
+import json
+import os
+import signal
+import struct
+import sys
+
+try:
+    control_fd = int(sys.argv[1])
 
     def read_exact(count):
         chunks = []
@@ -66,17 +106,38 @@ try:
     if payload_size > 262144:
         raise ValueError("payload too large")
     argv = json.loads(read_exact(payload_size).decode("utf-8"))
-    if not isinstance(argv, list) or not argv:
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(item, str) or not item for item in argv)
+    ):
         raise ValueError("invalid argv")
-    if read_exact(1) != b"\x01":
-        raise ValueError("start gate rejected")
-    os.fchdir(cwd_fd)
+
+    try:
+        probe_pid = os.fork()
+    except OSError as error:
+        if error.errno != errno.EPERM:
+            raise
+    else:
+        if probe_pid == 0:
+            os._exit(126)
+        try:
+            os.kill(probe_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        while True:
+            try:
+                os.waitpid(probe_pid, 0)
+                break
+            except InterruptedError:
+                continue
+        raise RuntimeError("process-fork sandbox verification failed")
+
     os.close(control_fd)
-    os.close(cwd_fd)
     os.execvpe(argv[0], argv, os.environ)
 except BaseException:
     try:
-        os.write(2, b"PTY exec wrapper failed\n")
+        os.write(2, b"PTY sandbox verification failed\n")
     finally:
         os._exit(126)
 """.strip()
@@ -108,219 +169,39 @@ class PtyExecutionSnapshot:
     quiescent: bool
 
 
-@dataclass(frozen=True, slots=True)
-class _ProcessIdentity:
-    pid: int
-    started_seconds: int
-    started_microseconds: int
-
-
 @dataclass(slots=True)
 class _SpawnedProcess:
     process: asyncio.subprocess.Process
-    start_gate: socket.socket
+    control: socket.socket
+    payload: bytes
 
-    def release(self) -> None:
+    async def release(self) -> None:
         try:
-            self.start_gate.sendall(b"\x01")
+            self.control.setblocking(False)
+            async with asyncio.timeout(_CONTROL_TRANSFER_MS / 1000):
+                await asyncio.get_running_loop().sock_sendall(
+                    self.control,
+                    self.payload,
+                )
         finally:
-            self.start_gate.close()
+            self.control.close()
 
     def abort(self) -> None:
-        self.start_gate.close()
+        self.control.close()
 
 
-class _DarwinProcBsdInfo(ctypes.Structure):
-    _fields_ = (
-        ("flags", ctypes.c_uint32),
-        ("status", ctypes.c_uint32),
-        ("exit_status", ctypes.c_uint32),
-        ("pid", ctypes.c_uint32),
-        ("ppid", ctypes.c_uint32),
-        ("uid", ctypes.c_uint32),
-        ("gid", ctypes.c_uint32),
-        ("ruid", ctypes.c_uint32),
-        ("rgid", ctypes.c_uint32),
-        ("svuid", ctypes.c_uint32),
-        ("svgid", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32),
-        ("command", ctypes.c_char * 16),
-        ("name", ctypes.c_char * 32),
-        ("open_files", ctypes.c_uint32),
-        ("pgid", ctypes.c_uint32),
-        ("job_control", ctypes.c_uint32),
-        ("terminal_device", ctypes.c_uint32),
-        ("terminal_pgid", ctypes.c_uint32),
-        ("nice", ctypes.c_int32),
-        ("started_seconds", ctypes.c_uint64),
-        ("started_microseconds", ctypes.c_uint64),
-    )
+@dataclass(slots=True)
+class _OwnedFd:
+    fd: int
 
-
-class _DarwinProcessTreeTracker:
-    """Bounded Darwin descendant observation with PID-reuse-safe identities."""
-
-    _MAX_TRACKED_PIDS = 4096
-    _PROC_PIDTBSDINFO = 3
-
-    def __init__(self, root_pid: int) -> None:
-        self._tracked: dict[int, _ProcessIdentity] = {}
-        self._complete = True
-        self._stop = False
-        self._monitor_task: asyncio.Task[None] | None = None
-        self._library: ctypes.CDLL | None = None
-        try:
-            if sys.platform != "darwin":
-                raise OSError("Darwin process observation unavailable")
-            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            library.proc_listchildpids.argtypes = (
-                ctypes.c_int,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            )
-            library.proc_listchildpids.restype = ctypes.c_int
-            library.proc_pidinfo.argtypes = (
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            )
-            library.proc_pidinfo.restype = ctypes.c_int
-            self._library = library
-            root = self._identity(root_pid)
-            if root is None:
-                raise OSError("root identity unavailable")
-            self._tracked[root.pid] = root
-        except (AttributeError, OSError, TypeError, ValueError):
-            self._complete = False
-
-    @property
-    def complete(self) -> bool:
-        return self._complete
-
-    def start(self) -> None:
-        if self._monitor_task is None:
-            self._monitor_task = asyncio.create_task(self._monitor())
-
-    async def stop(self) -> None:
-        self._stop = True
-        task = self._monitor_task
-        if task is not None:
-            await asyncio.gather(task, return_exceptions=True)
-
-    def scan(self) -> None:
-        if not self._complete or self._library is None:
+    def close(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd < 0:
             return
         try:
-            queue = list(self._tracked.values())
-            visited: set[_ProcessIdentity] = set()
-            while queue:
-                parent = queue.pop()
-                if parent in visited or not self._is_alive(parent):
-                    continue
-                visited.add(parent)
-                for child in self._children(parent.pid):
-                    existing = self._tracked.get(child.pid)
-                    if existing is not None and existing != child:
-                        raise OSError("tracked PID identity changed")
-                    if existing is None:
-                        if len(self._tracked) >= self._MAX_TRACKED_PIDS:
-                            raise OSError("tracked PID capacity exceeded")
-                        self._tracked[child.pid] = child
-                    queue.append(child)
-        except (OSError, TypeError, ValueError):
-            self._complete = False
-
-    def signal(self, sig: signal.Signals) -> None:
-        self.scan()
-        for identity in sorted(
-            self._tracked.values(),
-            key=lambda item: item.pid,
-            reverse=True,
-        ):
-            if not self._is_alive(identity):
-                continue
-            try:
-                os.kill(identity.pid, sig)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                self._complete = False
-
-    def is_quiescent(self) -> bool:
-        self.scan()
-        return self._complete and not any(
-            self._is_alive(identity) for identity in self._tracked.values()
-        )
-
-    async def wait_for_quiescence(self, timeout_ms: int) -> bool:
-        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
-        while not self.is_quiescent():
-            if not self._complete or asyncio.get_running_loop().time() >= deadline:
-                return False
-            await asyncio.sleep(_POLL_SECONDS)
-        return True
-
-    async def _monitor(self) -> None:
-        while not self._stop and self._complete:
-            self.scan()
-            await asyncio.sleep(0.001)
-
-    def _identity(self, pid: int) -> _ProcessIdentity | None:
-        library = self._library
-        if library is None:
-            raise OSError("process observation unavailable")
-        info = _DarwinProcBsdInfo()
-        ctypes.set_errno(0)
-        size = library.proc_pidinfo(
-            pid,
-            self._PROC_PIDTBSDINFO,
-            0,
-            ctypes.byref(info),
-            ctypes.sizeof(info),
-        )
-        if size == 0:
-            error_number = ctypes.get_errno()
-            if error_number in {0, errno.ESRCH}:
-                return None
-            raise OSError(error_number, "process identity unavailable")
-        if size != ctypes.sizeof(info) or info.pid != pid:
-            raise OSError("process identity response was incomplete")
-        return _ProcessIdentity(
-            pid=pid,
-            started_seconds=info.started_seconds,
-            started_microseconds=info.started_microseconds,
-        )
-
-    def _is_alive(self, identity: _ProcessIdentity) -> bool:
-        try:
-            return self._identity(identity.pid) == identity
+            os.close(fd)
         except OSError:
-            self._complete = False
-            return True
-
-    def _children(self, pid: int) -> tuple[_ProcessIdentity, ...]:
-        library = self._library
-        if library is None:
-            raise OSError("process observation unavailable")
-        buffer = (ctypes.c_int * self._MAX_TRACKED_PIDS)()
-        ctypes.set_errno(0)
-        count = library.proc_listchildpids(
-            pid,
-            buffer,
-            ctypes.sizeof(buffer),
-        )
-        if count < 0:
-            raise OSError(ctypes.get_errno(), "child process observation failed")
-        if count >= self._MAX_TRACKED_PIDS:
-            raise OSError("child process observation exceeded its bound")
-        identities: list[_ProcessIdentity] = []
-        for index in range(count):
-            child = self._identity(buffer[index])
-            if child is not None:
-                identities.append(child)
-        return tuple(identities)
+            pass
 
 
 class _OutputBudget:
@@ -364,7 +245,7 @@ class _OutputBudget:
 
 
 class PtyWorker:
-    """Execute argv in one canonical cwd and supervise its whole process group."""
+    """Execute one fork-denied process in a canonical cwd and supervise its PGID."""
 
     def __init__(
         self,
@@ -374,6 +255,7 @@ class PtyWorker:
         output_limit_bytes: int = 64 * 1024,
         termination_grace_ms: int = 500,
     ) -> None:
+        sandbox_executable = self._verified_sandbox_executable()
         cwd = self._canonical_directory(canonical_cwd)
         if (
             type(output_limit_bytes) is not int
@@ -431,7 +313,8 @@ class PtyWorker:
         self._environment_values = values
         self._output_limit_bytes = output_limit_bytes
         self._termination_grace_ms = termination_grace_ms
-        self._process_trackers: dict[int, _DarwinProcessTreeTracker] = {}
+        self._sandbox_executable = str(sandbox_executable)
+        self._sandbox_profile = _SINGLE_PROCESS_SANDBOX_PROFILE
         self.spawn_count = 0
         self.last_snapshot: PtyExecutionSnapshot | None = None
 
@@ -443,6 +326,52 @@ class PtyWorker:
             except OSError:
                 pass
             self._cwd_fd = -1
+
+    @staticmethod
+    def _verified_sandbox_executable() -> Path:
+        if sys.platform != "darwin":
+            raise ValueError(
+                "PTY single-process supervision is unavailable"
+            ) from None
+        sandbox_executable = _SANDBOX_EXECUTABLE
+        codesign_executable = _CODESIGN_EXECUTABLE
+        try:
+            sandbox_stat = sandbox_executable.stat(follow_symlinks=False)
+            codesign_stat = codesign_executable.stat(follow_symlinks=False)
+            if (
+                sandbox_executable.resolve(strict=True) != sandbox_executable
+                or codesign_executable.resolve(strict=True) != codesign_executable
+                or not stat.S_ISREG(sandbox_stat.st_mode)
+                or not stat.S_ISREG(codesign_stat.st_mode)
+                or sandbox_stat.st_uid != 0
+                or codesign_stat.st_uid != 0
+                or sandbox_stat.st_mode & 0o022
+                or codesign_stat.st_mode & 0o022
+            ):
+                raise OSError("sandbox capability identity was rejected")
+            verification = subprocess.run(
+                (
+                    str(codesign_executable),
+                    "--verify",
+                    "--strict",
+                    "--test-requirement",
+                    "=anchor apple",
+                    str(sandbox_executable),
+                ),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env={},
+                timeout=2,
+                check=False,
+            )
+            if verification.returncode != 0:
+                raise OSError("sandbox capability signature was rejected")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            raise ValueError(
+                "PTY single-process supervision is unavailable"
+            ) from None
+        return sandbox_executable
 
     @staticmethod
     def _canonical_directory(value: Path) -> Path:
@@ -477,13 +406,27 @@ class PtyWorker:
             )
         ).hexdigest()
         budget = _OutputBudget(self._output_limit_bytes)
-        cwd_fd = self._duplicate_cwd_fd()
-        master_fd, slave_fd = pty.openpty()
-        os.set_blocking(master_fd, False)
+        resources = ExitStack()
+        try:
+            cwd_fd = _OwnedFd(self._duplicate_cwd_fd())
+            resources.callback(cwd_fd.close)
+            master_number, slave_number = pty.openpty()
+            master_fd = _OwnedFd(master_number)
+            resources.callback(master_fd.close)
+            slave_fd = _OwnedFd(slave_number)
+            resources.callback(slave_fd.close)
+            os.set_blocking(master_fd.fd, False)
+        except PtyWorkerError:
+            resources.close()
+            raise
+        except OSError:
+            resources.close()
+            raise PtyWorkerError(
+                "spawn_failed", "PTY process could not be started"
+            ) from None
         process: asyncio.subprocess.Process | None = None
         spawned: _SpawnedProcess | None = None
         spawn_task: asyncio.Task[_SpawnedProcess] | None = None
-        tracker: _DarwinProcessTreeTracker | None = None
         stdout_task: asyncio.Task[None] | None = None
         stderr_task: asyncio.Task[None] | None = None
         wait_task: asyncio.Task[int] | None = None
@@ -500,8 +443,8 @@ class PtyWorker:
                     self._spawn_with_pinned_cwd(
                         argv,
                         environment,
-                        cwd_fd=cwd_fd,
-                        slave_fd=slave_fd,
+                        cwd_fd=cwd_fd.fd,
+                        slave_fd=slave_fd.fd,
                     )
                 )
                 spawned = await asyncio.shield(spawn_task)
@@ -517,16 +460,8 @@ class PtyWorker:
                     "spawn_failed", "PTY process could not be started"
                 ) from None
             finally:
-                try:
-                    os.close(cwd_fd)
-                except OSError:
-                    pass
-                cwd_fd = -1
-                try:
-                    os.close(slave_fd)
-                except OSError:
-                    pass
-                slave_fd = -1
+                cwd_fd.close()
+                slave_fd.close()
             if spawned is None:
                 if cancelled:
                     raise asyncio.CancelledError()
@@ -536,23 +471,28 @@ class PtyWorker:
             process = spawned.process
             self.spawn_count += 1
             pgid = process.pid
-            tracker = _DarwinProcessTreeTracker(process.pid)
-            self._process_trackers[process.pid] = tracker
-            tracker.start()
-            if cancelled or not tracker.complete:
+            if cancelled:
                 spawned.abort()
             else:
-                spawned.release()
-            if cancelled:
-                quiescent = await self._cleanup_group(process, pgid)
-            else:
                 stdout_task = asyncio.create_task(
-                    self._read_pty(master_fd, budget)
+                    self._read_pty(master_fd.fd, budget)
                 )
                 assert process.stderr is not None
                 stderr_task = asyncio.create_task(
                     self._read_stream(process.stderr, budget)
                 )
+                try:
+                    await spawned.release()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    quiescent = await self._cleanup_group(process, pgid)
+                    raise PtyWorkerError(
+                        "spawn_failed", "PTY process could not be started"
+                    ) from None
+            if cancelled:
+                quiescent = await self._cleanup_group(process, pgid)
+            else:
                 wait_task = asyncio.create_task(self._wait_leader_exit(process))
                 overflow_task = asyncio.create_task(budget.overflow.wait())
                 done, _ = await asyncio.wait(
@@ -581,19 +521,8 @@ class PtyWorker:
                     process, pgid
                 )
         finally:
-            if cwd_fd >= 0:
-                try:
-                    os.close(cwd_fd)
-                except OSError:
-                    pass
-            try:
-                os.close(slave_fd)
-            except OSError:
-                pass
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
+            if spawned is not None:
+                spawned.abort()
             for task in (overflow_task, stdout_task, stderr_task, wait_task):
                 if task is not None and not task.done():
                     task.cancel()
@@ -604,9 +533,7 @@ class PtyWorker:
                     if task is not None
                 )
             )
-            if tracker is not None and process is not None:
-                await tracker.stop()
-                self._process_trackers.pop(process.pid, None)
+            resources.close()
         if process is None:
             raise PtyWorkerError(
                 "spawn_failed", "PTY process could not be started"
@@ -751,8 +678,8 @@ class PtyWorker:
             ) from None
         return duplicated
 
-    @staticmethod
     async def _spawn_with_pinned_cwd(
+        self,
         argv: tuple[str, ...],
         environment: Mapping[str, str],
         *,
@@ -762,24 +689,14 @@ class PtyWorker:
         sender, receiver = socket.socketpair()
         process: asyncio.subprocess.Process | None = None
         try:
-            sender.setsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_SNDBUF,
-                _CONTROL_SOCKET_BYTES,
-            )
-            receiver.setsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_RCVBUF,
-                _CONTROL_SOCKET_BYTES,
-            )
             payload = json.dumps(
                 argv,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
-            if len(payload) > 262_144:
+            if len(payload) > _MAX_CONTROL_PAYLOAD_BYTES:
                 raise ValueError("PTY argv payload exceeded wrapper bound")
-            sender.sendall(len(payload).to_bytes(4, "big") + payload)
+            framed_payload = len(payload).to_bytes(4, "big") + payload
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-I",
@@ -787,6 +704,9 @@ class PtyWorker:
                 _EXEC_WRAPPER_SOURCE,
                 str(receiver.fileno()),
                 str(cwd_fd),
+                self._sandbox_executable,
+                self._sandbox_profile,
+                _SANDBOXED_EXEC_WRAPPER_SOURCE,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=asyncio.subprocess.PIPE,
@@ -795,7 +715,11 @@ class PtyWorker:
                 close_fds=True,
                 pass_fds=(receiver.fileno(), cwd_fd),
             )
-            return _SpawnedProcess(process=process, start_gate=sender)
+            return _SpawnedProcess(
+                process=process,
+                control=sender,
+                payload=framed_payload,
+            )
         finally:
             receiver.close()
             if process is None:
@@ -862,42 +786,22 @@ class PtyWorker:
         process: asyncio.subprocess.Process,
         pgid: int,
     ) -> bool:
-        tracker = self._process_trackers.get(process.pid)
-        tree_alive = tracker is None or not tracker.is_quiescent()
-        if process.returncode is None or tree_alive:
+        if process.returncode is None:
             self._signal_group(pgid, signal.SIGTERM)
-            if tracker is not None:
-                tracker.signal(signal.SIGTERM)
             await self._wait_process(process, self._termination_grace_ms)
-        if self._group_exists(pgid) or (
-            tracker is not None and not tracker.is_quiescent()
-        ):
+        if self._group_exists(pgid):
             self._signal_group(pgid, signal.SIGTERM)
-            if tracker is not None:
-                tracker.signal(signal.SIGTERM)
             await self._wait_group_exit(pgid, self._termination_grace_ms)
-            if tracker is not None:
-                await tracker.wait_for_quiescence(self._termination_grace_ms)
-        if self._group_exists(pgid) or (
-            tracker is not None and not tracker.is_quiescent()
-        ):
+        if self._group_exists(pgid):
             self._signal_group(pgid, signal.SIGKILL)
-            if tracker is not None:
-                tracker.signal(signal.SIGKILL)
             await self._wait_process(process, self._termination_grace_ms)
             await self._wait_group_exit(pgid, self._termination_grace_ms)
-            if tracker is not None:
-                await tracker.wait_for_quiescence(self._termination_grace_ms)
         if process.returncode is None:
             await self._wait_process(process, self._termination_grace_ms)
-        process_tree_quiescent = (
-            tracker is not None and tracker.is_quiescent()
-        )
-        return (
-            process.returncode is not None
-            and not self._group_exists(pgid)
-            and process_tree_quiescent
-        )
+        # The verified Seatbelt profile denies process-fork before caller code
+        # runs, so this is deliberately leader/PGID quiescence—not a claim that
+        # polling discovered an arbitrary descendant tree.
+        return process.returncode is not None and not self._group_exists(pgid)
 
     async def _finish_cleanup_despite_cancellation(
         self,
@@ -920,8 +824,7 @@ class PtyWorker:
         except ProcessLookupError:
             pass
         except PermissionError:
-            # Exact PID/start-time tracker remains authoritative when a stale
-            # or foreign process-group identity cannot be signalled.
+            # `_group_exists` remains true on EPERM, so cleanup fails closed.
             pass
 
     @staticmethod

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import importlib
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -41,6 +43,41 @@ def _write_script(tmp_path: Path, name: str, source: str) -> Path:
 def _context_with_environment(tmp_path: Path, names: tuple[str, ...]):
     context, _ = _runtime_context(tmp_path, command_policy="allow")
     return context.model_copy(update={"environment_allowlist": names})
+
+
+def _open_fd_count() -> int:
+    return len(os.listdir("/dev/fd"))
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("unsupported_platform", "missing_binary", "invalid_signature"),
+)
+def test_worker_fails_closed_without_verified_macos_sandbox_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    module = _pty_module()
+    worker_type, _ = _pty_api()
+    if failure_mode == "unsupported_platform":
+        monkeypatch.setattr(module.sys, "platform", "linux")
+    elif failure_mode == "missing_binary":
+        monkeypatch.setattr(
+            module,
+            "_SANDBOX_EXECUTABLE",
+            tmp_path / "missing-sandbox-exec",
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1),
+        )
+
+    with pytest.raises(ValueError, match="single-process supervision"):
+        worker_type(canonical_cwd=tmp_path.resolve())
 
 
 @pytest.mark.asyncio
@@ -329,83 +366,98 @@ def _process_exists(pid: int) -> bool:
 
 
 @pytest.mark.asyncio
-async def test_normal_completion_waits_for_descendant_group_quiescence(
+async def test_single_process_sandbox_denies_immediate_double_fork_escape(
     tmp_path: Path,
 ) -> None:
-    worker_type, _ = _pty_api()
-    pid_file = tmp_path / "child.pid"
-    script = _write_script(
-        tmp_path,
-        "spawn_descendant.py",
-        """
-import subprocess
-import sys
-from pathlib import Path
+    worker_type, error_type = _pty_api()
+    source = """
+import errno
+import os
+import time
 
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-Path("child.pid").write_text(str(child.pid), encoding="utf-8")
-""".strip(),
-    )
+try:
+    child = os.fork()
+except OSError as error:
+    print(f"FORK_DENIED:{error.errno}", flush=True)
+    raise SystemExit(73 if error.errno == errno.EPERM else 74)
+if child != 0:
+    os._exit(0)
+os.setsid()
+grandchild = os.fork()
+if grandchild != 0:
+    os._exit(0)
+print(f"ESCAPED:{os.getpid()}", flush=True)
+time.sleep(60)
+""".strip()
+    program = f"exec({source!r})"
     worker = worker_type(canonical_cwd=tmp_path.resolve())
     context = _context_with_environment(tmp_path, ())
+    escaped_pid: int | None = None
 
-    async with asyncio.timeout(3):
-        await worker.execute(
-            "python-term-pty",
-            context,
-            {"argv": (sys.executable, str(script)), "cwd": str(tmp_path.resolve())},
-        )
+    try:
+        with pytest.raises(error_type) as raised:
+            await worker.execute(
+                "python-term-pty",
+                context,
+                {
+                    "argv": (sys.executable, "-c", program),
+                    "cwd": str(tmp_path.resolve()),
+                },
+            )
 
-    child_pid = int(pid_file.read_text(encoding="utf-8"))
-    snapshot = worker.last_snapshot
-    assert snapshot is not None
-    assert snapshot.quiescent is True
-    assert not _process_group_exists(snapshot.process_group_id)
-    with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, signal.SIGTERM)
+        snapshot = worker.last_snapshot
+        assert raised.value.code == "process_failed"
+        assert snapshot is not None
+        assert snapshot.exit_code == 73
+        assert snapshot.quiescent is True
+        assert "FORK_DENIED:1" in snapshot.stdout_preview
+        assert "ESCAPED:" not in snapshot.stdout_preview
+    finally:
+        snapshot = worker.last_snapshot
+        if snapshot is not None:
+            for token in snapshot.stdout_preview.split():
+                if token.startswith("ESCAPED:"):
+                    escaped_pid = int(token.partition(":")[2])
+        if escaped_pid is not None and _process_exists(escaped_pid):
+            os.kill(escaped_pid, signal.SIGKILL)
 
 
 @pytest.mark.asyncio
-async def test_descendant_that_calls_setsid_is_tracked_and_reaped(
+async def test_sandbox_profile_mutation_fails_before_target_exec(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    worker_type, _ = _pty_api()
-    pid_file = tmp_path / "setsid-child.pid"
-    script = _write_script(
-        tmp_path,
-        "spawn_setsid_descendant.py",
-        """
-import subprocess
-import sys
-from pathlib import Path
-
-child = subprocess.Popen(
-    [sys.executable, "-c", "import time; time.sleep(60)"],
-    start_new_session=True,
-)
-Path("setsid-child.pid").write_text(str(child.pid), encoding="utf-8")
-""".strip(),
+    module = _pty_module()
+    worker_type, error_type = _pty_api()
+    monkeypatch.setattr(
+        module,
+        "_SINGLE_PROCESS_SANDBOX_PROFILE",
+        "(version 1) (allow default)",
+        raising=False,
     )
     worker = worker_type(canonical_cwd=tmp_path.resolve())
     context = _context_with_environment(tmp_path, ())
-    child_pid: int | None = None
 
-    try:
+    with pytest.raises(error_type) as raised:
         await worker.execute(
             "python-term-pty",
             context,
-            {"argv": (sys.executable, str(script)), "cwd": str(tmp_path.resolve())},
+            {
+                "argv": (
+                    sys.executable,
+                    "-c",
+                    "print('TARGET_RAN', flush=True)",
+                ),
+                "cwd": str(tmp_path.resolve()),
+            },
         )
-        child_pid = int(pid_file.read_text(encoding="utf-8"))
-        snapshot = worker.last_snapshot
-        assert snapshot is not None
-        assert snapshot.quiescent is True
-        assert not _process_exists(child_pid)
-    finally:
-        if child_pid is None and pid_file.exists():
-            child_pid = int(pid_file.read_text(encoding="utf-8"))
-        if child_pid is not None and _process_exists(child_pid):
-            os.kill(child_pid, signal.SIGKILL)
+
+    snapshot = worker.last_snapshot
+    assert raised.value.code == "process_failed"
+    assert snapshot is not None
+    assert snapshot.exit_code == 126
+    assert snapshot.quiescent is True
+    assert "TARGET_RAN" not in snapshot.stdout_preview
 
 
 @pytest.mark.asyncio
@@ -512,6 +564,88 @@ async def test_spawn_uses_pinned_cwd_fd_after_path_replacement(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ("openpty", "set_blocking"))
+async def test_resource_acquisition_fault_does_not_leak_file_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    module = _pty_module()
+    worker_type, error_type = _pty_api()
+    worker = worker_type(canonical_cwd=tmp_path.resolve())
+    context = _context_with_environment(tmp_path, ())
+    baseline = _open_fd_count()
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EMFILE, "fault injected")
+
+    if fault == "openpty":
+        monkeypatch.setattr(module.pty, "openpty", fail)
+    else:
+        monkeypatch.setattr(module.os, "set_blocking", fail)
+
+    with pytest.raises(error_type) as raised:
+        await worker.execute(
+            "python-term-pty",
+            context,
+            {
+                "argv": (sys.executable, "-c", "pass"),
+                "cwd": str(tmp_path.resolve()),
+            },
+        )
+
+    assert raised.value.code == "spawn_failed"
+    assert _open_fd_count() == baseline
+
+
+@pytest.mark.asyncio
+async def test_control_payload_handles_partial_write_and_eagain_after_spawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _pty_module()
+    worker_type, _ = _pty_api()
+    real_socketpair = module.socket.socketpair
+
+    class PartialWriteSocket:
+        def __init__(self, inner):
+            self._inner = inner
+            self._send_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def sendall(self, data):
+            raise BlockingIOError(errno.EAGAIN, "partial write required")
+
+        def send(self, data):
+            self._send_calls += 1
+            if self._send_calls == 2:
+                raise BlockingIOError(errno.EAGAIN, "try again")
+            return self._inner.send(data[:7])
+
+    def partial_socketpair():
+        sender, receiver = real_socketpair()
+        return PartialWriteSocket(sender), receiver
+
+    monkeypatch.setattr(module.socket, "socketpair", partial_socketpair)
+    worker = worker_type(canonical_cwd=tmp_path.resolve())
+    context = _context_with_environment(tmp_path, ())
+
+    result = await worker.execute(
+        "python-term-pty",
+        context,
+        {
+            "argv": (sys.executable, "-c", "print('payload delivered')"),
+            "cwd": str(tmp_path.resolve()),
+        },
+    )
+
+    assert result.status == "completed"
+    assert "payload delivered" in (result.summary or "")
+
+
+@pytest.mark.asyncio
 async def test_spawn_transfers_long_valid_argv_without_blocking_before_exec(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -551,22 +685,20 @@ async def test_spawn_transfers_long_valid_argv_without_blocking_before_exec(
 
 
 @pytest.mark.asyncio
-async def test_parent_cancellation_kills_process_tree_before_propagating(
+async def test_parent_cancellation_kills_single_process_before_propagating(
     tmp_path: Path,
 ) -> None:
     worker_type, _ = _pty_api()
-    pid_file = tmp_path / "child.pid"
+    pid_file = tmp_path / "leader.pid"
     script = _write_script(
         tmp_path,
-        "block_with_descendant.py",
+        "block_single_process.py",
         """
-import subprocess
-import sys
+import os
 import time
 from pathlib import Path
 
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-Path("child.pid").write_text(str(child.pid), encoding="utf-8")
+Path("leader.pid").write_text(str(os.getpid()), encoding="utf-8")
 time.sleep(60)
 """.strip(),
     )
@@ -585,11 +717,11 @@ time.sleep(60)
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    child_pid = int(pid_file.read_text(encoding="utf-8"))
+    leader_pid = int(pid_file.read_text(encoding="utf-8"))
     snapshot = worker.last_snapshot
     assert snapshot is not None
     assert snapshot.outcome == "cancelled"
     assert snapshot.quiescent is True
     assert not _process_group_exists(snapshot.process_group_id)
     with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, signal.SIGTERM)
+        os.kill(leader_pid, signal.SIGTERM)
