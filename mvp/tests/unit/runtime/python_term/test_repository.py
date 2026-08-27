@@ -11,6 +11,7 @@ from workbench.runtime.python_term.contracts import (
     PublicToolResult,
     StepCheckpointRecord,
     StepEventRecord,
+    StepEventTransitionRecord,
     StepRecord,
     ToolEffectRecord,
     canonical_digest,
@@ -27,7 +28,12 @@ from .test_contracts import _context, _envelope
 
 
 def _envelope_for(context, tmp_path):
-    return _envelope(tmp_path, attempt=context.attempt, agent_id=context.agent_id)
+    return _envelope(
+        tmp_path,
+        attempt=context.attempt,
+        agent_id=context.agent_id,
+        host_generation=context.host_generation,
+    )
 
 
 def _save_aggregate(repository, context, tmp_path):
@@ -35,6 +41,19 @@ def _save_aggregate(repository, context, tmp_path):
     step = context.to_step_record()
     repository.save_aggregate(term, (step,))
     return term, step
+
+
+def _transition(
+    event: StepEventRecord,
+    *,
+    step_status: str = "pending",
+    term_status: str = "pending",
+) -> StepEventTransitionRecord:
+    return StepEventTransitionRecord(
+        event=event,
+        step_status=step_status,
+        term_status=term_status,
+    )
 
 
 def test_migration_is_idempotent_and_preserves_legacy_data(tmp_path: Path) -> None:
@@ -78,6 +97,10 @@ def test_migration_is_idempotent_and_preserves_legacy_data(tmp_path: Path) -> No
         step_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(python_steps)")
         }
+        event_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(python_step_events)")
+        }
 
     assert {
         "python_terms",
@@ -89,6 +112,8 @@ def test_migration_is_idempotent_and_preserves_legacy_data(tmp_path: Path) -> No
     assert legacy == "keep-me"
     assert "identity_json" in term_columns
     assert "identity_json" in step_columns
+    assert "host_generation" in step_columns
+    assert {"transition_digest", "transition_json", "step_status", "term_status"} <= event_columns
 
 
 def test_legacy_python_rows_are_preserved_but_fail_closed_on_read_or_save(
@@ -234,6 +259,56 @@ def test_first_step_attempt_must_match_the_term_envelope(tmp_path) -> None:
             initial.to_term_record(_envelope_for(initial, tmp_path)),
             (retry.to_step_record(),),
         )
+
+
+def test_aggregate_retry_persists_host_generation_only_with_higher_attempt(
+    tmp_path,
+) -> None:
+    repository = PythonTermRepository(tmp_path / "host-generation.sqlite")
+    first = _context(
+        tmp_path,
+        attempt=0,
+        envelope=_envelope(tmp_path, attempt=0, host_generation="host-a"),
+    )
+    retry = _context(
+        tmp_path,
+        attempt=1,
+        envelope=_envelope(tmp_path, attempt=1, host_generation="host-b"),
+    )
+    repository.save_aggregate(
+        first.to_term_record(_envelope_for(first, tmp_path)),
+        (first.to_step_record(),),
+    )
+    repository.save_aggregate(
+        retry.to_term_record(_envelope_for(retry, tmp_path)),
+        (retry.to_step_record(),),
+    )
+
+    assert repository.get_step("term-1", "step-1").host_generation == "host-b"
+    same_attempt_other_host = retry.to_step_record().model_copy(
+        update={"host_generation": "host-c"}
+    )
+    with pytest.raises(RepositoryConflict, match="generation|attempt"):
+        repository.save_aggregate(
+            retry.to_term_record(_envelope_for(retry, tmp_path)),
+            (same_attempt_other_host,),
+        )
+
+
+def test_step_host_generation_column_tampering_fails_closed(tmp_path) -> None:
+    database = tmp_path / "host-tamper.sqlite"
+    repository = PythonTermRepository(database)
+    context = _context(tmp_path)
+    _save_aggregate(repository, context, tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """UPDATE python_steps SET host_generation = 'host-forged'
+            WHERE term_id = 'term-1' AND step_id = 'step-1'"""
+        )
+
+    with pytest.raises(RepositoryCorruption, match="generation|column"):
+        repository.get_step("term-1", "step-1")
 
 
 def test_single_record_apis_only_allow_identical_replay(tmp_path) -> None:
@@ -422,7 +497,7 @@ def test_terminal_step_cannot_return_to_running(tmp_path) -> None:
         payload={"content": "done"},
     )
     repository.append_event(
-        event, step_status="completed", term_status="completed"
+        _transition(event, step_status="completed", term_status="completed")
     )
     completed_term = repository.get_term("term-1")
     completed = repository.get_step("term-1", "step-1")
@@ -448,17 +523,244 @@ def test_events_have_monotonic_cursor_and_public_projection(tmp_path) -> None:
         payload={"content": "answer"},
     )
 
-    repository.append_event(event)
-    repository.append_event(event)
+    repository.append_event(_transition(event))
+    repository.append_event(_transition(event))
 
     with pytest.raises(RepositoryConflict, match="cursor"):
         repository.append_event(
-            event.model_copy(update={"event_id": "event-2", "cursor": 1})
+            _transition(
+                event.model_copy(update={"event_id": "event-2", "cursor": 1})
+            )
         )
     assert repository.list_events("term-1") == (event,)
     assert repository.list_public_projections("term-1") == (event.public_projection,)
     assert repository.get_term("term-1").cursor == 1
     assert repository.get_step("term-1", "step-1").cursor == 1
+
+
+def test_same_event_with_a_different_status_transition_is_a_conflict(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "transition-replay.sqlite")
+    context = _context(tmp_path)
+    _save_aggregate(repository, context, tmp_path)
+    event = StepEventRecord(
+        event_id="event-transition",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": "working"},
+    )
+    repository.append_event(
+        _transition(event, step_status="running", term_status="running")
+    )
+
+    with pytest.raises(RepositoryConflict, match="transition|status"):
+        repository.append_event(
+            _transition(event, step_status="completed", term_status="completed")
+        )
+
+
+def test_event_rejects_a_term_status_that_is_not_the_ordered_step_rollup(
+    tmp_path,
+) -> None:
+    repository = PythonTermRepository(tmp_path / "transition-rollup.sqlite")
+    context = _context(tmp_path)
+    _save_aggregate(repository, context, tmp_path)
+    event = StepEventRecord(
+        event_id="event-wrong-rollup",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": "working"},
+    )
+
+    with pytest.raises(RepositoryConflict, match="status|rollup"):
+        repository.append_event(
+            _transition(event, step_status="running", term_status="pending")
+        )
+
+
+_STATUS_ROLLUP_CASES = (
+    ("pending", "pending", "pending"),
+    ("pending", "running", "running"),
+    ("pending", "completed", "pending"),
+    ("pending", "failed", "pending"),
+    ("pending", "cancelled", "pending"),
+    ("running", "pending", "running"),
+    ("running", "running", "running"),
+    ("running", "completed", "running"),
+    ("running", "failed", "running"),
+    ("running", "cancelled", "running"),
+    ("completed", "pending", "pending"),
+    ("completed", "running", "running"),
+    ("completed", "completed", "completed"),
+    ("completed", "failed", "failed"),
+    ("completed", "cancelled", "cancelled"),
+    ("failed", "pending", "pending"),
+    ("failed", "running", "running"),
+    ("failed", "completed", "failed"),
+    ("failed", "failed", "failed"),
+    ("failed", "cancelled", "failed"),
+    ("cancelled", "pending", "pending"),
+    ("cancelled", "running", "running"),
+    ("cancelled", "completed", "cancelled"),
+    ("cancelled", "failed", "failed"),
+    ("cancelled", "cancelled", "cancelled"),
+)
+
+
+@pytest.mark.parametrize(("first_status", "second_status", "term_status"), _STATUS_ROLLUP_CASES)
+def test_term_status_has_one_rollup_for_every_ordered_step_status_combination(
+    tmp_path, first_status: str, second_status: str, term_status: str
+) -> None:
+    repository = PythonTermRepository(
+        tmp_path / f"rollup-{first_status}-{second_status}.sqlite"
+    )
+    first_context = _context(tmp_path)
+    term = first_context.to_term_record(
+        _envelope_for(first_context, tmp_path)
+    ).model_copy(update={"step_ids": ("step-1", "step-2")})
+    first = first_context.to_step_record()
+    second_envelope = _envelope_for(first_context, tmp_path).model_copy(
+        update={"step_id": "step-2", "command_id": "command-2"}
+    )
+    second = _context(tmp_path, envelope=second_envelope).to_step_record(ordinal=1)
+    repository.save_aggregate(term, (first, second))
+    first_term_status = next(
+        expected
+        for left, right, expected in _STATUS_ROLLUP_CASES
+        if left == first_status and right == "pending"
+    )
+    first_event = StepEventRecord(
+        event_id="event-first",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="assistant.message",
+        payload={"content": "first"},
+    )
+    repository.append_event(
+        _transition(
+            first_event,
+            step_status=first_status,
+            term_status=first_term_status,
+        )
+    )
+    second_event = StepEventRecord(
+        event_id="event-second",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-2",
+        cursor=2,
+        type="assistant.message",
+        payload={"content": "second"},
+    )
+    repository.append_event(
+        _transition(
+            second_event,
+            step_status=second_status,
+            term_status=term_status,
+        )
+    )
+
+    assert repository.get_term("term-1").status == term_status
+
+
+@pytest.mark.parametrize("operation", ["get", "retry", "effect"])
+def test_cross_table_decoder_rejects_projection_state_without_evidence(
+    tmp_path, operation: str
+) -> None:
+    database = tmp_path / f"evidence-{operation}.sqlite"
+    repository = PythonTermRepository(database)
+    context = _context(tmp_path)
+    term, step = _save_aggregate(repository, context, tmp_path)
+    projection = PublicStepProjection(status="running", summary="forged")
+    forged_term = term.model_copy(
+        update={"status": "running", "cursor": 1, "public_projection": projection}
+    )
+    forged_step = step.model_copy(
+        update={"status": "running", "cursor": 1, "public_projection": projection}
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """UPDATE python_terms SET status = ?, cursor = ?, record_json = ?
+            WHERE term_id = ?""",
+            ("running", 1, canonical_json(forged_term), "term-1"),
+        )
+        connection.execute(
+            """UPDATE python_steps SET status = ?, cursor = ?, record_json = ?
+            WHERE term_id = ? AND step_id = ?""",
+            ("running", 1, canonical_json(forged_step), "term-1", "step-1"),
+        )
+
+    with pytest.raises(RepositoryCorruption, match="evidence"):
+        if operation == "get":
+            repository.get_term("term-1")
+        elif operation == "retry":
+            repository.save_aggregate(forged_term, (forged_step,))
+        else:
+            repository.save_tool_effect(
+                ToolEffectRecord(
+                    effect_id="effect-forged",
+                    term_id="term-1",
+                    step_id="step-1",
+                    tool_call_id="call-forged",
+                    request_digest="f" * 64,
+                    status="reserved",
+                )
+            )
+
+
+@pytest.mark.parametrize("evidence_kind", ["checkpoint", "terminal"])
+def test_cross_table_decoder_requires_checkpoint_and_terminal_evidence(
+    tmp_path, evidence_kind: str
+) -> None:
+    database = tmp_path / f"evidence-{evidence_kind}.sqlite"
+    repository = PythonTermRepository(database)
+    context = _context(tmp_path)
+    term, step = _save_aggregate(repository, context, tmp_path)
+    if evidence_kind == "checkpoint":
+        projection = PublicStepProjection(status="running", summary="checkpoint")
+        updates = {
+            "status": "running",
+            "cursor": 1,
+            "checkpoint_ref": "checkpoint-forged",
+            "checkpoint_digest": "c" * 64,
+            "public_projection": projection,
+        }
+    else:
+        updates = {"status": "completed"}
+    forged_term = term.model_copy(update=updates)
+    forged_step = step.model_copy(update=updates)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """UPDATE python_terms SET status = ?, cursor = ?, record_json = ?
+            WHERE term_id = ?""",
+            (
+                forged_term.status,
+                forged_term.cursor,
+                canonical_json(forged_term),
+                "term-1",
+            ),
+        )
+        connection.execute(
+            """UPDATE python_steps SET status = ?, cursor = ?, record_json = ?
+            WHERE term_id = ? AND step_id = ?""",
+            (
+                forged_step.status,
+                forged_step.cursor,
+                canonical_json(forged_step),
+                "term-1",
+                "step-1",
+            ),
+        )
+
+    with pytest.raises(RepositoryCorruption, match="evidence"):
+        repository.get_term("term-1")
 
 
 def test_checkpoint_digest_is_idempotent_but_conflicting_reuse_is_rejected(tmp_path) -> None:
@@ -580,7 +882,7 @@ def test_terminal_aggregate_rejects_new_step_event_checkpoint_and_effect(tmp_pat
         payload={"content": "done"},
     )
     repository.append_event(
-        final_event, step_status="completed", term_status="completed"
+        _transition(final_event, step_status="completed", term_status="completed")
     )
 
     event = StepEventRecord(
@@ -609,7 +911,9 @@ def test_terminal_aggregate_rejects_new_step_event_checkpoint_and_effect(tmp_pat
         status="reserved",
     )
     for write in (
-        lambda: repository.append_event(event),
+        lambda: repository.append_event(
+            _transition(event, step_status="completed", term_status="completed")
+        ),
         lambda: repository.save_checkpoint(checkpoint),
         lambda: repository.save_tool_effect(effect),
     ):
@@ -640,17 +944,21 @@ def test_event_can_atomically_finalize_step_and_term_and_replay_same_value(tmp_p
     )
 
     repository.append_event(
-        event, step_status="completed", term_status="completed"
+        _transition(event, step_status="completed", term_status="completed")
     )
     repository.append_event(
-        event, step_status="completed", term_status="completed"
+        _transition(event, step_status="completed", term_status="completed")
     )
     assert repository.get_step("term-1", "step-1").status == "completed"
     assert repository.get_term("term-1").status == "completed"
 
     with pytest.raises(RepositoryConflict, match="terminal"):
         repository.append_event(
-            event.model_copy(update={"event_id": "event-late", "cursor": 2})
+            _transition(
+                event.model_copy(update={"event_id": "event-late", "cursor": 2}),
+                step_status="completed",
+                term_status="completed",
+            )
         )
 
 
@@ -670,7 +978,7 @@ def test_row_decoders_fail_closed_for_record_identity_and_projection_tampering(
         type="assistant.message",
         payload={"content": "answer"},
     )
-    repository.append_event(event)
+    repository.append_event(_transition(event))
 
     with sqlite3.connect(database) as connection:
         connection.execute(

@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 21
+PHASE1_SCHEMA_VERSION = 22
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -386,6 +386,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             ordinal INTEGER NOT NULL,
             command_id TEXT NOT NULL UNIQUE,
             agent_id TEXT NOT NULL,
+            host_generation TEXT NOT NULL,
             identity_digest TEXT NOT NULL,
             identity_json TEXT NOT NULL,
             attempt INTEGER NOT NULL,
@@ -405,6 +406,10 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             cursor INTEGER NOT NULL,
             event_type TEXT NOT NULL,
             event_digest TEXT NOT NULL,
+            transition_digest TEXT NOT NULL,
+            transition_json TEXT NOT NULL,
+            step_status TEXT NOT NULL,
+            term_status TEXT NOT NULL,
             event_json TEXT NOT NULL,
             public_projection_json TEXT NOT NULL,
             created_at REAL NOT NULL,
@@ -572,6 +577,15 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(connection, "python_terms", "identity_json", "TEXT")
     _add_column_if_missing(connection, "python_steps", "identity_json", "TEXT")
+    _add_column_if_missing(connection, "python_steps", "host_generation", "TEXT")
+    _add_column_if_missing(
+        connection, "python_step_events", "transition_digest", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "python_step_events", "transition_json", "TEXT"
+    )
+    _add_column_if_missing(connection, "python_step_events", "step_status", "TEXT")
+    _add_column_if_missing(connection, "python_step_events", "term_status", "TEXT")
     # ``DevelopmentJobRepository`` refuses rows without this immutable snapshot.
     # Legacy rows cannot be resumed safely, so preserve them as failed audit rows
     # while rebuilding the table with the admission invariant enforced by SQLite.

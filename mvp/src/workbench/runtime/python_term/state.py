@@ -11,7 +11,7 @@ import threading
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from workbench.runtime.engine_host.v2 import WorkspaceGrantV2
 
@@ -105,6 +105,99 @@ class TermStateStore:
         *,
         write: bool = False,
     ) -> Path:
+        """Return a validated locator, not a durable filesystem capability.
+
+        Callers that read or write must use :meth:`open_file`, whose descriptor
+        remains anchored below the authorized Term area throughout the access.
+        """
+        expected_root, segments = self._validate_access(
+            term_id, agent_id, reference, area, relative_path, write=write
+        )
+        area_root = expected_root / area
+        lexical_candidate = area_root.joinpath(*segments)
+        self._require_no_follow_chain(area_root, lexical_candidate)
+        candidate = lexical_candidate.resolve(strict=False)
+        if area_root.resolve(strict=False) != area_root or candidate != lexical_candidate:
+            raise StateBoundaryError("Term-local path contains a symlink or alias")
+        if not candidate.is_relative_to(area_root):
+            raise StateBoundaryError("path escapes the Term-local state area")
+        return candidate
+
+    @contextmanager
+    def open_file(
+        self,
+        term_id: str,
+        agent_id: str,
+        reference: TermWorkStateRef,
+        area: Literal["work", "outputs", "logs"],
+        relative_path: str,
+        *,
+        mode: Literal["rb", "wb", "xb", "ab"] = "rb",
+    ) -> Iterator[BinaryIO]:
+        """Open a Term-local regular file through no-follow directory handles."""
+        write = mode != "rb"
+        term_root, segments = self._validate_access(
+            term_id, agent_id, reference, area, relative_path, write=write
+        )
+        candidate = term_root / area
+        candidate = candidate.joinpath(*segments)
+        self._require_granted(candidate, write=write)
+
+        descriptors: list[int] = []
+        file_descriptor: int | None = None
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            term_descriptor = self._open_term_root_descriptor(term_id)
+            descriptors.append(term_descriptor)
+            area_descriptor = os.open(area, directory_flags, dir_fd=term_descriptor)
+            descriptors.append(area_descriptor)
+            parent_descriptor = area_descriptor
+            for segment in segments[:-1]:
+                parent_descriptor = os.open(
+                    segment, directory_flags, dir_fd=parent_descriptor
+                )
+                descriptors.append(parent_descriptor)
+            file_flags = {
+                "rb": os.O_RDONLY,
+                "wb": os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                "xb": os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                "ab": os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            }[mode] | getattr(os, "O_NOFOLLOW", 0)
+            file_descriptor = os.open(
+                segments[-1], file_flags, 0o600, dir_fd=parent_descriptor
+            )
+            metadata = os.fstat(file_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StateBoundaryError("Term-local target must be a regular file")
+            with os.fdopen(file_descriptor, mode) as handle:
+                file_descriptor = None
+                yield handle
+        except StateBoundaryError:
+            raise
+        except OSError as exc:
+            raise StateBoundaryError(
+                "Term-local file cannot be opened without following links"
+            ) from exc
+        finally:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def _validate_access(
+        self,
+        term_id: str,
+        agent_id: str,
+        reference: TermWorkStateRef,
+        area: Literal["work", "outputs", "logs"],
+        relative_path: str,
+        *,
+        write: bool,
+    ) -> tuple[Path, tuple[str, ...]]:
         if area not in self._AREAS:
             raise StateBoundaryError("unknown Term-local state area")
         if reference.term_id != term_id:
@@ -120,23 +213,15 @@ class TermStateStore:
         if referenced_root != expected_root:
             raise StateBoundaryError("cross-Term Work State reference")
         self._read_runtime_record(expected_root, reference)
-        segments = relative_path.split("/")
+        segments = tuple(relative_path.split("/"))
         if (
             not relative_path
             or "\\" in relative_path
             or any(part in {"", ".", ".."} for part in segments)
         ):
             raise StateBoundaryError("Term-local path must be a canonical relative path")
-        area_root = expected_root / area
-        lexical_candidate = area_root.joinpath(*segments)
-        self._require_no_follow_chain(area_root, lexical_candidate)
-        candidate = lexical_candidate.resolve(strict=False)
-        if area_root.resolve(strict=False) != area_root or candidate != lexical_candidate:
-            raise StateBoundaryError("Term-local path contains a symlink or alias")
-        if not candidate.is_relative_to(area_root):
-            raise StateBoundaryError("path escapes the Term-local state area")
-        self._require_granted(candidate, write=write)
-        return candidate
+        self._require_granted(expected_root.joinpath(area, *segments), write=write)
+        return expected_root, segments
 
     def _term_root(self, term_id: str) -> Path:
         self._validate_term_id(term_id)
@@ -199,19 +284,34 @@ class TermStateStore:
     ) -> dict[str, object]:
         self._reject_symlink_chain(term_root)
         runtime_file = term_root / "runtime.json"
+        self._require_granted(runtime_file, write=False)
+        root_descriptor: int | None = None
+        runtime_descriptor: int | None = None
         try:
-            metadata = runtime_file.lstat()
+            root_descriptor = self._open_term_root_descriptor(reference.term_id)
+            runtime_descriptor = os.open(
+                "runtime.json",
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_descriptor,
+            )
+            metadata = os.fstat(runtime_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StateBoundaryError(
+                    "Term runtime metadata must be a regular file"
+                )
+            with os.fdopen(runtime_descriptor, "r", encoding="utf-8") as handle:
+                runtime_descriptor = None
+                raw = handle.read()
         except OSError as exc:
             raise StateBoundaryError("Term runtime metadata is missing") from exc
-        if runtime_file.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-            raise StateBoundaryError("Term runtime metadata must be a regular file")
-        if runtime_file.resolve(strict=True) != runtime_file:
-            raise StateBoundaryError("Term runtime metadata is not canonical")
-        self._require_granted(runtime_file, write=False)
+        finally:
+            if runtime_descriptor is not None:
+                os.close(runtime_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
         try:
-            raw = runtime_file.read_text(encoding="utf-8")
             parsed = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as exc:
+        except json.JSONDecodeError as exc:
             raise StateBoundaryError("existing runtime metadata is invalid") from exc
         if not isinstance(parsed, dict) or set(parsed) != {
             "agent_id",
@@ -239,6 +339,31 @@ class TermStateStore:
         if raw != canonical_json(canonical) + "\n":
             raise StateBoundaryError("runtime metadata is not canonical")
         return canonical
+
+    def _open_term_root_descriptor(self, term_id: str) -> int:
+        """Open the lexical Term root one no-follow directory segment at a time."""
+        self._validate_term_id(term_id)
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptors: list[int] = []
+        try:
+            current = os.open(self.workspace_root, flags)
+            descriptors.append(current)
+            for segment in (".runtime", "terms", term_id):
+                current = os.open(segment, flags, dir_fd=current)
+                descriptors.append(current)
+            result = descriptors.pop()
+            return result
+        except OSError as exc:
+            raise StateBoundaryError(
+                "Term root cannot be opened without following links"
+            ) from exc
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
     @staticmethod
     def _validate_term_id(term_id: str) -> None:

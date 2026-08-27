@@ -18,6 +18,7 @@ from .contracts import (
     PublicEventProjection,
     StepCheckpointRecord,
     StepEventRecord,
+    StepEventTransitionRecord,
     StepRecord,
     TermRecord,
     ToolEffectRecord,
@@ -41,6 +42,7 @@ _RecordT = TypeVar(
     TermRecord,
     StepRecord,
     StepEventRecord,
+    StepEventTransitionRecord,
     StepCheckpointRecord,
     ToolEffectRecord,
 )
@@ -52,8 +54,11 @@ class PythonTermRepository:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as connection:
+        connection = self.connect()
+        try:
             migrate_phase1(connection)
+        finally:
+            connection.close()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -67,6 +72,20 @@ class PythonTermRepository:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
             yield connection
             connection.commit()
         except Exception:
@@ -100,9 +119,9 @@ class PythonTermRepository:
             if existing_row is None:
                 self._validate_initial_admission(validated_term, validated_steps)
             else:
-                existing_term = self._decode_term(existing_row)
-                existing_steps = self._load_steps(connection, existing_term.term_id)
-                self._validate_aggregate_snapshot(existing_term, existing_steps)
+                existing_term, existing_steps = self._load_aggregate(
+                    connection, existing_row
+                )
                 self._validate_retry_transition(
                     existing_term,
                     existing_steps,
@@ -122,7 +141,7 @@ class PythonTermRepository:
             ).fetchone()
             if row is None:
                 raise RepositoryConflict("Term admission requires save_aggregate")
-            existing = self._decode_term(row)
+            existing, _ = self._load_aggregate(connection, row)
             if canonical_json(existing) != canonical_json(validated):
                 raise RepositoryConflict("Term transition requires an aggregate API")
 
@@ -184,11 +203,11 @@ class PythonTermRepository:
         )
 
     def get_term(self, term_id: str) -> TermRecord | None:
-        with self.connect() as connection:
+        with self._read_snapshot() as connection:
             row = connection.execute(
                 "SELECT * FROM python_terms WHERE term_id = ?", (term_id,)
             ).fetchone()
-        return None if row is None else self._decode_term(row)
+            return None if row is None else self._load_aggregate(connection, row)[0]
 
     def save_step(self, record: StepRecord) -> None:
         validated = self._validate_model(record, StepRecord)
@@ -200,7 +219,22 @@ class PythonTermRepository:
             ).fetchone()
             if row is None:
                 raise RepositoryConflict("Step admission requires save_aggregate")
-            existing = self._decode_step(row)
+            selected = self._decode_step(row)
+            if (
+                selected.term_id != validated.term_id
+                or selected.step_id != validated.step_id
+                or selected.command_id != validated.command_id
+            ):
+                raise RepositoryConflict("Step command identity conflict")
+            term_row = connection.execute(
+                "SELECT * FROM python_terms WHERE term_id = ?", (selected.term_id,)
+            ).fetchone()
+            if term_row is None:
+                raise RepositoryCorruption("Step has no owning Term")
+            _, aggregate_steps = self._load_aggregate(connection, term_row)
+            existing = next(
+                step for step in aggregate_steps if step.step_id == selected.step_id
+            )
             if canonical_json(existing) != canonical_json(validated):
                 raise RepositoryConflict("Step transition requires an aggregate API")
 
@@ -234,15 +268,17 @@ class PythonTermRepository:
         try:
             connection.execute(
                 """INSERT INTO python_steps(
-                term_id, step_id, ordinal, command_id, agent_id, identity_digest,
-                identity_json, attempt, status, cursor, record_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                term_id, step_id, ordinal, command_id, agent_id, host_generation,
+                identity_digest, identity_json, attempt, status, cursor, record_json,
+                created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.term_id,
                     record.step_id,
                     record.ordinal,
                     record.command_id,
                     record.agent_id,
+                    record.host_generation,
                     record.identity_digest,
                     canonical_json(record.immutable_identity),
                     record.attempt,
@@ -260,10 +296,12 @@ class PythonTermRepository:
         self, connection: sqlite3.Connection, record: StepRecord
     ) -> None:
         connection.execute(
-            """UPDATE python_steps SET identity_digest = ?, identity_json = ?,
-            attempt = ?, status = ?, cursor = ?, record_json = ?, updated_at = ?
+            """UPDATE python_steps SET host_generation = ?, identity_digest = ?,
+            identity_json = ?, attempt = ?, status = ?, cursor = ?, record_json = ?,
+            updated_at = ?
             WHERE term_id = ? AND step_id = ?""",
             (
+                record.host_generation,
                 record.identity_digest,
                 canonical_json(record.immutable_identity),
                 record.attempt,
@@ -277,22 +315,23 @@ class PythonTermRepository:
         )
 
     def get_step(self, term_id: str, step_id: str) -> StepRecord | None:
-        with self.connect() as connection:
-            row = connection.execute(
-                """SELECT * FROM python_steps
-                WHERE term_id = ? AND step_id = ?""",
-                (term_id, step_id),
+        with self._read_snapshot() as connection:
+            term_row = connection.execute(
+                "SELECT * FROM python_terms WHERE term_id = ?", (term_id,)
             ).fetchone()
-        return None if row is None else self._decode_step(row)
+            if term_row is None:
+                return None
+            _, steps = self._load_aggregate(connection, term_row)
+            return next((step for step in steps if step.step_id == step_id), None)
 
     def list_steps(self, term_id: str) -> tuple[StepRecord, ...]:
-        with self.connect() as connection:
-            rows = connection.execute(
-                """SELECT * FROM python_steps
-                WHERE term_id = ? ORDER BY ordinal""",
-                (term_id,),
-            ).fetchall()
-        return tuple(self._decode_step(row) for row in rows)
+        with self._read_snapshot() as connection:
+            term_row = connection.execute(
+                "SELECT * FROM python_terms WHERE term_id = ?", (term_id,)
+            ).fetchone()
+            if term_row is None:
+                return ()
+            return self._load_aggregate(connection, term_row)[1]
 
     @staticmethod
     def _validate_execution_update(
@@ -314,23 +353,27 @@ class PythonTermRepository:
 
     def append_event(
         self,
-        event: StepEventRecord,
-        *,
-        step_status: ExecutionStatus | None = None,
-        term_status: ExecutionStatus | None = None,
+        transition: StepEventTransitionRecord,
     ) -> None:
-        validated = self._validate_model(event, StepEventRecord)
+        validated_transition = self._validate_model(
+            transition, StepEventTransitionRecord
+        )
+        validated = validated_transition.event
         encoded = canonical_json(validated)
-        projection = validated.public_projection
+        transition_json = canonical_json(validated_transition)
+        projection = validated_transition.public_projection
         with self._transaction() as connection:
             existing_row = connection.execute(
                 "SELECT * FROM python_step_events WHERE event_id = ?",
                 (validated.event_id,),
             ).fetchone()
             if existing_row is not None:
-                if canonical_json(self._decode_event(existing_row)) == encoded:
+                if (
+                    canonical_json(self._decode_transition(existing_row))
+                    == transition_json
+                ):
                     return
-                raise RepositoryConflict("event identity conflict")
+                raise RepositoryConflict("event transition identity or status conflict")
             term, step = self._require_active_aggregate(
                 connection, validated.term_id, validated.step_id
             )
@@ -341,17 +384,21 @@ class PythonTermRepository:
             next_step = step.model_copy(
                 update={
                     "cursor": validated.cursor,
-                    "status": step_status or step.status,
+                    "status": validated_transition.step_status,
                     "public_projection": projection,
                 }
             )
             aggregate_steps = list(self._load_steps(connection, term.term_id))
             aggregate_steps[step.ordinal] = next_step
+            derived_term_status = self._derive_term_status(aggregate_steps)
+            if validated_transition.term_status != derived_term_status:
+                raise RepositoryConflict(
+                    "event Term status does not match ordered Step status rollup"
+                )
             next_term = term.model_copy(
                 update={
                     "cursor": validated.cursor,
-                    "status": term_status
-                    or self._rollup_term_status(term.status, aggregate_steps),
+                    "status": derived_term_status,
                     "public_projection": projection,
                 }
             )
@@ -362,8 +409,9 @@ class PythonTermRepository:
                 connection.execute(
                     """INSERT INTO python_step_events(
                     event_id, term_id, step_id, cursor, event_type, event_digest,
+                    transition_digest, transition_json, step_status, term_status,
                     event_json, public_projection_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         validated.event_id,
                         validated.term_id,
@@ -371,6 +419,10 @@ class PythonTermRepository:
                         validated.cursor,
                         validated.type,
                         canonical_digest(validated),
+                        canonical_digest(validated_transition),
+                        transition_json,
+                        validated_transition.step_status,
+                        validated_transition.term_status,
                         encoded,
                         canonical_json(projection),
                         time.time(),
@@ -382,24 +434,26 @@ class PythonTermRepository:
             self._write_term(connection, next_term)
 
     def list_events(self, term_id: str) -> tuple[StepEventRecord, ...]:
-        with self.connect() as connection:
+        with self._read_snapshot() as connection:
             rows = connection.execute(
                 """SELECT * FROM python_step_events
                 WHERE term_id = ? ORDER BY cursor""",
                 (term_id,),
             ).fetchall()
-        return tuple(self._decode_event(row) for row in rows)
+        return tuple(self._decode_transition(row).event for row in rows)
 
     def list_public_projections(
         self, term_id: str
     ) -> tuple[PublicEventProjection, ...]:
-        with self.connect() as connection:
+        with self._read_snapshot() as connection:
             rows = connection.execute(
                 """SELECT * FROM python_step_events
                 WHERE term_id = ? ORDER BY cursor""",
                 (term_id,),
             ).fetchall()
-        return tuple(self._decode_event(row).public_projection for row in rows)
+        return tuple(
+            self._decode_transition(row).public_projection for row in rows
+        )
 
     def save_checkpoint(self, checkpoint: StepCheckpointRecord) -> None:
         validated = self._validate_model(checkpoint, StepCheckpointRecord)
@@ -431,7 +485,7 @@ class PythonTermRepository:
             aggregate_steps[step.ordinal] = next_step
             term_updates = {
                 **step_updates,
-                "status": self._rollup_term_status(term.status, aggregate_steps),
+                "status": self._derive_term_status(aggregate_steps),
             }
             next_term = term.model_copy(update=term_updates)
             self._validate_execution_update(step, next_step, kind="Step")
@@ -460,7 +514,7 @@ class PythonTermRepository:
             self._write_term(connection, next_term)
 
     def latest_checkpoint(self, term_id: str) -> StepCheckpointRecord | None:
-        with self.connect() as connection:
+        with self._read_snapshot() as connection:
             row = connection.execute(
                 """SELECT * FROM python_step_checkpoints
                 WHERE term_id = ? ORDER BY cursor DESC LIMIT 1""",
@@ -552,7 +606,7 @@ class PythonTermRepository:
             )
 
     def get_tool_effect(self, effect_id: str) -> ToolEffectRecord | None:
-        with self.connect() as connection:
+        with self._read_snapshot() as connection:
             row = connection.execute(
                 "SELECT * FROM python_tool_effects WHERE effect_id = ?",
                 (effect_id,),
@@ -572,27 +626,25 @@ class PythonTermRepository:
     def _require_active_aggregate(
         self, connection: sqlite3.Connection, term_id: str, step_id: str
     ) -> tuple[TermRecord, StepRecord]:
-        term = self._require_term(connection, term_id)
-        row = connection.execute(
-            """SELECT * FROM python_steps
-            WHERE term_id = ? AND step_id = ?""",
-            (term_id, step_id),
+        term_row = connection.execute(
+            "SELECT * FROM python_terms WHERE term_id = ?", (term_id,)
         ).fetchone()
-        if row is None:
+        if term_row is None:
+            raise RepositoryConflict("aggregate write requires an existing Term")
+        term, steps = self._load_aggregate(connection, term_row)
+        step = next((item for item in steps if item.step_id == step_id), None)
+        if step is None:
             raise RepositoryConflict("aggregate write requires an existing Step")
-        step = self._decode_step(row)
-        self._validate_membership(term, step)
-        self._validate_aggregate_snapshot(term, self._load_steps(connection, term_id))
         if term.status in _EXECUTION_TERMINAL or step.status in _EXECUTION_TERMINAL:
             raise RepositoryConflict("terminal Term or Step rejects new aggregate writes")
         return term, step
 
     @staticmethod
-    def _rollup_term_status(
-        current: ExecutionStatus, steps: Sequence[StepRecord]
-    ) -> ExecutionStatus:
-        if not all(step.status in _EXECUTION_TERMINAL for step in steps):
-            return current
+    def _derive_term_status(steps: Sequence[StepRecord]) -> ExecutionStatus:
+        if any(step.status == "running" for step in steps):
+            return "running"
+        if any(step.status == "pending" for step in steps):
+            return "pending"
         if all(step.status == "completed" for step in steps):
             return "completed"
         if any(step.status == "failed" for step in steps):
@@ -609,6 +661,175 @@ class PythonTermRepository:
         ).fetchall()
         return tuple(self._decode_step(row) for row in rows)
 
+    def _load_aggregate(
+        self, connection: sqlite3.Connection, term_row: sqlite3.Row
+    ) -> tuple[TermRecord, tuple[StepRecord, ...]]:
+        """Decode one aggregate and prove its mutable projection from evidence."""
+        term = self._decode_term(term_row)
+        steps = self._load_steps(connection, term.term_id)
+        try:
+            self._validate_aggregate_snapshot(term, steps)
+        except RepositoryConflict as exc:
+            raise RepositoryCorruption(
+                "persisted aggregate columns are internally inconsistent"
+            ) from exc
+        self._validate_aggregate_evidence(connection, term, steps)
+        return term, steps
+
+    def _validate_aggregate_evidence(
+        self,
+        connection: sqlite3.Connection,
+        term: TermRecord,
+        steps: Sequence[StepRecord],
+    ) -> None:
+        """Replay durable evidence and compare it with the aggregate projection."""
+        replayed_term = term.model_copy(
+            update={
+                "status": "pending",
+                "cursor": 0,
+                "checkpoint_ref": None,
+                "checkpoint_digest": None,
+                "public_projection": None,
+            }
+        )
+        replayed_steps = [
+            step.model_copy(
+                update={
+                    "status": "pending",
+                    "cursor": 0,
+                    "checkpoint_ref": None,
+                    "checkpoint_digest": None,
+                    "public_projection": None,
+                }
+            )
+            for step in steps
+        ]
+        event_rows = connection.execute(
+            """SELECT * FROM python_step_events
+            WHERE term_id = ? ORDER BY cursor""",
+            (term.term_id,),
+        ).fetchall()
+        checkpoint_rows = connection.execute(
+            """SELECT * FROM python_step_checkpoints
+            WHERE term_id = ? ORDER BY cursor""",
+            (term.term_id,),
+        ).fetchall()
+        evidence: list[
+            tuple[int, int, StepEventTransitionRecord | StepCheckpointRecord]
+        ] = [
+            (transition.event.cursor, 0, transition)
+            for transition in (self._decode_transition(row) for row in event_rows)
+        ]
+        evidence.extend(
+            (checkpoint.cursor, 1, checkpoint)
+            for checkpoint in (
+                self._decode_checkpoint(row) for row in checkpoint_rows
+            )
+        )
+        evidence.sort(key=lambda item: (item[0], item[1]))
+
+        try:
+            for _, _, item in evidence:
+                if isinstance(item, StepEventTransitionRecord):
+                    event = item.event
+                    target = self._replay_step(replayed_term, replayed_steps, event.step_id)
+                    if (
+                        event.run_id != replayed_term.envelope.run_id
+                        or event.cursor != replayed_term.cursor + 1
+                        or event.cursor <= target.cursor
+                    ):
+                        raise ValueError("event cursor or Run is inconsistent")
+                    if (
+                        replayed_term.status in _EXECUTION_TERMINAL
+                        or target.status in _EXECUTION_TERMINAL
+                    ):
+                        raise ValueError("event follows terminal state")
+                    next_step = target.model_copy(
+                        update={
+                            "cursor": event.cursor,
+                            "status": item.step_status,
+                            "public_projection": item.public_projection,
+                        }
+                    )
+                    replayed_steps[target.ordinal] = next_step
+                    derived = self._derive_term_status(replayed_steps)
+                    if item.term_status != derived:
+                        raise ValueError("event Term rollup is inconsistent")
+                    replayed_term = replayed_term.model_copy(
+                        update={
+                            "cursor": event.cursor,
+                            "status": derived,
+                            "public_projection": item.public_projection,
+                        }
+                    )
+                else:
+                    checkpoint = item
+                    target = self._replay_step(
+                        replayed_term, replayed_steps, checkpoint.step_id
+                    )
+                    if (
+                        checkpoint.cursor < replayed_term.cursor
+                        or checkpoint.cursor < target.cursor
+                    ):
+                        raise ValueError("checkpoint cursor is inconsistent")
+                    if (
+                        replayed_term.status in _EXECUTION_TERMINAL
+                        or target.status in _EXECUTION_TERMINAL
+                    ):
+                        raise ValueError("checkpoint follows terminal state")
+                    next_step = target.model_copy(
+                        update={
+                            "cursor": checkpoint.cursor,
+                            "status": checkpoint.public_projection.status,
+                            "checkpoint_ref": checkpoint.checkpoint_ref,
+                            "checkpoint_digest": checkpoint.checkpoint_digest,
+                            "public_projection": checkpoint.public_projection,
+                        }
+                    )
+                    replayed_steps[target.ordinal] = next_step
+                    replayed_term = replayed_term.model_copy(
+                        update={
+                            "cursor": checkpoint.cursor,
+                            "status": self._derive_term_status(replayed_steps),
+                            "checkpoint_ref": checkpoint.checkpoint_ref,
+                            "checkpoint_digest": checkpoint.checkpoint_digest,
+                            "public_projection": checkpoint.public_projection,
+                        }
+                    )
+            self._validate_aggregate_snapshot(replayed_term, replayed_steps)
+        except (RepositoryConflict, ValueError, IndexError) as exc:
+            raise RepositoryCorruption("aggregate durable evidence is inconsistent") from exc
+
+        if self._runtime_projection(term) != self._runtime_projection(replayed_term) or any(
+            self._runtime_projection(actual) != self._runtime_projection(expected)
+            for actual, expected in zip(steps, replayed_steps, strict=True)
+        ):
+            raise RepositoryCorruption(
+                "aggregate state lacks matching durable evidence"
+            )
+
+    @staticmethod
+    def _replay_step(
+        term: TermRecord, steps: Sequence[StepRecord], step_id: str
+    ) -> StepRecord:
+        try:
+            ordinal = term.step_ids.index(step_id)
+            return steps[ordinal]
+        except (ValueError, IndexError) as exc:
+            raise ValueError("evidence references a non-member Step") from exc
+
+    @staticmethod
+    def _runtime_projection(record: TermRecord | StepRecord) -> str:
+        return canonical_json(
+            {
+                "status": record.status,
+                "cursor": record.cursor,
+                "checkpoint_ref": record.checkpoint_ref,
+                "checkpoint_digest": record.checkpoint_digest,
+                "public_projection": record.public_projection,
+            }
+        )
+
     def _validate_aggregate_snapshot(
         self, term: TermRecord, steps: Sequence[StepRecord]
     ) -> None:
@@ -620,17 +841,10 @@ class PythonTermRepository:
         for step in steps:
             self._validate_membership(term, step)
 
-        terminal_steps = tuple(
-            step.status in _EXECUTION_TERMINAL for step in steps
-        )
-        if term.status in _EXECUTION_TERMINAL and not all(terminal_steps):
-            raise RepositoryConflict("terminal Term requires terminal member Steps")
-        if all(terminal_steps) and term.status not in _EXECUTION_TERMINAL:
-            raise RepositoryConflict("terminal member Steps require a terminal Term")
-        if term.status == "completed" and any(
-            step.status != "completed" for step in steps
-        ):
-            raise RepositoryConflict("completed Term requires completed member Steps")
+        if term.status != self._derive_term_status(steps):
+            raise RepositoryConflict(
+                "aggregate Term status does not match ordered Step status rollup"
+            )
 
         maximum_cursor = max(step.cursor for step in steps)
         if term.cursor != maximum_cursor:
@@ -695,6 +909,21 @@ class PythonTermRepository:
         for existing, record in pairs:
             if canonical_json(existing) == canonical_json(record):
                 continue
+            if isinstance(existing, TermRecord) and isinstance(record, TermRecord):
+                if canonical_json(self._retry_envelope(existing)) != canonical_json(
+                    self._retry_envelope(record)
+                ):
+                    raise RepositoryConflict(
+                        "Term retry changed its frozen envelope identity"
+                    )
+            if isinstance(existing, StepRecord) and isinstance(record, StepRecord):
+                if (
+                    record.attempt == existing.attempt
+                    and record.host_generation != existing.host_generation
+                ):
+                    raise RepositoryConflict(
+                        "Step host generation may change only with a higher attempt"
+                    )
             self._validate_execution_update(
                 existing,
                 record,
@@ -713,6 +942,16 @@ class PythonTermRepository:
                 )
 
     @staticmethod
+    def _retry_envelope(record: TermRecord) -> dict[str, object]:
+        envelope = record.envelope.model_dump(mode="json")
+        envelope.pop("attempt")
+        runtime = envelope["runtime"]
+        if not isinstance(runtime, dict):
+            raise RepositoryConflict("Term runtime envelope is invalid")
+        runtime.pop("host_generation")
+        return envelope
+
+    @staticmethod
     def _validate_membership(term: TermRecord, step: StepRecord) -> None:
         try:
             expected_ordinal = term.step_ids.index(step.step_id)
@@ -725,6 +964,7 @@ class PythonTermRepository:
         if expected_ordinal == 0 and (
             step.command_id != term.envelope.command_id
             or step.attempt != term.attempt
+            or step.host_generation != term.envelope.runtime.host_generation
             or canonical_json(step.command_identity)
             != canonical_json(term.command_identity)
         ):
@@ -779,6 +1019,7 @@ class PythonTermRepository:
             or row["ordinal"] != record.ordinal
             or row["command_id"] != record.command_id
             or row["agent_id"] != record.agent_id
+            or row["host_generation"] != record.host_generation
             or row["attempt"] != record.attempt
             or row["status"] != record.status
             or row["cursor"] != record.cursor
@@ -788,8 +1029,11 @@ class PythonTermRepository:
             raise RepositoryCorruption("Step columns or immutable identity disagree")
         return record
 
-    def _decode_event(self, row: sqlite3.Row) -> StepEventRecord:
-        record = self._parse_model(row["event_json"], StepEventRecord, "event")
+    def _decode_transition(self, row: sqlite3.Row) -> StepEventTransitionRecord:
+        transition = self._parse_model(
+            row["transition_json"], StepEventTransitionRecord, "event transition"
+        )
+        record = transition.event
         if (
             row["event_id"] != record.event_id
             or row["term_id"] != record.term_id
@@ -797,11 +1041,17 @@ class PythonTermRepository:
             or row["cursor"] != record.cursor
             or row["event_type"] != record.type
             or row["event_digest"] != canonical_digest(record)
+            or row["transition_digest"] != canonical_digest(transition)
+            or row["step_status"] != transition.step_status
+            or row["term_status"] != transition.term_status
+            or row["event_json"] != canonical_json(record)
             or row["public_projection_json"]
-            != canonical_json(record.public_projection)
+            != canonical_json(transition.public_projection)
         ):
-            raise RepositoryCorruption("event columns, digest, or projection disagree")
-        return record
+            raise RepositoryCorruption(
+                "event transition columns, digest, or projection disagree"
+            )
+        return transition
 
     def _decode_checkpoint(self, row: sqlite3.Row) -> StepCheckpointRecord:
         record = self._parse_model(

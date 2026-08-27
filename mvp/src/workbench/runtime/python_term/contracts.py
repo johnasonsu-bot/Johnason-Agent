@@ -633,6 +633,17 @@ class TermRecord(FrozenModel):
             raise ValueError("Term ordered Steps must be non-empty and unique")
         if self.step_ids[0] != self.envelope.step_id:
             raise ValueError("Term first Step must match its RunEnvelope")
+        if (
+            self.envelope.session_id != self.conversation_context.session_id
+            or self.envelope.context.snapshot_ref
+            != self.conversation_context.snapshot_ref
+            or self.envelope.context.snapshot_digest
+            != self.conversation_context.snapshot_digest
+            or self.envelope.context.version != self.conversation_context.version
+        ):
+            raise ValueError(
+                "Term RunEnvelope Context must match its Conversation Context"
+            )
         if canonical_json(self.command_identity) != canonical_json(
             _term_command_identity(self)
         ):
@@ -776,6 +787,7 @@ class StepRecord(FrozenModel):
     command_id: Identifier
     attempt: StrictInt = Field(ge=0)
     agent_id: Identifier
+    host_generation: Identifier
     command_identity: FrozenCommandIdentity
     checkpoint_ref: Reference | None = None
     checkpoint_digest: Digest | None = None
@@ -833,6 +845,7 @@ class StepRecord(FrozenModel):
             command_id=context.command_id,
             attempt=context.attempt,
             agent_id=context.agent_id,
+            host_generation=context.host_generation,
             command_identity=context.command_identity,
             status=status,
             cursor=cursor,
@@ -886,6 +899,18 @@ class StepEventRecord(_SafePayloadRecord):
             event_type=projected.event_type,
             payload=projected.payload,
         )
+
+
+class StepEventTransitionRecord(FrozenModel):
+    """Durable aggregate transition selected for one normalized runtime event."""
+
+    event: StepEventRecord
+    step_status: ExecutionStatus
+    term_status: ExecutionStatus
+
+    @property
+    def public_projection(self) -> PublicEventProjection:
+        return self.event.public_projection
 
 
 class StepCheckpointRecord(_SafePayloadRecord):

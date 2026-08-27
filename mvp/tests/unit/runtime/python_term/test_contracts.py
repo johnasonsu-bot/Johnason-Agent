@@ -28,7 +28,13 @@ from workbench.runtime.python_term.contracts import (
 )
 
 
-def _envelope(tmp_path, *, attempt: int = 0, agent_id: str = "agent-a") -> RunEnvelopeV2:
+def _envelope(
+    tmp_path,
+    *,
+    attempt: int = 0,
+    agent_id: str = "agent-a",
+    host_generation: str = "host-1",
+) -> RunEnvelopeV2:
     messages = ({"role": "user", "content": "hello"},)
     tools = (
         ToolManifestEntryV2(
@@ -64,7 +70,7 @@ def _envelope(tmp_path, *, attempt: int = 0, agent_id: str = "agent-a") -> RunEn
             runtime_id="python-term",
             build_id="build-1",
             config_digest="3" * 64,
-            host_generation="host-1",
+            host_generation=host_generation,
         ),
         session_id="session-1",
         run_id="run-1",
@@ -408,6 +414,36 @@ def test_term_ordered_steps_start_with_the_envelope_step(tmp_path) -> None:
 
     with pytest.raises(ValidationError, match="envelope|first"):
         term.model_copy(update={"step_ids": ("step-other",)})
+
+
+def test_term_envelope_context_must_equal_the_conversation_snapshot(tmp_path) -> None:
+    context = _context(tmp_path)
+    term = context.to_term_record(_envelope(tmp_path))
+    changed_context = term.envelope.context.model_copy(
+        update={"snapshot_ref": "context-other", "snapshot_digest": "a" * 64}
+    )
+
+    with pytest.raises(ValidationError, match="Context|conversation"):
+        term.model_copy(
+            update={"envelope": term.envelope.model_copy(update={"context": changed_context})}
+        )
+
+
+def test_step_record_retains_host_generation_outside_immutable_digest(tmp_path) -> None:
+    first = _context(
+        tmp_path,
+        attempt=0,
+        envelope=_envelope(tmp_path, attempt=0, host_generation="host-a"),
+    ).to_step_record()
+    retried = _context(
+        tmp_path,
+        attempt=1,
+        envelope=_envelope(tmp_path, attempt=1, host_generation="host-b"),
+    ).to_step_record()
+
+    assert first.host_generation == "host-a"
+    assert retried.host_generation == "host-b"
+    assert first.identity_digest == retried.identity_digest
 
 
 def test_nested_contract_values_are_deeply_frozen_and_detached(tmp_path) -> None:

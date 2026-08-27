@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -116,6 +117,111 @@ def test_rejects_area_root_symlink_alias_to_another_term(tmp_path) -> None:
 
     with pytest.raises(StateBoundaryError, match="symlink|canonical"):
         store.resolve("term-b", "agent-a", ref_b, "work", "file.txt", write=True)
+
+
+def test_controlled_open_keeps_the_authorized_inode_after_parent_replacement(
+    tmp_path,
+) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    store.initialize("term-a", "agent-a", {"owner": "a"})
+    ref_b = store.initialize("term-b", "agent-a", {"owner": "b"})
+    term_a_dir = tmp_path / ".runtime" / "terms" / "term-a" / "work" / "dir"
+    term_b_dir = tmp_path / ".runtime" / "terms" / "term-b" / "work" / "dir"
+    term_a_dir.mkdir()
+    term_b_dir.mkdir()
+    (term_a_dir / "value.txt").write_bytes(b"term-a")
+    (term_b_dir / "value.txt").write_bytes(b"term-b")
+
+    with store.open_file(
+        "term-b", "agent-a", ref_b, "work", "dir/value.txt", mode="rb"
+    ) as handle:
+        original = term_b_dir.with_name("dir-original")
+        term_b_dir.rename(original)
+        os.symlink(term_a_dir, term_b_dir)
+        assert handle.read() == b"term-b"
+
+
+def test_controlled_open_rejects_area_replacement_after_grant_check(
+    tmp_path, monkeypatch
+) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    store.initialize("term-a", "agent-a", {"owner": "a"})
+    ref_b = store.initialize("term-b", "agent-a", {"owner": "b"})
+    term_a_work = tmp_path / ".runtime" / "terms" / "term-a" / "work"
+    term_b_work = tmp_path / ".runtime" / "terms" / "term-b" / "work"
+    (term_a_work / "value.txt").write_bytes(b"term-a")
+    (term_b_work / "value.txt").write_bytes(b"term-b")
+    original_require_granted = store._require_granted
+    replaced = False
+
+    def replace_after_check(path: Path, *, write: bool) -> None:
+        nonlocal replaced
+        original_require_granted(path, write=write)
+        if path.name == "value.txt" and not replaced:
+            replaced = True
+            term_b_work.rename(term_b_work.with_name("work-original"))
+            os.symlink(term_a_work, term_b_work)
+
+    monkeypatch.setattr(store, "_require_granted", replace_after_check)
+    with pytest.raises(StateBoundaryError, match="symlink|open|directory"):
+        with store.open_file(
+            "term-b", "agent-a", ref_b, "work", "value.txt", mode="rb"
+        ):
+            pass
+
+
+def test_controlled_open_cannot_follow_a_link_beyond_the_workspace_grant(
+    tmp_path,
+) -> None:
+    broad_store = TermStateStore(tmp_path, _grant(tmp_path))
+    broad_store.initialize("term-a", "agent-a", {"owner": "a"})
+    term_b_root = tmp_path / ".runtime" / "terms" / "term-b"
+    narrow_store = TermStateStore(term_b_root.parents[2], _grant(term_b_root))
+    ref_b = narrow_store.initialize("term-b", "agent-a", {"owner": "b"})
+    term_a_file = tmp_path / ".runtime" / "terms" / "term-a" / "work" / "value.txt"
+    term_a_file.write_bytes(b"term-a")
+    os.symlink(
+        term_a_file,
+        term_b_root / "work" / "outside-grant.txt",
+    )
+
+    with pytest.raises(StateBoundaryError, match="Grant|symlink|open"):
+        with narrow_store.open_file(
+            "term-b",
+            "agent-a",
+            ref_b,
+            "work",
+            "outside-grant.txt",
+            mode="rb",
+        ):
+            pass
+
+
+def test_runtime_metadata_is_read_from_the_same_no_follow_descriptor(
+    tmp_path, monkeypatch
+) -> None:
+    store = TermStateStore(tmp_path, _grant(tmp_path))
+    ref = store.initialize("term-1", "agent-a", {"owner": "a"})
+    runtime_file = tmp_path / ".runtime" / "terms" / "term-1" / "runtime.json"
+    original_fstat = os.fstat
+    replaced = False
+
+    def replace_after_open(descriptor: int):
+        nonlocal replaced
+        metadata = original_fstat(descriptor)
+        if stat.S_ISREG(metadata.st_mode) and not replaced:
+            replaced = True
+            runtime_file.rename(runtime_file.with_name("runtime-original.json"))
+            runtime_file.write_text("{}", encoding="utf-8")
+        return metadata
+
+    monkeypatch.setattr(os, "fstat", replace_after_open)
+    locator = store.resolve(
+        "term-1", "agent-a", ref, "work", "value.txt", write=True
+    )
+
+    assert locator.name == "value.txt"
+    assert replaced
 
 
 def test_rejects_cross_term_reference(tmp_path) -> None:
