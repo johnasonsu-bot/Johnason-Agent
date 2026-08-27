@@ -92,6 +92,9 @@ def test_development_projections_reject_absolute_windows_and_traversal_values() 
     [
         r'https://example.com";artifact=C:\private\state.json',
         "https://example.com;artifact=C:/private/state.json",
+        "https://example.com|artifact=C:/private/state.json",
+        "https://example.com]artifact=C:/private/state.json",
+        "https://example.com`artifact=C:/private/state.json",
     ],
 )
 def test_development_projection_rejects_local_path_after_http_url(hostile: str) -> None:
@@ -109,6 +112,10 @@ def test_development_projection_allows_public_url_and_relative_path_text() -> No
     for safe in (
         "https://example.com/public/worktree",
         "https://example.com/docs/a;b?x=1#ok",
+        "https://example.com/docs;version=1/guide;section=2",
+        "https://example.com/docs;path=/public/file",
+        "https://example.com/search?path=/public/file",
+        "https://example.com/docs#path=/public/file",
         "backend/current/worktree",
     ):
         event = DomainEvent.new("development.branch.progress", "test", {

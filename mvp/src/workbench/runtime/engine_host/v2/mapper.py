@@ -42,10 +42,18 @@ _DIGEST_VALUE = re.compile(
     r"(?<![0-9a-f])(?:[0-9a-f]{64}|[0-9a-f]{40})(?![0-9a-f])",
     re.IGNORECASE,
 )
-_HTTP_URL = re.compile(
-    r'''https?://(?:(?!;[A-Za-z][A-Za-z0-9_.-]*=)[^\s"'<>\\])+''',
-    re.IGNORECASE,
+_HTTP_SCHEMES = ("http://", "https://")
+_URL_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_URL_UNRESERVED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 )
+# Quotes are deliberately excluded even though RFC 3986 lists apostrophe as a
+# sub-delimiter: public text treats either quote as the end of a trusted URL.
+_URL_SUB_DELIMITERS = frozenset("!$&()*+,;=")
+_URL_REG_NAME_CHARS = _URL_UNRESERVED | _URL_SUB_DELIMITERS
+_URL_IP_LITERAL_CHARS = _URL_REG_NAME_CHARS | frozenset(":")
+_URL_PATH_CHARS = _URL_REG_NAME_CHARS | frozenset(":@/")
+_URL_QUERY_FRAGMENT_CHARS = _URL_PATH_CHARS | frozenset("?")
 _TRAVERSAL_PATH = re.compile(r"(?<![A-Za-z0-9_.-])\.\.(?:[\\/]|$)")
 _PATH_BOUNDARY_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./\\-"
@@ -183,11 +191,160 @@ def _normalized_words(value: str) -> tuple[str, ...]:
     )
 
 
+def _percent_escape_end(value: str, index: int) -> int | None:
+    end = index + 3
+    if (
+        end <= len(value)
+        and value[index + 1] in _URL_HEX_DIGITS
+        and value[index + 2] in _URL_HEX_DIGITS
+    ):
+        return end
+    return None
+
+
+def _scan_url_tail(value: str, index: int) -> int:
+    component = "path"
+    if value[index] == "?":
+        component = "query"
+    elif value[index] == "#":
+        component = "fragment"
+
+    while index < len(value):
+        character = value[index]
+        if component == "path" and character in "?#":
+            component = "query" if character == "?" else "fragment"
+            index += 1
+            continue
+        if component == "query" and character == "#":
+            component = "fragment"
+            index += 1
+            continue
+        if character == "%":
+            escape_end = _percent_escape_end(value, index)
+            if escape_end is None:
+                return index
+            index = escape_end
+            continue
+        allowed = (
+            _URL_PATH_CHARS
+            if component == "path"
+            else _URL_QUERY_FRAGMENT_CHARS
+        )
+        if character not in allowed:
+            return index
+        index += 1
+    return index
+
+
+def _scan_http_url(value: str, authority_start: int) -> int | None:
+    index = authority_start
+    last_valid_end: int | None = None
+    host_has_value = False
+    in_ip_literal = False
+    ip_literal_has_value = False
+    ip_literal_closed = False
+    in_port = False
+
+    while index < len(value):
+        character = value[index]
+        if character in "/?#":
+            if last_valid_end != index:
+                return last_valid_end
+            return _scan_url_tail(value, index)
+
+        if in_port:
+            if character.isascii() and character.isdigit():
+                index += 1
+                last_valid_end = index
+                continue
+            return last_valid_end
+
+        if in_ip_literal:
+            if character == "]":
+                if not ip_literal_has_value:
+                    return None
+                in_ip_literal = False
+                ip_literal_closed = True
+                host_has_value = True
+                index += 1
+                last_valid_end = index
+                continue
+            if character == "%":
+                escape_end = _percent_escape_end(value, index)
+                if escape_end is None:
+                    return None
+                ip_literal_has_value = True
+                index = escape_end
+                continue
+            if character not in _URL_IP_LITERAL_CHARS:
+                return None
+            ip_literal_has_value = True
+            index += 1
+            continue
+
+        if ip_literal_closed:
+            if character == ":":
+                in_port = True
+                index += 1
+                continue
+            return last_valid_end
+
+        if not host_has_value and index == authority_start and character == "[":
+            in_ip_literal = True
+            index += 1
+            continue
+        if character == ":":
+            if not host_has_value:
+                return None
+            in_port = True
+            index += 1
+            continue
+        if character in "[]":
+            return last_valid_end
+        if character == "%":
+            escape_end = _percent_escape_end(value, index)
+            if escape_end is None:
+                return last_valid_end
+            host_has_value = True
+            index = escape_end
+            last_valid_end = index
+            continue
+        if character not in _URL_REG_NAME_CHARS:
+            return last_valid_end
+        host_has_value = True
+        index += 1
+        last_valid_end = index
+
+    return last_valid_end
+
+
+def _http_url_spans(value: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(value):
+        scheme_end = None
+        for scheme in _HTTP_SCHEMES:
+            if value[index : index + len(scheme)].lower() == scheme:
+                scheme_end = index + len(scheme)
+                break
+        if scheme_end is None:
+            index += 1
+            continue
+
+        url_end = _scan_http_url(value, scheme_end)
+        if url_end is None:
+            index = scheme_end
+            continue
+        spans.append((index, url_end))
+        index = url_end
+    return tuple(spans)
+
+
 def is_local_path(value: Any) -> bool:
     """Return whether text contains a local path outside an HTTP(S) URL."""
     if not isinstance(value, str):
         return False
-    url_spans = tuple(match.span() for match in _HTTP_URL.finditer(value))
+    url_spans = _http_url_spans(value)
 
     def outside_http_url(position: int) -> bool:
         return not any(start <= position < end for start, end in url_spans)
@@ -201,7 +358,11 @@ def is_local_path(value: Any) -> bool:
     for index, character in enumerate(value):
         if not outside_http_url(index):
             continue
-        at_boundary = index == 0 or value[index - 1] not in _PATH_BOUNDARY_CHARS
+        at_boundary = (
+            index == 0
+            or any(end == index for _, end in url_spans)
+            or value[index - 1] not in _PATH_BOUNDARY_CHARS
+        )
         if not at_boundary:
             continue
         if character in _PATH_SEPARATORS:

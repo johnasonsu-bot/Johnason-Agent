@@ -608,6 +608,9 @@ def test_runtime_public_boundary_rejects_local_paths_at_label_and_punctuation_bo
     [
         r'https://example.com";artifact=C:\private\state.json',
         "https://example.com;artifact=C:/private/state.json",
+        "https://example.com|artifact=C:/private/state.json",
+        "https://example.com]artifact=C:/private/state.json",
+        "https://example.com`artifact=C:/private/state.json",
     ],
 )
 def test_runtime_public_boundary_rejects_local_path_after_http_url(hostile: str) -> None:
@@ -622,6 +625,10 @@ def test_runtime_public_boundary_rejects_local_path_after_http_url(hostile: str)
         "https://example.com/private/state",
         "http://127.0.0.1:46121/api/v1",
         "https://example.com/docs/a;b?x=1#ok",
+        "https://example.com/docs;version=1/guide;section=2",
+        "https://example.com/docs;path=/public/file",
+        "https://example.com/search?path=/public/file",
+        "https://example.com/docs#path=/public/file",
     ],
 )
 def test_runtime_public_boundary_allows_http_urls_with_path_segments(url: str) -> None:
