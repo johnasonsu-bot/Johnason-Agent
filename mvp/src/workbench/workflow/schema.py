@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 19
+PHASE1_SCHEMA_VERSION = 20
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -368,6 +368,80 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (graph_run_id, interrupt_id),
             FOREIGN KEY (graph_run_id) REFERENCES development_graph_jobs(graph_run_id)
         );
+        CREATE TABLE IF NOT EXISTS python_terms (
+            term_id TEXT PRIMARY KEY,
+            command_id TEXT NOT NULL UNIQUE,
+            identity_digest TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            cursor INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS python_steps (
+            term_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            command_id TEXT NOT NULL UNIQUE,
+            agent_id TEXT NOT NULL,
+            identity_digest TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            cursor INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (term_id, step_id),
+            UNIQUE (term_id, ordinal),
+            FOREIGN KEY (term_id) REFERENCES python_terms(term_id)
+        );
+        CREATE TABLE IF NOT EXISTS python_step_events (
+            event_id TEXT PRIMARY KEY,
+            term_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            cursor INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_digest TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            public_projection_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE (term_id, cursor),
+            FOREIGN KEY (term_id, step_id) REFERENCES python_steps(term_id, step_id)
+        );
+        CREATE TABLE IF NOT EXISTS python_step_checkpoints (
+            checkpoint_ref TEXT PRIMARY KEY,
+            checkpoint_digest TEXT NOT NULL,
+            term_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            cursor INTEGER NOT NULL,
+            checkpoint_json TEXT NOT NULL,
+            public_projection_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE (term_id, cursor),
+            FOREIGN KEY (term_id, step_id) REFERENCES python_steps(term_id, step_id)
+        );
+        CREATE TABLE IF NOT EXISTS python_tool_effects (
+            effect_id TEXT PRIMARY KEY,
+            term_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_digest TEXT,
+            effect_json TEXT NOT NULL,
+            public_result_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE (term_id, step_id, tool_call_id),
+            FOREIGN KEY (term_id, step_id) REFERENCES python_steps(term_id, step_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_python_step_events_cursor
+        ON python_step_events(term_id, cursor);
+        CREATE INDEX IF NOT EXISTS idx_python_step_checkpoints_cursor
+        ON python_step_checkpoints(term_id, cursor);
+        CREATE INDEX IF NOT EXISTS idx_python_tool_effects_status
+        ON python_tool_effects(status, updated_at);
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
         BEGIN
