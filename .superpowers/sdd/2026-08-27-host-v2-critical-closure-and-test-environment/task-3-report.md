@@ -9,10 +9,61 @@
 - initial report：`e45141e4f12d1891a3f44017116996737c9f3a5e`
 - recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
 - previous recovery source：`e751353577778c092797b459f62a3b7a80fa0ac6`
-- final SOURCE_REV / source commit：`e01f7441985ef58140f8c51454aab2d7283fe48c`
+- previous fix-round source：`e01f7441985ef58140f8c51454aab2d7283fe48c`
+- final SOURCE_REV / source commit：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
 - report commit：`SELF`（本文件所在的 report-only child commit；最终 SHA 在交付回复中给出）
 - full-range baseline：`d894c81e0af03b8f74cf415bc0310c71459a3d67`
 - Python：`3.13.5`；Node.js：`v22.20.0`；npm：`10.9.3`
+
+## Final unified fix：URL-aware tokenizer 与 fresh gates
+
+最终 source 删除 delimiter-specific `_HTTP_URL` 正则，改为一个有限状态 tokenizer：
+HTTP(S) authority 独立于 path/query/fragment 验证；非法 authority 或组件字符结束可信
+span，后续文本继续进入共享 `is_local_path()` 的本地路径谓词。RuntimeEvent、持久
+AG-UI 与 Development projection 没有复制解析逻辑，公共签名与 Host wire contract
+未改变。
+
+### 严格 TDD RED / GREEN
+
+同一聚焦命令在生产改动前后执行：
+
+```bash
+cd mvp
+PYTHONPATH="$PWD/src:$PWD" .venv/bin/python -m pytest -q \
+  tests/unit/runtime/engine_host/v2/test_mapper.py \
+  tests/unit/agui/test_mapper.py \
+  tests/unit/api/test_development_graph.py \
+  -k 'url or local_path or absolute_windows'
+```
+
+- RED：exit `1`；`12 failed, 49 passed, 1088 deselected in 0.21s`。三层的
+  `|`、stray `]`、backtick hostile case 均被错误公开，三层 matrix URL
+  `https://example.com/docs;path=/public/file` 均被错误拒绝。
+- GREEN：exit `0`；`61 passed, 1088 deselected in 0.12s`。
+- 完整三文件回归：exit `0`；`1149 passed in 1.69s`。
+
+### Final SOURCE_REV 五门
+
+所有门禁均在不可变
+`6a8af6e6e28b28b4102f8b93709925268e5cf957` 上 fresh 执行；开始写报告前 HEAD
+仍为该 SHA 且工作树 clean。
+
+1. 标准 backend：exit `0`；`2260 passed, 6 skipped, 8 deselected`，1 warning；
+   pytest 189.61 秒，1200 秒 wrapper 194.01 秒。
+2. 单次 frontend：exit `0`；Vite `45 modules transformed`，Playwright
+   `38 passed (1.2m)`；600 秒 wrapper 71.80 秒。
+3. Development Graph meta/E2E：exit `0`；`8 passed, 9 deselected`；pytest
+   394.33 秒，1800 秒 wrapper 394.84 秒。
+4. `git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..6a8af6e6e28b28b4102f8b93709925268e5cf957`：
+   exit `0`；0 条问题，无输出；0.02 秒。
+5. fixed-revision credential scanner：exit `0`；
+   `scanned_blobs=43 fixture_allowances=0 findings=0`；0.92 秒。
+
+```text
+Decision: GO_HOST_V2_CONTRACT
+Source revision: 6a8af6e6e28b28b4102f8b93709925268e5cf957
+Real runtime status: NOT_YET_EVALUATED
+```
 
 ## Fix round 1：policy 结构契约与 fresh gates
 
@@ -378,6 +429,6 @@ final report-only commit 只修改：
 
 ```text
 Decision: GO_HOST_V2_CONTRACT
-Source revision: e751353577778c092797b459f62a3b7a80fa0ac6
+Source revision: 6a8af6e6e28b28b4102f8b93709925268e5cf957
 Real runtime status: NOT_YET_EVALUATED
 ```

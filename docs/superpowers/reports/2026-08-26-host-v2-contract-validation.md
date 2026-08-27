@@ -1,7 +1,8 @@
 # Engine Host v2 合同验证报告
 
-- 日期：2026-08-26；final split recovery gate 于 2026-08-27 完成
-- Latest fix-round source revision under test：`e01f7441985ef58140f8c51454aab2d7283fe48c`
+- 日期：2026-08-26；final URL tokenizer gate 于 2026-08-27 完成
+- Latest fix-round source revision under test：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
+- Previous fix-round source：`e01f7441985ef58140f8c51454aab2d7283fe48c`
 - Previous split-recovery source：`e751353577778c092797b459f62a3b7a80fa0ac6`
 - Recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
 - Initial split-gate source：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`（历史 BLOCKED）
@@ -21,18 +22,47 @@
 
 ## 结论
 
-同一 final split-recovery source 上，标准 backend、单次 frontend、独立
+同一 final URL tokenizer source 上，标准 backend、单次 frontend、独立
 Development Graph meta/E2E、全范围 diff check 与固定 revision credential scanner
 全部 exit 0。五类门禁分别计数且没有互相替代，因此发布 Host v2 合同 GO。
 
 ```text
 Decision: GO_HOST_V2_CONTRACT
+Source revision: 6a8af6e6e28b28b4102f8b93709925268e5cf957
 Real runtime status: NOT_YET_EVALUATED
 ```
 
 该 GO 只覆盖 Host v2 合同门。合同 Fake 的通过仍不等于真实 Python
 Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入；真实运行时状态保持
 `NOT_YET_EVALUATED`。
+
+## Final URL tokenizer gate：`6a8af6e6e28b28b4102f8b93709925268e5cf957`
+
+三层公开边界新增 `|`、stray `]` 与 backtick hostile cases，并保留普通 URL、
+分号 path segment、matrix parameter、query 与 fragment 正例。生产改动前 focused
+RED 为 exit `1`，`12 failed, 49 passed, 1088 deselected in 0.21s`；有限状态
+tokenizer 实现后，同一命令 GREEN 为 exit `0`，
+`61 passed, 1088 deselected in 0.12s`；完整三 mapper 文件为 exit `0`，
+`1149 passed in 1.69s`。
+
+五条 final gates 均在上述不可变 SOURCE_REV fresh 执行：
+
+1. 标准 backend，1200 秒上限：exit `0`；
+   `2260 passed, 6 skipped, 8 deselected`，1 warning；pytest 189.61 秒，
+   wrapper 194.01 秒。
+2. frontend `npm test`，600 秒上限：exit `0`；Vite
+   `45 modules transformed`，Playwright `38 passed (1.2m)`；wrapper 71.80 秒。
+3. Development Graph meta/E2E，1800 秒上限：exit `0`；
+   `8 passed, 9 deselected`；pytest 394.33 秒，wrapper 394.84 秒。
+4. 全范围 diff check：exit `0`；0 条问题，无输出；0.02 秒。
+5. fixed-revision credential scanner：exit `0`；
+   `scanned_blobs=43 fixture_allowances=0 findings=0`；0.92 秒。
+
+```text
+Decision: GO_HOST_V2_CONTRACT
+Source revision: 6a8af6e6e28b28b4102f8b93709925268e5cf957
+Real runtime status: NOT_YET_EVALUATED
+```
 
 ## Fix round 1 final gate：`e01f7441985ef58140f8c51454aab2d7283fe48c`
 
