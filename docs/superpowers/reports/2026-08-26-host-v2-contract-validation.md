@@ -1,7 +1,9 @@
 # Engine Host v2 合同验证报告
 
-- 日期：2026-08-26；split release gate 于 2026-08-27 完成
-- Latest split-gate source revision under test：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`
+- 日期：2026-08-26；final split recovery gate 于 2026-08-27 完成
+- Latest split-recovery source revision under test：`e751353577778c092797b459f62a3b7a80fa0ac6`
+- Recovery source A：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`（历史失败候选）
+- Initial split-gate source：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`（历史 BLOCKED）
 - Task 3 base revision：`ac435a927f8132d23ffa61685630c070944793f1`
 - Full-range baseline：`d894c81e0af03b8f74cf415bc0310c71459a3d67`
 - 历史 final unified source：`7712ac2254e7d106a401bac7a9dbe99b3eac7e0c`
@@ -18,21 +20,110 @@
 
 ## 结论
 
-同一 split-gate source 上，标准 backend、单次 frontend、全范围 diff check 与固定
-revision credential scanner 通过；独立 Development Graph meta/E2E 在 `remote`
-fault 场景失败。因此五类门禁并非全部 exit 0，不能发布 GO；标准 backend 的通过
-不得替代失败的 meta/E2E 门。
+同一 final split-recovery source 上，标准 backend、单次 frontend、独立
+Development Graph meta/E2E、全范围 diff check 与固定 revision credential scanner
+全部 exit 0。五类门禁分别计数且没有互相替代，因此发布 Host v2 合同 GO。
 
 ```text
-Decision: BLOCKED
+Decision: GO_HOST_V2_CONTRACT
 Real runtime status: NOT_YET_EVALUATED
 ```
 
-当前唯一非零门为 Development Graph meta/E2E exit 1：`remote` fault 结果的
-`completed_stages` 为空，未满足应包含 `main_graph` 的合同。合同 Fake 的通过也不
-等于真实 Python Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入。
+该 GO 只覆盖 Host v2 合同门。合同 Fake 的通过仍不等于真实 Python
+Codex-Compatible、Goose Query 或 DSH Plugin Runtime 已接入；真实运行时状态保持
+`NOT_YET_EVALUATED`。
 
-## Split release gate：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`
+## Final split recovery gate：`e751353577778c092797b459f62a3b7a80fa0ac6`
+
+五条命令开始与结束时 HEAD 均为
+`e751353577778c092797b459f62a3b7a80fa0ac6`，工作树保持 clean；后续报告提交未混入
+SOURCE_REV。fault cases 使用 shell-free、确定性的 Python pytest commands；只有
+happy-path 在 meta/E2E 内真实运行一次完整 backend 与 `npm test`。
+
+### 1. 标准 backend（排除 meta/E2E）
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); code=124; label=sys.argv[1]; timeout=float(sys.argv[2]); command=sys.argv[3:];
+try:
+ result=subprocess.run(command,timeout=timeout); code=result.returncode
+except subprocess.TimeoutExpired:
+ print(f"{label}_TIMEOUT={timeout}",flush=True)
+finally:
+ print(f"{label}_EXIT={code}",flush=True); print(f"{label}_SECONDS={time.monotonic()-started:.2f}",flush=True)
+raise SystemExit(code)' STANDARD_BACKEND 1200 .venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'
+```
+
+结果：exit `0`；`2243 passed, 6 skipped, 8 deselected`，1 条既有 Starlette
+弃用警告；wrapper 168.63 秒，pytest 167.24 秒。
+
+### 2. 单次 frontend
+
+```bash
+cd mvp/canvas-spike
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); code=124; label=sys.argv[1]; timeout=float(sys.argv[2]); command=sys.argv[3:];
+try:
+ result=subprocess.run(command,timeout=timeout); code=result.returncode
+except subprocess.TimeoutExpired:
+ print(f"{label}_TIMEOUT={timeout}",flush=True)
+finally:
+ print(f"{label}_EXIT={code}",flush=True); print(f"{label}_SECONDS={time.monotonic()-started:.2f}",flush=True)
+raise SystemExit(code)' FRONTEND 600 npm test
+```
+
+结果：exit `0`；Vite `45 modules transformed`；Playwright `38 passed (1.2m)`；
+wrapper 72.03 秒。存在既有 Vite config 与 `NO_COLOR` 警告。
+
+### 3. 独立 Development Graph meta/E2E
+
+```bash
+cd mvp
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); code=124; label=sys.argv[1]; timeout=float(sys.argv[2]); command=sys.argv[3:];
+try:
+ result=subprocess.run(command,timeout=timeout); code=result.returncode
+except subprocess.TimeoutExpired:
+ print(f"{label}_TIMEOUT={timeout}",flush=True)
+finally:
+ print(f"{label}_EXIT={code}",flush=True); print(f"{label}_SECONDS={time.monotonic()-started:.2f}",flush=True)
+raise SystemExit(code)' META_E2E 1800 .venv/bin/python -m pytest -q tests/acceptance/test_development_graph_blueprint.py -m development_graph_meta_e2e
+```
+
+结果：exit `0`；`8 passed, 9 deselected`；wrapper 415.23 秒，pytest 414.66 秒。
+happy-path 执行一次真实 nested backend/Electron regression；7 个 fault cases 使用
+确定性 Python pass/fail commands，只验证 fault 路由、结果与证据。
+
+### 4. 全范围 diff check
+
+```bash
+/usr/bin/python3 -I -c 'import subprocess,sys,time; started=time.monotonic(); result=subprocess.run(sys.argv[2:]); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' DIFF_CHECK git diff --check d894c81e0af03b8f74cf415bc0310c71459a3d67..e751353577778c092797b459f62a3b7a80fa0ac6
+```
+
+结果：exit `0`；0 条问题，无 diff 输出；0.02 秒。
+
+### 5. 固定 revision credential scanner
+
+```bash
+/usr/bin/python3 -I -c 'import os,subprocess,sys,time; started=time.monotonic(); environment=os.environ.copy(); environment["BASE_REV"]=sys.argv[2]; environment["HEAD_REV"]=sys.argv[3]; result=subprocess.run(sys.argv[4:],env=environment); print(f"{sys.argv[1]}_EXIT={result.returncode}",flush=True); print(f"{sys.argv[1]}_SECONDS={time.monotonic()-started:.2f}",flush=True); raise SystemExit(result.returncode)' CREDENTIAL_SCANNER d894c81e0af03b8f74cf415bc0310c71459a3d67 e751353577778c092797b459f62a3b7a80fa0ac6 /usr/bin/python3 -I mvp/scripts/scan_changed_credentials.py
+```
+
+结果：exit `0`；`scanned_blobs=43 fixture_allowances=0 findings=0`；1.00 秒。
+
+```text
+Decision: GO_HOST_V2_CONTRACT
+Source revision: e751353577778c092797b459f62a3b7a80fa0ac6
+Implementation commits: 1796b37ba779a1864722e6ab9a1f6b0ec492d4a3, e751353577778c092797b459f62a3b7a80fa0ac6
+Real runtime status: NOT_YET_EVALUATED
+```
+
+### Historical recovery attempt：`1796b37ba779a1864722e6ab9a1f6b0ec492d4a3`
+
+该中间 source 的标准 backend exit `0`（`2243 passed, 6 skipped, 8 deselected`，
+163.57 秒）与 frontend exit `0`（`38 passed`，65.40 秒）通过；meta/E2E exit `1`
+（`1 passed, 7 failed, 9 deselected`，304.94 秒）。7 个 fault cases 均因
+`pytest --version` 不在 CommandPolicy allowlist 而得到 `InvalidDevelopmentNode`。
+该候选立即作废，未签发 GO，也未用其通过项替代最终 source 的 fresh gates。
+
+## Historical initial split gate：`327f157678f796a9fba4b3e5ec3973a1ce4512b1`
 
 五条命令开始与结束时 HEAD 均为
 `327f157678f796a9fba4b3e5ec3973a1ce4512b1`，工作树保持 clean；后续报告提交未混入
@@ -683,4 +774,5 @@ Vite `45 modules transformed`；Playwright `38 passed`。另一次 A2 fresh Play
   仍需后续独立验收。
 - `query.status` terminal seal ack 已冻结为 Host v2 的有序封口要求；真实 Host
   必须实现该控制帧及 bounded response。
-- 完整必需后端回归未获得 PASS 前，本批次保持 BLOCKED。
+- 该历史 Source C 未获得完整必需后端 PASS，因此其当时判定保持 BLOCKED；不覆盖
+  本报告顶部 final split recovery gate 的当前 GO。

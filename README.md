@@ -122,17 +122,19 @@ Focused orchestration/runtime/restart/acceptance: 108 passed
 Complete backend: 568 passed, 6 skipped
 ```
 
-Batch 3.4-A 的 Engine Host v2 定向合同子集已通过，但这不是正式 GO。当前完整
-后端门仍未取得全绿结果，因此判定保持：
+Batch 3.4-A 的最终 split recovery gate 在同一 source revision
+`e751353577778c092797b459f62a3b7a80fa0ac6` 上全部通过：标准 backend
+`2243 passed, 6 skipped, 8 deselected`；独立 frontend `38 passed`；Development
+Graph meta/E2E `8 passed, 9 deselected`；全范围 diff 与 credential scanner 均为
+exit 0。因此合同门判定为：
 
 ```text
-Decision: BLOCKED
+Decision: GO_HOST_V2_CONTRACT
 Real runtime status: NOT_YET_EVALUATED
 ```
 
-只有同一可达 Source revision 上的完整后端、前端 build、Playwright、v1/v2
-兼容与安全扫描全部通过，才能发布 `GO_HOST_V2_CONTRACT`；Fake/专项结果不能替代
-完整门禁。
+该 GO 只覆盖 Host v2 合同门；Fake 的通过不等于真实 Python Codex-Compatible、
+Goose Query 或 DSH Plugin Runtime 已接入。真实运行时状态仍需独立验收。
 
 复现核心门：
 

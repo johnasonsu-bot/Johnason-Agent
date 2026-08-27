@@ -189,9 +189,10 @@ Engine Host v2 默认关闭，且与现有 v1 路由并存。当前可重复执�
 控制面合同通过；门禁使用 `contract_fake` / `fake-v2` 测试进程，不代表任何
 真实 Runtime 已接入，也不会改变 v2 关闭时继续使用现有 Python/v1 路径的行为。
 
-该专项当前只属于通过的定向子集。完整后端尚未全绿，所以正式判定仍为
-`Decision: BLOCKED`；不得以 conformance、Host 专项或旧前端结果替代同一 Source
-revision 上的完整后端、build 与 Playwright 门禁。
+Final split recovery source `e751353577778c092797b459f62a3b7a80fa0ac6` 已取得同一
+revision 的标准 backend、独立 frontend、Development Graph meta/E2E、全范围 diff
+与 scanner 全绿结果，因此正式判定为 `Decision: GO_HOST_V2_CONTRACT`。该 GO 不得
+替代下列真实 Runtime 的独立门禁。
 
 后续真实 Runtime 必须分别通过独立门禁，不能复用本合同门禁的 GO 结论：
 
@@ -270,6 +271,10 @@ happy-path 会在内部真实运行一次完整 backend 与 `npm test`；fault c
 该门单独运行 happy-path 与 fault-injection 场景。happy-path 内部 backend
 regression 继续忽略当前 blueprint 文件，禁止递归，并与 Electron regression 各
 执行一次；fault cases 不重复外部套件。轻量 CLI 安全测试仍属于标准后端门。
+
+Final split recovery source `e751353577778c092797b459f62a3b7a80fa0ac6` 的独立
+结果：标准 backend `2243 passed, 6 skipped, 8 deselected`；frontend
+`38 passed`；meta/E2E `8 passed, 9 deselected`。三类计数不得合并。
 
 ### 10.4 LangGraph 运行门
 
