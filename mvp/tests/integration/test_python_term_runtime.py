@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
+from agents.usage import Usage
 from agents.testing import ScriptedModel, assistant_message, function_call
 from openai.types.responses.response_reasoning_item import (
     ResponseReasoningItem,
@@ -33,17 +36,22 @@ from workbench.runtime.python_term.contracts import (
     PermissionPolicy,
     ProjectContextRef,
     PublicToolResult,
+    PythonTermRuntimeLimits,
     TermWorkStateRef,
     canonical_digest,
     canonical_json,
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.runtime.python_term.runtime import (
+    AgentDescriptor,
     PythonTermRuntimeError,
     PythonTermRuntime,
     StructuredHandoff,
 )
-from workbench.runtime.python_term.sdk_adapter import PINNED_AGENTS_SDK_REVISION
+from workbench.runtime.python_term.sdk_adapter import (
+    PINNED_AGENTS_SDK_REVISION,
+    FixedModelProvider,
+)
 from workbench.runtime.python_term.tool_router import (
     HmacRequestDigestService,
     ToolAccess,
@@ -55,6 +63,32 @@ from tests.unit.runtime.python_term.test_tool_router import (
     _executor_registry,
     _tool,
 )
+
+
+def _descriptor(
+    agent_id: str = "agent-a",
+    *,
+    name: str | None = None,
+    provider_ref: str = "provider-1",
+    model: str = "model-1",
+    instructions: str | None = None,
+) -> AgentDescriptor:
+    return AgentDescriptor(
+        agent_id=agent_id,
+        name=name or agent_id,
+        provider_ref=provider_ref,
+        model=model,
+        instructions=instructions,
+    )
+
+
+def _model_provider(*bindings) -> FixedModelProvider:
+    return FixedModelProvider(
+        {
+            (provider_ref, model_id): model
+            for provider_ref, model_id, model in bindings
+        }
+    )
 
 
 def _runtime_inputs(tmp_path, runtime: PythonTermRuntime, *, tools=()):
@@ -136,18 +170,23 @@ def _runtime_inputs(tmp_path, runtime: PythonTermRuntime, *, tools=()):
 
 
 def test_runtime_is_selectable_only_after_capability_registration(tmp_path) -> None:
-    runtime = PythonTermRuntime(PythonTermRepository(tmp_path / "runtime.sqlite"))
+    runtime = PythonTermRuntime(
+        PythonTermRepository(tmp_path / "runtime.sqlite"),
+        model_provider=_model_provider(
+            (
+                "provider-1",
+                "model-1",
+                ScriptedModel([[assistant_message("unused")]]),
+            )
+        ),
+    )
     registry = RuntimeRegistryV2(RuntimeV2Repository(tmp_path / "registry.sqlite"))
     requirements = RuntimeRequirementsV2(
         preferred_runtime_id="python-term",
         query=True,
         model=True,
-        tools=True,
-        workspace=True,
         checkpoints=True,
         streaming=True,
-        prompt_sections=True,
-        tool_interceptors=True,
         event_cursor=True,
     )
 
@@ -161,6 +200,13 @@ def test_runtime_is_selectable_only_after_capability_registration(tmp_path) -> N
     assert selected.runtime_id == "python-term"
     assert selected.build_id == runtime.build_id
     assert PINNED_AGENTS_SDK_REVISION in selected.build_id
+    assert set(selected.capabilities) == {
+        "query",
+        "model",
+        "checkpoints",
+        "streaming",
+        "event_cursor",
+    }
 
 
 @pytest.mark.asyncio
@@ -170,7 +216,13 @@ async def test_real_sdk_stream_executes_ordered_steps_with_fresh_frozen_contexts
     """Reusing a RunContext or rereading mutable source history breaks Step isolation."""
     database = tmp_path / "runtime.sqlite"
     repository = PythonTermRepository(database)
-    runtime = PythonTermRuntime(repository)
+    model = ScriptedModel(
+        [[assistant_message("first answer")], [assistant_message("second answer")]]
+    )
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
     inputs = _runtime_inputs(tmp_path, runtime)
     command = QueryCommandV2(
         type="query.start",
@@ -182,31 +234,13 @@ async def test_real_sdk_stream_executes_ordered_steps_with_fresh_frozen_contexts
             ]
         },
     )
-    observed_contexts: list[tuple[int, int, str]] = []
-
-    def instructions(run_context, _agent) -> str:
-        observed_contexts.append(
-            (id(run_context), id(run_context.context), run_context.context.step_id)
-        )
-        if len(observed_contexts) == 1:
-            inputs["model_messages"][0]["content"] = "changed after compilation"
-        return "Return the scripted result."
-
-    model = ScriptedModel(
-        [[assistant_message("first answer")], [assistant_message("second answer")]]
-    )
-    agent = runtime.sdk.Agent(name="agent-a", model=model, instructions=instructions)
-
     result = await runtime.execute(
         command,
-        agents={"agent-a": agent},
+        agents=(_descriptor(instructions="Return the scripted result."),),
         **inputs,
     )
 
     assert result.status == "completed"
-    assert [item[2] for item in observed_contexts] == ["step-1", "step-2"]
-    assert len({item[0] for item in observed_contexts}) == 2
-    assert len({item[1] for item in observed_contexts}) == 2
     assert [call.input for call in model.calls] == [
         [{"role": "user", "content": "private source history"}],
         [{"role": "user", "content": "private source history"}],
@@ -248,26 +282,34 @@ async def test_real_sdk_stream_executes_ordered_steps_with_fresh_frozen_contexts
 async def test_sdk_handoff_exposes_only_the_frozen_structured_transfer(tmp_path) -> None:
     """Passing SDK input history to a target Agent leaks the source Agent's private history."""
     repository = PythonTermRepository(tmp_path / "handoff.sqlite")
-    runtime = PythonTermRuntime(repository)
+    target_model = ScriptedModel([[assistant_message("target answer")]])
+    source_model = ScriptedModel(
+        [[function_call("transfer_to_agent_b", {}, call_id="call-handoff-1")]]
+    )
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(
+            ("provider-1", "model-1", source_model),
+            ("provider-1", "model-target", target_model),
+        ),
+    )
     inputs = _runtime_inputs(tmp_path, runtime)
     command = QueryCommandV2(type="query.start", command_id="command-1")
-    target_model = ScriptedModel([[assistant_message("target answer")]])
-    target = runtime.sdk.Agent(name="agent-b", model=target_model)
     handoff = StructuredHandoff(
         handoff_id="handoff-1",
         source_agent_id="agent-a",
         target_agent_id="agent-b",
         summary="safe transfer",
     )
-    sdk_handoff = runtime.sdk.handoff(target, tool_name_override="transfer_to_agent_b")
-    source_model = ScriptedModel(
-        [[function_call(sdk_handoff.tool_name, {}, call_id="call-handoff-1")]]
-    )
-    source = runtime.sdk.Agent(name="agent-a", model=source_model)
 
     result = await runtime.execute(
         command,
-        agents={"agent-a": source, "agent-b": target},
+        agents=(
+            _descriptor(),
+            _descriptor(
+                "agent-b", provider_ref="provider-1", model="model-target"
+            ),
+        ),
         handoffs=(handoff,),
         **inputs,
     )
@@ -323,19 +365,22 @@ async def test_real_sdk_tool_call_crosses_fixed_router_and_effect_boundary(
         request_digests=HmacRequestDigestService(os.urandom(32)),
         clock_ms=lambda: 1_000,
     )
-    runtime = PythonTermRuntime(repository, tool_router=router)
-    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
     model = ScriptedModel(
         [
             [function_call(sdk_tool_name, {"name": "public"}, call_id="call-tool-1")],
             [assistant_message("tool answer")],
         ]
     )
-    agent = runtime.sdk.Agent(name="agent-a", model=model)
+    runtime = PythonTermRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
 
     result = await runtime.execute(
         QueryCommandV2(type="query.start", command_id="command-1"),
-        agents={"agent-a": agent},
+        agents=(_descriptor(),),
         **inputs,
     )
 
@@ -360,8 +405,6 @@ async def test_real_sdk_tool_call_crosses_fixed_router_and_effect_boundary(
 @pytest.mark.asyncio
 async def test_private_reasoning_is_reduced_to_a_non_secret_count(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "reasoning.sqlite")
-    runtime = PythonTermRuntime(repository)
-    inputs = _runtime_inputs(tmp_path, runtime)
     private_reasoning = "internal deliberation sk-not-public-123456"
     model = ScriptedModel(
         [[
@@ -378,12 +421,15 @@ async def test_private_reasoning_is_reduced_to_a_non_secret_count(tmp_path) -> N
             assistant_message("public answer"),
         ]]
     )
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
 
     result = await runtime.execute(
         QueryCommandV2(type="query.start", command_id="command-1"),
-        agents={
-            "agent-a": runtime.sdk.Agent(name="agent-a", model=model)
-        },
+        agents=(_descriptor(),),
         **inputs,
     )
 
@@ -404,16 +450,17 @@ async def test_unsafe_sdk_output_fails_closed_without_public_leak(
     tmp_path, unsafe_output
 ) -> None:
     repository = PythonTermRepository(tmp_path / "unsafe.sqlite")
-    runtime = PythonTermRuntime(repository)
-    inputs = _runtime_inputs(tmp_path, runtime)
     model = ScriptedModel([[assistant_message(unsafe_output)]])
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
 
     with pytest.raises(PythonTermRuntimeError, match="Step failed"):
         await runtime.execute(
             QueryCommandV2(type="query.start", command_id="command-1"),
-            agents={
-                "agent-a": runtime.sdk.Agent(name="agent-a", model=model)
-            },
+            agents=(_descriptor(),),
             **inputs,
         )
 
@@ -424,3 +471,217 @@ async def test_unsafe_sdk_output_fails_closed_without_public_leak(
         "code": "runtime_error",
         "summary": "Python Term Step failed",
     }
+
+
+def test_agent_descriptor_cannot_capture_callable_or_runtime_authority(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "descriptor.sqlite")
+
+    with pytest.raises((TypeError, ValueError)):
+        AgentDescriptor(
+            agent_id="agent-a",
+            name="agent-a",
+            provider_ref="provider-1",
+            model="model-1",
+            instructions=lambda: "bypass",
+        )
+    with pytest.raises((TypeError, ValueError)):
+        AgentDescriptor(
+            agent_id="agent-a",
+            name="agent-a",
+            provider_ref="provider-1",
+            model="model-1",
+            repository=repository,
+        )
+
+
+@pytest.mark.asyncio
+async def test_external_sdk_agent_is_not_an_execution_authority(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "external-agent.sqlite")
+    configured_model = ScriptedModel([[assistant_message("must not run")]])
+    bypass_model = ScriptedModel([[assistant_message("bypass")]])
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(
+            ("provider-1", "model-1", configured_model)
+        ),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    external = runtime.sdk.Agent(
+        name="agent-a",
+        model=bypass_model,
+        instructions=lambda *_: "callable bypass",
+    )
+
+    with pytest.raises(TypeError, match="descriptor"):
+        await runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents={"agent-a": external},
+            **inputs,
+        )
+    assert configured_model.calls == ()
+    assert bypass_model.calls == ()
+    assert repository.get_term("term-1") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit_kind", ["event", "byte", "token"])
+async def test_sdk_stream_limits_fail_closed_and_quiesce(tmp_path, limit_kind) -> None:
+    usage = Usage(output_tokens=2) if limit_kind == "token" else None
+    model = ScriptedModel(
+        [[assistant_message("bounded answer")]], default_usage=usage
+    )
+    limits = PythonTermRuntimeLimits(
+        max_sdk_events=1 if limit_kind == "event" else 100,
+        max_sdk_bytes=3 if limit_kind == "byte" else 1024,
+        max_sdk_tokens=1 if limit_kind == "token" else 1024,
+    )
+    repository = PythonTermRepository(tmp_path / f"{limit_kind}-limit.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        limits=limits,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+
+    with pytest.raises(PythonTermRuntimeError, match="Step failed"):
+        await runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+
+    assert repository.get_term("term-1").status == "failed"
+    await asyncio.sleep(0)
+    assert not any(
+        not task.done() and "agents" in repr(task.get_coro()).casefold()
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    )
+
+
+@pytest.mark.asyncio
+async def test_sdk_deadline_cancels_provider_and_waits_for_quiescence(tmp_path) -> None:
+    provider_quiesced = asyncio.Event()
+    never = asyncio.Event()
+
+    async def block_provider(_call):
+        try:
+            await never.wait()
+        finally:
+            provider_quiesced.set()
+
+    model = ScriptedModel([{"responder": block_provider}])
+    repository = PythonTermRepository(tmp_path / "deadline.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    inputs["envelope"] = inputs["envelope"].model_copy(update={"deadline_ms": 25})
+
+    with pytest.raises(PythonTermRuntimeError, match="Step failed"):
+        await asyncio.wait_for(
+            runtime.execute(
+                QueryCommandV2(type="query.start", command_id="command-1"),
+                agents=(_descriptor(),),
+                **inputs,
+            ),
+            timeout=1,
+        )
+
+    assert provider_quiesced.is_set()
+    assert repository.get_term("term-1").status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_sdk_external_cancellation_waits_for_provider_quiescence(tmp_path) -> None:
+    provider_entered = asyncio.Event()
+    provider_quiesced = asyncio.Event()
+    never = asyncio.Event()
+
+    async def block_provider(_call):
+        provider_entered.set()
+        try:
+            await never.wait()
+        finally:
+            provider_quiesced.set()
+
+    model = ScriptedModel([{"responder": block_provider}])
+    repository = PythonTermRepository(tmp_path / "cancel.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    execution = asyncio.create_task(
+        runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    )
+    await provider_entered.wait()
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert provider_quiesced.is_set()
+    assert repository.get_term("term-1").status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_kind", ["tool", "handoff"])
+async def test_sdk_stream_cannot_complete_with_an_unclosed_call(tmp_path, call_kind) -> None:
+    model = ScriptedModel([[assistant_message("unused")]])
+    repository = PythonTermRepository(tmp_path / f"unclosed-{call_kind}.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    compiled = runtime.compile_start(
+        QueryCommandV2(type="query.start", command_id="command-1"),
+        agents=(_descriptor(),),
+        **inputs,
+    )
+    context = compiled.contexts[0]
+    if call_kind == "handoff":
+        event_name = "handoff_requested"
+        tool_name = "transfer_to_agent_b"
+        handoff_names = frozenset({tool_name})
+        sdk_tools = {}
+    else:
+        event_name = "tool_called"
+        tool_name = "read_file"
+        handoff_names = frozenset()
+        sdk_tools = {
+            tool_name: SimpleNamespace(
+                tool_id=tool_name,
+                manifest=SimpleNamespace(read_only=True),
+            )
+        }
+
+    class UnclosedResult:
+        final_output = None
+
+        async def stream_events(self):
+            yield SimpleNamespace(
+                type="run_item_stream_event",
+                name=event_name,
+                item=SimpleNamespace(
+                    raw_item=SimpleNamespace(
+                        call_id="call-unclosed-1", name=tool_name, arguments="{}"
+                    )
+                ),
+            )
+
+    with pytest.raises(PythonTermRuntimeError, match="every call was closed"):
+        await runtime._consume_sdk_step(
+            context,
+            UnclosedResult(),
+            handoff_tool_names=handoff_names,
+            sdk_tools=sdk_tools,
+            persisted_source_events=(),
+            publish=lambda *_: None,
+        )

@@ -41,6 +41,42 @@ class AgentsSdkBuildMetadata:
         return f"{self.package}@{self.sdk_version}+{self.revision}"
 
 
+class FixedModelProvider:
+    """Composition-owned mapping from frozen provider/model refs to SDK Models."""
+
+    __slots__ = ("__models",)
+
+    def __init__(self, models: Mapping[tuple[str, str], Model]) -> None:
+        if not isinstance(models, Mapping) or not models:
+            raise ValueError("fixed model provider requires at least one binding")
+        normalized: dict[tuple[str, str], Model] = {}
+        for identity, model in models.items():
+            if (
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or any(
+                    not isinstance(value, str) or not 1 <= len(value) <= 1024
+                    for value in identity
+                )
+                or not isinstance(model, Model)
+            ):
+                raise TypeError("fixed model binding is invalid")
+            if identity in normalized:
+                raise ValueError("fixed model binding identity is duplicated")
+            normalized[identity] = model
+        self.__models = MappingProxyType(normalized)
+
+    def resolve(self, provider_ref: str, model: str) -> Model:
+        try:
+            return self.__models[(provider_ref, model)]
+        except KeyError as exc:
+            raise LookupError("frozen provider/model binding is unavailable") from exc
+
+    @property
+    def binding_count(self) -> int:
+        return len(self.__models)
+
+
 def _freeze(value: object) -> object:
     if isinstance(value, Mapping):
         frozen: dict[str, object] = {}

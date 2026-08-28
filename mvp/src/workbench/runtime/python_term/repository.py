@@ -20,6 +20,7 @@ from .contracts import (
     PublicEventProjection,
     PublicToolResult,
     StepCheckpointRecord,
+    StepExecutionClaim,
     StepEventRecord,
     StepEventTransitionRecord,
     StepRecord,
@@ -419,6 +420,136 @@ class PythonTermRepository:
                 return ()
             return self._load_aggregate(connection, term_row)[1]
 
+    def claim_step(
+        self,
+        term_id: str,
+        step_id: str,
+        *,
+        owner_id: str,
+        lease_seconds: float,
+    ) -> StepExecutionClaim | None:
+        """Atomically acquire or renew one Step execution lease.
+
+        ``None`` means another live owner holds the Step, or the Step became
+        terminal before the claim.  Expired takeovers always receive a new
+        fence and monotonically increasing generation.
+        """
+        if not isinstance(lease_seconds, int | float) or not 0 < lease_seconds <= 86_400:
+            raise ValueError("Step lease must be between zero and one day")
+        with self._transaction() as connection:
+            owning = self._load_owning_aggregate(connection, term_id, step_id)
+            if owning is None:
+                raise RepositoryCorruption("Step claim has no owning aggregate")
+            _, steps = owning
+            step = next(item for item in steps if item.step_id == step_id)
+            if step.status in _EXECUTION_TERMINAL:
+                return None
+            now_ms = self._database_now_ms(connection)
+            lease_expires_at_ms = now_ms + max(1, int(lease_seconds * 1000))
+            row = connection.execute(
+                """SELECT owner_id, lease_expires_at_ms, fence_id, fence_generation
+                FROM python_step_claims WHERE term_id = ? AND step_id = ?""",
+                (term_id, step_id),
+            ).fetchone()
+            if row is None:
+                claim = StepExecutionClaim(
+                    term_id=term_id,
+                    step_id=step_id,
+                    owner_id=owner_id,
+                    lease_expires_at_ms=lease_expires_at_ms,
+                    fence_id=f"step-fence-{secrets.token_hex(16)}",
+                    fence_generation=1,
+                )
+                connection.execute(
+                    """INSERT INTO python_step_claims(
+                    term_id, step_id, owner_id, lease_expires_at_ms, fence_id,
+                    fence_generation, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, unixepoch('subsec'))""",
+                    (
+                        claim.term_id,
+                        claim.step_id,
+                        claim.owner_id,
+                        claim.lease_expires_at_ms,
+                        claim.fence_id,
+                        claim.fence_generation,
+                    ),
+                )
+                return claim
+            if row["owner_id"] == owner_id and row["lease_expires_at_ms"] > now_ms:
+                claim = StepExecutionClaim(
+                    term_id=term_id,
+                    step_id=step_id,
+                    owner_id=owner_id,
+                    lease_expires_at_ms=lease_expires_at_ms,
+                    fence_id=row["fence_id"],
+                    fence_generation=row["fence_generation"],
+                )
+                connection.execute(
+                    """UPDATE python_step_claims
+                    SET lease_expires_at_ms = ?, updated_at = unixepoch('subsec')
+                    WHERE term_id = ? AND step_id = ? AND owner_id = ?
+                    AND fence_id = ? AND fence_generation = ?""",
+                    (
+                        claim.lease_expires_at_ms,
+                        term_id,
+                        step_id,
+                        owner_id,
+                        claim.fence_id,
+                        claim.fence_generation,
+                    ),
+                )
+                return claim
+            if row["owner_id"] is not None and row["lease_expires_at_ms"] > now_ms:
+                return None
+            claim = StepExecutionClaim(
+                term_id=term_id,
+                step_id=step_id,
+                owner_id=owner_id,
+                lease_expires_at_ms=lease_expires_at_ms,
+                fence_id=f"step-fence-{secrets.token_hex(16)}",
+                fence_generation=row["fence_generation"] + 1,
+            )
+            cursor = connection.execute(
+                """UPDATE python_step_claims
+                SET owner_id = ?, lease_expires_at_ms = ?, fence_id = ?,
+                fence_generation = ?, updated_at = unixepoch('subsec')
+                WHERE term_id = ? AND step_id = ? AND fence_generation = ?
+                AND (owner_id IS NULL OR lease_expires_at_ms <= ?)""",
+                (
+                    claim.owner_id,
+                    claim.lease_expires_at_ms,
+                    claim.fence_id,
+                    claim.fence_generation,
+                    term_id,
+                    step_id,
+                    row["fence_generation"],
+                    now_ms,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return claim
+
+    def _require_step_claim(
+        self,
+        connection: sqlite3.Connection,
+        claim: StepExecutionClaim,
+    ) -> None:
+        now_ms = self._database_now_ms(connection)
+        row = connection.execute(
+            """SELECT owner_id, lease_expires_at_ms, fence_id, fence_generation
+            FROM python_step_claims WHERE term_id = ? AND step_id = ?""",
+            (claim.term_id, claim.step_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["owner_id"] != claim.owner_id
+            or row["fence_id"] != claim.fence_id
+            or row["fence_generation"] != claim.fence_generation
+            or row["lease_expires_at_ms"] <= now_ms
+        ):
+            raise RepositoryConflict("Step execution lease is not owned")
+
     @staticmethod
     def _validate_execution_update(
         existing: TermRecord | StepRecord,
@@ -526,6 +657,8 @@ class PythonTermRepository:
         self,
         transition: StepEventTransitionRecord,
         checkpoint: StepCheckpointRecord,
+        *,
+        execution_claim: StepExecutionClaim | None = None,
     ) -> None:
         """Atomically persist one Event, its public projection, and checkpoint hint."""
         validated_transition = self._validate_model(
@@ -552,6 +685,13 @@ class PythonTermRepository:
         event_projection = validated_transition.public_projection
         checkpoint_projection = validated_checkpoint.public_projection
         with self._transaction() as connection:
+            if execution_claim is not None:
+                if (
+                    execution_claim.term_id != validated_event.term_id
+                    or execution_claim.step_id != validated_event.step_id
+                ):
+                    raise RepositoryConflict("Step execution claim identity conflict")
+                self._require_step_claim(connection, execution_claim)
             event_row = connection.execute(
                 "SELECT * FROM python_step_events WHERE event_id = ?",
                 (validated_event.event_id,),
@@ -664,6 +804,26 @@ class PythonTermRepository:
                 ) from exc
             self._write_step(connection, next_step)
             self._write_term(connection, next_term)
+            if (
+                execution_claim is not None
+                and validated_transition.step_status in _EXECUTION_TERMINAL
+            ):
+                released = connection.execute(
+                    """UPDATE python_step_claims
+                    SET owner_id = NULL, lease_expires_at_ms = 0,
+                    updated_at = unixepoch('subsec')
+                    WHERE term_id = ? AND step_id = ? AND owner_id = ?
+                    AND fence_id = ? AND fence_generation = ?""",
+                    (
+                        execution_claim.term_id,
+                        execution_claim.step_id,
+                        execution_claim.owner_id,
+                        execution_claim.fence_id,
+                        execution_claim.fence_generation,
+                    ),
+                )
+                if released.rowcount != 1:
+                    raise RepositoryConflict("Step execution lease release lost its fence")
 
     def list_events(self, term_id: str) -> tuple[StepEventRecord, ...]:
         with self._read_snapshot() as connection:
@@ -768,6 +928,21 @@ class PythonTermRepository:
                 term_id,
                 None if checkpoint is None else checkpoint.step_id,
                 required=checkpoint is not None,
+            )
+            return checkpoint
+
+    def latest_step_checkpoint(
+        self, term_id: str, step_id: str
+    ) -> StepCheckpointRecord | None:
+        with self._read_snapshot() as connection:
+            row = connection.execute(
+                """SELECT * FROM python_step_checkpoints
+                WHERE term_id = ? AND step_id = ? ORDER BY cursor DESC LIMIT 1""",
+                (term_id, step_id),
+            ).fetchone()
+            checkpoint = None if row is None else self._decode_checkpoint(row)
+            self._load_owning_aggregate(
+                connection, term_id, step_id, required=checkpoint is not None
             )
             return checkpoint
 

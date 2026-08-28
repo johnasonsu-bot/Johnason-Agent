@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import asyncio
 
 import pytest
 from agents.testing import ScriptedModel, assistant_message, function_call
 
-from tests.integration.test_python_term_runtime import _runtime_inputs
+from tests.integration.test_python_term_runtime import (
+    _descriptor,
+    _model_provider,
+    _runtime_inputs,
+)
 from workbench.runtime.engine_host.v2.contracts import QueryCommandV2
 from workbench.runtime.python_term.contracts import (
     EffectScope,
@@ -19,13 +24,15 @@ from workbench.runtime.python_term.contracts import (
 )
 from workbench.runtime.python_term.repository import (
     PythonTermRepository,
+    RepositoryConflict,
     RepositoryCorruption,
 )
 from workbench.runtime.python_term.runtime import (
     PythonTermResumeRejected,
     PythonTermRuntime,
+    PythonTermRuntimeError,
+    StructuredHandoff,
 )
-from workbench.runtime.python_term.sdk_adapter import AgentsSdkFacade
 from workbench.runtime.python_term.tool_router import (
     HmacRequestDigestService,
     ToolAccess,
@@ -42,17 +49,6 @@ class SimulatedRuntimeCrash(BaseException):
     pass
 
 
-class CrashBeforeSecondStepFacade(AgentsSdkFacade):
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def run_streamed(self, agent, input, **kwargs):
-        self.calls += 1
-        if self.calls == 2:
-            raise SimulatedRuntimeCrash()
-        return await super().run_streamed(agent, input, **kwargs)
-
-
 class CrashOnceAfterSdkStepRuntime(PythonTermRuntime):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -64,6 +60,21 @@ class CrashOnceAfterSdkStepRuntime(PythonTermRuntime):
             self.crash_once = False
             raise SimulatedRuntimeCrash()
         return result
+
+
+class CrashAfterFirstSourceEventRuntime(PythonTermRuntime):
+    """Crash after one SDK-derived event is already durably public."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.crash_once = True
+
+    def _commit_event(self, context, **kwargs):
+        event = super()._commit_event(context, **kwargs)
+        if self.crash_once and event.type in {"assistant.delta", "tool.call"}:
+            self.crash_once = False
+            raise SimulatedRuntimeCrash()
+        return event
 
 
 def _command(*, two_steps: bool = False) -> QueryCommandV2:
@@ -174,24 +185,28 @@ async def test_crash_after_committed_sdk_write_reuses_effect_without_reexecution
         request_digests=HmacRequestDigestService(os.urandom(32)),
         clock_ms=lambda: 1_000,
     )
-    runtime = CrashOnceAfterSdkStepRuntime(repository, tool_router=router)
-    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
-    inputs["effect_scope"] = EffectScope(
-        scope_id="scope-1", write_effects=True
-    )
     first_model = ScriptedModel(
         [
             [function_call("write_value", {}, call_id="call-write-1")],
             [assistant_message("write answer")],
+            [function_call("write_value", {}, call_id="call-write-1")],
+            [assistant_message("write answer")],
         ]
+    )
+    runtime = CrashOnceAfterSdkStepRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", first_model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+    inputs["effect_scope"] = EffectScope(
+        scope_id="scope-1", write_effects=True
     )
 
     with pytest.raises(SimulatedRuntimeCrash):
         await runtime.execute(
             _command(),
-            agents={
-                "agent-a": runtime.sdk.Agent(name="agent-a", model=first_model)
-            },
+            agents=(_descriptor(),),
             **inputs,
         )
 
@@ -199,29 +214,20 @@ async def test_crash_after_committed_sdk_write_reuses_effect_without_reexecution
     assert effect.status == "committed"
     assert executor.calls == 1
 
-    decision = runtime.recover(_command(), **inputs)
+    decision = runtime.recover(_command(), agents=(_descriptor(),), **inputs)
     assert decision.action == "retry_step"
     assert decision.reusable_effect_ids == (effect.effect_id,)
 
-    resumed_model = ScriptedModel(
-        [
-            [function_call("write_value", {}, call_id="call-write-1")],
-            [assistant_message("write answer")],
-        ]
-    )
     resumed = await runtime.execute(
         _command(),
-        agents={
-            "agent-a": runtime.sdk.Agent(name="agent-a", model=resumed_model)
-        },
+        agents=(_descriptor(),),
         **inputs,
     )
 
     assert resumed.status == "completed"
     assert executor.calls == 1
-    assert [event.type for event in resumed.events if event.type.startswith("tool.")] == [
-        "tool.call",
-        "tool.result",
+    assert not [
+        event for event in resumed.events if event.type.startswith("tool.")
     ]
 
 
@@ -232,18 +238,23 @@ async def test_restart_continues_cursor_skips_completed_step_and_deduplicates_co
     """Restarting the Term from Step zero duplicates completed output and cursor evidence."""
     database = tmp_path / "crash.sqlite"
     repository = PythonTermRepository(database)
-    crashing_sdk = CrashBeforeSecondStepFacade()
-    first_runtime = PythonTermRuntime(repository, sdk=crashing_sdk)
+
+    async def crash_second(_call):
+        raise SimulatedRuntimeCrash()
+
+    first_model = ScriptedModel(
+        [[assistant_message("first answer")], {"responder": crash_second}]
+    )
+    first_runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", first_model)),
+    )
     inputs = _runtime_inputs(tmp_path, first_runtime)
     command = _command(two_steps=True)
-    first_model = ScriptedModel(
-        [[assistant_message("first answer")], [assistant_message("must not run")]]
-    )
-    first_agent = first_runtime.sdk.Agent(name="agent-a", model=first_model)
 
     with pytest.raises(SimulatedRuntimeCrash):
         await first_runtime.execute(
-            command, agents={"agent-a": first_agent}, **inputs
+            command, agents=(_descriptor(),), **inputs
         )
 
     assert tuple(step.status for step in repository.list_steps("term-1")) == (
@@ -253,13 +264,21 @@ async def test_restart_continues_cursor_skips_completed_step_and_deduplicates_co
     cursor_before_restart = repository.get_term("term-1").cursor
     events_before_restart = repository.list_events("term-1")
 
-    resumed_runtime = PythonTermRuntime(repository)
-    resumed_inputs = _runtime_inputs(tmp_path, resumed_runtime)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-2"),
+        )
     resumed_model = ScriptedModel([[assistant_message("second answer")]])
-    resumed_agent = resumed_runtime.sdk.Agent(name="agent-a", model=resumed_model)
+    resumed_runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", resumed_model)),
+    )
+    resumed_inputs = _runtime_inputs(tmp_path, resumed_runtime)
 
     resumed = await resumed_runtime.execute(
-        command, agents={"agent-a": resumed_agent}, **resumed_inputs
+        command, agents=(_descriptor(),), **resumed_inputs
     )
 
     assert resumed.status == "completed"
@@ -272,16 +291,12 @@ async def test_restart_continues_cursor_skips_completed_step_and_deduplicates_co
         range(1, len(all_events) + 1)
     )
 
-    duplicate_model = ScriptedModel([[assistant_message("duplicate")]])
-    duplicate_agent = resumed_runtime.sdk.Agent(
-        name="agent-a", model=duplicate_model
-    )
     duplicate = await resumed_runtime.execute(
-        command, agents={"agent-a": duplicate_agent}, **resumed_inputs
+        command, agents=(_descriptor(),), **resumed_inputs
     )
     assert duplicate.replayed is True
     assert duplicate.events == ()
-    assert len(duplicate_model.calls) == 0
+    assert len(resumed_model.calls) == 1
     assert repository.list_events("term-1") == all_events
 
 
@@ -291,12 +306,14 @@ async def test_checkpoint_freezes_runtime_context_manifest_workspace_and_effect_
 ) -> None:
     """Omitting one frozen digest lets a changed environment resume the same command."""
     repository = PythonTermRepository(tmp_path / "checkpoint.sqlite")
-    runtime = PythonTermRuntime(repository)
-    inputs = _runtime_inputs(tmp_path, runtime)
     model = ScriptedModel([[assistant_message("answer")]])
-    agent = runtime.sdk.Agent(name="agent-a", model=model)
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
 
-    await runtime.execute(_command(), agents={"agent-a": agent}, **inputs)
+    await runtime.execute(_command(), agents=(_descriptor(),), **inputs)
     checkpoint = repository.latest_checkpoint("term-1")
 
     assert checkpoint is not None
@@ -306,6 +323,10 @@ async def test_checkpoint_freezes_runtime_context_manifest_workspace_and_effect_
     assert checkpoint.evidence.manifest_digest
     assert checkpoint.evidence.workspace_grant_digest
     assert checkpoint.evidence.effect_digest == canonical_digest(())
+    assert checkpoint.evidence.agent_descriptor_digest == canonical_digest(
+        (_descriptor(),)
+    )
+    assert checkpoint.evidence.handoff_descriptor_digest == canonical_digest(())
     assert checkpoint.checkpoint_digest == canonical_digest(checkpoint.evidence)
 
 
@@ -340,16 +361,15 @@ async def test_resume_rejects_every_changed_frozen_checkpoint_boundary(
     tmp_path, changed_boundary
 ) -> None:
     repository = PythonTermRepository(tmp_path / "frozen-boundary.sqlite")
-    runtime = PythonTermRuntime(repository)
+    model = ScriptedModel([[assistant_message("answer")]])
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
     inputs = _runtime_inputs(tmp_path, runtime)
     await runtime.execute(
         _command(),
-        agents={
-            "agent-a": runtime.sdk.Agent(
-                name="agent-a",
-                model=ScriptedModel([[assistant_message("answer")]]),
-            )
-        },
+        agents=(_descriptor(),),
         **inputs,
     )
     changed = dict(inputs)
@@ -392,22 +412,21 @@ async def test_resume_rejects_every_changed_frozen_checkpoint_boundary(
         )
 
     with pytest.raises(PythonTermResumeRejected):
-        runtime.recover(_command(), **changed)
+        runtime.recover(_command(), agents=(_descriptor(),), **changed)
 
 
 @pytest.mark.asyncio
 async def test_checkpoint_evidence_tamper_is_detected_before_resume(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "tamper.sqlite")
-    runtime = PythonTermRuntime(repository)
+    model = ScriptedModel([[assistant_message("answer")]])
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
     inputs = _runtime_inputs(tmp_path, runtime)
     await runtime.execute(
         _command(),
-        agents={
-            "agent-a": runtime.sdk.Agent(
-                name="agent-a",
-                model=ScriptedModel([[assistant_message("answer")]]),
-            )
-        },
+        agents=(_descriptor(),),
         **inputs,
     )
 
@@ -425,4 +444,298 @@ async def test_checkpoint_evidence_tamper_is_detected_before_resume(tmp_path) ->
         )
 
     with pytest.raises(RepositoryCorruption):
-        runtime.recover(_command(), **inputs)
+        runtime.recover(_command(), agents=(_descriptor(),), **inputs)
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_identical_durable_sdk_prefix_without_public_duplicates(
+    tmp_path,
+) -> None:
+    repository = PythonTermRepository(tmp_path / "source-prefix.sqlite")
+    model = ScriptedModel(
+        [[assistant_message("same answer")], [assistant_message("same answer")]]
+    )
+    runtime = CrashAfterFirstSourceEventRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+
+    with pytest.raises(SimulatedRuntimeCrash):
+        await runtime.execute(
+            _command(),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+
+    before = repository.list_events("term-1")
+    assert [event.type for event in before] == ["runtime.status", "assistant.delta"]
+
+    result = await runtime.execute(
+        _command(),
+        agents=(_descriptor(),),
+        **inputs,
+    )
+
+    assert result.status == "completed"
+    all_events = repository.list_events("term-1")
+    assert sum(event.type == "assistant.delta" for event in all_events) == 1
+    assert all_events[: len(before)] == before
+
+
+@pytest.mark.asyncio
+async def test_resume_skips_durable_tool_call_prefix_without_public_duplicates(
+    tmp_path,
+) -> None:
+    manifest = _tool("read_value")
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="Read completed")
+    )
+    repository = PythonTermRepository(tmp_path / "tool-source-prefix.sqlite")
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-read", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    model = ScriptedModel(
+        [
+            [function_call("read_value", {}, call_id="call-read-1")],
+            [assistant_message("read answer")],
+        ]
+    )
+    runtime = CrashAfterFirstSourceEventRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+
+    with pytest.raises(SimulatedRuntimeCrash):
+        await runtime.execute(_command(), agents=(_descriptor(),), **inputs)
+    before = repository.list_events("term-1")
+    assert [event.type for event in before] == ["runtime.status", "tool.call"]
+
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        )
+    resumed_model = ScriptedModel(
+        [
+            [function_call("read_value", {}, call_id="call-read-1")],
+            [assistant_message("read answer")],
+        ]
+    )
+    resumed_runtime = PythonTermRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", resumed_model)),
+    )
+    resumed_inputs = _runtime_inputs(tmp_path, resumed_runtime, tools=(manifest,))
+
+    result = await resumed_runtime.execute(
+        _command(), agents=(_descriptor(),), **resumed_inputs
+    )
+
+    assert result.status == "completed"
+    assert executor.calls == 1
+    all_events = repository.list_events("term-1")
+    assert [event.type for event in all_events].count("tool.call") == 1
+    assert [event.type for event in all_events].count("tool.result") == 1
+    assert all_events[: len(before)] == before
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_changed_provider_source_prefix(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "changed-prefix.sqlite")
+    model = ScriptedModel(
+        [[assistant_message("original")], [assistant_message("changed")]]
+    )
+    runtime = CrashAfterFirstSourceEventRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+
+    with pytest.raises(SimulatedRuntimeCrash):
+        await runtime.execute(
+            _command(),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+
+    before = repository.list_events("term-1")
+    with pytest.raises(PythonTermResumeRejected, match="source|prefix|identity"):
+        await runtime.execute(
+            _command(),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    assert repository.list_events("term-1") == before
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_command_claims_one_sdk_execution_without_loser_failure(
+    tmp_path,
+) -> None:
+    repository = PythonTermRepository(tmp_path / "step-claim.sqlite")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block_once(_call):
+        entered.set()
+        await release.wait()
+        return [assistant_message("winner")]
+
+    model = ScriptedModel(
+        [
+            {"responder": block_once},
+            [assistant_message("loser must not invoke")],
+        ]
+    )
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    winner = asyncio.create_task(
+        runtime.execute(_command(), agents=(_descriptor(),), **inputs)
+    )
+    await entered.wait()
+    loser = asyncio.create_task(
+        runtime.execute(_command(), agents=(_descriptor(),), **inputs)
+    )
+    await asyncio.sleep(0)
+    release.set()
+    results = await asyncio.gather(winner, loser, return_exceptions=True)
+
+    assert len(model.calls) == 1
+    assert sum(getattr(result, "status", None) == "completed" for result in results) == 1
+    retryable = [
+        result
+        for result in results
+        if isinstance(result, PythonTermRuntimeError)
+        and result.code == "retryable_conflict"
+    ]
+    assert len(retryable) == 1
+    assert not any(event.type == "error" for event in repository.list_events("term-1"))
+    assert repository.get_term("term-1").status == "completed"
+
+
+def test_expired_step_claim_takeover_fences_the_stale_owner(tmp_path) -> None:
+    repository = PythonTermRepository(tmp_path / "step-fence.sqlite")
+    runtime = PythonTermRuntime(repository)
+    inputs = _runtime_inputs(tmp_path, runtime)
+    compiled = runtime.compile_start(_command(), **inputs)
+    context = compiled.contexts[0]
+    stale = repository.claim_step(
+        "term-1", "step-1", owner_id="owner-a", lease_seconds=10
+    )
+    assert stale is not None
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        )
+    winner = repository.claim_step(
+        "term-1", "step-1", owner_id="owner-b", lease_seconds=10
+    )
+    assert winner is not None
+    assert winner.fence_generation == stale.fence_generation + 1
+    assert winner.fence_id != stale.fence_id
+
+    with pytest.raises(RepositoryConflict, match="lease"):
+        runtime._commit_event(
+            context,
+            event_type="runtime.status",
+            payload={"status": "running"},
+            step_status="running",
+            execution_claim=stale,
+        )
+    assert repository.list_events("term-1") == ()
+
+    event = runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=winner,
+    )
+    assert event.cursor == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_descriptor", ["agent", "model", "handoff"])
+async def test_resume_rejects_changed_agent_model_or_handoff_descriptor(
+    tmp_path, changed_descriptor
+) -> None:
+    repository = PythonTermRepository(tmp_path / f"{changed_descriptor}-descriptor.sqlite")
+    source_model = ScriptedModel([[assistant_message("frozen answer")]])
+    replacement_model = ScriptedModel([[assistant_message("must not run")]])
+    target_model = ScriptedModel([[assistant_message("must not run")]])
+    runtime = CrashAfterFirstSourceEventRuntime(
+        repository,
+        model_provider=_model_provider(
+            ("provider-1", "model-1", source_model),
+            ("provider-1", "model-2", replacement_model),
+            ("provider-1", "target-model", target_model),
+        ),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    initial_agents = (
+        _descriptor(),
+        _descriptor("agent-b", model="target-model"),
+    )
+    initial_handoff = StructuredHandoff(
+        handoff_id="handoff-1",
+        source_agent_id="agent-a",
+        target_agent_id="agent-b",
+        summary="frozen summary",
+    )
+
+    with pytest.raises(SimulatedRuntimeCrash):
+        await runtime.execute(
+            _command(),
+            agents=initial_agents,
+            handoffs=(initial_handoff,),
+            **inputs,
+        )
+    before = repository.list_events("term-1")
+
+    changed_agents = initial_agents
+    changed_handoffs = (initial_handoff,)
+    if changed_descriptor == "agent":
+        changed_agents = (
+            _descriptor(name="changed-agent-name"),
+            initial_agents[1],
+        )
+    elif changed_descriptor == "model":
+        changed_agents = (
+            _descriptor(model="model-2"),
+            initial_agents[1],
+        )
+    else:
+        changed_handoffs = (
+            initial_handoff.model_copy(update={"summary": "changed summary"}),
+        )
+
+    with pytest.raises(PythonTermResumeRejected, match="identity"):
+        await runtime.execute(
+            _command(),
+            agents=changed_agents,
+            handoffs=changed_handoffs,
+            **inputs,
+        )
+    assert len(source_model.calls) == 1
+    assert replacement_model.calls == ()
+    assert target_model.calls == ()
+    assert repository.list_events("term-1") == before

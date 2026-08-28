@@ -428,6 +428,17 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             UNIQUE (term_id, cursor),
             FOREIGN KEY (term_id, step_id) REFERENCES python_steps(term_id, step_id)
         );
+        CREATE TABLE IF NOT EXISTS python_step_claims (
+            term_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            owner_id TEXT,
+            lease_expires_at_ms INTEGER NOT NULL,
+            fence_id TEXT NOT NULL,
+            fence_generation INTEGER NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (term_id, step_id),
+            FOREIGN KEY (term_id, step_id) REFERENCES python_steps(term_id, step_id)
+        );
         CREATE TABLE IF NOT EXISTS python_tool_effects (
             effect_id TEXT PRIMARY KEY,
             term_id TEXT NOT NULL,

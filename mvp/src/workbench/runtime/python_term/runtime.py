@@ -6,17 +6,15 @@ import asyncio
 import hashlib
 import json
 import re
+import secrets
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal
 
-from pydantic import field_validator
-
 from workbench.runtime.engine_host.v2.contracts import (
     CheckpointHintV2,
-    FrozenModel,
     QueryCommandV2,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
@@ -32,17 +30,22 @@ from workbench.runtime.engine_host.v2.registry import (
 )
 
 from .contracts import (
+    AgentDescriptor,
     ConversationContextRef,
     EffectScope,
     ExecutionStatus,
+    HandoffDescriptor,
     PermissionPolicy,
     ProjectContextRef,
     PromptSectionPin,
+    PythonTermRuntimeLimits,
     PublicToolResult,
     PublicStepProjection,
     RuntimeCheckpointEvidence,
+    SdkSourceEventEvidence,
     StepCheckpointRecord,
     StepContext,
+    StepExecutionClaim,
     StepEventRecord,
     StepEventTransitionRecord,
     StepRecord,
@@ -53,11 +56,12 @@ from .contracts import (
     canonical_json,
     validate_safe_json,
 )
-from .repository import PythonTermRepository
+from .repository import PythonTermRepository, RepositoryConflict
 from .sdk_adapter import (
     PINNED_AGENTS_SDK_REVISION,
     AgentsSdkFacade,
     FrozenSnapshotSession,
+    FixedModelProvider,
 )
 from .tool_router import SdkToolWrapper, ToolRouteError, ToolRouter
 
@@ -89,25 +93,7 @@ class PythonTermResumeRejected(PythonTermRuntimeError):
     """Raised when an accepted command no longer matches frozen recovery evidence."""
 
 
-class StructuredHandoff(FrozenModel):
-    """The complete data allowed to cross one private Agent history boundary."""
-
-    handoff_id: str
-    source_agent_id: str
-    target_agent_id: str
-    summary: str
-
-    @field_validator("handoff_id", "source_agent_id", "target_agent_id")
-    @classmethod
-    def validate_identifier(cls, value: str) -> str:
-        if not is_opaque_identifier(value):
-            raise ValueError("handoff identity must be a bounded opaque identifier")
-        return value
-
-    @field_validator("summary")
-    @classmethod
-    def validate_summary(cls, value: str) -> str:
-        return validate_public_text(value, maximum=280)
+StructuredHandoff = HandoffDescriptor
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,43 +198,64 @@ class PythonTermRuntime:
         self,
         repository: PythonTermRepository,
         *,
-        sdk: AgentsSdkFacade | None = None,
+        model_provider: FixedModelProvider | None = None,
         tool_router: ToolRouter | None = None,
+        limits: PythonTermRuntimeLimits | None = None,
     ) -> None:
         if not isinstance(repository, PythonTermRepository):
             raise TypeError("repository must be a PythonTermRepository")
-        if sdk is not None and not isinstance(sdk, AgentsSdkFacade):
-            raise TypeError("sdk must be an AgentsSdkFacade")
+        if model_provider is not None and type(model_provider) is not FixedModelProvider:
+            raise TypeError("model_provider must be an exact FixedModelProvider")
+        if limits is not None and type(limits) is not PythonTermRuntimeLimits:
+            raise TypeError("limits must be an exact PythonTermRuntimeLimits")
         if tool_router is not None and not isinstance(tool_router, ToolRouter):
             raise TypeError("tool_router must be a ToolRouter")
         if tool_router is not None and tool_router.repository is not repository:
             raise ValueError("runtime and Tool Router must share one owning repository")
         self.repository = repository
-        self.sdk = sdk or AgentsSdkFacade()
+        self.sdk = AgentsSdkFacade()
+        self.model_provider = model_provider
         self.tool_router = tool_router
+        self.limits = limits or PythonTermRuntimeLimits()
+        self._owner_nonce = secrets.token_bytes(32)
 
     @property
     def capabilities(self) -> RuntimeCapabilitiesV2:
+        model_available = self.model_provider is not None
+        tools_available = model_available and self.tool_router is not None
         return RuntimeCapabilitiesV2(
             runtime_id=self.runtime_id,
             build_id=self.build_id,
-            query=True,
-            model=True,
-            tools=True,
-            skills=True,
-            plugins=True,
-            workspace=True,
+            query=model_available,
+            model=model_available,
+            tools=tools_available,
+            skills=False,
+            plugins=False,
+            workspace=tools_available,
             checkpoints=True,
-            streaming=True,
-            prompt_sections=True,
-            tool_interceptors=True,
+            streaming=model_available,
+            prompt_sections=False,
+            tool_interceptors=False,
             event_cursor=True,
         )
 
     def register(self, registry: RuntimeRegistryV2) -> RuntimeSelectionV2:
         if not isinstance(registry, RuntimeRegistryV2):
             raise TypeError("registry must be a RuntimeRegistryV2")
-        return registry.register(self.capabilities)
+        capabilities = self.capabilities
+        if capabilities.model and (
+            self.model_provider is None or self.model_provider.binding_count < 1
+        ):
+            raise PythonTermRuntimeError(
+                "capability_unavailable", "Python Term model capability self-check failed"
+            )
+        if capabilities.tools and (
+            self.tool_router is None or self.tool_router.repository is not self.repository
+        ):
+            raise PythonTermRuntimeError(
+                "capability_unavailable", "Python Term Tool capability self-check failed"
+            )
+        return registry.register(capabilities)
 
     def compile_start(
         self,
@@ -263,6 +270,8 @@ class PythonTermRuntime:
         environment_allowlist: Sequence[str],
         effect_scope: EffectScope,
         prompt_sections: Sequence[PromptSectionPin] = (),
+        agents: Sequence[AgentDescriptor] = (),
+        handoffs: Sequence[HandoffDescriptor] = (),
     ) -> CompiledPythonTerm:
         if not isinstance(command, QueryCommandV2) or not isinstance(
             envelope, RunEnvelopeV2
@@ -275,6 +284,26 @@ class PythonTermRuntime:
         if command.command_id != envelope.command_id:
             raise PythonTermRuntimeError(
                 "invalid_request", "Query command identity does not match its envelope"
+            )
+        if envelope.skill_pins or envelope.plugin_pins or prompt_sections:
+            error_type = (
+                PythonTermResumeRejected
+                if self.repository.get_term(envelope.term_id) is not None
+                else PythonTermRuntimeError
+            )
+            raise error_type(
+                "capability_unavailable",
+                "Python Term does not implement skills, plugins, or prompt sections",
+            )
+        if envelope.tool_manifest and self.tool_router is None:
+            error_type = (
+                PythonTermResumeRejected
+                if self.repository.get_term(envelope.term_id) is not None
+                else PythonTermRuntimeError
+            )
+            raise error_type(
+                "capability_unavailable",
+                "Python Term Tool capability is not composed",
             )
         if (
             envelope.runtime.runtime_id != self.runtime_id
@@ -289,6 +318,12 @@ class PythonTermRuntime:
                 "capability_unavailable", "Python Term runtime identity is unavailable"
             )
 
+        frozen_agents = self._freeze_agent_descriptors(agents)
+        frozen_handoffs = self._freeze_handoff_descriptors(handoffs)
+        agent_descriptor_digest = canonical_digest(
+            tuple(sorted(frozen_agents, key=lambda item: item.agent_id))
+        )
+        handoff_descriptor_digest = canonical_digest(frozen_handoffs)
         step_identities = self._step_identities(command, envelope)
         contexts = tuple(
             StepContext.from_envelope(
@@ -303,6 +338,8 @@ class PythonTermRuntime:
                 environment_allowlist=environment_allowlist,
                 effect_scope=effect_scope,
                 prompt_sections=prompt_sections,
+                agent_descriptor_digest=agent_descriptor_digest,
+                handoff_descriptor_digest=handoff_descriptor_digest,
             )
             for step_id, command_id in step_identities
         )
@@ -383,6 +420,8 @@ class PythonTermRuntime:
         environment_allowlist: Sequence[str],
         effect_scope: EffectScope,
         prompt_sections: Sequence[PromptSectionPin] = (),
+        agents: Sequence[AgentDescriptor] = (),
+        handoffs: Sequence[HandoffDescriptor] = (),
     ) -> PythonTermRecovery:
         compiled = self.compile_start(
             command,
@@ -395,6 +434,8 @@ class PythonTermRuntime:
             environment_allowlist=environment_allowlist,
             effect_scope=effect_scope,
             prompt_sections=prompt_sections,
+            agents=agents,
+            handoffs=handoffs,
         )
         return self._recover_compiled(compiled)
 
@@ -466,6 +507,7 @@ class PythonTermRuntime:
                     update={
                         "effect_digest": evidence.effect_digest,
                         "effect_record_digests": evidence.effect_record_digests,
+                        "source_events": evidence.source_events,
                     }
                 )
             )
@@ -565,7 +607,7 @@ class PythonTermRuntime:
         command: QueryCommandV2,
         *,
         envelope: RunEnvelopeV2,
-        agents: Mapping[str, Any],
+        agents: Sequence[AgentDescriptor],
         model_messages: Sequence[Mapping[str, object]],
         conversation_context: ConversationContextRef,
         project_context: ProjectContextRef,
@@ -574,8 +616,10 @@ class PythonTermRuntime:
         environment_allowlist: Sequence[str],
         effect_scope: EffectScope,
         prompt_sections: Sequence[PromptSectionPin] = (),
-        handoffs: Sequence[StructuredHandoff] = (),
+        handoffs: Sequence[HandoffDescriptor] = (),
     ) -> PythonTermExecution:
+        frozen_agents = self._freeze_agent_descriptors(agents)
+        frozen_handoffs = self._freeze_handoff_descriptors(handoffs)
         compiled = self.compile_start(
             command,
             envelope=envelope,
@@ -587,6 +631,8 @@ class PythonTermRuntime:
             environment_allowlist=environment_allowlist,
             effect_scope=effect_scope,
             prompt_sections=prompt_sections,
+            agents=frozen_agents,
+            handoffs=frozen_handoffs,
         )
         recovery = self._recover_compiled(compiled)
         if recovery.action == "reconciliation_required":
@@ -617,11 +663,9 @@ class PythonTermRuntime:
                 final_output=final_output,
                 replayed=True,
             )
-        frozen_handoffs = tuple(
-            StructuredHandoff.model_validate(item.model_dump(mode="python"))
-            for item in handoffs
+        agent_bindings = self._validate_agent_descriptors(
+            frozen_agents, compiled.contexts, frozen_handoffs
         )
-        self._validate_agents(agents, compiled.contexts, frozen_handoffs)
 
         emitted: list[RuntimeEventV2] = []
         final_output: str | None = None
@@ -637,8 +681,27 @@ class PythonTermRuntime:
                 raise PythonTermResumeRejected(
                     "invalid_request", "Python Term Step cannot resume"
                 )
-            base_agent, handoff_tool_names, sdk_tools = self._agent_for_step(
-                context, agents, frozen_handoffs
+            claim = self.repository.claim_step(
+                context.term_id,
+                context.step_id,
+                owner_id=self._execution_owner_id(),
+                lease_seconds=min(86_400, (context.deadline_ms + 5_000) / 1_000),
+            )
+            if claim is None:
+                current = self.repository.get_step(context.term_id, context.step_id)
+                if current is not None and current.status == "completed":
+                    continue
+                raise PythonTermRuntimeError(
+                    "retryable_conflict",
+                    "Python Term Step is owned by another active execution",
+                )
+            checkpoint = self.repository.latest_step_checkpoint(
+                context.term_id, context.step_id
+            )
+            source_prefix = (
+                ()
+                if checkpoint is None or checkpoint.evidence is None
+                else checkpoint.evidence.source_events
             )
             if durable_step.status == "pending":
                 emitted.append(
@@ -647,43 +710,86 @@ class PythonTermRuntime:
                         event_type="runtime.status",
                         payload={"status": "running"},
                         step_status="running",
+                        execution_claim=claim,
+                        source_events=source_prefix,
                     )
                 )
             try:
-                step_events, final_output = await self._run_sdk_step(
-                    context,
-                    base_agent,
-                    handoff_tool_names=handoff_tool_names,
-                    sdk_tools=sdk_tools,
+                base_agent, handoff_tool_names, sdk_tools = self._agent_for_step(
+                    context, agent_bindings, frozen_handoffs
                 )
-                for event_type, payload in step_events:
+
+                def commit_source_event(
+                    event_type: str,
+                    payload: Mapping[str, object],
+                    source_events: tuple[SdkSourceEventEvidence, ...],
+                ) -> None:
                     emitted.append(
                         self._commit_event(
                             context,
                             event_type=event_type,
                             payload=payload,
                             step_status="running",
+                            execution_claim=claim,
+                            source_events=source_events,
                         )
                     )
+
+                final_output, source_events = await self._run_sdk_step(
+                    context,
+                    base_agent,
+                    handoff_tool_names=handoff_tool_names,
+                    sdk_tools=sdk_tools,
+                    persisted_source_events=source_prefix,
+                    publish=commit_source_event,
+                )
                 emitted.append(
                     self._commit_event(
                         context,
                         event_type="runtime.status",
                         payload={"status": "completed"},
                         step_status="completed",
+                        execution_claim=claim,
+                        source_events=source_events,
                     )
                 )
             except asyncio.CancelledError:
+                cancelled_checkpoint = self.repository.latest_step_checkpoint(
+                    context.term_id, context.step_id
+                )
+                cancelled_source_events = (
+                    source_prefix
+                    if cancelled_checkpoint is None
+                    or cancelled_checkpoint.evidence is None
+                    else cancelled_checkpoint.evidence.source_events
+                )
                 emitted.append(
                     self._commit_event(
                         context,
                         event_type="runtime.status",
                         payload={"status": "cancelled"},
                         step_status="cancelled",
+                        execution_claim=claim,
+                        source_events=cancelled_source_events,
                     )
                 )
                 raise
+            except PythonTermResumeRejected:
+                raise
+            except RepositoryConflict:
+                raise PythonTermRuntimeError(
+                    "retryable_conflict",
+                    "Python Term Step execution fence was lost",
+                ) from None
             except Exception:
+                failed_checkpoint = self.repository.latest_step_checkpoint(
+                    context.term_id, context.step_id
+                )
+                failed_source_events = (
+                    source_prefix
+                    if failed_checkpoint is None or failed_checkpoint.evidence is None
+                    else failed_checkpoint.evidence.source_events
+                )
                 emitted.append(
                     self._commit_event(
                         context,
@@ -693,6 +799,8 @@ class PythonTermRuntime:
                             "summary": "Python Term Step failed",
                         },
                         step_status="failed",
+                        execution_claim=claim,
+                        source_events=failed_source_events,
                     )
                 )
                 raise PythonTermRuntimeError(
@@ -718,6 +826,14 @@ class PythonTermRuntime:
             checkpoint_hint=hint,
             final_output=final_output,
         )
+
+    def _execution_owner_id(self) -> str:
+        task = asyncio.current_task()
+        task_identity = 0 if task is None else id(task)
+        digest = hashlib.sha256(
+            self._owner_nonce + str(task_identity).encode("ascii")
+        ).hexdigest()[:32]
+        return f"step-owner-{digest}"
 
     @staticmethod
     def _step_identities(
@@ -761,49 +877,128 @@ class PythonTermRuntime:
         return tuple(identities)
 
     @staticmethod
-    def _validate_agents(
-        agents: Mapping[str, Any],
+    def _freeze_agent_descriptors(
+        agents: Sequence[AgentDescriptor],
+    ) -> tuple[AgentDescriptor, ...]:
+        if isinstance(agents, Mapping | str | bytes) or not isinstance(agents, Sequence):
+            raise TypeError("agents must be frozen Agent descriptors")
+        frozen: list[AgentDescriptor] = []
+        for item in agents:
+            if type(item) is not AgentDescriptor:
+                raise TypeError("agents must contain exact AgentDescriptor values")
+            frozen.append(AgentDescriptor.model_validate(item.model_dump(mode="python")))
+        if len({item.agent_id for item in frozen}) != len(frozen):
+            raise PythonTermRuntimeError(
+                "invalid_request", "Agent descriptor identity is duplicated"
+            )
+        if len({item.name for item in frozen}) != len(frozen):
+            raise PythonTermRuntimeError(
+                "invalid_request", "Agent descriptor SDK name is duplicated"
+            )
+        return tuple(frozen)
+
+    @staticmethod
+    def _freeze_handoff_descriptors(
+        handoffs: Sequence[HandoffDescriptor],
+    ) -> tuple[HandoffDescriptor, ...]:
+        if isinstance(handoffs, Mapping | str | bytes) or not isinstance(
+            handoffs, Sequence
+        ):
+            raise TypeError("handoffs must be frozen Handoff descriptors")
+        frozen: list[HandoffDescriptor] = []
+        for item in handoffs:
+            if type(item) is not HandoffDescriptor:
+                raise TypeError("handoffs must contain exact HandoffDescriptor values")
+            frozen.append(
+                HandoffDescriptor.model_validate(item.model_dump(mode="python"))
+            )
+        if len({item.handoff_id for item in frozen}) != len(frozen):
+            raise PythonTermRuntimeError(
+                "invalid_request", "Handoff descriptor identity is duplicated"
+            )
+        return tuple(frozen)
+
+    def _validate_agent_descriptors(
+        self,
+        agents: Sequence[AgentDescriptor],
         contexts: Sequence[StepContext],
-        handoffs: Sequence[StructuredHandoff],
-    ) -> None:
-        if not isinstance(agents, Mapping):
-            raise TypeError("agents must be a mapping")
+        handoffs: Sequence[HandoffDescriptor],
+    ) -> Mapping[str, AgentDescriptor]:
+        if self.model_provider is None:
+            raise PythonTermRuntimeError(
+                "capability_unavailable", "Python Term model provider is unavailable"
+            )
+        bindings = {item.agent_id: item for item in agents}
         required = {context.agent_id for context in contexts}
         required.update(handoff.target_agent_id for handoff in handoffs)
-        if not required.issubset(agents):
+        if not required.issubset(bindings):
             raise PythonTermRuntimeError(
                 "invalid_request", "A frozen Agent binding is missing"
             )
-        for agent_id in required:
-            agent = agents[agent_id]
-            if getattr(agent, "tools", None):
+        for context in contexts:
+            descriptor = bindings[context.agent_id]
+            if (
+                descriptor.provider_ref != context.provider_ref
+                or descriptor.model != context.model
+            ):
                 raise PythonTermRuntimeError(
-                    "policy_rejected", "SDK Tools require the fixed Tool Router bridge"
+                    "invalid_request",
+                    "Agent descriptor provider/model does not match the frozen Step",
                 )
-            if getattr(agent, "handoffs", None):
+        for descriptor in bindings.values():
+            try:
+                self.model_provider.resolve(
+                    descriptor.provider_ref, descriptor.model
+                )
+            except LookupError:
                 raise PythonTermRuntimeError(
-                    "policy_rejected", "Only structured runtime Handoffs are accepted"
-                )
+                    "capability_unavailable",
+                    "Frozen Agent provider/model binding is unavailable",
+                ) from None
         for handoff in handoffs:
-            if handoff.source_agent_id not in required:
+            if (
+                handoff.source_agent_id not in {item.agent_id for item in contexts}
+                or handoff.target_agent_id not in bindings
+                or handoff.source_agent_id == handoff.target_agent_id
+            ):
                 raise PythonTermRuntimeError(
-                    "invalid_request", "Handoff source Agent is not frozen"
+                    "invalid_request", "Handoff Agent graph is not frozen"
                 )
+        return bindings
+
+    def _sdk_agent(self, descriptor: AgentDescriptor) -> Any:
+        if self.model_provider is None:
+            raise PythonTermRuntimeError(
+                "capability_unavailable", "Python Term model provider is unavailable"
+            )
+        model = self.model_provider.resolve(descriptor.provider_ref, descriptor.model)
+        return self.sdk.Agent(
+            name=descriptor.name,
+            instructions=descriptor.instructions,
+            model=model,
+        )
 
     def _agent_for_step(
         self,
         context: StepContext,
-        agents: Mapping[str, Any],
-        handoffs: Sequence[StructuredHandoff],
+        agents: Mapping[str, AgentDescriptor],
+        handoffs: Sequence[HandoffDescriptor],
     ) -> tuple[Any, frozenset[str], Mapping[str, SdkToolWrapper]]:
-        agent = agents[context.agent_id]
+        descriptor = agents[context.agent_id]
+        if self.model_provider is None:
+            raise PythonTermRuntimeError(
+                "capability_unavailable", "Python Term model provider is unavailable"
+            )
+        model = self.model_provider.resolve(
+            descriptor.provider_ref, descriptor.model
+        )
         sdk_tools = self._sdk_tools(context)
         sdk_handoffs: list[Any] = []
         tool_names: set[str] = set()
         for transfer in handoffs:
             if transfer.source_agent_id != context.agent_id:
                 continue
-            target = agents[transfer.target_agent_id]
+            target = self._sdk_agent(agents[transfer.target_agent_id])
             content = (
                 f"Handoff {transfer.handoff_id} from {transfer.source_agent_id}: "
                 f"{transfer.summary}"
@@ -831,8 +1026,12 @@ class PythonTermRuntime:
             sdk_handoffs.append(sdk_handoff)
             tool_names.add(sdk_handoff.tool_name)
         return (
-            agent.clone(
-                tools=[tool for tool, _ in sdk_tools], handoffs=sdk_handoffs
+            self.sdk.Agent(
+                name=descriptor.name,
+                instructions=descriptor.instructions,
+                model=model,
+                tools=[tool for tool, _ in sdk_tools],
+                handoffs=sdk_handoffs,
             ),
             frozenset(tool_names),
             {tool.name: wrapper for tool, wrapper in sdk_tools},
@@ -892,20 +1091,140 @@ class PythonTermRuntime:
         *,
         handoff_tool_names: frozenset[str],
         sdk_tools: Mapping[str, SdkToolWrapper],
-    ) -> tuple[tuple[tuple[str, Mapping[str, object]], ...], str | None]:
+        persisted_source_events: tuple[SdkSourceEventEvidence, ...],
+        publish: Callable[
+            [str, Mapping[str, object], tuple[SdkSourceEventEvidence, ...]], None
+        ],
+    ) -> tuple[str | None, tuple[SdkSourceEventEvidence, ...]]:
         session = FrozenSnapshotSession(context.session_id, context.model_messages)
-        result = await self.sdk.run_streamed(
-            agent,
-            [],
-            context=context,
-            session=session,
+        result: Any | None = None
+        try:
+            async with asyncio.timeout(context.deadline_ms / 1_000):
+                result = await self.sdk.run_streamed(
+                    agent,
+                    [],
+                    context=context,
+                    session=session,
+                    max_turns=self.limits.max_turns,
+                )
+                sdk_context = getattr(result, "context_wrapper", None)
+                if getattr(sdk_context, "context", None) is not context:
+                    raise PythonTermRuntimeError(
+                        "runtime_error", "SDK RunContext identity was rejected"
+                    )
+                return await self._consume_sdk_step(
+                    context,
+                    result,
+                    handoff_tool_names=handoff_tool_names,
+                    sdk_tools=sdk_tools,
+                    persisted_source_events=persisted_source_events,
+                    publish=publish,
+                )
+        except TimeoutError:
+            await self._cancel_and_quiesce_sdk(result)
+            raise PythonTermRuntimeError(
+                "deadline_exceeded", "Python Term SDK deadline was exceeded"
+            ) from None
+        except asyncio.CancelledError:
+            await self._cancel_and_quiesce_sdk(result)
+            raise
+        except BaseException:
+            await self._cancel_and_quiesce_sdk(result)
+            raise
+
+    async def _cancel_and_quiesce_sdk(self, result: Any | None) -> None:
+        if result is None:
+            return
+        cancel = getattr(result, "cancel", None)
+        run_loop_task = getattr(result, "run_loop_task", None)
+        if not isinstance(run_loop_task, asyncio.Task) or run_loop_task.done():
+            if callable(cancel):
+                cancel()
+            return
+        timeout = self.limits.quiescence_timeout_ms / 2_000
+        for _ in range(2):
+            if callable(cancel):
+                cancel()
+            run_loop_task.cancel()
+            done, _ = await asyncio.wait({run_loop_task}, timeout=timeout)
+            if done:
+                try:
+                    run_loop_task.result()
+                except BaseException:
+                    pass
+                return
+        raise PythonTermRuntimeError(
+            "runtime_error", "Python Term SDK run did not quiesce"
         )
-        normalized: list[tuple[str, Mapping[str, object]]] = []
+
+    async def _consume_sdk_step(
+        self,
+        context: StepContext,
+        result: Any,
+        *,
+        handoff_tool_names: frozenset[str],
+        sdk_tools: Mapping[str, SdkToolWrapper],
+        persisted_source_events: tuple[SdkSourceEventEvidence, ...],
+        publish: Callable[
+            [str, Mapping[str, object], tuple[SdkSourceEventEvidence, ...]], None
+        ],
+    ) -> tuple[str | None, tuple[SdkSourceEventEvidence, ...]]:
+        source_events = list(persisted_source_events)
+        source_index = 0
         pending_deltas: list[str] = []
         handoff_calls: list[str] = []
         tool_calls: dict[str, SdkToolWrapper] = {}
         current_agent_name: str | None = None
+        sdk_event_count = 0
+        sdk_byte_count = 0
+        sdk_token_count = 0
+
+        def consume_bytes(value: str) -> None:
+            nonlocal sdk_byte_count
+            sdk_byte_count += len(value.encode("utf-8"))
+            if sdk_byte_count > self.limits.max_sdk_bytes:
+                result.cancel()
+                raise PythonTermRuntimeError(
+                    "resource_exhausted", "SDK stream byte limit was exceeded"
+                )
+
+        def emit(event_type: str, payload: Mapping[str, object]) -> None:
+            nonlocal source_index
+            source_event_id = f"sdk-source-{source_index + 1}"
+            evidence = SdkSourceEventEvidence(
+                source_event_id=source_event_id,
+                source_event_digest=canonical_digest(
+                    {
+                        "source_event_id": source_event_id,
+                        "event_type": event_type,
+                        "payload": payload,
+                    }
+                ),
+            )
+            if source_index < len(persisted_source_events):
+                if persisted_source_events[source_index] != evidence:
+                    result.cancel()
+                    raise PythonTermResumeRejected(
+                        "invalid_request",
+                        "SDK source event prefix changed before resume",
+                    )
+            else:
+                candidate = (*source_events, evidence)
+                try:
+                    publish(event_type, payload, candidate)
+                except BaseException:
+                    result.cancel()
+                    raise
+                source_events.append(evidence)
+            source_index += 1
+
         async for sdk_event in result.stream_events():
+            sdk_event_count += 1
+            if sdk_event_count > self.limits.max_sdk_events:
+                result.cancel()
+                raise PythonTermRuntimeError(
+                    "resource_exhausted", "SDK stream event limit was exceeded"
+                )
             sdk_type = getattr(sdk_event, "type", None)
             if sdk_type == "agent_updated_stream_event":
                 new_agent_name = getattr(
@@ -915,18 +1234,16 @@ class PythonTermRuntime:
                     current_agent_name = new_agent_name
                 elif new_agent_name != current_agent_name and handoff_calls:
                     call_id = handoff_calls.pop(0)
-                    normalized.append(
-                        (
-                            "tool.result",
-                            {
-                                "tool_id": "agent-handoff",
-                                "tool_call_id": call_id,
-                                "read_only": True,
-                                "name": "Agent handoff",
-                                "summary": "Structured handoff accepted",
-                                "status": "completed",
-                            },
-                        )
+                    emit(
+                        "tool.result",
+                        {
+                            "tool_id": "agent-handoff",
+                            "tool_call_id": call_id,
+                            "read_only": True,
+                            "name": "Agent handoff",
+                            "summary": "Structured handoff accepted",
+                            "status": "completed",
+                        },
                     )
                     current_agent_name = new_agent_name
                 continue
@@ -936,22 +1253,47 @@ class PythonTermRuntime:
                 if data_type == "response.output_text.delta":
                     delta = getattr(data, "delta", None)
                     if isinstance(delta, str) and delta:
+                        consume_bytes(delta)
+                        try:
+                            validate_public_text(
+                                "".join((*pending_deltas, delta)), maximum=4096
+                            )
+                        except (TypeError, ValueError):
+                            result.cancel()
+                            raise
                         pending_deltas.append(delta)
+                        emit("assistant.delta", {"content": delta})
                 elif data_type in {
                     "response.reasoning_text.delta",
                     "response.reasoning_summary_text.delta",
                 }:
                     delta = getattr(data, "delta", None)
                     if isinstance(delta, str) and delta:
-                        normalized.append(
-                            ("reasoning.delta", {"char_count": len(delta)})
-                        )
+                        consume_bytes(delta)
+                        emit("reasoning.delta", {"char_count": len(delta)})
+                elif data_type == "response.completed":
+                    usage = getattr(getattr(data, "response", None), "usage", None)
+                    output_tokens = getattr(usage, "output_tokens", 0)
+                    if isinstance(output_tokens, int) and output_tokens > 0:
+                        sdk_token_count += output_tokens
+                        if sdk_token_count > self.limits.max_sdk_tokens:
+                            result.cancel()
+                            raise PythonTermRuntimeError(
+                                "resource_exhausted",
+                                "SDK stream token limit was exceeded",
+                            )
                 continue
             if sdk_type != "run_item_stream_event":
                 continue
             name = getattr(sdk_event, "name", None)
             item = getattr(sdk_event, "item", None)
             raw_item = getattr(item, "raw_item", None)
+            raw_arguments = getattr(raw_item, "arguments", None)
+            if isinstance(raw_arguments, str) and name in {
+                "handoff_requested",
+                "tool_called",
+            }:
+                consume_bytes(raw_arguments)
             if name == "handoff_requested":
                 call_id = getattr(raw_item, "call_id", None)
                 tool_name = getattr(raw_item, "name", None)
@@ -960,40 +1302,48 @@ class PythonTermRuntime:
                     and isinstance(tool_name, str)
                     and tool_name in handoff_tool_names
                 ):
-                    handoff_calls.append(call_id)
-                    normalized.append(
-                        (
-                            "tool.call",
-                            {
-                                "tool_id": "agent-handoff",
-                                "tool_call_id": call_id,
-                                "read_only": True,
-                                "name": "Agent handoff",
-                                "summary": "Structured handoff requested",
-                            },
+                    if call_id in handoff_calls or call_id in tool_calls:
+                        raise PythonTermRuntimeError(
+                            "runtime_error", "SDK call identity was duplicated"
                         )
+                    handoff_calls.append(call_id)
+                    emit(
+                        "tool.call",
+                        {
+                            "tool_id": "agent-handoff",
+                            "tool_call_id": call_id,
+                            "read_only": True,
+                            "name": "Agent handoff",
+                            "summary": "Structured handoff requested",
+                        },
                     )
             elif name == "tool_called":
                 call_id = getattr(raw_item, "call_id", None)
                 tool_name = getattr(raw_item, "name", None)
                 wrapper = sdk_tools.get(tool_name) if isinstance(tool_name, str) else None
                 if wrapper is not None and is_opaque_identifier(call_id):
-                    tool_calls[call_id] = wrapper
-                    normalized.append(
-                        (
-                            "tool.call",
-                            {
-                                "tool_id": self._sdk_tool_name(wrapper.tool_id),
-                                "tool_call_id": call_id,
-                                "read_only": wrapper.manifest.read_only,
-                                "name": "Tool invocation",
-                                "summary": "Tool execution requested",
-                            },
+                    if call_id in tool_calls or call_id in handoff_calls:
+                        raise PythonTermRuntimeError(
+                            "runtime_error", "SDK call identity was duplicated"
                         )
+                    tool_calls[call_id] = wrapper
+                    emit(
+                        "tool.call",
+                        {
+                            "tool_id": self._sdk_tool_name(wrapper.tool_id),
+                            "tool_call_id": call_id,
+                            "read_only": wrapper.manifest.read_only,
+                            "name": "Tool invocation",
+                            "summary": "Tool execution requested",
+                        },
                     )
             elif name == "tool_output":
                 call_id = self._sdk_tool_output_call_id(raw_item)
                 wrapper = tool_calls.pop(call_id, None)
+                if call_id is not None and wrapper is None:
+                    raise PythonTermRuntimeError(
+                        "runtime_error", "SDK Tool result has no matching call"
+                    )
                 if wrapper is not None:
                     effect = next(
                         (
@@ -1025,40 +1375,44 @@ class PythonTermRuntime:
                     }
                     if public_result.artifact_ref is not None:
                         payload["artifact_ref"] = public_result.artifact_ref
-                    normalized.append(("tool.result", payload))
+                    emit("tool.result", payload)
             elif name == "handoff_occured":
                 call_id = raw_item.get("call_id") if isinstance(raw_item, Mapping) else None
                 if call_id in handoff_calls:
                     handoff_calls.remove(call_id)
-                    normalized.append(
-                        (
-                            "tool.result",
-                            {
-                                "tool_id": "agent-handoff",
-                                "tool_call_id": call_id,
-                                "read_only": True,
-                                "name": "Agent handoff",
-                                "summary": "Structured handoff accepted",
-                                "status": "completed",
-                            },
-                        )
+                    emit(
+                        "tool.result",
+                        {
+                            "tool_id": "agent-handoff",
+                            "tool_call_id": call_id,
+                            "read_only": True,
+                            "name": "Agent handoff",
+                            "summary": "Structured handoff accepted",
+                            "status": "completed",
+                        },
                     )
             elif name == "message_output_created":
                 text = self.sdk.ItemHelpers.text_message_output(item)
                 text = validate_public_text(text, maximum=4096)
+                if not pending_deltas:
+                    consume_bytes(text)
                 if pending_deltas and "".join(pending_deltas) != text:
                     raise PythonTermRuntimeError(
                         "runtime_error", "SDK streaming output changed before completion"
                     )
-                normalized.extend(
-                    ("assistant.delta", {"content": delta})
-                    for delta in pending_deltas
-                )
                 pending_deltas.clear()
-                normalized.append(("assistant.message", {"content": text}))
+                emit("assistant.message", {"content": text})
         if pending_deltas:
             raise PythonTermRuntimeError(
                 "runtime_error", "SDK streaming output did not reach a safe boundary"
+            )
+        if source_index < len(persisted_source_events):
+            raise PythonTermResumeRejected(
+                "invalid_request", "SDK source event prefix ended before resume boundary"
+            )
+        if tool_calls or handoff_calls:
+            raise PythonTermRuntimeError(
+                "runtime_error", "SDK call stream ended before every call was closed"
             )
         final_output = result.final_output
         if final_output is not None:
@@ -1067,7 +1421,7 @@ class PythonTermRuntime:
                     "runtime_error", "SDK output is not public text"
                 )
             final_output = validate_public_text(final_output, maximum=4096)
-        return tuple(normalized), final_output
+        return final_output, tuple(source_events)
 
     @staticmethod
     def _sdk_tool_output_call_id(raw_item: object) -> str | None:
@@ -1085,6 +1439,8 @@ class PythonTermRuntime:
         event_type: str,
         payload: Mapping[str, object],
         step_status: ExecutionStatus,
+        execution_claim: StepExecutionClaim,
+        source_events: Sequence[SdkSourceEventEvidence] = (),
     ) -> RuntimeEventV2:
         term = self.repository.get_term(context.term_id)
         if term is None:
@@ -1128,6 +1484,7 @@ class PythonTermRuntime:
             effects=self.repository.list_tool_effects(
                 context.term_id, context.step_id
             ),
+            source_events=source_events,
         )
         checkpoint = StepCheckpointRecord(
             checkpoint_ref=f"checkpoint-{identity}",
@@ -1138,7 +1495,9 @@ class PythonTermRuntime:
             public_projection=PublicStepProjection(status=step_status),
             evidence=evidence,
         )
-        self.repository.commit_runtime_boundary(transition, checkpoint)
+        self.repository.commit_runtime_boundary(
+            transition, checkpoint, execution_claim=execution_claim
+        )
         return runtime_event
 
     @staticmethod
@@ -1147,6 +1506,7 @@ class PythonTermRuntime:
         *,
         cursor: int,
         effects: Sequence[ToolEffectRecord],
+        source_events: Sequence[SdkSourceEventEvidence] = (),
     ) -> RuntimeCheckpointEvidence:
         context_digest = canonical_digest(
             {
@@ -1173,10 +1533,13 @@ class PythonTermRuntime:
             manifest_digest=manifest_digest,
             workspace_grant_digest=context.workspace_grant_digest,
             permission_policy_digest=context.permission_policy_digest,
+            agent_descriptor_digest=context.agent_descriptor_digest,
+            handoff_descriptor_digest=context.handoff_descriptor_digest,
             effect_digest=canonical_digest(tuple(effects)),
             effect_record_digests=tuple(
                 canonical_digest(effect) for effect in effects
             ),
+            source_events=tuple(source_events),
             term_id=context.term_id,
             step_id=context.step_id,
             cursor=cursor,

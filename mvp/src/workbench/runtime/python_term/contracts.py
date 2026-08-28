@@ -132,6 +132,59 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+EMPTY_MANIFEST_DIGEST = canonical_digest(())
+
+
+class AgentDescriptor(FrozenModel):
+    """Declarative Agent input; never an SDK Agent or callable authority."""
+
+    agent_id: Identifier
+    name: Annotated[
+        str,
+        StringConstraints(min_length=1, max_length=128, pattern=r"^[^\x00\r\n]+$"),
+    ]
+    provider_ref: Reference
+    model: Identifier
+    instructions: Annotated[
+        str, StringConstraints(max_length=16_384, pattern=r"^[^\x00]+$")
+    ] | None = None
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(self)
+
+
+class HandoffDescriptor(FrozenModel):
+    """Complete frozen data allowed across one private Agent boundary."""
+
+    handoff_id: Identifier
+    source_agent_id: Identifier
+    target_agent_id: Identifier
+    summary: Annotated[
+        str,
+        StringConstraints(min_length=1, max_length=280, pattern=r"^[^\x00\r\n]+$"),
+    ]
+
+    @field_validator("summary")
+    @classmethod
+    def validate_summary(cls, value: str) -> str:
+        return validate_public_text(value, maximum=280)
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(self)
+
+
+class PythonTermRuntimeLimits(FrozenModel):
+    """Fixed bounded supervisor limits for one SDK Step stream."""
+
+    max_sdk_events: StrictInt = Field(default=10_000, gt=0, le=100_000)
+    max_sdk_bytes: StrictInt = Field(default=1_048_576, gt=0, le=16_777_216)
+    max_sdk_tokens: StrictInt = Field(default=32_768, gt=0, le=1_000_000)
+    max_turns: StrictInt = Field(default=10, gt=0, le=64)
+    quiescence_timeout_ms: StrictInt = Field(default=2_000, gt=0, le=30_000)
+
+
 def validate_safe_json(value: object) -> JsonValue:
     """Public validation seam used before state or repository persistence."""
     return _normalized_json(value)
@@ -257,6 +310,8 @@ class FrozenCommandIdentity(FrozenModel):
     environment_allowlist: tuple[Identifier, ...]
     context_budget: ContextBudgetV2
     effect_scope: EffectScope
+    agent_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
+    handoff_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
 
     @field_validator("environment_allowlist")
     @classmethod
@@ -429,6 +484,8 @@ class StepContext(FrozenModel):
     environment_allowlist: tuple[Identifier, ...]
     context_budget: ContextBudgetV2
     effect_scope: EffectScope
+    agent_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
+    handoff_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
 
     @field_validator("model_messages", mode="before")
     @classmethod
@@ -521,6 +578,8 @@ class StepContext(FrozenModel):
         environment_allowlist: Sequence[str],
         effect_scope: EffectScope,
         prompt_sections: Sequence[PromptSectionPin] = (),
+        agent_descriptor_digest: str = EMPTY_MANIFEST_DIGEST,
+        handoff_descriptor_digest: str = EMPTY_MANIFEST_DIGEST,
     ) -> Self:
         if (
             conversation_context.session_id != envelope.session_id
@@ -572,6 +631,8 @@ class StepContext(FrozenModel):
             environment_allowlist=tuple(environment_allowlist),
             context_budget=envelope.context_budget,
             effect_scope=effect_scope,
+            agent_descriptor_digest=agent_descriptor_digest,
+            handoff_descriptor_digest=handoff_descriptor_digest,
         )
 
     @property
@@ -618,6 +679,8 @@ class TermRecord(FrozenModel):
     effect_scope: EffectScope
     prompt_sections: tuple[PromptSectionPin, ...] = ()
     prompt_manifest_digest: Digest
+    agent_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
+    handoff_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
     step_ids: tuple[Identifier, ...]
     checkpoint_ref: Reference | None = None
     checkpoint_digest: Digest | None = None
@@ -729,6 +792,8 @@ class TermRecord(FrozenModel):
             effect_scope=context.effect_scope,
             prompt_sections=context.prompt_sections,
             prompt_manifest_digest=context.prompt_manifest_digest,
+            agent_descriptor_digest=context.agent_descriptor_digest,
+            handoff_descriptor_digest=context.handoff_descriptor_digest,
             step_ids=(context.step_id,),
             status=status,
             cursor=cursor,
@@ -776,6 +841,8 @@ def _term_command_identity(record: TermRecord) -> FrozenCommandIdentity:
             "environment_allowlist": record.environment_allowlist,
             "context_budget": envelope.context_budget,
             "effect_scope": record.effect_scope,
+            "agent_descriptor_digest": record.agent_descriptor_digest,
+            "handoff_descriptor_digest": record.handoff_descriptor_digest,
         },
     )
 
@@ -923,11 +990,32 @@ class RuntimeCheckpointEvidence(FrozenModel):
     manifest_digest: Digest
     workspace_grant_digest: Digest
     permission_policy_digest: Digest
+    agent_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
+    handoff_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
     effect_digest: Digest
     effect_record_digests: tuple[Digest, ...] = ()
+    source_events: tuple["SdkSourceEventEvidence", ...] = ()
     term_id: Identifier
     step_id: Identifier
     cursor: StrictInt = Field(ge=0)
+
+
+class SdkSourceEventEvidence(FrozenModel):
+    """Stable public identity for one normalized SDK source event."""
+
+    source_event_id: Identifier
+    source_event_digest: Digest
+
+
+class StepExecutionClaim(FrozenModel):
+    """Durable owner/lease/fence proof for one active Step execution."""
+
+    term_id: Identifier
+    step_id: Identifier
+    owner_id: Identifier
+    lease_expires_at_ms: StrictInt = Field(gt=0)
+    fence_id: Identifier
+    fence_generation: StrictInt = Field(gt=0)
 
 
 class StepCheckpointRecord(_SafePayloadRecord):
