@@ -51,6 +51,7 @@ from .contracts import (
     StepRecord,
     TermRecord,
     TermWorkStateRef,
+    ToolEffectCheckpointEvidence,
     ToolEffectRecord,
     canonical_digest,
     canonical_json,
@@ -112,6 +113,44 @@ class PythonTermExecution:
     replayed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class SupervisedSdkRunSnapshot:
+    """Bounded public state for an SDK run still quiescing in-process."""
+
+    execution_id: str
+    run_id: str
+    term_id: str
+    step_id: str
+    state: Literal["cancelling", "orphaned"]
+
+
+@dataclass(slots=True)
+class _ActiveSdkRun:
+    execution_id: str
+    run_id: str
+    term_id: str
+    step_id: str
+    task: asyncio.Task[None]
+    state: Literal["cancelling", "orphaned"] = "cancelling"
+
+
+class _SdkRunRequiresSupervision(BaseException):
+    """Private control signal containing no provider exception or output."""
+
+    def __init__(
+        self,
+        run_loop_task: asyncio.Task[object],
+        *,
+        terminal_status: Literal["failed", "cancelled"],
+        error_code: Literal["runtime_error"],
+        caller_cancelled: bool,
+    ) -> None:
+        self.run_loop_task = run_loop_task
+        self.terminal_status = terminal_status
+        self.error_code = error_code
+        self.caller_cancelled = caller_cancelled
+
+
 RecoveryAction = Literal[
     "retry_step", "reuse_completed", "reconciliation_required"
 ]
@@ -133,6 +172,7 @@ class _SdkToolInvocation:
     router: weakref.ReferenceType[ToolRouter]
     tool_id: str
     context_identity_digest: str
+    step_claim: StepExecutionClaim
 
     async def __call__(self, sdk_context: Any, raw_arguments: str) -> str:
         context = getattr(sdk_context, "context", None)
@@ -156,6 +196,7 @@ class _SdkToolInvocation:
             self.tool_id,
             arguments,
             tool_call_id=tool_call_id,
+            step_claim=self.step_claim,
         )
         return canonical_json(result)
 
@@ -218,6 +259,8 @@ class PythonTermRuntime:
         self.tool_router = tool_router
         self.limits = limits or PythonTermRuntimeLimits()
         self._owner_nonce = secrets.token_bytes(32)
+        self._sdk_supervisor_runs: dict[str, _ActiveSdkRun] = {}
+        self._sdk_run_slots: set[str] = set()
 
     @property
     def capabilities(self) -> RuntimeCapabilitiesV2:
@@ -507,6 +550,7 @@ class PythonTermRuntime:
                     update={
                         "effect_digest": evidence.effect_digest,
                         "effect_record_digests": evidence.effect_record_digests,
+                        "effect_evidence": evidence.effect_evidence,
                         "source_events": evidence.source_events,
                     }
                 )
@@ -514,26 +558,28 @@ class PythonTermRuntime:
             identity_matches = evidence is not None and canonical_json(
                 evidence
             ) == canonical_json(frozen_expected)
-            exact_effects = evidence is not None and (
-                evidence.effect_digest == expected.effect_digest
-                and evidence.effect_record_digests
-                == expected.effect_record_digests
+            durable_tool_calls = frozenset(
+                call_id
+                for event in self.repository.list_events(term.term_id)
+                if event.step_id == checkpoint.step_id
+                and event.cursor <= checkpoint.cursor
+                and event.type == "tool.call"
+                and is_opaque_identifier(
+                    call_id := event.payload.get("tool_call_id")
+                )
             )
-            previous_effects = (
-                frozenset()
-                if evidence is None
-                else frozenset(evidence.effect_record_digests)
+            effect_advance = (
+                evidence is not None
+                and self._effect_evidence_collection_is_coherent(evidence)
+                and self._effect_evidence_collection_is_coherent(expected)
+                and self._effect_evidence_transition_is_valid(
+                    evidence.effect_evidence,
+                    expected.effect_evidence,
+                    step_is_running=checkpoint_step.status == "running",
+                    durable_tool_calls=durable_tool_calls,
+                )
             )
-            current_effects = frozenset(expected.effect_record_digests)
-            committed_effect_advance = (
-                checkpoint_step.status == "running"
-                and len(current_effects) > len(previous_effects)
-                and previous_effects.issubset(current_effects)
-                and all(effect.status == "committed" for effect in checkpoint_effects)
-            )
-            if not identity_matches or not (
-                exact_effects or committed_effect_advance
-            ):
+            if not identity_matches or not effect_advance:
                 raise PythonTermResumeRejected(
                     "invalid_request", "Python Term checkpoint identity changed before resume"
                 )
@@ -568,6 +614,70 @@ class PythonTermRuntime:
             checkpoint_hint=self._checkpoint_hint(term.term_id),
         )
 
+    @staticmethod
+    def _effect_evidence_collection_is_coherent(
+        evidence: RuntimeCheckpointEvidence,
+    ) -> bool:
+        effects = evidence.effect_evidence
+        return (
+            tuple((item.tool_call_id, item.effect_id) for item in effects)
+            == tuple(
+                sorted((item.tool_call_id, item.effect_id) for item in effects)
+            )
+            and len({item.effect_id for item in effects}) == len(effects)
+            and evidence.effect_digest == canonical_digest(effects)
+            and evidence.effect_record_digests
+            == tuple(canonical_digest(item) for item in effects)
+        )
+
+    @staticmethod
+    def _effect_evidence_transition_is_valid(
+        previous: Sequence[ToolEffectCheckpointEvidence],
+        current: Sequence[ToolEffectCheckpointEvidence],
+        *,
+        step_is_running: bool,
+        durable_tool_calls: frozenset[str],
+    ) -> bool:
+        previous_by_id = {item.effect_id: item for item in previous}
+        current_by_id = {item.effect_id: item for item in current}
+        if not previous_by_id.keys() <= current_by_id.keys():
+            return False
+        for effect_id, before in previous_by_id.items():
+            after = current_by_id[effect_id]
+            if before == after:
+                continue
+            if not step_is_running or (
+                before.tool_call_id != after.tool_call_id
+                or before.stable_identity_digest != after.stable_identity_digest
+                or before.request_digest != after.request_digest
+                or before.request_digest_version != after.request_digest_version
+                or before.step_claim_digest != after.step_claim_digest
+                or before.fence_id != after.fence_id
+                or before.fence_generation != after.fence_generation
+                or before.status != "reserved"
+                or after.status
+                not in {"committed", "rejected", "reconciliation_required"}
+                or before.execution_owner_id is None
+                or after.execution_owner_id is not None
+                or after.result_digest is None
+                or after.tool_call_id not in durable_tool_calls
+            ):
+                return False
+            if (after.status == "committed") != (after.result_code is None):
+                return False
+        for effect_id in current_by_id.keys() - previous_by_id.keys():
+            added = current_by_id[effect_id]
+            if (
+                not step_is_running
+                or added.status != "committed"
+                or added.execution_owner_id is not None
+                or added.result_code is not None
+                or added.result_digest is None
+                or added.tool_call_id not in durable_tool_calls
+            ):
+                return False
+        return True
+
     def _mark_unknown_write(self, effect: ToolEffectRecord) -> None:
         result = PublicToolResult(
             status="failed", summary="Write outcome requires reconciliation"
@@ -577,6 +687,7 @@ class PythonTermRuntime:
                 "status": "reconciliation_required",
                 "execution_owner_id": None,
                 "lease_expires_at_ms": None,
+                "result_code": "unknown_write_outcome",
                 "result_digest": canonical_digest(
                     {"code": "unknown_write_outcome", "result": result}
                 ),
@@ -681,6 +792,7 @@ class PythonTermRuntime:
                 raise PythonTermResumeRejected(
                     "invalid_request", "Python Term Step cannot resume"
                 )
+            self._ensure_sdk_run_capacity()
             claim = self.repository.claim_step(
                 context.term_id,
                 context.step_id,
@@ -714,9 +826,10 @@ class PythonTermRuntime:
                         source_events=source_prefix,
                     )
                 )
+            sdk_slot_id: str | None = None
             try:
                 base_agent, handoff_tool_names, sdk_tools = self._agent_for_step(
-                    context, agent_bindings, frozen_handoffs
+                    context, agent_bindings, frozen_handoffs, claim
                 )
 
                 def commit_source_event(
@@ -735,6 +848,7 @@ class PythonTermRuntime:
                         )
                     )
 
+                sdk_slot_id = self._claim_sdk_run_slot()
                 final_output, source_events = await self._run_sdk_step(
                     context,
                     base_agent,
@@ -753,6 +867,31 @@ class PythonTermRuntime:
                         source_events=source_events,
                     )
                 )
+            except _SdkRunRequiresSupervision as pending:
+                supervised_checkpoint = self.repository.latest_step_checkpoint(
+                    context.term_id, context.step_id
+                )
+                supervised_source_events = (
+                    source_prefix
+                    if supervised_checkpoint is None
+                    or supervised_checkpoint.evidence is None
+                    else supervised_checkpoint.evidence.source_events
+                )
+                self._supervise_sdk_run(
+                    pending.run_loop_task,
+                    execution_id=sdk_slot_id,
+                    context=context,
+                    claim=claim,
+                    source_events=supervised_source_events,
+                    terminal_status=pending.terminal_status,
+                    error_code=pending.error_code,
+                )
+                sdk_slot_id = None
+                if pending.caller_cancelled:
+                    raise asyncio.CancelledError()
+                raise PythonTermRuntimeError(
+                    "runtime_error", "Python Term Step failed"
+                ) from None
             except asyncio.CancelledError:
                 cancelled_checkpoint = self.repository.latest_step_checkpoint(
                     context.term_id, context.step_id
@@ -806,6 +945,9 @@ class PythonTermRuntime:
                 raise PythonTermRuntimeError(
                     "runtime_error", "Python Term Step failed"
                 ) from None
+            finally:
+                if sdk_slot_id is not None:
+                    self._sdk_run_slots.discard(sdk_slot_id)
 
         term = self.repository.get_term(envelope.term_id)
         if term is None:
@@ -983,6 +1125,7 @@ class PythonTermRuntime:
         context: StepContext,
         agents: Mapping[str, AgentDescriptor],
         handoffs: Sequence[HandoffDescriptor],
+        execution_claim: StepExecutionClaim,
     ) -> tuple[Any, frozenset[str], Mapping[str, SdkToolWrapper]]:
         descriptor = agents[context.agent_id]
         if self.model_provider is None:
@@ -992,7 +1135,7 @@ class PythonTermRuntime:
         model = self.model_provider.resolve(
             descriptor.provider_ref, descriptor.model
         )
-        sdk_tools = self._sdk_tools(context)
+        sdk_tools = self._sdk_tools(context, execution_claim)
         sdk_handoffs: list[Any] = []
         tool_names: set[str] = set()
         for transfer in handoffs:
@@ -1038,7 +1181,7 @@ class PythonTermRuntime:
         )
 
     def _sdk_tools(
-        self, context: StepContext
+        self, context: StepContext, execution_claim: StepExecutionClaim
     ) -> tuple[tuple[Any, SdkToolWrapper], ...]:
         if not context.tool_manifest:
             return ()
@@ -1046,8 +1189,10 @@ class PythonTermRuntime:
             raise PythonTermRuntimeError(
                 "policy_rejected", "SDK Tools require the fixed Tool Router bridge"
             )
-        self.tool_router.admit(context)
-        wrappers = self.tool_router.exposed_tools(context)
+        self.tool_router.admit(context, step_claim=execution_claim)
+        wrappers = self.tool_router.exposed_tools(
+            context, step_claim=execution_claim
+        )
         sdk_tools: list[tuple[Any, SdkToolWrapper]] = []
         names: set[str] = set()
         router_reference = weakref.ref(self.tool_router)
@@ -1067,6 +1212,7 @@ class PythonTermRuntime:
                     router=router_reference,
                     tool_id=wrapper.tool_id,
                     context_identity_digest=context.identity_digest,
+                    step_claim=wrapper.step_claim,
                 ),
                 strict_json_schema=False,
                 timeout_behavior="raise_exception",
@@ -1121,26 +1267,49 @@ class PythonTermRuntime:
                     publish=publish,
                 )
         except TimeoutError:
-            await self._cancel_and_quiesce_sdk(result)
+            quiescent, run_loop_task = await self._cancel_and_quiesce_sdk(result)
+            if not quiescent and run_loop_task is not None:
+                raise _SdkRunRequiresSupervision(
+                    run_loop_task,
+                    terminal_status="failed",
+                    error_code="runtime_error",
+                    caller_cancelled=False,
+                )
             raise PythonTermRuntimeError(
                 "deadline_exceeded", "Python Term SDK deadline was exceeded"
             ) from None
         except asyncio.CancelledError:
-            await self._cancel_and_quiesce_sdk(result)
+            quiescent, run_loop_task = await self._cancel_and_quiesce_sdk(result)
+            if not quiescent and run_loop_task is not None:
+                raise _SdkRunRequiresSupervision(
+                    run_loop_task,
+                    terminal_status="cancelled",
+                    error_code="runtime_error",
+                    caller_cancelled=True,
+                )
             raise
         except BaseException:
-            await self._cancel_and_quiesce_sdk(result)
+            quiescent, run_loop_task = await self._cancel_and_quiesce_sdk(result)
+            if not quiescent and run_loop_task is not None:
+                raise _SdkRunRequiresSupervision(
+                    run_loop_task,
+                    terminal_status="failed",
+                    error_code="runtime_error",
+                    caller_cancelled=False,
+                )
             raise
 
-    async def _cancel_and_quiesce_sdk(self, result: Any | None) -> None:
+    async def _cancel_and_quiesce_sdk(
+        self, result: Any | None
+    ) -> tuple[bool, asyncio.Task[object] | None]:
         if result is None:
-            return
+            return True, None
         cancel = getattr(result, "cancel", None)
         run_loop_task = getattr(result, "run_loop_task", None)
         if not isinstance(run_loop_task, asyncio.Task) or run_loop_task.done():
             if callable(cancel):
                 cancel()
-            return
+            return True, None
         timeout = self.limits.quiescence_timeout_ms / 2_000
         for _ in range(2):
             if callable(cancel):
@@ -1152,10 +1321,141 @@ class PythonTermRuntime:
                     run_loop_task.result()
                 except BaseException:
                     pass
+                return True, None
+        return False, run_loop_task
+
+    def _supervise_sdk_run(
+        self,
+        run_loop_task: asyncio.Task[object],
+        *,
+        execution_id: str | None,
+        context: StepContext,
+        claim: StepExecutionClaim,
+        source_events: tuple[SdkSourceEventEvidence, ...],
+        terminal_status: Literal["failed", "cancelled"],
+        error_code: Literal["runtime_error"],
+    ) -> None:
+        if execution_id is None or execution_id not in self._sdk_run_slots:
+            raise PythonTermRuntimeError(
+                "runtime_error", "Python Term SDK supervisor admission is missing"
+            )
+
+        async def observe() -> None:
+            try:
+                heartbeat_seconds = max(
+                    0.001,
+                    min(1.0, self.limits.quiescence_timeout_ms / 2_000),
+                )
+                lease_seconds = min(
+                    86_400,
+                    max(1.0, (context.deadline_ms + 5_000) / 1_000),
+                )
+                while not run_loop_task.done():
+                    done, _ = await asyncio.wait(
+                        {run_loop_task}, timeout=heartbeat_seconds
+                    )
+                    if done:
+                        break
+                    renewed: StepExecutionClaim | None = None
+                    try:
+                        renewed = self.repository.renew_step_claim(
+                            claim, lease_seconds=lease_seconds
+                        )
+                    except Exception:
+                        renewed = None
+                    if renewed is None:
+                        active = self._sdk_supervisor_runs.get(execution_id)
+                        if active is not None:
+                            active.state = "orphaned"
+                        try:
+                            await asyncio.shield(run_loop_task)
+                        except BaseException:
+                            pass
+                        return
+                try:
+                    run_loop_task.result()
+                except BaseException:
+                    pass
+                if terminal_status == "cancelled":
+                    self._commit_event(
+                        context,
+                        event_type="runtime.status",
+                        payload={"status": "cancelled"},
+                        step_status="cancelled",
+                        execution_claim=claim,
+                        source_events=source_events,
+                    )
+                else:
+                    self._commit_event(
+                        context,
+                        event_type="error",
+                        payload={
+                            "code": error_code,
+                            "summary": "Python Term Step failed",
+                        },
+                        step_status="failed",
+                        execution_claim=claim,
+                        source_events=source_events,
+                    )
+            except RepositoryConflict:
+                active = self._sdk_supervisor_runs.get(execution_id)
+                if active is not None:
+                    active.state = "orphaned"
                 return
-        raise PythonTermRuntimeError(
-            "runtime_error", "Python Term SDK run did not quiesce"
+            finally:
+                active = self._sdk_supervisor_runs.get(execution_id)
+                if active is not None and active.state != "orphaned":
+                    self._sdk_supervisor_runs.pop(execution_id, None)
+                    self._sdk_run_slots.discard(execution_id)
+
+        supervisor_task = asyncio.create_task(observe())
+        self._sdk_supervisor_runs[execution_id] = _ActiveSdkRun(
+            execution_id=execution_id,
+            run_id=context.run_id,
+            term_id=context.term_id,
+            step_id=context.step_id,
+            task=supervisor_task,
         )
+
+    def _claim_sdk_run_slot(self) -> str:
+        self._ensure_sdk_run_capacity()
+        execution_id = "sdk-execution-" + secrets.token_hex(16)
+        self._sdk_run_slots.add(execution_id)
+        return execution_id
+
+    def _ensure_sdk_run_capacity(self) -> None:
+        if len(self._sdk_run_slots) >= self.limits.max_supervised_sdk_runs:
+            raise PythonTermRuntimeError(
+                "execution_unavailable",
+                "Python Term SDK supervisor capacity is unavailable",
+            )
+
+    def supervised_sdk_runs(self) -> tuple[SupervisedSdkRunSnapshot, ...]:
+        return tuple(
+            SupervisedSdkRunSnapshot(
+                execution_id=active.execution_id,
+                run_id=active.run_id,
+                term_id=active.term_id,
+                step_id=active.step_id,
+                state=active.state,
+            )
+            for active in sorted(
+                self._sdk_supervisor_runs.values(), key=lambda item: item.execution_id
+            )
+        )
+
+    async def wait_for_sdk_quiescence(self, *, timeout_ms: int) -> bool:
+        if type(timeout_ms) is not int or timeout_ms < 0:
+            raise ValueError("quiescence timeout must be a non-negative integer")
+        active_tasks = {
+            active.task
+            for active in self._sdk_supervisor_runs.values()
+            if active.state != "orphaned"
+        }
+        if not active_tasks:
+            return not self._sdk_supervisor_runs
+        _, pending = await asyncio.wait(active_tasks, timeout=timeout_ms / 1_000)
+        return not pending and not self._sdk_supervisor_runs
 
     async def _consume_sdk_step(
         self,
@@ -1174,6 +1474,7 @@ class PythonTermRuntime:
         pending_deltas: list[str] = []
         handoff_calls: list[str] = []
         tool_calls: dict[str, SdkToolWrapper] = {}
+        seen_call_ids: set[str] = set()
         current_agent_name: str | None = None
         sdk_event_count = 0
         sdk_byte_count = 0
@@ -1302,10 +1603,11 @@ class PythonTermRuntime:
                     and isinstance(tool_name, str)
                     and tool_name in handoff_tool_names
                 ):
-                    if call_id in handoff_calls or call_id in tool_calls:
+                    if call_id in seen_call_ids:
                         raise PythonTermRuntimeError(
                             "runtime_error", "SDK call identity was duplicated"
                         )
+                    seen_call_ids.add(call_id)
                     handoff_calls.append(call_id)
                     emit(
                         "tool.call",
@@ -1322,9 +1624,17 @@ class PythonTermRuntime:
                 tool_name = getattr(raw_item, "name", None)
                 wrapper = sdk_tools.get(tool_name) if isinstance(tool_name, str) else None
                 if wrapper is not None and is_opaque_identifier(call_id):
-                    if call_id in tool_calls or call_id in handoff_calls:
+                    if call_id in seen_call_ids:
                         raise PythonTermRuntimeError(
                             "runtime_error", "SDK call identity was duplicated"
+                        )
+                    seen_call_ids.add(call_id)
+                    if self.tool_router is not None:
+                        await self._await_tool_effect_checkpoint_boundary(
+                            context,
+                            wrapper,
+                            call_id,
+                            result,
                         )
                     tool_calls[call_id] = wrapper
                     emit(
@@ -1422,6 +1732,45 @@ class PythonTermRuntime:
                 )
             final_output = validate_public_text(final_output, maximum=4096)
         return final_output, tuple(source_events)
+
+    async def _await_tool_effect_checkpoint_boundary(
+        self,
+        context: StepContext,
+        wrapper: SdkToolWrapper,
+        tool_call_id: str,
+        result: object,
+    ) -> ToolEffectRecord:
+        """Wait until SDK Tool admission has a durable Effect before publication."""
+        timeout_ms = min(context.deadline_ms, self.limits.quiescence_timeout_ms)
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
+        while True:
+            effect = next(
+                (
+                    item
+                    for item in self.repository.list_tool_effects(
+                        context.term_id, context.step_id
+                    )
+                    if item.tool_call_id == tool_call_id
+                ),
+                None,
+            )
+            if effect is not None:
+                if (
+                    effect.status == "reserved"
+                    and effect.step_claim_digest != wrapper.step_claim.identity_digest
+                ):
+                    result.cancel()
+                    raise PythonTermRuntimeError(
+                        "runtime_error", "SDK Tool Effect Step fence was rejected"
+                    )
+                return effect
+            if asyncio.get_running_loop().time() >= deadline:
+                result.cancel()
+                raise PythonTermRuntimeError(
+                    "runtime_error",
+                    "SDK Tool call has no durable Effect reservation",
+                )
+            await asyncio.sleep(0.001)
 
     @staticmethod
     def _sdk_tool_output_call_id(raw_item: object) -> str | None:
@@ -1525,6 +1874,24 @@ class PythonTermRuntime:
                 "prompt_manifest_digest": context.prompt_manifest_digest,
             }
         )
+        effect_evidence = tuple(
+            ToolEffectCheckpointEvidence(
+                effect_id=effect.effect_id,
+                tool_call_id=effect.tool_call_id,
+                stable_identity_digest=effect.stable_identity_digest,
+                request_digest=effect.request_digest,
+                request_digest_version=effect.request_digest_version,
+                step_claim_digest=effect.step_claim_digest,
+                execution_owner_id=effect.execution_owner_id,
+                fence_id=effect.fence_id,
+                fence_generation=effect.fence_generation,
+                status=effect.status,
+                result_code=effect.result_code,
+                result_digest=effect.result_digest,
+                result_evidence_digest=effect.result_evidence_digest,
+            )
+            for effect in effects
+        )
         return RuntimeCheckpointEvidence(
             runtime_id=context.runtime_id,
             runtime_build_id=context.runtime_build_id,
@@ -1535,10 +1902,11 @@ class PythonTermRuntime:
             permission_policy_digest=context.permission_policy_digest,
             agent_descriptor_digest=context.agent_descriptor_digest,
             handoff_descriptor_digest=context.handoff_descriptor_digest,
-            effect_digest=canonical_digest(tuple(effects)),
+            effect_digest=canonical_digest(effect_evidence),
             effect_record_digests=tuple(
-                canonical_digest(effect) for effect in effects
+                canonical_digest(effect) for effect in effect_evidence
             ),
+            effect_evidence=effect_evidence,
             source_events=tuple(source_events),
             term_id=context.term_id,
             step_id=context.step_id,

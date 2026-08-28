@@ -28,6 +28,7 @@ from workbench.runtime.engine_host.v2.registry import (
 from .contracts import (
     PublicToolResult,
     StepContext,
+    StepExecutionClaim,
     ToolEffectRecord,
     canonical_digest,
     canonical_json,
@@ -380,6 +381,7 @@ class _AdmittedTool:
 class SdkToolWrapper:
     manifest: ToolManifestEntryV2
     registration: ExecutorRegistration
+    step_claim: StepExecutionClaim
 
     @property
     def tool_id(self) -> str:
@@ -626,7 +628,9 @@ class ToolRouter:
         self.request_digests = cast(HmacRequestDigestService, request_digests)
         self.clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self.monotonic_ms = monotonic_ms or (lambda: int(time.monotonic() * 1000))
-        self._admissions: dict[str, dict[str, _AdmittedTool]] = {}
+        self._admissions: dict[
+            str, tuple[StepExecutionClaim, dict[str, _AdmittedTool]]
+        ] = {}
 
     @property
     def executor_broker(self) -> None:
@@ -659,7 +663,20 @@ class ToolRouter:
             timeout_ms=timeout_ms
         )
 
-    def admit(self, context: StepContext) -> None:
+    def admit(
+        self,
+        context: StepContext,
+        *,
+        step_claim: StepExecutionClaim,
+    ) -> None:
+        if type(step_claim) is not StepExecutionClaim or (
+            step_claim.term_id != context.term_id
+            or step_claim.step_id != context.step_id
+            or not self.repository.step_claim_is_current(step_claim)
+        ):
+            raise ToolRouteError(
+                "step_claim_lost", "Tool Step execution claim was rejected"
+            ) from None
         broker = self._validated_executor_broker()
         admitted: dict[str, _AdmittedTool] = {}
         seen: set[str] = set()
@@ -702,15 +719,29 @@ class ToolRouter:
                 failed_code,
                 "Frozen Tool Manifest admission was rejected",
             ) from None
-        self._admissions[context.tool_manifest_digest] = admitted
+        self._admissions[context.identity_digest] = (step_claim, admitted)
 
-    def exposed_tools(self, context: StepContext) -> tuple[SdkToolWrapper, ...]:
+    def exposed_tools(
+        self,
+        context: StepContext,
+        *,
+        step_claim: StepExecutionClaim | None = None,
+    ) -> tuple[SdkToolWrapper, ...]:
         broker = self._validated_executor_broker()
-        admission = self._admissions.get(context.tool_manifest_digest)
-        if admission is None:
+        admission_entry = self._admissions.get(context.identity_digest)
+        if admission_entry is None:
             raise ToolRouteError(
                 "manifest_not_admitted", "Frozen Tool Manifest was not admitted"
             )
+        admitted_claim, admission = admission_entry
+        if step_claim is not None and step_claim != admitted_claim:
+            raise ToolRouteError(
+                "step_claim_lost", "Tool Step execution claim changed after admission"
+            ) from None
+        if not self.repository.step_claim_is_current(admitted_claim):
+            raise ToolRouteError(
+                "step_claim_lost", "Tool Step execution claim was rejected"
+            ) from None
         wrappers: list[SdkToolWrapper] = []
         for manifest in context.tool_manifest:
             admitted = admission.get(manifest.tool_id)
@@ -725,6 +756,7 @@ class ToolRouter:
                 SdkToolWrapper(
                     manifest=manifest,
                     registration=admitted.registration,
+                    step_claim=admitted_claim,
                 )
             )
         return tuple(wrappers)
@@ -737,10 +769,13 @@ class ToolRouter:
         *,
         tool_call_id: str,
         approval: ApprovalCallback | None = None,
+        step_claim: StepExecutionClaim | None = None,
     ) -> PublicToolResult:
         started_ms = self.monotonic_ms()
         deadline_at_ms = started_ms + context.deadline_ms
-        admitted = self._admitted_tool(context, tool_id)
+        admitted, bound_step_claim = self._admitted_tool(
+            context, tool_id, step_claim=step_claim
+        )
         normalized = self._validate_admitted_arguments(admitted, arguments)
         access = self._resolve_access(admitted.registration, normalized)
         write_effect = self._classify_effect(context, admitted.manifest, access)
@@ -810,6 +845,9 @@ class ToolRouter:
             tool_call_id=tool_call_id,
             request_digest=request_digest,
             request_digest_version="hmac-sha256-v1",
+            step_claim_digest=(
+                bound_step_claim.identity_digest
+            ),
             write_effect=write_effect,
             status="reserved",
         )
@@ -818,6 +856,7 @@ class ToolRouter:
             reservation,
             owner_id=owner_id,
             deadline_at_ms=deadline_at_ms,
+            step_claim=bound_step_claim,
         )
         if replay is not None:
             return replay
@@ -840,6 +879,7 @@ class ToolRouter:
             deadline_at_ms=deadline_at_ms,
             reservation=reservation,
             reacquire_approval=waited_for_ownership,
+            step_claim=bound_step_claim,
         )
 
         remaining_ms = min(
@@ -848,7 +888,17 @@ class ToolRouter:
         )
         if remaining_ms <= 0:
             await self._finish_failed_execution(
-                reservation, write_effect=write_effect, code="deadline_exceeded"
+                reservation,
+                write_effect=write_effect,
+                code="deadline_exceeded",
+                step_claim=bound_step_claim,
+            )
+        if not self.repository.step_claim_is_current(bound_step_claim):
+            await self._finish_failed_execution(
+                reservation,
+                write_effect=write_effect,
+                code="step_claim_lost",
+                step_claim=bound_step_claim,
             )
         outcome, raw_result = await self._execute_bounded(
             admitted.registration,
@@ -863,11 +913,16 @@ class ToolRouter:
                 status=("reconciliation_required" if write_effect else "rejected"),
                 code="cancelled",
             )
-            await self._persist_terminal_or_raise(terminal, reservation)
+            await self._persist_terminal_or_raise(
+                terminal, reservation, step_claim=bound_step_claim
+            )
             raise asyncio.CancelledError()
         if outcome != "completed":
             await self._finish_failed_execution(
-                reservation, write_effect=write_effect, code=outcome
+                reservation,
+                write_effect=write_effect,
+                code=outcome,
+                step_claim=bound_step_claim,
             )
 
         result: PublicToolResult | None = None
@@ -885,7 +940,9 @@ class ToolRouter:
                 status=("reconciliation_required" if write_effect else "rejected"),
                 code="result_rejected",
             )
-            await self._persist_terminal_or_raise(terminal, reservation)
+            await self._persist_terminal_or_raise(
+                terminal, reservation, step_claim=bound_step_claim
+            )
             raise ToolRouteError(
                 "reconciliation_required" if write_effect else "result_rejected",
                 "Tool result failed the public result boundary",
@@ -901,7 +958,9 @@ class ToolRouter:
                 "public_result": result,
             }
         )
-        persisted = await self._persist_terminal(committed, reservation)
+        persisted = await self._persist_terminal(
+            committed, reservation, step_claim=bound_step_claim
+        )
         if persisted is not None:
             return result
         durable = self._safe_get_effect(effect_id)
@@ -912,13 +971,27 @@ class ToolRouter:
             and durable.public_result == result
         ):
             return result
+        if durable is not None and durable.status == "reconciliation_required":
+            raise ToolRouteError(
+                "reconciliation_required",
+                "Tool Effect requires reconciliation",
+                effect_id=effect_id,
+            ) from None
+        if durable is not None and durable.status == "rejected":
+            raise ToolRouteError(
+                "step_claim_lost",
+                "Tool Step execution claim was lost",
+                effect_id=effect_id,
+            ) from None
         if write_effect:
             reconciliation = self._terminal_effect(
                 reservation,
                 status="reconciliation_required",
                 code="commit_persistence_failed",
             )
-            reconciled = await self._persist_terminal(reconciliation, reservation)
+            reconciled = await self._persist_terminal(
+                reconciliation, reservation, step_claim=bound_step_claim
+            )
             if reconciled is None:
                 raise ToolRouteError(
                     "persistence_failure",
@@ -936,13 +1009,28 @@ class ToolRouter:
             effect_id=effect_id,
         ) from None
 
-    def _admitted_tool(self, context: StepContext, tool_id: str) -> _AdmittedTool:
+    def _admitted_tool(
+        self,
+        context: StepContext,
+        tool_id: str,
+        *,
+        step_claim: StepExecutionClaim | None = None,
+    ) -> tuple[_AdmittedTool, StepExecutionClaim]:
         broker = self._validated_executor_broker()
-        admission = self._admissions.get(context.tool_manifest_digest)
-        if admission is None:
+        admission_entry = self._admissions.get(context.identity_digest)
+        if admission_entry is None:
             raise ToolRouteError(
                 "manifest_not_admitted", "Frozen Tool Manifest was not admitted"
             )
+        admitted_claim, admission = admission_entry
+        if step_claim is not None and step_claim != admitted_claim:
+            raise ToolRouteError(
+                "step_claim_lost", "Tool Step execution claim changed after admission"
+            ) from None
+        if not self.repository.step_claim_is_current(admitted_claim):
+            raise ToolRouteError(
+                "step_claim_lost", "Tool Step execution claim was rejected"
+            ) from None
         matches = tuple(
             item for item in context.tool_manifest if item.tool_id == tool_id
         )
@@ -959,7 +1047,7 @@ class ToolRouter:
                 "registration_rejected",
                 "Executor capability provenance was rejected",
             ) from None
-        return admitted
+        return admitted, admitted_claim
 
     @staticmethod
     def _validate_admitted_arguments(
@@ -1204,6 +1292,7 @@ class ToolRouter:
         deadline_at_ms: int,
         reservation: ToolEffectRecord,
         reacquire_approval: bool,
+        step_claim: StepExecutionClaim | None,
     ) -> None:
         failure_code: str | None = None
         cancelled = False
@@ -1257,7 +1346,9 @@ class ToolRouter:
             status="rejected",
             code="cancelled" if cancelled else failure_code or "authorization_failed",
         )
-        await self._persist_terminal_or_raise(rejected, reservation)
+        await self._persist_terminal_or_raise(
+            rejected, reservation, step_claim=step_claim
+        )
         if cancelled:
             raise asyncio.CancelledError()
         raise ToolRouteError(
@@ -1349,6 +1440,7 @@ class ToolRouter:
         *,
         owner_id: str,
         deadline_at_ms: int,
+        step_claim: StepExecutionClaim | None,
     ) -> tuple[ToolEffectRecord | None, PublicToolResult | None, bool]:
         reserve_failed = False
         effect: ToolEffectRecord | None = None
@@ -1358,6 +1450,7 @@ class ToolRouter:
                 reservation,
                 execution_owner_id=owner_id,
                 lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
+                step_claim=step_claim,
             )
         except Exception:
             reserve_failed = True
@@ -1395,6 +1488,7 @@ class ToolRouter:
                     expected_fence_generation=effect.fence_generation,
                     execution_owner_id=owner_id,
                     lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
+                    step_claim=step_claim,
                 )
             except Exception:
                 takeover_failed = True
@@ -1410,7 +1504,12 @@ class ToolRouter:
                     status="reconciliation_required",
                     code="write_outcome_unknown",
                 )
-                if await self._persist_terminal(terminal, replacement) is not None:
+                if (
+                    await self._persist_terminal(
+                        terminal, replacement, step_claim=step_claim
+                    )
+                    is not None
+                ):
                     raise ToolRouteError(
                         "reconciliation_required",
                         "Tool Effect requires reconciliation",
@@ -1424,7 +1523,9 @@ class ToolRouter:
                 terminal = self._terminal_effect(
                     replacement, status="rejected", code="replay_not_allowed"
                 )
-                await self._persist_terminal_or_raise(terminal, replacement)
+                await self._persist_terminal_or_raise(
+                    terminal, replacement, step_claim=step_claim
+                )
                 raise ToolRouteError(
                     "replay_not_allowed",
                     "Manifest does not permit replay of this read Tool",
@@ -1489,13 +1590,16 @@ class ToolRouter:
         *,
         write_effect: bool,
         code: str,
+        step_claim: StepExecutionClaim | None,
     ) -> None:
         terminal = self._terminal_effect(
             reservation,
             status=("reconciliation_required" if write_effect else "rejected"),
             code=code,
         )
-        await self._persist_terminal_or_raise(terminal, reservation)
+        await self._persist_terminal_or_raise(
+            terminal, reservation, step_claim=step_claim
+        )
         raise ToolRouteError(
             "reconciliation_required" if write_effect else code,
             "Tool execution did not produce a reusable result",
@@ -1506,6 +1610,8 @@ class ToolRouter:
         self,
         effect: ToolEffectRecord,
         reservation: ToolEffectRecord,
+        *,
+        step_claim: StepExecutionClaim | None,
     ) -> ToolEffectRecord | None:
         async def persist() -> ToolEffectRecord | None:
             durable: ToolEffectRecord | None = None
@@ -1515,6 +1621,7 @@ class ToolRouter:
                     expected_owner_id=reservation.execution_owner_id or "",
                     expected_fence_token=reservation.fence_token or "",
                     expected_fence_generation=reservation.fence_generation,
+                    step_claim=step_claim,
                 )
             except Exception:
                 return None
@@ -1542,8 +1649,12 @@ class ToolRouter:
         self,
         effect: ToolEffectRecord,
         reservation: ToolEffectRecord,
+        *,
+        step_claim: StepExecutionClaim | None,
     ) -> ToolEffectRecord:
-        durable = await self._persist_terminal(effect, reservation)
+        durable = await self._persist_terminal(
+            effect, reservation, step_claim=step_claim
+        )
         if durable is None:
             raise ToolRouteError(
                 "persistence_failure",
@@ -1581,6 +1692,7 @@ class ToolRouter:
                 "status": status,
                 "execution_owner_id": None,
                 "lease_expires_at_ms": None,
+                "result_code": code,
                 "result_digest": canonical_digest({"code": code, "result": result}),
                 "public_result": result,
             }

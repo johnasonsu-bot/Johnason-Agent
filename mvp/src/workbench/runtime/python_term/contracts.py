@@ -183,6 +183,7 @@ class PythonTermRuntimeLimits(FrozenModel):
     max_sdk_tokens: StrictInt = Field(default=32_768, gt=0, le=1_000_000)
     max_turns: StrictInt = Field(default=10, gt=0, le=64)
     quiescence_timeout_ms: StrictInt = Field(default=2_000, gt=0, le=30_000)
+    max_supervised_sdk_runs: StrictInt = Field(default=64, gt=0, le=256)
 
 
 def validate_safe_json(value: object) -> JsonValue:
@@ -980,6 +981,26 @@ class StepEventTransitionRecord(FrozenModel):
         return self.event.public_projection
 
 
+class ToolEffectCheckpointEvidence(FrozenModel):
+    """Stable, secret-free identity and state proof for one durable Effect."""
+
+    effect_id: Identifier
+    tool_call_id: Identifier
+    stable_identity_digest: Digest
+    request_digest: Digest
+    request_digest_version: Literal[
+        "opaque-v1", "hmac-sha256-v1", "legacy-unkeyed-sha256-v0"
+    ]
+    step_claim_digest: Digest
+    execution_owner_id: Identifier | None = None
+    fence_id: Identifier | None = None
+    fence_generation: StrictInt = Field(ge=0)
+    status: EffectStatus
+    result_code: Identifier | None = None
+    result_digest: Digest | None = None
+    result_evidence_digest: Digest
+
+
 class RuntimeCheckpointEvidence(FrozenModel):
     """Frozen execution evidence required to resume one Step safely."""
 
@@ -994,6 +1015,7 @@ class RuntimeCheckpointEvidence(FrozenModel):
     handoff_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
     effect_digest: Digest
     effect_record_digests: tuple[Digest, ...] = ()
+    effect_evidence: tuple[ToolEffectCheckpointEvidence, ...] = ()
     source_events: tuple["SdkSourceEventEvidence", ...] = ()
     term_id: Identifier
     step_id: Identifier
@@ -1016,6 +1038,18 @@ class StepExecutionClaim(FrozenModel):
     lease_expires_at_ms: StrictInt = Field(gt=0)
     fence_id: Identifier
     fence_generation: StrictInt = Field(gt=0)
+
+    @property
+    def identity_digest(self) -> str:
+        return canonical_digest(
+            {
+                "term_id": self.term_id,
+                "step_id": self.step_id,
+                "owner_id": self.owner_id,
+                "fence_id": self.fence_id,
+                "fence_generation": self.fence_generation,
+            }
+        )
 
 
 class StepCheckpointRecord(_SafePayloadRecord):
@@ -1055,12 +1089,14 @@ class ToolEffectRecord(_SafePayloadRecord):
     request_digest_version: Literal[
         "opaque-v1", "hmac-sha256-v1", "legacy-unkeyed-sha256-v0"
     ] = "opaque-v1"
+    step_claim_digest: Digest = EMPTY_MANIFEST_DIGEST
     write_effect: StrictBool = False
     execution_owner_id: Identifier | None = None
     lease_expires_at_ms: StrictInt | None = Field(default=None, gt=0)
     fence_id: Identifier | None = None
     fence_generation: StrictInt = Field(default=0, ge=0)
     status: EffectStatus
+    result_code: Identifier | None = None
     result_digest: Digest | None = None
     result_digest_version: Literal["canonical-sha256-v1"] = "canonical-sha256-v1"
     public_result: PublicToolResult | None = None
@@ -1077,15 +1113,57 @@ class ToolEffectRecord(_SafePayloadRecord):
             raise ValueError("unfenced Tool Effect cannot retain a generation")
         if self.status != "reserved" and self.execution_owner_id is not None:
             raise ValueError("terminal Tool Effect cannot retain an execution owner")
-        if self.status == "committed" and (
+        if self.status != "reserved" and (
             self.result_digest is None or self.public_result is None
         ):
-            raise ValueError("committed Tool Effect requires a result digest and projection")
+            raise ValueError("terminal Tool Effect requires a result digest and projection")
         if self.status == "reserved" and (
-            self.result_digest is not None or self.public_result is not None
+            self.result_code is not None
+            or self.result_digest is not None
+            or self.public_result is not None
         ):
             raise ValueError("reserved Tool Effect cannot contain a result")
+        if self.status == "committed":
+            if self.result_code is not None:
+                raise ValueError("committed Tool Effect cannot contain an error code")
+            expected_result_digest = canonical_digest(self.public_result)
+        elif self.status in {"rejected", "reconciliation_required"}:
+            if self.result_code is None:
+                raise ValueError("failed Tool Effect requires a result code")
+            expected_result_digest = canonical_digest(
+                {"code": self.result_code, "result": self.public_result}
+            )
+        else:
+            expected_result_digest = None
+        if self.result_digest != expected_result_digest:
+            raise ValueError("Tool Effect result evidence digest is invalid")
         return self
+
+    @property
+    def stable_identity_digest(self) -> str:
+        return canonical_digest(
+            {
+                "record_version": self.record_version,
+                "effect_id": self.effect_id,
+                "effect_identity_version": self.effect_identity_version,
+                "term_id": self.term_id,
+                "step_id": self.step_id,
+                "tool_call_id": self.tool_call_id,
+                "write_effect": self.write_effect,
+            }
+        )
+
+    @property
+    def result_evidence_digest(self) -> str:
+        return canonical_digest(
+            {
+                "status": self.status,
+                "result_code": self.result_code,
+                "result_digest": self.result_digest,
+                "result_digest_version": self.result_digest_version,
+                "public_result": self.public_result,
+            }
+        )
 
     @property
     def fence_token(self) -> str | None:

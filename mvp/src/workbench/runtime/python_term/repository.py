@@ -118,6 +118,7 @@ class PythonTermRepository:
                     request_digest_version="legacy-unkeyed-sha256-v0",
                     write_effect=True,
                     status="reconciliation_required",
+                    result_code="legacy_effect_retired",
                     result_digest=canonical_digest(
                         {"code": "legacy_effect_retired", "result": result}
                     ),
@@ -549,6 +550,60 @@ class PythonTermRepository:
             or row["lease_expires_at_ms"] <= now_ms
         ):
             raise RepositoryConflict("Step execution lease is not owned")
+
+    def renew_step_claim(
+        self,
+        claim: StepExecutionClaim,
+        *,
+        lease_seconds: float,
+    ) -> StepExecutionClaim | None:
+        """Extend the exact live Step fence without minting new ownership."""
+        validated = self._validate_model(claim, StepExecutionClaim)
+        if not isinstance(lease_seconds, int | float) or not 0 < lease_seconds <= 86_400:
+            raise ValueError("Step lease must be between zero and one day")
+        with self._transaction() as connection:
+            owning = self._load_owning_aggregate(
+                connection, validated.term_id, validated.step_id
+            )
+            if owning is None:
+                raise RepositoryCorruption("Step renewal has no owning aggregate")
+            _, steps = owning
+            step = next(item for item in steps if item.step_id == validated.step_id)
+            if step.status in _EXECUTION_TERMINAL:
+                return None
+            now_ms = self._database_now_ms(connection)
+            lease_expires_at_ms = now_ms + max(1, int(lease_seconds * 1000))
+            cursor = connection.execute(
+                """UPDATE python_step_claims
+                SET lease_expires_at_ms = ?, updated_at = unixepoch('subsec')
+                WHERE term_id = ? AND step_id = ? AND owner_id = ?
+                AND fence_id = ? AND fence_generation = ?
+                AND lease_expires_at_ms > ?""",
+                (
+                    lease_expires_at_ms,
+                    validated.term_id,
+                    validated.step_id,
+                    validated.owner_id,
+                    validated.fence_id,
+                    validated.fence_generation,
+                    now_ms,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return validated.model_copy(
+                update={"lease_expires_at_ms": lease_expires_at_ms}
+            )
+
+    def step_claim_is_current(self, claim: StepExecutionClaim) -> bool:
+        """Validate the exact live Step owner/fence in one read transaction."""
+        validated = self._validate_model(claim, StepExecutionClaim)
+        try:
+            with self._transaction() as connection:
+                self._require_step_claim(connection, validated)
+        except RepositoryConflict:
+            return False
+        return True
 
     @staticmethod
     def _validate_execution_update(
@@ -1013,7 +1068,9 @@ class PythonTermRepository:
                 or existing.request_digest_version != validated.request_digest_version
                 or existing.effect_identity_version
                 != validated.effect_identity_version
+                or existing.step_claim_digest != validated.step_claim_digest
                 or existing.write_effect != validated.write_effect
+                or existing.result_digest_version != validated.result_digest_version
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
             if existing.status in _EFFECT_TERMINAL:
@@ -1046,6 +1103,7 @@ class PythonTermRepository:
         *,
         execution_owner_id: str,
         lease_duration_ms: int,
+        step_claim: StepExecutionClaim | None = None,
     ) -> tuple[ToolEffectRecord, bool]:
         """Atomically reserve an Effect identity and report who won admission.
 
@@ -1063,8 +1121,21 @@ class PythonTermRepository:
             or not 1 <= lease_duration_ms <= 86_400_000
         ):
             raise RepositoryConflict("Tool Effect reservation must be reserved")
+        validated_step_claim = (
+            None
+            if step_claim is None
+            else self._validate_model(step_claim, StepExecutionClaim)
+        )
+        if validated_step_claim is not None and (
+            validated_step_claim.term_id != validated.term_id
+            or validated_step_claim.step_id != validated.step_id
+            or validated.step_claim_digest != validated_step_claim.identity_digest
+        ):
+            raise RepositoryConflict("Tool Effect Step claim identity conflict")
         now = time.time()
         with self._transaction() as connection:
+            if validated_step_claim is not None:
+                self._require_step_claim(connection, validated_step_claim)
             row = connection.execute(
                 """SELECT * FROM python_tool_effects
                 WHERE effect_id = ? OR
@@ -1092,6 +1163,12 @@ class PythonTermRepository:
                     or existing.effect_identity_version
                     != validated.effect_identity_version
                     or existing.write_effect != validated.write_effect
+                    or existing.result_digest_version
+                    != validated.result_digest_version
+                    or (
+                        existing.status == "reserved"
+                        and existing.step_claim_digest != validated.step_claim_digest
+                    )
                 ):
                     raise RepositoryConflict("Tool Effect request conflict")
                 return existing, False
@@ -1145,6 +1222,7 @@ class PythonTermRepository:
         expected_fence_generation: int,
         execution_owner_id: str,
         lease_duration_ms: int,
+        step_claim: StepExecutionClaim | None = None,
     ) -> tuple[ToolEffectRecord, bool]:
         """Fence an expired reservation to one replacement execution owner."""
         validated = self._validate_model(proposal, ToolEffectRecord)
@@ -1157,7 +1235,20 @@ class PythonTermRepository:
             or not 1 <= lease_duration_ms <= 86_400_000
         ):
             raise RepositoryConflict("takeover requires an unowned Effect proposal")
+        validated_step_claim = (
+            None
+            if step_claim is None
+            else self._validate_model(step_claim, StepExecutionClaim)
+        )
+        if validated_step_claim is not None and (
+            validated_step_claim.term_id != validated.term_id
+            or validated_step_claim.step_id != validated.step_id
+            or validated.step_claim_digest != validated_step_claim.identity_digest
+        ):
+            raise RepositoryConflict("Tool Effect Step claim identity conflict")
         with self._transaction() as connection:
+            if validated_step_claim is not None:
+                self._require_step_claim(connection, validated_step_claim)
             row = connection.execute(
                 "SELECT * FROM python_tool_effects WHERE effect_id = ?",
                 (validated.effect_id,),
@@ -1176,7 +1267,9 @@ class PythonTermRepository:
                 or existing.request_digest_version != validated.request_digest_version
                 or existing.effect_identity_version
                 != validated.effect_identity_version
+                or existing.step_claim_digest != validated.step_claim_digest
                 or existing.write_effect != validated.write_effect
+                or existing.result_digest_version != validated.result_digest_version
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
             if existing.status != "reserved":
@@ -1213,11 +1306,23 @@ class PythonTermRepository:
         expected_owner_id: str,
         expected_fence_token: str,
         expected_fence_generation: int,
+        step_claim: StepExecutionClaim | None = None,
     ) -> tuple[ToolEffectRecord, bool]:
         """Persist a terminal Effect only for the current fenced execution owner."""
         validated = self._validate_model(terminal, ToolEffectRecord)
         if validated.status not in _EFFECT_TERMINAL:
             raise RepositoryConflict("fenced Effect completion must be terminal")
+        validated_step_claim = (
+            None
+            if step_claim is None
+            else self._validate_model(step_claim, StepExecutionClaim)
+        )
+        if validated_step_claim is not None and (
+            validated_step_claim.term_id != validated.term_id
+            or validated_step_claim.step_id != validated.step_id
+            or validated.step_claim_digest != validated_step_claim.identity_digest
+        ):
+            raise RepositoryConflict("Tool Effect Step claim identity conflict")
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM python_tool_effects WHERE effect_id = ?",
@@ -1240,7 +1345,10 @@ class PythonTermRepository:
                 == validated.request_digest_version
                 and existing.effect_identity_version
                 == validated.effect_identity_version
+                and existing.step_claim_digest == validated.step_claim_digest
                 and existing.write_effect == validated.write_effect
+                and existing.result_digest_version
+                == validated.result_digest_version
             )
             fence_matches = (
                 existing.execution_owner_id == expected_owner_id
@@ -1255,6 +1363,53 @@ class PythonTermRepository:
                 raise RepositoryConflict("Tool Effect request conflict")
             if not fence_matches:
                 return existing, False
+            if validated_step_claim is not None:
+                step_claim_current = True
+                try:
+                    self._require_step_claim(connection, validated_step_claim)
+                except RepositoryConflict:
+                    step_claim_current = False
+                if not step_claim_current:
+                    result = PublicToolResult(
+                        status="failed",
+                        summary=(
+                            "Tool execution requires reconciliation"
+                            if existing.write_effect
+                            else "Tool call was rejected"
+                        ),
+                    )
+                    conservative = existing.model_copy(
+                        update={
+                            "status": (
+                                "reconciliation_required"
+                                if existing.write_effect
+                                else "rejected"
+                            ),
+                            "execution_owner_id": None,
+                            "lease_expires_at_ms": None,
+                            "result_code": "step_claim_lost",
+                            "result_digest": canonical_digest(
+                                {"code": "step_claim_lost", "result": result}
+                            ),
+                            "public_result": result,
+                        }
+                    )
+                    connection.execute(
+                        """UPDATE python_tool_effects SET status = ?, result_digest = ?,
+                        effect_json = ?, public_result_json = ?, updated_at = ?
+                        WHERE effect_id = ?""",
+                        (
+                            conservative.status,
+                            conservative.result_digest,
+                            canonical_json(conservative),
+                            canonical_json(conservative.public_result),
+                            time.time(),
+                            conservative.effect_id,
+                        ),
+                    )
+                    return conservative, canonical_json(conservative) == canonical_json(
+                        validated
+                    )
             public_result = (
                 None
                 if validated.public_result is None

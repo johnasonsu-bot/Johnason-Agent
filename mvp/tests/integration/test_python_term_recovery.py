@@ -21,6 +21,7 @@ from workbench.runtime.python_term.contracts import (
     PublicToolResult,
     ToolEffectRecord,
     canonical_digest,
+    canonical_json,
 )
 from workbench.runtime.python_term.repository import (
     PythonTermRepository,
@@ -77,6 +78,28 @@ class CrashAfterFirstSourceEventRuntime(PythonTermRuntime):
         return event
 
 
+class CrashBeforeToolResultRuntime(PythonTermRuntime):
+    """Crash after the Effect commits but before its public result boundary."""
+
+    def _commit_event(self, context, **kwargs):
+        if kwargs.get("event_type") == "tool.result":
+            raise SimulatedRuntimeCrash()
+        return super()._commit_event(context, **kwargs)
+
+
+class BlockingWriteExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, executor_handle, context, arguments):
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return PublicToolResult(status="completed", summary="Write completed")
+
+
 def _command(*, two_steps: bool = False) -> QueryCommandV2:
     payload = (
         {
@@ -125,13 +148,14 @@ def test_effect_recovery_reuses_committed_write_and_reconciles_unknown_write(
         write_effect=True,
         status="reserved",
     )
+    committed_result = PublicToolResult(
+        status="completed", summary="write completed"
+    )
     committed = reserved.model_copy(
         update={
             "status": "committed",
-            "result_digest": "9" * 64,
-            "public_result": PublicToolResult(
-                status="completed", summary="write completed"
-            ),
+            "result_digest": canonical_digest(committed_result),
+            "public_result": committed_result,
         }
     )
     committed_repository.save_tool_effect(reserved)
@@ -229,6 +253,241 @@ async def test_crash_after_committed_sdk_write_reuses_effect_without_reexecution
     assert not [
         event for event in resumed.events if event.type.startswith("tool.")
     ]
+
+
+@pytest.mark.asyncio
+async def test_reserved_tool_call_checkpoint_advances_to_committed_without_replay(
+    tmp_path,
+) -> None:
+    manifest = _tool(
+        "write_value", read_only=False, idempotency="non_idempotent"
+    )
+    executor = BlockingWriteExecutor()
+    repository = PythonTermRepository(tmp_path / "reserved-checkpoint-crash.sqlite")
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-write", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    first_model = ScriptedModel(
+        [
+            [function_call("write_value", {}, call_id="call-write-1")],
+            [assistant_message("write answer")],
+        ]
+    )
+    first_runtime = CrashBeforeToolResultRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", first_model)),
+    )
+    inputs = _runtime_inputs(tmp_path, first_runtime, tools=(manifest,))
+    inputs["effect_scope"] = EffectScope(scope_id="scope-1", write_effects=True)
+    execution = asyncio.create_task(
+        first_runtime.execute(
+            _command(),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    )
+    await asyncio.wait_for(executor.entered.wait(), timeout=1)
+    checkpoint = None
+    for _ in range(100):
+        candidate = repository.latest_step_checkpoint("term-1", "step-1")
+        if (
+            candidate is not None
+            and repository.list_events("term-1")[-1].type == "tool.call"
+        ):
+            checkpoint = candidate
+            break
+        await asyncio.sleep(0.01)
+    try:
+        assert checkpoint is not None
+        effect = repository.list_tool_effects("term-1", "step-1")[0]
+        assert effect.status == "reserved"
+        assert checkpoint.evidence.effect_evidence[0].status == "reserved"
+    finally:
+        executor.release.set()
+    with pytest.raises(SimulatedRuntimeCrash):
+        await execution
+
+    committed = repository.list_tool_effects("term-1", "step-1")[0]
+    assert committed.status == "committed"
+    assert executor.calls == 1
+    assert [event.type for event in repository.list_events("term-1")] == [
+        "runtime.status",
+        "tool.call",
+    ]
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        )
+
+    resumed_model = ScriptedModel(
+        [
+            [function_call("write_value", {}, call_id="call-write-1")],
+            [assistant_message("write answer")],
+        ]
+    )
+    resumed_runtime = PythonTermRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", resumed_model)),
+    )
+    resumed_inputs = _runtime_inputs(tmp_path, resumed_runtime, tools=(manifest,))
+    resumed_inputs["effect_scope"] = EffectScope(
+        scope_id="scope-1", write_effects=True
+    )
+
+    resumed = await resumed_runtime.execute(
+        _command(), agents=(_descriptor(),), **resumed_inputs
+    )
+
+    assert resumed.status == "completed"
+    assert executor.calls == 1
+    assert [event.type for event in repository.list_events("term-1")].count(
+        "tool.call"
+    ) == 1
+    assert [event.type for event in repository.list_events("term-1")].count(
+        "tool.result"
+    ) == 1
+
+
+@pytest.mark.parametrize("tamper", ["request", "owner_fence", "result"])
+def test_effect_checkpoint_rejects_request_owner_fence_or_result_tamper(
+    tmp_path,
+    tamper,
+) -> None:
+    repository = PythonTermRepository(tmp_path / f"effect-{tamper}-tamper.sqlite")
+    runtime = PythonTermRuntime(repository)
+    inputs = _runtime_inputs(tmp_path, runtime)
+    context = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    ).contexts[0]
+    claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="checkpoint-owner",
+        lease_seconds=60,
+    )
+    assert claim is not None
+    runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=claim,
+    )
+    proposal = ToolEffectRecord(
+        effect_id="effect-checkpoint-1",
+        term_id=context.term_id,
+        step_id=context.step_id,
+        tool_call_id="call-checkpoint-1",
+        request_digest="8" * 64,
+        step_claim_digest=claim.identity_digest,
+        status="reserved",
+    )
+    owned, created = repository.reserve_tool_effect(
+        proposal,
+        execution_owner_id="effect-owner",
+        lease_duration_ms=60_000,
+        step_claim=claim,
+    )
+    assert created
+    runtime._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": "read_value",
+            "tool_call_id": proposal.tool_call_id,
+            "read_only": True,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=claim,
+    )
+    if tamper == "result":
+        result = PublicToolResult(status="completed", summary="original")
+        terminal = owned.model_copy(
+            update={
+                "status": "committed",
+                "execution_owner_id": None,
+                "lease_expires_at_ms": None,
+                "result_digest": canonical_digest(result),
+                "public_result": result,
+            }
+        )
+        persisted, finished = repository.finish_tool_effect(
+            terminal,
+            expected_owner_id="effect-owner",
+            expected_fence_token=owned.fence_token,
+            expected_fence_generation=owned.fence_generation,
+            step_claim=claim,
+        )
+        assert finished and persisted.status == "committed"
+        runtime._commit_event(
+            context,
+            event_type="tool.result",
+            payload={
+                "tool_id": "read_value",
+                "tool_call_id": proposal.tool_call_id,
+                "read_only": True,
+                "name": "Tool invocation",
+                "summary": result.summary,
+                "status": result.status,
+            },
+            step_status="running",
+            execution_claim=claim,
+        )
+
+    with sqlite3.connect(repository.path) as connection:
+        encoded = connection.execute(
+            "SELECT effect_json FROM python_tool_effects WHERE effect_id = ?",
+            (proposal.effect_id,),
+        ).fetchone()[0]
+        payload = json.loads(encoded)
+        if tamper == "request":
+            payload["request_digest"] = "9" * 64
+            connection.execute(
+                "UPDATE python_tool_effects SET request_digest = ?, effect_json = ? "
+                "WHERE effect_id = ?",
+                ("9" * 64, canonical_json(payload), proposal.effect_id),
+            )
+        elif tamper == "owner_fence":
+            payload["execution_owner_id"] = "tampered-owner"
+            payload["fence_id"] = "tampered-fence"
+            connection.execute(
+                "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+                (canonical_json(payload), proposal.effect_id),
+            )
+        else:
+            changed_result = PublicToolResult(
+                status="completed", summary="tampered"
+            )
+            payload["result_digest"] = canonical_digest(changed_result)
+            payload["public_result"] = changed_result.model_dump(mode="json")
+            connection.execute(
+                "UPDATE python_tool_effects SET result_digest = ?, effect_json = ?, "
+                "public_result_json = ? WHERE effect_id = ?",
+                (
+                    payload["result_digest"],
+                    canonical_json(payload),
+                    canonical_json(changed_result),
+                    proposal.effect_id,
+                ),
+            )
+
+    with pytest.raises(PythonTermResumeRejected, match="identity"):
+        runtime.recover(_command(), agents=(_descriptor(),), **inputs)
 
 
 @pytest.mark.asyncio

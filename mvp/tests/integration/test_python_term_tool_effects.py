@@ -90,7 +90,14 @@ def _durable_router(
         clock_ms=clock_ms,
         monotonic_ms=monotonic_ms,
     )
-    router.admit(context)
+    step_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="tool-step-owner",
+        lease_seconds=86_400,
+    )
+    assert step_claim is not None
+    router.admit(context, step_claim=step_claim)
     return context, router, database
 
 
@@ -123,7 +130,14 @@ def _restart_router(
         request_digests=request_digests,
         clock_ms=clock_ms,
     )
-    router.admit(context)
+    step_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="tool-step-owner",
+        lease_seconds=86_400,
+    )
+    assert step_claim is not None
+    router.admit(context, step_claim=step_claim)
     return router
 
 
@@ -151,6 +165,117 @@ async def test_completed_write_reuses_authoritative_result_without_duplicate_eff
 
     assert second == first
     assert executor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_sdk_tool_step_claim_is_rejected_before_effect_or_executor(
+    tmp_path: Path,
+) -> None:
+    manifest = _tool("read-file")
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="must not execute")
+    )
+    context, router, _ = _durable_router(
+        tmp_path, manifest=manifest, executor=executor
+    )
+    repository = router.repository
+    wrapper = router.exposed_tools(context)[0]
+    stale = wrapper.step_claim
+    assert wrapper.step_claim == stale
+
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            (context.term_id, context.step_id),
+        )
+    replacement = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="step-owner-b",
+        lease_seconds=10,
+    )
+    assert replacement is not None
+
+    with pytest.raises(ToolRouteError) as rejected:
+        await router.invoke(
+            context,
+            wrapper.tool_id,
+            {},
+            tool_call_id="call-stale-step",
+            step_claim=wrapper.step_claim,
+        )
+    assert rejected.value.code == "step_claim_lost"
+    assert executor.calls == 0
+    assert repository.list_tool_effects(context.term_id, context.step_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_running_write_effect_cannot_commit_after_step_fence_takeover(
+    tmp_path: Path,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingWriteExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, _executor_handle, _context, _arguments):
+            self.calls += 1
+            entered.set()
+            await release.wait()
+            return PublicToolResult(status="completed", summary="write finished")
+
+    manifest = _tool("write-file", read_only=False, idempotency="non_idempotent")
+    executor = BlockingWriteExecutor()
+    context, router, _ = _durable_router(
+        tmp_path, manifest=manifest, executor=executor
+    )
+    repository = router.repository
+    stale = router.exposed_tools(context)[0].step_claim
+
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-running-write",
+            step_claim=stale,
+        )
+    )
+    await entered.wait()
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            (context.term_id, context.step_id),
+        )
+    replacement = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="step-owner-b",
+        lease_seconds=10,
+    )
+    assert replacement is not None
+    release.set()
+
+    with pytest.raises(ToolRouteError) as rejected:
+        await invocation
+    assert rejected.value.code == "reconciliation_required"
+    assert executor.calls == 1
+    effects = repository.list_tool_effects(context.term_id, context.step_id)
+    assert len(effects) == 1
+    assert effects[0].status == "reconciliation_required"
+    assert effects[0].step_claim_digest == canonical_digest(
+        {
+            "term_id": stale.term_id,
+            "step_id": stale.step_id,
+            "owner_id": stale.owner_id,
+            "fence_id": stale.fence_id,
+            "fence_generation": stale.fence_generation,
+        }
+    )
 
 
 @pytest.mark.asyncio

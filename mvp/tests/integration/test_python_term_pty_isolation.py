@@ -99,7 +99,14 @@ def _router(
         request_digests=HmacRequestDigestService(b"p" * 32),
         clock_ms=lambda: 1_000,
     )
-    router.admit(context)
+    step_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="pty-step-owner",
+        lease_seconds=86_400,
+    )
+    assert step_claim is not None
+    router.admit(context, step_claim=step_claim)
     return context, router, repository
 
 

@@ -809,13 +809,12 @@ def test_tool_effect_terminal_state_cannot_be_replayed_or_changed(tmp_path) -> N
         request_digest="d" * 64,
         status="reserved",
     )
+    result = PublicToolResult(status="completed", summary="tool completed")
     committed = reserved.model_copy(
         update={
             "status": "committed",
-            "result_digest": "e" * 64,
-            "public_result": PublicToolResult(
-                status="completed", summary="tool completed"
-            ),
+            "result_digest": canonical_digest(result),
+            "public_result": result,
         }
     )
 
@@ -826,8 +825,16 @@ def test_tool_effect_terminal_state_cannot_be_replayed_or_changed(tmp_path) -> N
     with pytest.raises(RepositoryConflict, match="terminal"):
         repository.save_tool_effect(reserved)
     with pytest.raises(RepositoryConflict, match="conflict"):
+        changed_result = PublicToolResult(
+            status="completed", summary="different result"
+        )
         repository.save_tool_effect(
-            committed.model_copy(update={"result_digest": "f" * 64})
+            committed.model_copy(
+                update={
+                    "result_digest": canonical_digest(changed_result),
+                    "public_result": changed_result,
+                }
+            )
         )
 
 
@@ -984,13 +991,12 @@ def test_exact_event_checkpoint_and_effect_replays_remain_idempotent_after_termi
         request_digest="d" * 64,
         status="reserved",
     )
+    result = PublicToolResult(status="completed", summary="tool completed")
     committed = reserved.model_copy(
         update={
             "status": "committed",
-            "result_digest": "e" * 64,
-            "public_result": PublicToolResult(
-                status="completed", summary="tool completed"
-            ),
+            "result_digest": canonical_digest(result),
+            "public_result": result,
         }
     )
     final_event = StepEventRecord(

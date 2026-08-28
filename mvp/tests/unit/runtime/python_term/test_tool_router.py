@@ -176,6 +176,21 @@ def _runtime_context(
     return context, envelope
 
 
+def _claim_and_admit(
+    repository: PythonTermRepository,
+    router: ToolRouter,
+    context,
+) -> None:
+    step_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="tool-step-owner",
+        lease_seconds=86_400,
+    )
+    assert step_claim is not None
+    router.admit(context, step_claim=step_claim)
+
+
 def _router(
     tmp_path: Path,
     context,
@@ -218,7 +233,7 @@ def _router(
         clock_ms=clock_ms,
         monotonic_ms=monotonic_ms,
     )
-    router.admit(context)
+    _claim_and_admit(repository, router, context)
     return router, repository
 
 
@@ -240,6 +255,7 @@ async def test_unlisted_tools_are_not_exposed_or_directly_invocable(tmp_path: Pa
     assert {field.name for field in fields(wrappers[0])} == {
         "manifest",
         "registration",
+        "step_claim",
     }
     with pytest.raises(ToolRouteError, match="manifest") as raised:
         await router.invoke(
@@ -503,7 +519,7 @@ def test_manifest_admission_rejects_unsafe_or_excessive_schema(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        router.admit(context)
+        _claim_and_admit(repository, router, context)
 
     assert raised.value.code == "schema_rejected"
     assert raised.value.__cause__ is None
@@ -563,7 +579,7 @@ def test_manifest_admission_rejects_recursive_or_exponential_local_refs(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        router.admit(context)
+        _claim_and_admit(repository, router, context)
 
     assert raised.value.code == "schema_rejected"
     assert raised.value.__cause__ is None
@@ -844,7 +860,11 @@ def test_registration_and_sdk_wrapper_hold_no_execution_authority_or_workspace(
     )
 
     wrapper = router.exposed_tools(context)[0]
-    assert {field.name for field in fields(wrapper)} == {"manifest", "registration"}
+    assert {field.name for field in fields(wrapper)} == {
+        "manifest",
+        "registration",
+        "step_claim",
+    }
     assert {slot.removeprefix("__") for slot in wrapper.registration.__slots__ if slot != "__weakref__"} == {
         "descriptor_id",
         "tool_id",
@@ -896,7 +916,7 @@ async def test_fixed_dispatcher_cannot_be_replaced_after_composition(
         request_digests=HmacRequestDigestService(os.urandom(32)),
         clock_ms=lambda: 1_000,
     )
-    router.admit(context)
+    _claim_and_admit(repository, router, context)
 
     result = await router.invoke(
         context,
@@ -1191,7 +1211,7 @@ async def test_post_admission_broker_or_registration_mutation_fails_before_effec
         request_digests=HmacRequestDigestService(os.urandom(32)),
         clock_ms=lambda: 1_000,
     )
-    router.admit(context)
+    _claim_and_admit(repository, router, context)
     registration = registrations[context.tool_manifest[0].tool_id]
     object.__setattr__(
         registration,
@@ -1243,7 +1263,7 @@ async def test_post_admission_router_broker_replacement_fails_before_effect(
         request_digests=HmacRequestDigestService(os.urandom(32)),
         clock_ms=lambda: 1_000,
     )
-    router.admit(context)
+    _claim_and_admit(repository, router, context)
 
     class ReplacementBroker:
         calls = 0

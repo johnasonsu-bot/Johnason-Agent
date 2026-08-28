@@ -631,6 +631,309 @@ async def test_sdk_external_cancellation_waits_for_provider_quiescence(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_sdk_cancel_suppression_stays_supervised_without_releasing_step_claim(
+    tmp_path,
+) -> None:
+    """A provider still running after bounded cancellation must never be detached."""
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+    cancellation_count = 0
+
+    async def suppress_cancellation(_call):
+        nonlocal cancellation_count
+        provider_entered.set()
+        while not release_provider.is_set():
+            try:
+                await release_provider.wait()
+            except asyncio.CancelledError:
+                cancellation_count += 1
+        return [assistant_message("late provider output must stay private")]
+
+    model = ScriptedModel([{"responder": suppress_cancellation}])
+    repository = PythonTermRepository(tmp_path / "cancel-supervisor.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        limits=PythonTermRuntimeLimits(quiescence_timeout_ms=20),
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    execution = asyncio.create_task(
+        runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    )
+    await provider_entered.wait()
+
+    execution.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(execution), timeout=1)
+
+        assert cancellation_count >= 2
+        assert repository.get_term("term-1").status == "running"
+        assert [event.type for event in repository.list_events("term-1")] == [
+            "runtime.status"
+        ]
+        with sqlite3.connect(repository.path) as connection:
+            claim = connection.execute(
+                "SELECT owner_id FROM python_step_claims "
+                "WHERE term_id = ? AND step_id = ?",
+                ("term-1", "step-1"),
+            ).fetchone()
+        assert claim is not None and claim[0] is not None
+
+        snapshots = runtime.supervised_sdk_runs()
+        assert len(snapshots) == 1
+        assert snapshots[0].run_id == "run-1"
+        assert snapshots[0].term_id == "term-1"
+        assert snapshots[0].step_id == "step-1"
+        assert snapshots[0].state == "cancelling"
+        assert not hasattr(snapshots[0], "task")
+        assert not hasattr(snapshots[0], "result")
+        assert not hasattr(snapshots[0], "arguments")
+    finally:
+        release_provider.set()
+
+    assert await runtime.wait_for_sdk_quiescence(timeout_ms=1_000)
+    assert runtime.supervised_sdk_runs() == ()
+    assert repository.get_term("term-1").status == "cancelled"
+    with sqlite3.connect(repository.path) as connection:
+        owner = connection.execute(
+            "SELECT owner_id FROM python_step_claims "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        ).fetchone()[0]
+    assert owner is None
+
+
+@pytest.mark.asyncio
+async def test_sdk_supervisor_renews_the_same_step_claim_until_provider_quiesces(
+    tmp_path,
+) -> None:
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def suppress_cancellation(_call):
+        provider_entered.set()
+        while not release_provider.is_set():
+            try:
+                await release_provider.wait()
+            except asyncio.CancelledError:
+                continue
+        return [assistant_message("late output")]
+
+    model = ScriptedModel([{"responder": suppress_cancellation}])
+    repository = PythonTermRepository(tmp_path / "supervisor-heartbeat.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        limits=PythonTermRuntimeLimits(quiescence_timeout_ms=20),
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    execution = asyncio.create_task(
+        runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    )
+    await provider_entered.wait()
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    with sqlite3.connect(repository.path) as connection:
+        forced_expiry = connection.execute(
+            "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) + 100"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = ? "
+            "WHERE term_id = ? AND step_id = ?",
+            (forced_expiry, "term-1", "step-1"),
+        )
+
+    renewed_expiry = forced_expiry
+    for _ in range(40):
+        with sqlite3.connect(repository.path) as connection:
+            renewed_expiry = connection.execute(
+                "SELECT lease_expires_at_ms FROM python_step_claims "
+                "WHERE term_id = ? AND step_id = ?",
+                ("term-1", "step-1"),
+            ).fetchone()[0]
+        if renewed_expiry > forced_expiry:
+            break
+        await asyncio.sleep(0.005)
+
+    try:
+        assert renewed_expiry > forced_expiry
+        assert (
+            repository.claim_step(
+                "term-1", "step-1", owner_id="contender", lease_seconds=1
+            )
+            is None
+        )
+    finally:
+        release_provider.set()
+    assert await runtime.wait_for_sdk_quiescence(timeout_ms=1_000)
+
+
+@pytest.mark.asyncio
+async def test_sdk_supervisor_capacity_rejects_a_new_model_run_before_provider_call(
+    tmp_path,
+) -> None:
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def suppress_cancellation(_call):
+        provider_entered.set()
+        while not release_provider.is_set():
+            try:
+                await release_provider.wait()
+            except asyncio.CancelledError:
+                continue
+        return [assistant_message("late output")]
+
+    model = ScriptedModel(
+        [
+            {"responder": suppress_cancellation},
+            [assistant_message("capacity bypass")],
+        ]
+    )
+    try:
+        limits = PythonTermRuntimeLimits(
+            quiescence_timeout_ms=20,
+            max_supervised_sdk_runs=1,
+        )
+    except Exception as error:
+        pytest.fail(f"bounded SDK supervisor capacity is unavailable: {error}")
+    repository = PythonTermRepository(tmp_path / "supervisor-capacity.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        limits=limits,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    first_inputs = _runtime_inputs(tmp_path, runtime)
+    first = asyncio.create_task(
+        runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **first_inputs,
+        )
+    )
+    await provider_entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    second_inputs = _runtime_inputs(tmp_path, runtime)
+    second_inputs["envelope"] = second_inputs["envelope"].model_copy(
+        update={
+            "run_id": "run-2",
+            "term_id": "term-2",
+            "step_id": "step-2",
+            "command_id": "command-2",
+        }
+    )
+    second_inputs["work_state"] = TermWorkStateRef(
+        term_id="term-2",
+        agent_id="agent-a",
+        root_ref=".runtime/terms/term-2",
+        metadata_digest="8" * 64,
+    )
+    try:
+        with pytest.raises(PythonTermRuntimeError) as rejected:
+            await runtime.execute(
+                QueryCommandV2(type="query.start", command_id="command-2"),
+                agents=(_descriptor(),),
+                **second_inputs,
+            )
+        assert rejected.value.code == "execution_unavailable"
+        assert len(model.calls) == 1
+        assert len(runtime.supervised_sdk_runs()) == 1
+    finally:
+        release_provider.set()
+    assert await runtime.wait_for_sdk_quiescence(timeout_ms=1_000)
+
+
+@pytest.mark.asyncio
+async def test_sdk_supervisor_claim_loss_becomes_observable_orphan_without_terminal(
+    tmp_path,
+) -> None:
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+    provider_quiesced = asyncio.Event()
+
+    async def suppress_cancellation(_call):
+        provider_entered.set()
+        while not release_provider.is_set():
+            try:
+                await release_provider.wait()
+            except asyncio.CancelledError:
+                continue
+        provider_quiesced.set()
+        return [assistant_message("orphaned output")]
+
+    model = ScriptedModel([{"responder": suppress_cancellation}])
+    repository = PythonTermRepository(tmp_path / "supervisor-orphan.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        limits=PythonTermRuntimeLimits(quiescence_timeout_ms=20),
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    execution = asyncio.create_task(
+        runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    )
+    await provider_entered.wait()
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        )
+    replacement = repository.claim_step(
+        "term-1", "step-1", owner_id="replacement", lease_seconds=10
+    )
+    assert replacement is not None
+
+    snapshots = runtime.supervised_sdk_runs()
+    for _ in range(40):
+        snapshots = runtime.supervised_sdk_runs()
+        if snapshots and snapshots[0].state == "orphaned":
+            break
+        await asyncio.sleep(0.005)
+    assert len(snapshots) == 1
+    assert snapshots[0].state == "orphaned"
+    assert repository.get_term("term-1").status == "running"
+    assert [event.type for event in repository.list_events("term-1")] == [
+        "runtime.status"
+    ]
+
+    release_provider.set()
+    await asyncio.wait_for(provider_quiesced.wait(), timeout=1)
+    assert not await runtime.wait_for_sdk_quiescence(timeout_ms=100)
+    assert runtime.supervised_sdk_runs()[0].state == "orphaned"
+    assert repository.get_term("term-1").status == "running"
+    with sqlite3.connect(repository.path) as connection:
+        owner = connection.execute(
+            "SELECT owner_id FROM python_step_claims "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        ).fetchone()[0]
+    assert owner == "replacement"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("call_kind", ["tool", "handoff"])
 async def test_sdk_stream_cannot_complete_with_an_unclosed_call(tmp_path, call_kind) -> None:
     model = ScriptedModel([[assistant_message("unused")]])
@@ -682,6 +985,90 @@ async def test_sdk_stream_cannot_complete_with_an_unclosed_call(tmp_path, call_k
             UnclosedResult(),
             handoff_tool_names=handoff_names,
             sdk_tools=sdk_tools,
+            persisted_source_events=(),
+            publish=lambda *_: None,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("close_first", "second_kind"),
+    [(False, "tool"), (True, "tool"), (True, "handoff")],
+)
+async def test_sdk_call_identity_is_unique_for_the_whole_step(
+    tmp_path,
+    close_first,
+    second_kind,
+) -> None:
+    model = ScriptedModel([[assistant_message("unused")]])
+    repository = PythonTermRepository(tmp_path / "duplicate-call-id.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    compiled = runtime.compile_start(
+        QueryCommandV2(type="query.start", command_id="command-1"),
+        agents=(_descriptor(),),
+        **inputs,
+    )
+    context = compiled.contexts[0]
+    call_id = "call-duplicate-1"
+    handoff_name = "transfer_to_agent_b"
+    tool_name = "read_file"
+    events = [
+        SimpleNamespace(
+            type="run_item_stream_event",
+            name="handoff_requested",
+            item=SimpleNamespace(
+                raw_item=SimpleNamespace(
+                    call_id=call_id,
+                    name=handoff_name,
+                    arguments="{}",
+                )
+            ),
+        )
+    ]
+    if close_first:
+        events.append(
+            SimpleNamespace(
+                type="run_item_stream_event",
+                name="handoff_occured",
+                item=SimpleNamespace(raw_item={"call_id": call_id}),
+            )
+        )
+    events.append(
+        SimpleNamespace(
+            type="run_item_stream_event",
+            name=("tool_called" if second_kind == "tool" else "handoff_requested"),
+            item=SimpleNamespace(
+                raw_item=SimpleNamespace(
+                    call_id=call_id,
+                    name=(tool_name if second_kind == "tool" else handoff_name),
+                    arguments="{}",
+                )
+            ),
+        )
+    )
+
+    class DuplicateResult:
+        final_output = None
+
+        async def stream_events(self):
+            for event in events:
+                yield event
+
+    with pytest.raises(PythonTermRuntimeError, match="identity was duplicated"):
+        await runtime._consume_sdk_step(
+            context,
+            DuplicateResult(),
+            handoff_tool_names=frozenset({handoff_name}),
+            sdk_tools={
+                tool_name: SimpleNamespace(
+                    tool_id=tool_name,
+                    manifest=SimpleNamespace(read_only=True),
+                )
+            },
             persisted_source_events=(),
             publish=lambda *_: None,
         )
