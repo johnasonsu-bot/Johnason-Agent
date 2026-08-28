@@ -20,6 +20,7 @@ from jsonschema import FormatChecker
 from jsonschema.validators import validator_for
 
 from workbench.runtime.engine_host.v2 import ToolManifestEntryV2
+from workbench.runtime.engine_host.v2.mapper import is_opaque_identifier
 from workbench.runtime.engine_host.v2.registry import (
     ExecutorAccessV2 as ToolAccess,
     ExecutorFileAccessV2 as FileAccess,
@@ -34,7 +35,7 @@ from .contracts import (
     canonical_json,
     validate_safe_json,
 )
-from .repository import PythonTermRepository
+from .repository import PythonTermRepository, RepositoryConflict
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +389,27 @@ class SdkToolWrapper:
         return self.manifest.tool_id
 
 
+@dataclass(frozen=True, slots=True)
+class ToolDispatchPermit:
+    """Opaque, secret-free proof identifying one paused Tool dispatch."""
+
+    gate_id: str
+    context_identity_digest: str
+    tool_call_id: str
+    effect_id: str
+    step_claim_digest: str
+    effect_fence_digest: str
+    dispatch_required: bool
+
+
+@dataclass(slots=True)
+class _ToolDispatchGate:
+    permit: ToolDispatchPermit
+    effect: ToolEffectRecord
+    step_claim: StepExecutionClaim
+    release_event: asyncio.Event
+
+
 class ToolRouteError(RuntimeError):
     def __init__(
         self, code: str, message: str, *, effect_id: str | None = None
@@ -631,6 +653,7 @@ class ToolRouter:
         self._admissions: dict[
             str, tuple[StepExecutionClaim, dict[str, _AdmittedTool]]
         ] = {}
+        self._dispatch_gates: dict[tuple[str, str], _ToolDispatchGate] = {}
 
     @property
     def executor_broker(self) -> None:
@@ -662,6 +685,120 @@ class ToolRouter:
         return await self._validated_executor_broker().wait_for_quiescence(
             timeout_ms=timeout_ms
         )
+
+    async def await_dispatch_gate(
+        self,
+        *,
+        context_identity_digest: str,
+        tool_call_id: str,
+        timeout_ms: int,
+    ) -> ToolDispatchPermit:
+        if (
+            not isinstance(context_identity_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", context_identity_digest) is None
+            or not is_opaque_identifier(tool_call_id)
+            or type(timeout_ms) is not int
+            or timeout_ms <= 0
+        ):
+            raise ToolRouteError(
+                "dispatch_gate_rejected", "Tool dispatch gate identity was rejected"
+            ) from None
+        key = (context_identity_digest, tool_call_id)
+        deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
+        while True:
+            gate = self._dispatch_gates.get(key)
+            if gate is not None:
+                return gate.permit
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ToolRouteError(
+                    "dispatch_gate_missing", "Tool dispatch gate was not reserved"
+                ) from None
+            await asyncio.sleep(0.001)
+
+    def release_dispatch_gate(self, permit: ToolDispatchPermit) -> bool:
+        if type(permit) is not ToolDispatchPermit:
+            raise TypeError("dispatch permit must be an exact ToolDispatchPermit")
+        key = (permit.context_identity_digest, permit.tool_call_id)
+        gate = self._dispatch_gates.get(key)
+        if gate is None or gate.permit != permit:
+            raise ToolRouteError(
+                "dispatch_gate_rejected", "Tool dispatch gate identity was rejected"
+            ) from None
+        try:
+            released = self.repository.release_tool_dispatch_gate(
+                gate.effect,
+                step_claim=gate.step_claim,
+                dispatch_required=gate.permit.dispatch_required,
+            )
+        except RepositoryConflict:
+            raise ToolRouteError(
+                "step_claim_lost", "Tool dispatch Step claim was rejected",
+                effect_id=gate.effect.effect_id,
+            ) from None
+        except Exception:
+            raise ToolRouteError(
+                "dispatch_gate_rejected", "Tool dispatch Effect fence was rejected",
+                effect_id=gate.effect.effect_id,
+            ) from None
+        if released is None:
+            raise ToolRouteError(
+                "effect_fence_lost", "Tool dispatch Effect fence was rejected",
+                effect_id=gate.effect.effect_id,
+            ) from None
+        gate.effect = released
+        gate.release_event.set()
+        return True
+
+    def _pause_dispatch(
+        self,
+        context: StepContext,
+        *,
+        tool_call_id: str,
+        effect: ToolEffectRecord,
+        step_claim: StepExecutionClaim,
+        dispatch_required: bool,
+    ) -> _ToolDispatchGate:
+        key = (context.identity_digest, tool_call_id)
+        if key in self._dispatch_gates:
+            raise ToolRouteError(
+                "dispatch_gate_conflict", "Tool dispatch gate identity was duplicated",
+                effect_id=effect.effect_id,
+            ) from None
+        fence_digest = canonical_digest(
+            {
+                "effect_id": effect.effect_id,
+                "execution_owner_id": effect.execution_owner_id,
+                "fence_id": effect.fence_id,
+                "fence_generation": effect.fence_generation,
+            }
+        )
+        permit = ToolDispatchPermit(
+            gate_id="dispatch-gate-" + secrets.token_hex(16),
+            context_identity_digest=context.identity_digest,
+            tool_call_id=tool_call_id,
+            effect_id=effect.effect_id,
+            step_claim_digest=step_claim.identity_digest,
+            effect_fence_digest=fence_digest,
+            dispatch_required=dispatch_required,
+        )
+        gate = _ToolDispatchGate(
+            permit=permit,
+            effect=effect,
+            step_claim=step_claim,
+            release_event=asyncio.Event(),
+        )
+        self._dispatch_gates[key] = gate
+        return gate
+
+    def _dispatch_gate_is_current(self, gate: _ToolDispatchGate) -> bool:
+        try:
+            return self.repository.validate_tool_dispatch_gate(
+                gate.effect,
+                step_claim=gate.step_claim,
+                dispatch_required=gate.permit.dispatch_required,
+            )
+        except Exception:
+            return False
 
     def admit(
         self,
@@ -826,7 +963,6 @@ class ToolRouter:
                     "Tool authorization changed while awaiting approval",
                 )
 
-        owner_id = "owner-" + secrets.token_hex(16)
         effect_id = "effect-" + self.request_digests.digest(
             {
                 "domain": "tool-effect-v1",
@@ -834,6 +970,13 @@ class ToolRouter:
                 "term_id": context.term_id,
                 "step_id": context.step_id,
                 "tool_call_id": tool_call_id,
+            }
+        )
+        owner_id = "owner-" + self.request_digests.digest(
+            {
+                "domain": "tool-effect-owner-v1",
+                "effect_id": effect_id,
+                "step_claim_digest": bound_step_claim.identity_digest,
             }
         )
         reservation = ToolEffectRecord(
@@ -851,21 +994,61 @@ class ToolRouter:
             write_effect=write_effect,
             status="reserved",
         )
-        owned, replay, waited_for_ownership = await self._reserve_or_replay(
+        reservation, replay, waited_for_ownership = await self._reserve_or_replay(
             admitted.manifest,
             reservation,
             owner_id=owner_id,
             deadline_at_ms=deadline_at_ms,
             step_claim=bound_step_claim,
         )
+        gate = self._pause_dispatch(
+            context,
+            tool_call_id=tool_call_id,
+            effect=reservation,
+            step_claim=bound_step_claim,
+            dispatch_required=replay is None,
+        )
+        try:
+            remaining_seconds = self._remaining_ms(deadline_at_ms) / 1_000
+            if remaining_seconds <= 0:
+                raise TimeoutError
+            await asyncio.wait_for(
+                gate.release_event.wait(), timeout=remaining_seconds
+            )
+        except asyncio.CancelledError:
+            self._dispatch_gates.pop((context.identity_digest, tool_call_id), None)
+            raise
+        except asyncio.TimeoutError:
+            self._dispatch_gates.pop((context.identity_digest, tool_call_id), None)
+            raise ToolRouteError(
+                "dispatch_checkpoint_timeout",
+                "Tool dispatch checkpoint gate timed out",
+                effect_id=reservation.effect_id,
+            ) from None
+        finally:
+            if gate.release_event.is_set():
+                self._dispatch_gates.pop(
+                    (context.identity_digest, tool_call_id), None
+                )
+
+        reservation = gate.effect
+        if not self._dispatch_gate_is_current(gate):
+            self._dispatch_gates.pop((context.identity_digest, tool_call_id), None)
+            if replay is None:
+                await self._finish_failed_execution(
+                    reservation,
+                    write_effect=write_effect,
+                    code="step_claim_lost",
+                    step_claim=bound_step_claim,
+                )
+            raise ToolRouteError(
+                "step_claim_lost",
+                "Tool dispatch gate lost its Step or Effect fence",
+                effect_id=reservation.effect_id,
+            ) from None
+        self._dispatch_gates.pop((context.identity_digest, tool_call_id), None)
         if replay is not None:
             return replay
-        if owned is None:
-            raise ToolRouteError(
-                "effect_unavailable", "Tool Effect reservation is unavailable",
-                effect_id=effect_id,
-            )
-        reservation = owned
 
         await self._reauthorize_owned_effect(
             context,
@@ -1441,7 +1624,7 @@ class ToolRouter:
         owner_id: str,
         deadline_at_ms: int,
         step_claim: StepExecutionClaim | None,
-    ) -> tuple[ToolEffectRecord | None, PublicToolResult | None, bool]:
+    ) -> tuple[ToolEffectRecord, PublicToolResult | None, bool]:
         reserve_failed = False
         effect: ToolEffectRecord | None = None
         created = False
@@ -1465,7 +1648,7 @@ class ToolRouter:
         while True:
             replay = self._terminal_replay(manifest, effect, reservation.write_effect)
             if replay is not None:
-                return None, replay, False
+                return effect, replay, False
             if effect.status != "reserved":
                 self._raise_terminal(effect)
             if (
@@ -1477,12 +1660,112 @@ class ToolRouter:
                     "effect_corrupt", "Reserved Tool Effect has no execution fence",
                     effect_id=effect.effect_id,
                 )
+            claim_changed = (
+                step_claim is None
+                or effect.step_claim_digest != step_claim.identity_digest
+            )
+            if (
+                not claim_changed
+                and effect.dispatch_state == "pending"
+                and effect.execution_owner_id == owner_id
+            ):
+                # A retry under the exact Step and deterministic Effect owner can
+                # safely rebuild the in-process gate around the durable pending
+                # reservation without changing either fence.
+                return effect, None, False
+            if claim_changed or effect.dispatch_state != "pending":
+                if effect.write_effect:
+                    terminal = self._terminal_effect(
+                        effect,
+                        status="reconciliation_required",
+                        code="write_dispatch_ambiguous",
+                    )
+                    await self._persist_terminal_or_raise(
+                        terminal, effect, step_claim=None
+                    )
+                    raise ToolRouteError(
+                        "reconciliation_required",
+                        "Tool Effect requires reconciliation",
+                        effect_id=effect.effect_id,
+                    ) from None
+                if manifest.idempotency != "idempotent":
+                    terminal = self._terminal_effect(
+                        effect, status="rejected", code="replay_not_allowed"
+                    )
+                    await self._persist_terminal_or_raise(
+                        terminal, effect, step_claim=None
+                    )
+                    raise ToolRouteError(
+                        "replay_not_allowed",
+                        "Manifest does not permit replay of this read Tool",
+                        effect_id=effect.effect_id,
+                    ) from None
+                if step_claim is None:
+                    raise ToolRouteError(
+                        "step_claim_lost", "Tool Step execution claim was rejected",
+                        effect_id=effect.effect_id,
+                    ) from None
+                next_attempt = effect.effect_attempt + 1
+                successor_id = "effect-" + self.request_digests.digest(
+                    {
+                        "domain": "tool-effect-successor-v1",
+                        "predecessor_effect_id": effect.effect_id,
+                        "effect_attempt": next_attempt,
+                        "term_id": effect.term_id,
+                        "step_id": effect.step_id,
+                        "tool_call_id": effect.tool_call_id,
+                        "request_digest": effect.request_digest,
+                    }
+                )
+                successor = effect.model_copy(
+                    update={
+                        "effect_id": successor_id,
+                        "step_claim_digest": step_claim.identity_digest,
+                        "execution_owner_id": None,
+                        "lease_expires_at_ms": None,
+                        "fence_id": None,
+                        "fence_generation": 0,
+                        "dispatch_state": "pending",
+                        "effect_attempt": next_attempt,
+                        "predecessor_effect_id": effect.effect_id,
+                        "predecessor_record_digest": canonical_digest(effect),
+                        "status": "reserved",
+                        "result_code": None,
+                        "result_digest": None,
+                        "public_result": None,
+                    }
+                )
+                try:
+                    effect, won = self.repository.replace_read_effect_with_successor(
+                        effect,
+                        successor,
+                        execution_owner_id=owner_id,
+                        lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
+                        step_claim=step_claim,
+                    )
+                except Exception:
+                    raise ToolRouteError(
+                        "effect_takeover_failed",
+                        "Tool Effect recovery ownership failed",
+                        effect_id=effect.effect_id,
+                    ) from None
+                if won:
+                    return effect, None, True
+                continue
             takeover_failed = False
             replacement: ToolEffectRecord | None = None
             won = False
             try:
+                takeover_proposal = effect.model_copy(
+                    update={
+                        "execution_owner_id": None,
+                        "lease_expires_at_ms": None,
+                        "fence_id": None,
+                        "fence_generation": 0,
+                    }
+                )
                 replacement, won = self.repository.takeover_expired_tool_effect(
-                    reservation,
+                    takeover_proposal,
                     expected_owner_id=effect.execution_owner_id,
                     expected_fence_token=effect.fence_token,
                     expected_fence_generation=effect.fence_generation,
@@ -1498,39 +1781,6 @@ class ToolRouter:
                     "Tool Effect recovery ownership failed",
                     effect_id=effect.effect_id,
                 ) from None
-            if won and reservation.write_effect:
-                terminal = self._terminal_effect(
-                    replacement,
-                    status="reconciliation_required",
-                    code="write_outcome_unknown",
-                )
-                if (
-                    await self._persist_terminal(
-                        terminal, replacement, step_claim=step_claim
-                    )
-                    is not None
-                ):
-                    raise ToolRouteError(
-                        "reconciliation_required",
-                        "Tool Effect requires reconciliation",
-                        effect_id=replacement.effect_id,
-                    )
-                raise ToolRouteError(
-                    "persistence_failure", "Tool Effect persistence is unavailable",
-                    effect_id=replacement.effect_id,
-                )
-            if won and manifest.idempotency != "idempotent":
-                terminal = self._terminal_effect(
-                    replacement, status="rejected", code="replay_not_allowed"
-                )
-                await self._persist_terminal_or_raise(
-                    terminal, replacement, step_claim=step_claim
-                )
-                raise ToolRouteError(
-                    "replay_not_allowed",
-                    "Manifest does not permit replay of this read Tool",
-                    effect_id=replacement.effect_id,
-                )
             if won:
                 return replacement, None, True
             effect = replacement
@@ -1690,6 +1940,11 @@ class ToolRouter:
         return effect.model_copy(
             update={
                 "status": status,
+                "dispatch_state": (
+                    "ambiguous"
+                    if status == "reconciliation_required"
+                    else effect.dispatch_state
+                ),
                 "execution_owner_id": None,
                 "lease_expires_at_ms": None,
                 "result_code": code,
@@ -1706,6 +1961,7 @@ __all__ = [
     "SupervisedExecutionSnapshot",
     "ApprovalRequest",
     "SdkToolWrapper",
+    "ToolDispatchPermit",
     "ToolAccess",
     "ToolRouteError",
     "ToolRouter",

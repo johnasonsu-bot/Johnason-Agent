@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from workbench.workflow.schema import migrate_phase1
 
 from .contracts import (
+    EMPTY_MANIFEST_DIGEST,
     ExecutionStatus,
     PublicEventProjection,
     PublicToolResult,
@@ -77,15 +78,79 @@ class PythonTermRepository:
     def _migrate_legacy_tool_effects(self, connection: sqlite3.Connection) -> None:
         connection.execute("BEGIN IMMEDIATE")
         try:
-            rows = connection.execute("SELECT * FROM python_tool_effects").fetchall()
-            migrations: list[ToolEffectRecord] = []
+            rows = connection.execute(
+                """SELECT * FROM python_tool_effects
+                ORDER BY term_id, step_id, tool_call_id, effect_id"""
+            ).fetchall()
+            parsed_rows: list[tuple[sqlite3.Row, dict[str, object]]] = []
             for row in rows:
                 try:
                     raw = json.loads(row["effect_json"])
-                except (TypeError, ValueError):
+                except (TypeError, ValueError) as error:
+                    raise RepositoryCorruption(
+                        "legacy Tool Effect JSON is invalid"
+                    ) from error
+                if not isinstance(raw, dict):
+                    raise RepositoryCorruption(
+                        "legacy Tool Effect JSON must be an object"
+                    )
+                current_marker = {
+                    "dispatch_state",
+                    "effect_attempt",
+                    "predecessor_effect_id",
+                    "predecessor_record_digest",
+                    "legacy_record_digest",
+                    "legacy_effect_collection_digest",
+                }
+                if current_marker <= raw.keys():
+                    try:
+                        current = ToolEffectRecord.model_validate(raw)
+                    except ValidationError as error:
+                        raise RepositoryCorruption(
+                            "current Tool Effect failed migration validation"
+                        ) from error
+                    if canonical_json(current) != row["effect_json"]:
+                        raise RepositoryCorruption(
+                            "current Tool Effect is not canonical"
+                        )
                     continue
-                if not isinstance(raw, dict) or "record_version" in raw:
-                    continue
+                parsed_rows.append((row, raw))
+
+            group_digests: dict[tuple[str, str], str] = {}
+            for row, raw in parsed_rows:
+                key = (row["term_id"], row["step_id"])
+                group = tuple(
+                    candidate
+                    for candidate_row, candidate in parsed_rows
+                    if (candidate_row["term_id"], candidate_row["step_id"]) == key
+                )
+                group_digests[key] = canonical_digest(group)
+
+            migrations: list[ToolEffectRecord] = []
+            legacy_9968_fields = {
+                "record_version",
+                "effect_id",
+                "effect_identity_version",
+                "term_id",
+                "step_id",
+                "tool_call_id",
+                "request_digest",
+                "request_digest_version",
+                "write_effect",
+                "execution_owner_id",
+                "lease_expires_at_ms",
+                "fence_id",
+                "fence_generation",
+                "status",
+                "result_digest",
+                "result_digest_version",
+                "public_result",
+            }
+            legacy_round2_fields = legacy_9968_fields | {
+                "step_claim_digest",
+                "result_code",
+            }
+            for row, raw in parsed_rows:
                 identity_matches = (
                     raw.get("effect_id") == row["effect_id"]
                     and raw.get("term_id") == row["term_id"]
@@ -102,28 +167,93 @@ class PythonTermRepository:
                     )
                 )
                 if not identity_matches:
-                    continue
-                result = PublicToolResult(
-                    status="failed",
-                    summary="Legacy Tool Effect requires reconciliation",
-                )
-                migrated = ToolEffectRecord(
-                    record_version=2,
-                    effect_id=row["effect_id"],
-                    effect_identity_version="legacy-unkeyed-sha256-v0",
-                    term_id=row["term_id"],
-                    step_id=row["step_id"],
-                    tool_call_id=row["tool_call_id"],
-                    request_digest=row["request_digest"],
-                    request_digest_version="legacy-unkeyed-sha256-v0",
-                    write_effect=True,
-                    status="reconciliation_required",
-                    result_code="legacy_effect_retired",
-                    result_digest=canonical_digest(
-                        {"code": "legacy_effect_retired", "result": result}
-                    ),
-                    public_result=result,
-                )
+                    raise RepositoryCorruption(
+                        "legacy Tool Effect columns disagree with JSON"
+                    )
+                fields = frozenset(raw)
+                record_version = raw.get("record_version")
+                if record_version == 2 and fields not in {
+                    frozenset(legacy_9968_fields),
+                    frozenset(legacy_round2_fields),
+                }:
+                    raise RepositoryCorruption(
+                        "legacy Tool Effect version 2 shape is unsupported"
+                    )
+                if record_version not in {None, 2}:
+                    raise RepositoryCorruption(
+                        "Tool Effect record version is unsupported"
+                    )
+                legacy_record_digest = canonical_digest(raw)
+                legacy_collection_digest = group_digests[
+                    (row["term_id"], row["step_id"])
+                ]
+                legacy_status = raw.get("status")
+                if legacy_status == "committed":
+                    migrated = ToolEffectRecord.model_validate(
+                        {
+                            **raw,
+                            "step_claim_digest": raw.get(
+                                "step_claim_digest", EMPTY_MANIFEST_DIGEST
+                            ),
+                            "result_code": None,
+                            "dispatch_state": "released",
+                            "legacy_record_digest": legacy_record_digest,
+                            "legacy_effect_collection_digest": (
+                                legacy_collection_digest
+                            ),
+                        }
+                    )
+                elif legacy_status == "reserved":
+                    migrated = ToolEffectRecord.model_validate(
+                        {
+                            **raw,
+                            "step_claim_digest": raw.get(
+                                "step_claim_digest", EMPTY_MANIFEST_DIGEST
+                            ),
+                            "result_code": None,
+                            "dispatch_state": "ambiguous",
+                            "legacy_record_digest": legacy_record_digest,
+                            "legacy_effect_collection_digest": (
+                                legacy_collection_digest
+                            ),
+                        }
+                    )
+                else:
+                    result = PublicToolResult(
+                        status="failed",
+                        summary="Legacy Tool Effect requires reconciliation",
+                    )
+                    migrated = ToolEffectRecord(
+                        record_version=2,
+                        effect_id=row["effect_id"],
+                        effect_identity_version=raw.get(
+                            "effect_identity_version",
+                            "legacy-unkeyed-sha256-v0",
+                        ),
+                        term_id=row["term_id"],
+                        step_id=row["step_id"],
+                        tool_call_id=row["tool_call_id"],
+                        request_digest=row["request_digest"],
+                        request_digest_version=raw.get(
+                            "request_digest_version",
+                            "legacy-unkeyed-sha256-v0",
+                        ),
+                        step_claim_digest=raw.get(
+                            "step_claim_digest", EMPTY_MANIFEST_DIGEST
+                        ),
+                        write_effect=bool(raw.get("write_effect", True)),
+                        fence_id=raw.get("fence_id"),
+                        fence_generation=int(raw.get("fence_generation", 0)),
+                        dispatch_state="ambiguous",
+                        status="reconciliation_required",
+                        result_code="legacy_effect_retired",
+                        result_digest=canonical_digest(
+                            {"code": "legacy_effect_retired", "result": result}
+                        ),
+                        public_result=result,
+                        legacy_record_digest=legacy_record_digest,
+                        legacy_effect_collection_digest=legacy_collection_digest,
+                    )
                 migrations.append(migrated)
             for migrated in migrations:
                 cursor = connection.execute(
@@ -135,7 +265,11 @@ class PythonTermRepository:
                         migrated.status,
                         migrated.result_digest,
                         canonical_json(migrated),
-                        canonical_json(migrated.public_result),
+                        (
+                            None
+                            if migrated.public_result is None
+                            else canonical_json(migrated.public_result)
+                        ),
                         migrated.effect_id,
                     ),
                 )
@@ -605,6 +739,100 @@ class PythonTermRepository:
             return False
         return True
 
+    def release_tool_dispatch_gate(
+        self,
+        effect: ToolEffectRecord,
+        *,
+        step_claim: StepExecutionClaim,
+        dispatch_required: bool,
+    ) -> ToolEffectRecord | None:
+        """Durably release an exact pending Effect gate under its Step fence."""
+        validated_effect = self._validate_model(effect, ToolEffectRecord)
+        validated_claim = self._validate_model(step_claim, StepExecutionClaim)
+        if type(dispatch_required) is not bool or (
+            validated_effect.term_id != validated_claim.term_id
+            or validated_effect.step_id != validated_claim.step_id
+        ):
+            raise RepositoryConflict("Tool dispatch gate identity conflict")
+        with self._transaction() as connection:
+            self._require_step_claim(connection, validated_claim)
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (validated_effect.effect_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            current = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, current.term_id, current.step_id
+            )
+            if canonical_json(current) != canonical_json(validated_effect):
+                return None
+            if dispatch_required:
+                valid = (
+                    current.status == "reserved"
+                    and current.dispatch_state == "pending"
+                    and current.step_claim_digest == validated_claim.identity_digest
+                    and current.execution_owner_id is not None
+                    and current.fence_token is not None
+                    and current.fence_generation > 0
+                )
+                if not valid:
+                    return None
+                released = current.model_copy(
+                    update={"dispatch_state": "released"}
+                )
+                released = self._validate_model(released, ToolEffectRecord)
+                connection.execute(
+                    """UPDATE python_tool_effects SET effect_json = ?,
+                    updated_at = ? WHERE effect_id = ?""",
+                    (canonical_json(released), time.time(), released.effect_id),
+                )
+                return released
+            if current.status != "committed" or current.public_result is None:
+                return None
+            return current
+
+    def validate_tool_dispatch_gate(
+        self,
+        effect: ToolEffectRecord,
+        *,
+        step_claim: StepExecutionClaim,
+        dispatch_required: bool,
+    ) -> bool:
+        """Revalidate an exact released gate immediately before dispatch."""
+        validated_effect = self._validate_model(effect, ToolEffectRecord)
+        validated_claim = self._validate_model(step_claim, StepExecutionClaim)
+        if type(dispatch_required) is not bool or (
+            validated_effect.term_id != validated_claim.term_id
+            or validated_effect.step_id != validated_claim.step_id
+        ):
+            raise RepositoryConflict("Tool dispatch gate identity conflict")
+        with self._transaction() as connection:
+            self._require_step_claim(connection, validated_claim)
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (validated_effect.effect_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, current.term_id, current.step_id
+            )
+            if canonical_json(current) != canonical_json(validated_effect):
+                return False
+            if dispatch_required:
+                return (
+                    current.status == "reserved"
+                    and current.dispatch_state == "released"
+                    and current.step_claim_digest == validated_claim.identity_digest
+                    and current.execution_owner_id is not None
+                    and current.fence_token is not None
+                    and current.fence_generation > 0
+                )
+            return current.status == "committed" and current.public_result is not None
+
     @staticmethod
     def _validate_execution_update(
         existing: TermRecord | StepRecord,
@@ -1070,6 +1298,11 @@ class PythonTermRepository:
                 != validated.effect_identity_version
                 or existing.step_claim_digest != validated.step_claim_digest
                 or existing.write_effect != validated.write_effect
+                or existing.effect_attempt != validated.effect_attempt
+                or existing.predecessor_effect_id
+                != validated.predecessor_effect_id
+                or existing.predecessor_record_digest
+                != validated.predecessor_record_digest
                 or existing.result_digest_version != validated.result_digest_version
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
@@ -1153,8 +1386,7 @@ class PythonTermRepository:
                     connection, existing.term_id, existing.step_id
                 )
                 if (
-                    existing.effect_id != validated.effect_id
-                    or existing.term_id != validated.term_id
+                    existing.term_id != validated.term_id
                     or existing.step_id != validated.step_id
                     or existing.tool_call_id != validated.tool_call_id
                     or existing.request_digest != validated.request_digest
@@ -1165,10 +1397,6 @@ class PythonTermRepository:
                     or existing.write_effect != validated.write_effect
                     or existing.result_digest_version
                     != validated.result_digest_version
-                    or (
-                        existing.status == "reserved"
-                        and existing.step_claim_digest != validated.step_claim_digest
-                    )
                 ):
                     raise RepositoryConflict("Tool Effect request conflict")
                 return existing, False
@@ -1269,10 +1497,17 @@ class PythonTermRepository:
                 != validated.effect_identity_version
                 or existing.step_claim_digest != validated.step_claim_digest
                 or existing.write_effect != validated.write_effect
+                or existing.effect_attempt != validated.effect_attempt
+                or existing.predecessor_effect_id
+                != validated.predecessor_effect_id
+                or existing.predecessor_record_digest
+                != validated.predecessor_record_digest
                 or existing.result_digest_version != validated.result_digest_version
             ):
                 raise RepositoryConflict("Tool Effect request conflict")
             if existing.status != "reserved":
+                return existing, False
+            if existing.dispatch_state != "pending":
                 return existing, False
             now_ms = self._database_now_ms(connection)
             if (
@@ -1298,6 +1533,123 @@ class PythonTermRepository:
                 (canonical_json(replacement), time.time(), validated.effect_id),
             )
             return replacement, True
+
+    def replace_read_effect_with_successor(
+        self,
+        predecessor: ToolEffectRecord,
+        successor: ToolEffectRecord,
+        *,
+        execution_owner_id: str,
+        lease_duration_ms: int,
+        step_claim: StepExecutionClaim,
+    ) -> tuple[ToolEffectRecord, bool]:
+        """Atomically retire one stale read reservation into a lineage successor."""
+        validated_predecessor = self._validate_model(
+            predecessor, ToolEffectRecord
+        )
+        validated_successor = self._validate_model(successor, ToolEffectRecord)
+        validated_claim = self._validate_model(step_claim, StepExecutionClaim)
+        if (
+            validated_predecessor.status != "reserved"
+            or validated_predecessor.write_effect
+            or validated_successor.status != "reserved"
+            or validated_successor.write_effect
+            or validated_successor.dispatch_state != "pending"
+            or validated_successor.execution_owner_id is not None
+            or validated_successor.fence_token is not None
+            or validated_successor.fence_generation != 0
+            or validated_successor.effect_attempt
+            != validated_predecessor.effect_attempt + 1
+            or validated_successor.predecessor_effect_id
+            != validated_predecessor.effect_id
+            or validated_successor.predecessor_record_digest
+            != canonical_digest(validated_predecessor)
+            or validated_successor.effect_id == validated_predecessor.effect_id
+            or validated_successor.term_id != validated_predecessor.term_id
+            or validated_successor.step_id != validated_predecessor.step_id
+            or validated_successor.tool_call_id
+            != validated_predecessor.tool_call_id
+            or validated_successor.request_digest
+            != validated_predecessor.request_digest
+            or validated_successor.request_digest_version
+            != validated_predecessor.request_digest_version
+            or validated_successor.effect_identity_version
+            != validated_predecessor.effect_identity_version
+            or validated_successor.step_claim_digest
+            != validated_claim.identity_digest
+            or validated_claim.term_id != validated_successor.term_id
+            or validated_claim.step_id != validated_successor.step_id
+            or type(lease_duration_ms) is not int
+            or not 1 <= lease_duration_ms <= 86_400_000
+        ):
+            raise RepositoryConflict("read Effect successor identity conflict")
+        with self._transaction() as connection:
+            self._require_step_claim(connection, validated_claim)
+            row = connection.execute(
+                """SELECT * FROM python_tool_effects WHERE effect_id = ? OR
+                (term_id = ? AND step_id = ? AND tool_call_id = ?)""",
+                (
+                    validated_predecessor.effect_id,
+                    validated_predecessor.term_id,
+                    validated_predecessor.step_id,
+                    validated_predecessor.tool_call_id,
+                ),
+            ).fetchone()
+            if row is None:
+                raise RepositoryConflict("read Effect predecessor is missing")
+            current = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, current.term_id, current.step_id
+            )
+            if current.effect_id != validated_predecessor.effect_id:
+                successor_matches = (
+                    current.effect_id == validated_successor.effect_id
+                    and current.effect_attempt == validated_successor.effect_attempt
+                    and current.predecessor_effect_id
+                    == validated_successor.predecessor_effect_id
+                    and current.predecessor_record_digest
+                    == validated_successor.predecessor_record_digest
+                    and current.step_claim_digest
+                    == validated_successor.step_claim_digest
+                    and current.request_digest == validated_successor.request_digest
+                )
+                if successor_matches:
+                    return current, False
+                raise RepositoryConflict("read Effect successor uniqueness conflict")
+            if canonical_json(current) != canonical_json(validated_predecessor):
+                raise RepositoryConflict("read Effect predecessor fence changed")
+            owned = validated_successor.model_copy(
+                update={
+                    "execution_owner_id": execution_owner_id,
+                    "lease_expires_at_ms": (
+                        self._database_now_ms(connection) + lease_duration_ms
+                    ),
+                    "fence_id": "fence-" + secrets.token_hex(16),
+                    "fence_generation": current.fence_generation + 1,
+                }
+            )
+            owned = self._validate_model(owned, ToolEffectRecord)
+            cursor = connection.execute(
+                """UPDATE python_tool_effects SET effect_id = ?,
+                request_digest = ?, status = ?, result_digest = NULL,
+                effect_json = ?, public_result_json = NULL, updated_at = ?
+                WHERE effect_id = ? AND term_id = ? AND step_id = ?
+                AND tool_call_id = ?""",
+                (
+                    owned.effect_id,
+                    owned.request_digest,
+                    owned.status,
+                    canonical_json(owned),
+                    time.time(),
+                    validated_predecessor.effect_id,
+                    validated_predecessor.term_id,
+                    validated_predecessor.step_id,
+                    validated_predecessor.tool_call_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RepositoryConflict("read Effect successor lost its row fence")
+            return owned, True
 
     def finish_tool_effect(
         self,
@@ -1347,6 +1699,21 @@ class PythonTermRepository:
                 == validated.effect_identity_version
                 and existing.step_claim_digest == validated.step_claim_digest
                 and existing.write_effect == validated.write_effect
+                and (
+                    existing.dispatch_state == validated.dispatch_state
+                    or (
+                        validated.status == "reconciliation_required"
+                        and validated.dispatch_state == "ambiguous"
+                        and existing.write_effect
+                        and validated.write_effect
+                        and existing.dispatch_state in {"pending", "released"}
+                    )
+                )
+                and existing.effect_attempt == validated.effect_attempt
+                and existing.predecessor_effect_id
+                == validated.predecessor_effect_id
+                and existing.predecessor_record_digest
+                == validated.predecessor_record_digest
                 and existing.result_digest_version
                 == validated.result_digest_version
             )
@@ -1384,6 +1751,12 @@ class PythonTermRepository:
                                 "reconciliation_required"
                                 if existing.write_effect
                                 else "rejected"
+                            ),
+                            "dispatch_state": (
+                                "ambiguous"
+                                if existing.write_effect
+                                and existing.dispatch_state != "pending"
+                                else existing.dispatch_state
                             ),
                             "execution_owner_id": None,
                             "lease_expires_at_ms": None,

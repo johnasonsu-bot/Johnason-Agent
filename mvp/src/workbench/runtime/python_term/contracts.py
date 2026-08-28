@@ -53,6 +53,7 @@ Identifier = Annotated[
 Reference = Annotated[str, StringConstraints(min_length=1, max_length=1024)]
 ExecutionStatus = Literal["pending", "running", "completed", "failed", "cancelled"]
 EffectStatus = Literal["reserved", "committed", "rejected", "reconciliation_required"]
+EffectDispatchState = Literal["pending", "released", "ambiguous"]
 
 
 def _sensitive_key(key: str) -> bool:
@@ -184,6 +185,7 @@ class PythonTermRuntimeLimits(FrozenModel):
     max_turns: StrictInt = Field(default=10, gt=0, le=64)
     quiescence_timeout_ms: StrictInt = Field(default=2_000, gt=0, le=30_000)
     max_supervised_sdk_runs: StrictInt = Field(default=64, gt=0, le=256)
+    max_supervised_sdk_history: StrictInt = Field(default=256, gt=0, le=4_096)
 
 
 def validate_safe_json(value: object) -> JsonValue:
@@ -984,6 +986,7 @@ class StepEventTransitionRecord(FrozenModel):
 class ToolEffectCheckpointEvidence(FrozenModel):
     """Stable, secret-free identity and state proof for one durable Effect."""
 
+    evidence_version: Literal[2]
     effect_id: Identifier
     tool_call_id: Identifier
     stable_identity_digest: Digest
@@ -995,6 +998,13 @@ class ToolEffectCheckpointEvidence(FrozenModel):
     execution_owner_id: Identifier | None = None
     fence_id: Identifier | None = None
     fence_generation: StrictInt = Field(ge=0)
+    dispatch_state: EffectDispatchState
+    write_effect: StrictBool
+    effect_attempt: StrictInt = Field(ge=0)
+    predecessor_effect_id: Identifier | None = None
+    predecessor_record_digest: Digest | None = None
+    legacy_record_digest: Digest | None = None
+    legacy_effect_collection_digest: Digest | None = None
     status: EffectStatus
     result_code: Identifier | None = None
     result_digest: Digest | None = None
@@ -1004,6 +1014,7 @@ class ToolEffectCheckpointEvidence(FrozenModel):
 class RuntimeCheckpointEvidence(FrozenModel):
     """Frozen execution evidence required to resume one Step safely."""
 
+    evidence_version: Literal[2]
     runtime_id: Identifier
     runtime_build_id: Identifier
     command_identity_digest: Digest
@@ -1016,6 +1027,26 @@ class RuntimeCheckpointEvidence(FrozenModel):
     effect_digest: Digest
     effect_record_digests: tuple[Digest, ...] = ()
     effect_evidence: tuple[ToolEffectCheckpointEvidence, ...] = ()
+    source_events: tuple["SdkSourceEventEvidence", ...] = ()
+    term_id: Identifier
+    step_id: Identifier
+    cursor: StrictInt = Field(ge=0)
+
+
+class LegacyRuntimeCheckpointEvidenceV1(FrozenModel):
+    """Exact 9968b3a checkpoint shape; absence is never interpreted as v2."""
+
+    runtime_id: Identifier
+    runtime_build_id: Identifier
+    command_identity_digest: Digest
+    context_digest: Digest
+    manifest_digest: Digest
+    workspace_grant_digest: Digest
+    permission_policy_digest: Digest
+    agent_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
+    handoff_descriptor_digest: Digest = EMPTY_MANIFEST_DIGEST
+    effect_digest: Digest
+    effect_record_digests: tuple[Digest, ...] = ()
     source_events: tuple["SdkSourceEventEvidence", ...] = ()
     term_id: Identifier
     step_id: Identifier
@@ -1059,7 +1090,7 @@ class StepCheckpointRecord(_SafePayloadRecord):
     step_id: Identifier
     cursor: StrictInt = Field(ge=0)
     public_projection: PublicStepProjection
-    evidence: RuntimeCheckpointEvidence | None = None
+    evidence: RuntimeCheckpointEvidence | LegacyRuntimeCheckpointEvidenceV1 | None = None
 
     @model_validator(mode="after")
     def evidence_matches_checkpoint(self) -> Self:
@@ -1095,6 +1126,12 @@ class ToolEffectRecord(_SafePayloadRecord):
     lease_expires_at_ms: StrictInt | None = Field(default=None, gt=0)
     fence_id: Identifier | None = None
     fence_generation: StrictInt = Field(default=0, ge=0)
+    dispatch_state: EffectDispatchState = "pending"
+    effect_attempt: StrictInt = Field(default=0, ge=0)
+    predecessor_effect_id: Identifier | None = None
+    predecessor_record_digest: Digest | None = None
+    legacy_record_digest: Digest | None = None
+    legacy_effect_collection_digest: Digest | None = None
     status: EffectStatus
     result_code: Identifier | None = None
     result_digest: Digest | None = None
@@ -1103,6 +1140,21 @@ class ToolEffectRecord(_SafePayloadRecord):
 
     @model_validator(mode="after")
     def terminal_result_is_coherent(self) -> Self:
+        if self.effect_attempt == 0 and (
+            self.predecessor_effect_id is not None
+            or self.predecessor_record_digest is not None
+        ):
+            raise ValueError("initial Tool Effect cannot contain predecessor lineage")
+        if self.effect_attempt > 0 and (
+            self.predecessor_effect_id is None
+            or self.predecessor_record_digest is None
+            or self.predecessor_effect_id == self.effect_id
+        ):
+            raise ValueError("retried Tool Effect requires predecessor lineage")
+        if (self.legacy_record_digest is None) != (
+            self.legacy_effect_collection_digest is None
+        ):
+            raise ValueError("legacy Tool Effect lineage must be atomic")
         if (self.execution_owner_id is None) != (self.lease_expires_at_ms is None):
             raise ValueError("Tool Effect execution owner and lease must be atomic")
         if self.execution_owner_id is not None and self.fence_id is None:
@@ -1126,6 +1178,8 @@ class ToolEffectRecord(_SafePayloadRecord):
         if self.status == "committed":
             if self.result_code is not None:
                 raise ValueError("committed Tool Effect cannot contain an error code")
+            if self.dispatch_state != "released":
+                raise ValueError("committed Tool Effect requires released dispatch")
             expected_result_digest = canonical_digest(self.public_result)
         elif self.status in {"rejected", "reconciliation_required"}:
             if self.result_code is None:
@@ -1150,6 +1204,9 @@ class ToolEffectRecord(_SafePayloadRecord):
                 "step_id": self.step_id,
                 "tool_call_id": self.tool_call_id,
                 "write_effect": self.write_effect,
+                "effect_attempt": self.effect_attempt,
+                "predecessor_effect_id": self.predecessor_effect_id,
+                "predecessor_record_digest": self.predecessor_record_digest,
             }
         )
 
@@ -1158,6 +1215,7 @@ class ToolEffectRecord(_SafePayloadRecord):
         return canonical_digest(
             {
                 "status": self.status,
+                "dispatch_state": self.dispatch_state,
                 "result_code": self.result_code,
                 "result_digest": self.result_digest,
                 "result_digest_version": self.result_digest_version,

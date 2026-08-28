@@ -65,6 +65,37 @@ from tests.unit.runtime.python_term.test_tool_router import (
 )
 
 
+class _GateCommitRolledBack(BaseException):
+    pass
+
+
+class _CrashBeforeToolCallCommitRuntime(PythonTermRuntime):
+    def _commit_event(self, context, **kwargs):
+        if kwargs.get("event_type") == "tool.call":
+            raise _GateCommitRolledBack()
+        return super()._commit_event(context, **kwargs)
+
+
+class _ZeroLatencyBoundaryBroker:
+    def __init__(self, repository: PythonTermRepository) -> None:
+        self.repository = repository
+        self.calls = 0
+        self.saw_durable_boundary = False
+
+    async def execute(self, executor_handle, context, arguments):
+        self.calls += 1
+        events = self.repository.list_events(context.term_id)
+        effects = self.repository.list_tool_effects(context.term_id, context.step_id)
+        self.saw_durable_boundary = bool(
+            events
+            and events[-1].type == "tool.call"
+            and effects
+            and effects[0].status == "reserved"
+            and effects[0].dispatch_state == "released"
+        )
+        return PublicToolResult(status="completed", summary="Zero latency completed")
+
+
 def _descriptor(
     agent_id: str = "agent-a",
     *,
@@ -400,6 +431,97 @@ async def test_real_sdk_tool_call_crosses_fixed_router_and_effect_boundary(
         for event in tool_events
         for domain in map_runtime_event(event)
     )
+
+
+@pytest.mark.asyncio
+async def test_zero_latency_executor_starts_only_after_durable_tool_call_release(
+    tmp_path,
+) -> None:
+    manifest = _tool("read_value")
+    repository = PythonTermRepository(tmp_path / "zero-latency-gate.sqlite")
+    executor = _ZeroLatencyBoundaryBroker(repository)
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-zero", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    model = ScriptedModel(
+        [
+            [function_call("read_value", {}, call_id="call-zero-1")],
+            [assistant_message("zero answer")],
+        ]
+    )
+    runtime = PythonTermRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+
+    result = await runtime.execute(
+        QueryCommandV2(type="query.start", command_id="command-1"),
+        agents=(_descriptor(),),
+        **inputs,
+    )
+
+    assert result.status == "completed"
+    assert executor.calls == 1
+    assert executor.saw_durable_boundary
+
+
+@pytest.mark.asyncio
+async def test_tool_call_transaction_rollback_never_releases_dispatch_gate(
+    tmp_path,
+) -> None:
+    manifest = _tool("read_value")
+    repository = PythonTermRepository(tmp_path / "rollback-gate.sqlite")
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="must not execute")
+    )
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-rollback", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    model = ScriptedModel(
+        [[function_call("read_value", {}, call_id="call-rollback-1")]]
+    )
+    runtime = _CrashBeforeToolCallCommitRuntime(
+        repository,
+        tool_router=router,
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+
+    with pytest.raises(_GateCommitRolledBack):
+        await runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+
+    assert executor.calls == 0
+    assert [event.type for event in repository.list_events("term-1")] == [
+        "runtime.status"
+    ]
+    effect = repository.list_tool_effects("term-1", "step-1")[0]
+    assert effect.status == "reserved"
+    assert effect.dispatch_state == "pending"
+    assert await router.wait_for_executor_quiescence(timeout_ms=1_000)
 
 
 @pytest.mark.asyncio
@@ -875,11 +997,20 @@ async def test_sdk_supervisor_claim_loss_becomes_observable_orphan_without_termi
         provider_quiesced.set()
         return [assistant_message("orphaned output")]
 
-    model = ScriptedModel([{"responder": suppress_cancellation}])
+    model = ScriptedModel(
+        [
+            {"responder": suppress_cancellation},
+            [assistant_message("capacity recovered")],
+        ]
+    )
     repository = PythonTermRepository(tmp_path / "supervisor-orphan.sqlite")
     runtime = PythonTermRuntime(
         repository,
-        limits=PythonTermRuntimeLimits(quiescence_timeout_ms=20),
+        limits=PythonTermRuntimeLimits(
+            quiescence_timeout_ms=20,
+            max_supervised_sdk_runs=1,
+            max_supervised_sdk_history=1,
+        ),
         model_provider=_model_provider(("provider-1", "model-1", model)),
     )
     inputs = _runtime_inputs(tmp_path, runtime)
@@ -914,6 +1045,7 @@ async def test_sdk_supervisor_claim_loss_becomes_observable_orphan_without_termi
         await asyncio.sleep(0.005)
     assert len(snapshots) == 1
     assert snapshots[0].state == "orphaned"
+    assert snapshots[0].provider_done is False
     assert repository.get_term("term-1").status == "running"
     assert [event.type for event in repository.list_events("term-1")] == [
         "runtime.status"
@@ -921,8 +1053,8 @@ async def test_sdk_supervisor_claim_loss_becomes_observable_orphan_without_termi
 
     release_provider.set()
     await asyncio.wait_for(provider_quiesced.wait(), timeout=1)
-    assert not await runtime.wait_for_sdk_quiescence(timeout_ms=100)
-    assert runtime.supervised_sdk_runs()[0].state == "orphaned"
+    assert await runtime.wait_for_sdk_quiescence(timeout_ms=1_000)
+    assert runtime.supervised_sdk_runs() == ()
     assert repository.get_term("term-1").status == "running"
     with sqlite3.connect(repository.path) as connection:
         owner = connection.execute(
@@ -931,6 +1063,109 @@ async def test_sdk_supervisor_claim_loss_becomes_observable_orphan_without_termi
             ("term-1", "step-1"),
         ).fetchone()[0]
     assert owner == "replacement"
+
+    history = runtime.supervised_sdk_run_history()
+    assert len(history) == 1
+    assert history[0].execution_id == snapshots[0].execution_id
+    assert history[0].state == "orphaned_provider_done"
+    assert history[0].reconciled is False
+    assert not hasattr(history[0], "task")
+    assert not hasattr(history[0], "result")
+    assert not hasattr(history[0], "arguments")
+    assert not hasattr(history[0], "error")
+    assert runtime.reconcile_supervised_sdk_run(history[0].execution_id)
+    assert runtime.supervised_sdk_run_history()[0].reconciled is True
+    assert runtime.retire_supervised_sdk_run(history[0].execution_id)
+    assert runtime.supervised_sdk_run_history() == ()
+
+    second_inputs = _runtime_inputs(tmp_path, runtime)
+    second_inputs["envelope"] = second_inputs["envelope"].model_copy(
+        update={
+            "run_id": "run-2",
+            "term_id": "term-2",
+            "step_id": "step-2",
+            "command_id": "command-2",
+        }
+    )
+    second_inputs["work_state"] = TermWorkStateRef(
+        term_id="term-2",
+        agent_id="agent-a",
+        root_ref=".runtime/terms/term-2",
+        metadata_digest="8" * 64,
+    )
+    second = await runtime.execute(
+        QueryCommandV2(type="query.start", command_id="command-2"),
+        agents=(_descriptor(),),
+        **second_inputs,
+    )
+    assert second.status == "completed"
+    assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_sdk_provider_ownership_survives_observer_cancel_and_bounded_shutdown(
+    tmp_path,
+) -> None:
+    provider_entered = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def suppress_cancellation(_call):
+        provider_entered.set()
+        while not release_provider.is_set():
+            try:
+                await release_provider.wait()
+            except asyncio.CancelledError:
+                continue
+        return [assistant_message("observer-independent output")]
+
+    model = ScriptedModel([{"responder": suppress_cancellation}])
+    repository = PythonTermRepository(tmp_path / "supervisor-observer-cancel.sqlite")
+    runtime = PythonTermRuntime(
+        repository,
+        limits=PythonTermRuntimeLimits(
+            quiescence_timeout_ms=20,
+            max_supervised_sdk_runs=1,
+            max_supervised_sdk_history=2,
+        ),
+        model_provider=_model_provider(("provider-1", "model-1", model)),
+    )
+    inputs = _runtime_inputs(tmp_path, runtime)
+    execution = asyncio.create_task(
+        runtime.execute(
+            QueryCommandV2(type="query.start", command_id="command-1"),
+            agents=(_descriptor(),),
+            **inputs,
+        )
+    )
+    await provider_entered.wait()
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    snapshot = runtime.supervised_sdk_runs()[0]
+    active = runtime._sdk_supervisor_runs[snapshot.execution_id]
+    active.observer_task.cancel()
+    await asyncio.sleep(0)
+
+    snapshot = runtime.supervised_sdk_runs()[0]
+    assert snapshot.state == "orphaned"
+    assert snapshot.provider_done is False
+    assert not await runtime.shutdown_sdk_supervisors(timeout_ms=10)
+    assert runtime.supervised_sdk_runs()[0].provider_done is False
+    assert repository.get_term("term-1").status == "running"
+
+    release_provider.set()
+    assert await runtime.shutdown_sdk_supervisors(timeout_ms=1_000)
+    assert runtime.supervised_sdk_runs() == ()
+    assert runtime.supervised_sdk_run_history()[0].state == "orphaned_provider_done"
+    assert repository.get_term("term-1").status == "running"
+    with sqlite3.connect(repository.path) as connection:
+        owner = connection.execute(
+            "SELECT owner_id FROM python_step_claims "
+            "WHERE term_id = ? AND step_id = ?",
+            ("term-1", "step-1"),
+        ).fetchone()[0]
+    assert owner is not None
 
 
 @pytest.mark.asyncio

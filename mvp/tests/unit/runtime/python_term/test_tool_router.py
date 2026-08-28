@@ -5,6 +5,7 @@ import copy
 import importlib
 import inspect
 import os
+import sqlite3
 import traceback
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
@@ -265,7 +266,190 @@ async def test_unlisted_tools_are_not_exposed_or_directly_invocable(tmp_path: Pa
             tool_call_id="call-unlisted",
         )
     assert raised.value.code == "tool_not_manifested"
+
+
+@pytest.mark.asyncio
+async def test_durable_effect_reservation_pauses_dispatch_until_gate_release(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    executor = RecordingBroker(PublicToolResult(status="completed", summary="ok"))
+    router, repository = _router(
+        tmp_path,
+        context,
+        envelope,
+        executor,
+        {"read-file": _registration(context.tool_manifest[0])},
+    )
+    wrapper = router.exposed_tools(context)[0]
+
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            wrapper.tool_id,
+            {},
+            tool_call_id="call-gated",
+            step_claim=wrapper.step_claim,
+        )
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-gated",
+        timeout_ms=1_000,
+    )
+
+    effect = repository.list_tool_effects(context.term_id, context.step_id)[0]
+    assert effect.status == "reserved"
+    assert effect.dispatch_state == "pending"
     assert executor.calls == 0
+    assert not invocation.done()
+    assert not hasattr(permit, "repository")
+    assert not hasattr(permit, "arguments")
+    assert router.release_dispatch_gate(permit)
+    released = repository.list_tool_effects(context.term_id, context.step_id)[0]
+    assert released.status == "reserved"
+    assert released.dispatch_state == "released"
+    assert executor.calls == 0
+
+    result = await invocation
+    assert result.status == "completed"
+    assert executor.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_step_claim_cannot_release_or_dispatch_a_reserved_effect(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    executor = RecordingBroker(PublicToolResult(status="completed", summary="unsafe"))
+    router, repository = _router(
+        tmp_path,
+        context,
+        envelope,
+        executor,
+        {"read-file": _registration(context.tool_manifest[0])},
+    )
+    wrapper = router.exposed_tools(context)[0]
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            wrapper.tool_id,
+            {},
+            tool_call_id="call-stale-gate",
+            step_claim=wrapper.step_claim,
+        )
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-stale-gate",
+        timeout_ms=1_000,
+    )
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            (context.term_id, context.step_id),
+        )
+    replacement = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="replacement-step-owner",
+        lease_seconds=10,
+    )
+    assert replacement is not None
+
+    with pytest.raises(ToolRouteError) as stale:
+        router.release_dispatch_gate(permit)
+    assert stale.value.code == "step_claim_lost"
+    assert executor.calls == 0
+    assert not invocation.done()
+
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+    assert executor.calls == 0
+    assert repository.list_tool_effects(context.term_id, context.step_id)[0].status == (
+        "reserved"
+    )
+    assert repository.list_tool_effects(
+        context.term_id, context.step_id
+    )[0].dispatch_state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_read_successor_attempt_is_atomically_unique_for_one_logical_call(
+    tmp_path: Path,
+) -> None:
+    context, envelope = _runtime_context(tmp_path)
+    executor = RecordingBroker(PublicToolResult(status="completed", summary="ok"))
+    router, repository = _router(
+        tmp_path,
+        context,
+        envelope,
+        executor,
+        {"read-file": _registration(context.tool_manifest[0])},
+    )
+    old_wrapper = router.exposed_tools(context)[0]
+    old_invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            old_wrapper.tool_id,
+            {},
+            tool_call_id="call-successor",
+            step_claim=old_wrapper.step_claim,
+        )
+    )
+    await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-successor",
+        timeout_ms=1_000,
+    )
+    predecessor = repository.list_tool_effects(context.term_id, context.step_id)[0]
+    old_invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await old_invocation
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            (context.term_id, context.step_id),
+        )
+    replacement = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="successor-step-owner",
+        lease_seconds=10,
+    )
+    assert replacement is not None
+    router.admit(context, step_claim=replacement)
+
+    attempts = tuple(
+        asyncio.create_task(
+            router.invoke(
+                context,
+                old_wrapper.tool_id,
+                {},
+                tool_call_id="call-successor",
+                step_claim=replacement,
+            )
+        )
+        for _ in range(2)
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-successor",
+        timeout_ms=1_000,
+    )
+    assert router.release_dispatch_gate(permit)
+    outcomes = await asyncio.gather(*attempts, return_exceptions=True)
+
+    assert sum(isinstance(item, PublicToolResult) for item in outcomes) == 1
+    assert sum(isinstance(item, ToolRouteError) for item in outcomes) == 1
+    assert executor.calls == 1
+    successor = repository.list_tool_effects(context.term_id, context.step_id)[0]
+    assert successor.effect_attempt == 1
+    assert successor.predecessor_effect_id == predecessor.effect_id
+    assert successor.predecessor_record_digest == canonical_digest(predecessor)
 
 
 @pytest.mark.asyncio

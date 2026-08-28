@@ -146,6 +146,7 @@ def test_effect_recovery_reuses_committed_write_and_reconciles_unknown_write(
         tool_call_id="call-committed",
         request_digest="8" * 64,
         write_effect=True,
+        dispatch_state="released",
         status="reserved",
     )
     committed_result = PublicToolResult(
@@ -361,6 +362,100 @@ async def test_reserved_tool_call_checkpoint_advances_to_committed_without_repla
     ) == 1
 
 
+@pytest.mark.asyncio
+async def test_crash_after_durable_gate_release_marks_write_dispatch_ambiguous(
+    tmp_path,
+) -> None:
+    manifest = _tool(
+        "write_value", read_only=False, idempotency="non_idempotent"
+    )
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="must not be assumed absent")
+    )
+    repository = PythonTermRepository(tmp_path / "released-gate-crash.sqlite")
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-write", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    runtime = PythonTermRuntime(repository, tool_router=router)
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+    inputs["effect_scope"] = EffectScope(scope_id="scope-1", write_effects=True)
+    compiled = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    )
+    context = compiled.contexts[0]
+    claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="released-gate-owner",
+        lease_seconds=10,
+    )
+    assert claim is not None
+    router.admit(context, step_claim=claim)
+    runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=claim,
+    )
+
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-released-write",
+            step_claim=claim,
+        )
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-released-write",
+        timeout_ms=1_000,
+    )
+    runtime._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": "write_value",
+            "tool_call_id": "call-released-write",
+            "read_only": False,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=claim,
+    )
+    assert router.release_dispatch_gate(permit)
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    released = repository.list_tool_effects("term-1", "step-1")[0]
+    assert released.status == "reserved"
+    assert released.dispatch_state == "released"
+    assert executor.calls == 0
+
+    decision = runtime.recover(
+        _command(), agents=(_descriptor(),), **inputs
+    )
+
+    assert decision.action == "reconciliation_required"
+    reconciled = repository.list_tool_effects("term-1", "step-1")[0]
+    assert reconciled.status == "reconciliation_required"
+    assert reconciled.dispatch_state == "ambiguous"
+    assert executor.calls == 0
+
+
 @pytest.mark.parametrize("tamper", ["request", "owner_fence", "result"])
 def test_effect_checkpoint_rejects_request_owner_fence_or_result_tamper(
     tmp_path,
@@ -417,7 +512,13 @@ def test_effect_checkpoint_rejects_request_owner_fence_or_result_tamper(
     )
     if tamper == "result":
         result = PublicToolResult(status="completed", summary="original")
-        terminal = owned.model_copy(
+        released = repository.release_tool_dispatch_gate(
+            owned,
+            step_claim=claim,
+            dispatch_required=True,
+        )
+        assert released is not None
+        terminal = released.model_copy(
             update={
                 "status": "committed",
                 "execution_owner_id": None,
@@ -780,6 +881,11 @@ async def test_resume_skips_durable_tool_call_prefix_without_public_duplicates(
         await runtime.execute(_command(), agents=(_descriptor(),), **inputs)
     before = repository.list_events("term-1")
     assert [event.type for event in before] == ["runtime.status", "tool.call"]
+    predecessor = repository.list_tool_effects("term-1", "step-1")[0]
+    assert predecessor.status == "reserved"
+    assert predecessor.dispatch_state == "pending"
+    assert predecessor.effect_attempt == 0
+    assert executor.calls == 0
 
     with sqlite3.connect(repository.path) as connection:
         connection.execute(
@@ -806,6 +912,13 @@ async def test_resume_skips_durable_tool_call_prefix_without_public_duplicates(
 
     assert result.status == "completed"
     assert executor.calls == 1
+    successor = repository.list_tool_effects("term-1", "step-1")[0]
+    assert successor.status == "committed"
+    assert successor.dispatch_state == "released"
+    assert successor.effect_attempt == 1
+    assert successor.predecessor_effect_id == predecessor.effect_id
+    assert successor.predecessor_record_digest == canonical_digest(predecessor)
+    assert successor.effect_id != predecessor.effect_id
     all_events = repository.list_events("term-1")
     assert [event.type for event in all_events].count("tool.call") == 1
     assert [event.type for event in all_events].count("tool.result") == 1
@@ -998,3 +1111,256 @@ async def test_resume_rejects_changed_agent_model_or_handoff_descriptor(
     assert replacement_model.calls == ()
     assert target_model.calls == ()
     assert repository.list_events("term-1") == before
+
+
+def test_9968b3a_database_fixture_migrates_effect_and_resumes_as_v2(
+    tmp_path,
+) -> None:
+    manifest = _tool("read_value")
+    database = tmp_path / "legacy-9968b3a.sqlite"
+    repository = PythonTermRepository(database)
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="unused")
+    )
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-legacy", ToolAccess()),),
+    )
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    runtime = PythonTermRuntime(repository, tool_router=router)
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+    compiled = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    )
+    context = compiled.contexts[0]
+    claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="legacy-owner",
+        lease_seconds=86_400,
+    )
+    assert claim is not None
+    result = PublicToolResult(status="completed", summary="Legacy read completed")
+    current_effect = ToolEffectRecord(
+        record_version=2,
+        effect_id="effect-legacy-9968",
+        effect_identity_version="hmac-sha256-v1",
+        term_id=context.term_id,
+        step_id=context.step_id,
+        tool_call_id="call-legacy-9968",
+        request_digest="8" * 64,
+        request_digest_version="hmac-sha256-v1",
+        step_claim_digest=claim.identity_digest,
+        write_effect=False,
+        dispatch_state="released",
+        status="committed",
+        result_digest=canonical_digest(result),
+        public_result=result,
+    )
+    repository.save_tool_effect(current_effect)
+    runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=claim,
+    )
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        effect_row = connection.execute(
+            "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+            (current_effect.effect_id,),
+        ).fetchone()
+        legacy_effect = json.loads(effect_row["effect_json"])
+        for field in (
+            "step_claim_digest",
+            "result_code",
+            "dispatch_state",
+            "effect_attempt",
+            "predecessor_effect_id",
+            "predecessor_record_digest",
+            "legacy_record_digest",
+            "legacy_effect_collection_digest",
+        ):
+            legacy_effect.pop(field, None)
+        legacy_record_digest = canonical_digest(legacy_effect)
+        legacy_effect_digest = canonical_digest((legacy_effect,))
+        connection.execute(
+            "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+            (canonical_json(legacy_effect), current_effect.effect_id),
+        )
+
+        checkpoint_row = connection.execute(
+            "SELECT * FROM python_step_checkpoints WHERE term_id = ?",
+            (context.term_id,),
+        ).fetchone()
+        checkpoint_payload = json.loads(checkpoint_row["checkpoint_json"])
+        legacy_evidence = checkpoint_payload["evidence"]
+        legacy_evidence.pop("evidence_version", None)
+        legacy_evidence.pop("effect_evidence", None)
+        legacy_evidence["effect_digest"] = legacy_effect_digest
+        legacy_evidence["effect_record_digests"] = [legacy_record_digest]
+        legacy_checkpoint_digest = canonical_digest(legacy_evidence)
+        checkpoint_payload["checkpoint_digest"] = legacy_checkpoint_digest
+        checkpoint_payload["evidence"] = legacy_evidence
+        connection.execute(
+            """UPDATE python_step_checkpoints SET checkpoint_digest = ?,
+            checkpoint_json = ? WHERE checkpoint_ref = ?""",
+            (
+                legacy_checkpoint_digest,
+                canonical_json(checkpoint_payload),
+                checkpoint_row["checkpoint_ref"],
+            ),
+        )
+        for table in ("python_terms", "python_steps"):
+            record_row = connection.execute(
+                f"SELECT rowid, record_json FROM {table} WHERE term_id = ?",
+                (context.term_id,),
+            ).fetchone()
+            record_payload = json.loads(record_row["record_json"])
+            record_payload["checkpoint_digest"] = legacy_checkpoint_digest
+            connection.execute(
+                f"UPDATE {table} SET record_json = ? WHERE rowid = ?",
+                (canonical_json(record_payload), record_row["rowid"]),
+            )
+
+    migrated = PythonTermRepository(database)
+    with sqlite3.connect(database) as connection:
+        first_json = connection.execute(
+            "SELECT effect_json FROM python_tool_effects WHERE effect_id = ?",
+            (current_effect.effect_id,),
+        ).fetchone()[0]
+    migrated_again = PythonTermRepository(database)
+    with sqlite3.connect(database) as connection:
+        second_json = connection.execute(
+            "SELECT effect_json FROM python_tool_effects WHERE effect_id = ?",
+            (current_effect.effect_id,),
+        ).fetchone()[0]
+    assert first_json == second_json
+
+    upgraded_effect = migrated_again.get_tool_effect(current_effect.effect_id)
+    assert upgraded_effect is not None
+    assert upgraded_effect.status == "committed"
+    assert upgraded_effect.dispatch_state == "released"
+    assert upgraded_effect.legacy_record_digest == legacy_record_digest
+    assert upgraded_effect.legacy_effect_collection_digest == legacy_effect_digest
+    resumed_broker, resumed_registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-legacy", ToolAccess()),),
+    )
+    resumed_router = ToolRouter(
+        migrated_again,
+        resumed_registrations,
+        executor_broker=resumed_broker,
+        request_digests=HmacRequestDigestService(os.urandom(32)),
+        clock_ms=lambda: 1_000,
+    )
+    resumed_runtime = PythonTermRuntime(
+        migrated_again, tool_router=resumed_router
+    )
+    resumed_inputs = _runtime_inputs(tmp_path, resumed_runtime, tools=(manifest,))
+    decision = resumed_runtime.recover(
+        _command(), agents=(_descriptor(),), **resumed_inputs
+    )
+    assert decision.action == "retry_step"
+
+    renewed = migrated_again.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="legacy-owner",
+        lease_seconds=86_400,
+    )
+    assert renewed is not None
+    resumed_context = resumed_runtime.compile_start(
+        _command(), agents=(_descriptor(),), **resumed_inputs
+    ).contexts[0]
+    resumed_runtime._commit_event(
+        resumed_context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=renewed,
+    )
+    v2_checkpoint = migrated_again.latest_step_checkpoint(
+        context.term_id, context.step_id
+    )
+    assert v2_checkpoint is not None
+    assert v2_checkpoint.evidence.evidence_version == 2
+    assert v2_checkpoint.evidence.effect_evidence[0].evidence_version == 2
+
+
+def test_legacy_effect_migration_rolls_back_every_row_on_invalid_evidence(
+    tmp_path,
+) -> None:
+    database = tmp_path / "legacy-atomic-rollback.sqlite"
+    repository = PythonTermRepository(database)
+    runtime = PythonTermRuntime(repository)
+    inputs = _runtime_inputs(tmp_path, runtime)
+    context = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    ).contexts[0]
+    result = PublicToolResult(status="completed", summary="Legacy read completed")
+    for suffix in ("a", "b"):
+        repository.save_tool_effect(
+            ToolEffectRecord(
+                effect_id=f"effect-legacy-{suffix}",
+                effect_identity_version="hmac-sha256-v1",
+                term_id=context.term_id,
+                step_id=context.step_id,
+                tool_call_id=f"call-legacy-{suffix}",
+                request_digest=suffix * 64,
+                request_digest_version="hmac-sha256-v1",
+                step_claim_digest="8" * 64,
+                write_effect=False,
+                dispatch_state="released",
+                status="committed",
+                result_digest=canonical_digest(result),
+                public_result=result,
+            )
+        )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT effect_id, effect_json FROM python_tool_effects ORDER BY effect_id"
+        ).fetchall()
+        legacy_json: dict[str, str] = {}
+        for effect_id, encoded in rows:
+            payload = json.loads(encoded)
+            for field in (
+                "step_claim_digest",
+                "result_code",
+                "dispatch_state",
+                "effect_attempt",
+                "predecessor_effect_id",
+                "predecessor_record_digest",
+                "legacy_record_digest",
+                "legacy_effect_collection_digest",
+            ):
+                payload.pop(field, None)
+            if effect_id.endswith("b"):
+                payload["unsupported_evidence"] = True
+            legacy_json[effect_id] = canonical_json(payload)
+            connection.execute(
+                "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+                (legacy_json[effect_id], effect_id),
+            )
+
+    with pytest.raises(RepositoryCorruption, match="shape is unsupported"):
+        PythonTermRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        persisted = dict(
+            connection.execute(
+                "SELECT effect_id, effect_json FROM python_tool_effects"
+            ).fetchall()
+        )
+    assert persisted == legacy_json

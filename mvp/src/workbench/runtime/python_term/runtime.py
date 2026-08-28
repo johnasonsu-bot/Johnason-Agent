@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import weakref
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -35,6 +36,7 @@ from .contracts import (
     EffectScope,
     ExecutionStatus,
     HandoffDescriptor,
+    LegacyRuntimeCheckpointEvidenceV1,
     PermissionPolicy,
     ProjectContextRef,
     PromptSectionPin,
@@ -64,7 +66,12 @@ from .sdk_adapter import (
     FrozenSnapshotSession,
     FixedModelProvider,
 )
-from .tool_router import SdkToolWrapper, ToolRouteError, ToolRouter
+from .tool_router import (
+    SdkToolWrapper,
+    ToolDispatchPermit,
+    ToolRouteError,
+    ToolRouter,
+)
 
 
 RUNTIME_ID = "python-term"
@@ -122,6 +129,19 @@ class SupervisedSdkRunSnapshot:
     term_id: str
     step_id: str
     state: Literal["cancelling", "orphaned"]
+    provider_done: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisedSdkRunAudit:
+    """Bounded secret-free audit metadata for a completed orphan provider."""
+
+    execution_id: str
+    run_id: str
+    term_id: str
+    step_id: str
+    state: Literal["orphaned_provider_done"]
+    reconciled: bool = False
 
 
 @dataclass(slots=True)
@@ -130,7 +150,8 @@ class _ActiveSdkRun:
     run_id: str
     term_id: str
     step_id: str
-    task: asyncio.Task[None]
+    provider_task: asyncio.Task[object]
+    observer_task: asyncio.Task[None] | None = None
     state: Literal["cancelling", "orphaned"] = "cancelling"
 
 
@@ -261,6 +282,9 @@ class PythonTermRuntime:
         self._owner_nonce = secrets.token_bytes(32)
         self._sdk_supervisor_runs: dict[str, _ActiveSdkRun] = {}
         self._sdk_run_slots: set[str] = set()
+        self._sdk_supervisor_history: deque[SupervisedSdkRunAudit] = deque(
+            maxlen=self.limits.max_supervised_sdk_history
+        )
 
     @property
     def capabilities(self) -> RuntimeCapabilitiesV2:
@@ -543,21 +567,28 @@ class PythonTermRuntime:
             checkpoint_step = next(
                 item for item in steps if item.step_id == checkpoint.step_id
             )
-            frozen_expected = (
-                None
-                if evidence is None
-                else expected.model_copy(
-                    update={
-                        "effect_digest": evidence.effect_digest,
-                        "effect_record_digests": evidence.effect_record_digests,
-                        "effect_evidence": evidence.effect_evidence,
-                        "source_events": evidence.source_events,
-                    }
+            if isinstance(evidence, LegacyRuntimeCheckpointEvidenceV1):
+                identity_matches = self._legacy_checkpoint_evidence_is_valid(
+                    evidence,
+                    expected=expected,
+                    effects=checkpoint_effects,
                 )
-            )
-            identity_matches = evidence is not None and canonical_json(
-                evidence
-            ) == canonical_json(frozen_expected)
+            else:
+                frozen_expected = (
+                    None
+                    if evidence is None
+                    else expected.model_copy(
+                        update={
+                            "effect_digest": evidence.effect_digest,
+                            "effect_record_digests": evidence.effect_record_digests,
+                            "effect_evidence": evidence.effect_evidence,
+                            "source_events": evidence.source_events,
+                        }
+                    )
+                )
+                identity_matches = evidence is not None and canonical_json(
+                    evidence
+                ) == canonical_json(frozen_expected)
             durable_tool_calls = frozenset(
                 call_id
                 for event in self.repository.list_events(term.term_id)
@@ -569,14 +600,18 @@ class PythonTermRuntime:
                 )
             )
             effect_advance = (
-                evidence is not None
-                and self._effect_evidence_collection_is_coherent(evidence)
-                and self._effect_evidence_collection_is_coherent(expected)
-                and self._effect_evidence_transition_is_valid(
-                    evidence.effect_evidence,
-                    expected.effect_evidence,
-                    step_is_running=checkpoint_step.status == "running",
-                    durable_tool_calls=durable_tool_calls,
+                identity_matches
+                if isinstance(evidence, LegacyRuntimeCheckpointEvidenceV1)
+                else (
+                    evidence is not None
+                    and self._effect_evidence_collection_is_coherent(evidence)
+                    and self._effect_evidence_collection_is_coherent(expected)
+                    and self._effect_evidence_transition_is_valid(
+                        evidence.effect_evidence,
+                        expected.effect_evidence,
+                        step_is_running=checkpoint_step.status == "running",
+                        durable_tool_calls=durable_tool_calls,
+                    )
                 )
             )
             if not identity_matches or not effect_advance:
@@ -612,6 +647,49 @@ class PythonTermRuntime:
             cursor=term.cursor,
             reusable_effect_ids=reusable,
             checkpoint_hint=self._checkpoint_hint(term.term_id),
+        )
+
+    @staticmethod
+    def _legacy_checkpoint_evidence_is_valid(
+        evidence: LegacyRuntimeCheckpointEvidenceV1,
+        *,
+        expected: RuntimeCheckpointEvidence,
+        effects: Sequence[ToolEffectRecord],
+    ) -> bool:
+        expected_identity = LegacyRuntimeCheckpointEvidenceV1(
+            runtime_id=expected.runtime_id,
+            runtime_build_id=expected.runtime_build_id,
+            command_identity_digest=expected.command_identity_digest,
+            context_digest=expected.context_digest,
+            manifest_digest=expected.manifest_digest,
+            workspace_grant_digest=expected.workspace_grant_digest,
+            permission_policy_digest=expected.permission_policy_digest,
+            agent_descriptor_digest=expected.agent_descriptor_digest,
+            handoff_descriptor_digest=expected.handoff_descriptor_digest,
+            effect_digest=evidence.effect_digest,
+            effect_record_digests=evidence.effect_record_digests,
+            source_events=evidence.source_events,
+            term_id=expected.term_id,
+            step_id=expected.step_id,
+            cursor=expected.cursor,
+        )
+        if canonical_json(evidence) != canonical_json(expected_identity):
+            return False
+        if not effects:
+            return (
+                evidence.effect_digest == canonical_digest(())
+                and not evidence.effect_record_digests
+            )
+        legacy_record_digests = tuple(
+            effect.legacy_record_digest for effect in effects
+        )
+        legacy_collection_digests = {
+            effect.legacy_effect_collection_digest for effect in effects
+        }
+        return (
+            None not in legacy_record_digests
+            and evidence.effect_record_digests == legacy_record_digests
+            and legacy_collection_digests == {evidence.effect_digest}
         )
 
     @staticmethod
@@ -685,6 +763,7 @@ class PythonTermRuntime:
         terminal = effect.model_copy(
             update={
                 "status": "reconciliation_required",
+                "dispatch_state": "ambiguous",
                 "execution_owner_id": None,
                 "lease_expires_at_ms": None,
                 "result_code": "unknown_write_outcome",
@@ -1356,26 +1435,26 @@ class PythonTermRuntime:
                     )
                     if done:
                         break
-                    renewed: StepExecutionClaim | None = None
+                    active = self._sdk_supervisor_runs.get(execution_id)
+                    if active is None or active.state != "cancelling":
+                        return
                     try:
                         renewed = self.repository.renew_step_claim(
                             claim, lease_seconds=lease_seconds
                         )
                     except Exception:
-                        renewed = None
+                        self._mark_supervised_sdk_run_orphaned(execution_id)
+                        return
                     if renewed is None:
-                        active = self._sdk_supervisor_runs.get(execution_id)
-                        if active is not None:
-                            active.state = "orphaned"
-                        try:
-                            await asyncio.shield(run_loop_task)
-                        except BaseException:
-                            pass
+                        self._mark_supervised_sdk_run_orphaned(execution_id)
                         return
                 try:
                     run_loop_task.result()
                 except BaseException:
                     pass
+                active = self._sdk_supervisor_runs.get(execution_id)
+                if active is None or active.state != "cancelling":
+                    return
                 if terminal_status == "cancelled":
                     self._commit_event(
                         context,
@@ -1397,24 +1476,95 @@ class PythonTermRuntime:
                         execution_claim=claim,
                         source_events=source_events,
                     )
-            except RepositoryConflict:
                 active = self._sdk_supervisor_runs.get(execution_id)
-                if active is not None:
-                    active.state = "orphaned"
-                return
-            finally:
-                active = self._sdk_supervisor_runs.get(execution_id)
-                if active is not None and active.state != "orphaned":
+                if active is not None and active.state == "cancelling":
                     self._sdk_supervisor_runs.pop(execution_id, None)
                     self._sdk_run_slots.discard(execution_id)
+            except asyncio.CancelledError:
+                self._mark_supervised_sdk_run_orphaned(execution_id)
+                raise
+            except Exception:
+                self._mark_supervised_sdk_run_orphaned(execution_id)
+                return
 
-        supervisor_task = asyncio.create_task(observe())
-        self._sdk_supervisor_runs[execution_id] = _ActiveSdkRun(
+        active = _ActiveSdkRun(
             execution_id=execution_id,
             run_id=context.run_id,
             term_id=context.term_id,
             step_id=context.step_id,
-            task=supervisor_task,
+            provider_task=run_loop_task,
+        )
+        self._sdk_supervisor_runs[execution_id] = active
+        run_loop_task.add_done_callback(
+            lambda task: self._provider_sdk_run_done(execution_id, task)
+        )
+        supervisor_task = asyncio.create_task(observe())
+        active.observer_task = supervisor_task
+        supervisor_task.add_done_callback(
+            lambda task: self._observer_sdk_run_done(execution_id, task)
+        )
+
+    def _mark_supervised_sdk_run_orphaned(self, execution_id: str) -> None:
+        active = self._sdk_supervisor_runs.get(execution_id)
+        if active is None:
+            return
+        active.state = "orphaned"
+        if active.provider_task.done():
+            self._retire_completed_sdk_orphan(execution_id, active)
+
+    def _provider_sdk_run_done(
+        self, execution_id: str, provider_task: asyncio.Task[object]
+    ) -> None:
+        try:
+            provider_task.result()
+        except BaseException:
+            pass
+        active = self._sdk_supervisor_runs.get(execution_id)
+        if (
+            active is not None
+            and active.provider_task is provider_task
+            and active.state == "orphaned"
+        ):
+            self._retire_completed_sdk_orphan(execution_id, active)
+
+    def _observer_sdk_run_done(
+        self, execution_id: str, observer_task: asyncio.Task[None]
+    ) -> None:
+        failed = observer_task.cancelled()
+        if not failed:
+            try:
+                failed = observer_task.exception() is not None
+            except BaseException:
+                failed = True
+        active = self._sdk_supervisor_runs.get(execution_id)
+        if active is None or active.observer_task is not observer_task:
+            return
+        # A normally completed observer removes its entry after committing the
+        # terminal transition.  Any observer completion still present here has
+        # lost authoritative supervision and must become an orphan.
+        if failed or active.state == "cancelling":
+            self._mark_supervised_sdk_run_orphaned(execution_id)
+
+    def _retire_completed_sdk_orphan(
+        self, execution_id: str, active: _ActiveSdkRun
+    ) -> None:
+        current = self._sdk_supervisor_runs.get(execution_id)
+        if (
+            current is not active
+            or active.state != "orphaned"
+            or not active.provider_task.done()
+        ):
+            return
+        self._sdk_supervisor_runs.pop(execution_id, None)
+        self._sdk_run_slots.discard(execution_id)
+        self._sdk_supervisor_history.append(
+            SupervisedSdkRunAudit(
+                execution_id=active.execution_id,
+                run_id=active.run_id,
+                term_id=active.term_id,
+                step_id=active.step_id,
+                state="orphaned_provider_done",
+            )
         )
 
     def _claim_sdk_run_slot(self) -> str:
@@ -1438,24 +1588,75 @@ class PythonTermRuntime:
                 term_id=active.term_id,
                 step_id=active.step_id,
                 state=active.state,
+                provider_done=active.provider_task.done(),
             )
             for active in sorted(
                 self._sdk_supervisor_runs.values(), key=lambda item: item.execution_id
             )
         )
 
+    def supervised_sdk_run_history(self) -> tuple[SupervisedSdkRunAudit, ...]:
+        return tuple(self._sdk_supervisor_history)
+
+    def reconcile_supervised_sdk_run(self, execution_id: str) -> bool:
+        for index, audit in enumerate(self._sdk_supervisor_history):
+            if audit.execution_id != execution_id:
+                continue
+            if not audit.reconciled:
+                self._sdk_supervisor_history[index] = SupervisedSdkRunAudit(
+                    execution_id=audit.execution_id,
+                    run_id=audit.run_id,
+                    term_id=audit.term_id,
+                    step_id=audit.step_id,
+                    state=audit.state,
+                    reconciled=True,
+                )
+            return True
+        return False
+
+    def retire_supervised_sdk_run(self, execution_id: str) -> bool:
+        retained = deque(
+            (
+                audit
+                for audit in self._sdk_supervisor_history
+                if audit.execution_id != execution_id
+            ),
+            maxlen=self.limits.max_supervised_sdk_history,
+        )
+        if len(retained) == len(self._sdk_supervisor_history):
+            return False
+        self._sdk_supervisor_history = retained
+        return True
+
     async def wait_for_sdk_quiescence(self, *, timeout_ms: int) -> bool:
         if type(timeout_ms) is not int or timeout_ms < 0:
             raise ValueError("quiescence timeout must be a non-negative integer")
-        active_tasks = {
-            active.task
-            for active in self._sdk_supervisor_runs.values()
-            if active.state != "orphaned"
-        }
+        active_tasks: set[asyncio.Task[object] | asyncio.Task[None]] = set()
+        for active in self._sdk_supervisor_runs.values():
+            active_tasks.add(active.provider_task)
+            if active.state == "cancelling" and active.observer_task is not None:
+                active_tasks.add(active.observer_task)
         if not active_tasks:
             return not self._sdk_supervisor_runs
-        _, pending = await asyncio.wait(active_tasks, timeout=timeout_ms / 1_000)
-        return not pending and not self._sdk_supervisor_runs
+        await asyncio.wait(active_tasks, timeout=timeout_ms / 1_000)
+        await asyncio.sleep(0)
+        return not self._sdk_supervisor_runs
+
+    async def shutdown_sdk_supervisors(self, *, timeout_ms: int) -> bool:
+        if type(timeout_ms) is not int or timeout_ms < 0:
+            raise ValueError("shutdown timeout must be a non-negative integer")
+        provider_tasks: set[asyncio.Task[object]] = set()
+        for execution_id, active in tuple(self._sdk_supervisor_runs.items()):
+            active.state = "orphaned"
+            provider_tasks.add(active.provider_task)
+            if active.observer_task is not None and not active.observer_task.done():
+                active.observer_task.cancel()
+            if active.provider_task.done():
+                self._retire_completed_sdk_orphan(execution_id, active)
+        if provider_tasks:
+            await asyncio.wait(provider_tasks, timeout=timeout_ms / 1_000)
+            await asyncio.sleep(0)
+        return not self._sdk_supervisor_runs
 
     async def _consume_sdk_step(
         self,
@@ -1629,8 +1830,9 @@ class PythonTermRuntime:
                             "runtime_error", "SDK call identity was duplicated"
                         )
                     seen_call_ids.add(call_id)
+                    dispatch_permit: ToolDispatchPermit | None = None
                     if self.tool_router is not None:
-                        await self._await_tool_effect_checkpoint_boundary(
+                        dispatch_permit = await self._await_tool_dispatch_gate(
                             context,
                             wrapper,
                             call_id,
@@ -1647,6 +1849,12 @@ class PythonTermRuntime:
                             "summary": "Tool execution requested",
                         },
                     )
+                    if dispatch_permit is not None and self.tool_router is not None:
+                        try:
+                            self.tool_router.release_dispatch_gate(dispatch_permit)
+                        except ToolRouteError:
+                            result.cancel()
+                            raise
             elif name == "tool_output":
                 call_id = self._sdk_tool_output_call_id(raw_item)
                 wrapper = tool_calls.pop(call_id, None)
@@ -1733,44 +1941,39 @@ class PythonTermRuntime:
             final_output = validate_public_text(final_output, maximum=4096)
         return final_output, tuple(source_events)
 
-    async def _await_tool_effect_checkpoint_boundary(
+    async def _await_tool_dispatch_gate(
         self,
         context: StepContext,
         wrapper: SdkToolWrapper,
         tool_call_id: str,
         result: object,
-    ) -> ToolEffectRecord:
-        """Wait until SDK Tool admission has a durable Effect before publication."""
-        timeout_ms = min(context.deadline_ms, self.limits.quiescence_timeout_ms)
-        deadline = asyncio.get_running_loop().time() + timeout_ms / 1_000
-        while True:
-            effect = next(
-                (
-                    item
-                    for item in self.repository.list_tool_effects(
-                        context.term_id, context.step_id
-                    )
-                    if item.tool_call_id == tool_call_id
-                ),
-                None,
+    ) -> ToolDispatchPermit:
+        """Wait for a durable reservation that is still paused before dispatch."""
+        if self.tool_router is None:
+            raise PythonTermRuntimeError(
+                "runtime_error", "SDK Tool Router gate is unavailable"
             )
-            if effect is not None:
-                if (
-                    effect.status == "reserved"
-                    and effect.step_claim_digest != wrapper.step_claim.identity_digest
-                ):
-                    result.cancel()
-                    raise PythonTermRuntimeError(
-                        "runtime_error", "SDK Tool Effect Step fence was rejected"
-                    )
-                return effect
-            if asyncio.get_running_loop().time() >= deadline:
-                result.cancel()
-                raise PythonTermRuntimeError(
-                    "runtime_error",
-                    "SDK Tool call has no durable Effect reservation",
-                )
-            await asyncio.sleep(0.001)
+        timeout_ms = min(context.deadline_ms, self.limits.quiescence_timeout_ms)
+        try:
+            permit = await self.tool_router.await_dispatch_gate(
+                context_identity_digest=context.identity_digest,
+                tool_call_id=tool_call_id,
+                timeout_ms=timeout_ms,
+            )
+        except ToolRouteError:
+            result.cancel()
+            raise PythonTermRuntimeError(
+                "runtime_error", "SDK Tool call has no durable dispatch gate"
+            ) from None
+        if (
+            permit.effect_id == ""
+            or permit.step_claim_digest != wrapper.step_claim.identity_digest
+        ):
+            result.cancel()
+            raise PythonTermRuntimeError(
+                "runtime_error", "SDK Tool Effect Step fence was rejected"
+            )
+        return permit
 
     @staticmethod
     def _sdk_tool_output_call_id(raw_item: object) -> str | None:
@@ -1876,6 +2079,7 @@ class PythonTermRuntime:
         )
         effect_evidence = tuple(
             ToolEffectCheckpointEvidence(
+                evidence_version=2,
                 effect_id=effect.effect_id,
                 tool_call_id=effect.tool_call_id,
                 stable_identity_digest=effect.stable_identity_digest,
@@ -1885,6 +2089,15 @@ class PythonTermRuntime:
                 execution_owner_id=effect.execution_owner_id,
                 fence_id=effect.fence_id,
                 fence_generation=effect.fence_generation,
+                dispatch_state=effect.dispatch_state,
+                write_effect=effect.write_effect,
+                effect_attempt=effect.effect_attempt,
+                predecessor_effect_id=effect.predecessor_effect_id,
+                predecessor_record_digest=effect.predecessor_record_digest,
+                legacy_record_digest=effect.legacy_record_digest,
+                legacy_effect_collection_digest=(
+                    effect.legacy_effect_collection_digest
+                ),
                 status=effect.status,
                 result_code=effect.result_code,
                 result_digest=effect.result_digest,
@@ -1893,6 +2106,7 @@ class PythonTermRuntime:
             for effect in effects
         )
         return RuntimeCheckpointEvidence(
+            evidence_version=2,
             runtime_id=context.runtime_id,
             runtime_build_id=context.runtime_build_id,
             command_identity_digest=context.identity_digest,
