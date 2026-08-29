@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -26,6 +29,7 @@ from workbench.orchestration.project_context import (
 from workbench.providers.repository import ProviderRepository
 from workbench.settings import WorkbenchSettings
 from workbench.api.conversations import python_term_command_id
+from workbench.workflow.event_store import EventStore
 from tests.fixtures.host_v2 import runtime_capabilities
 
 
@@ -38,20 +42,36 @@ class _V1Runner:
             yield command
 
 
-def _save_provider(database: Path, *, enabled: bool = True) -> None:
+def _save_provider(
+    database: Path,
+    *,
+    enabled: bool = True,
+    headers: dict[str, str] | None = None,
+    model_aliases: dict[str, str] | None = None,
+) -> None:
     ProviderRepository(database).save(
         ProviderProfileRecord(
             id="provider-1",
             name="Provider",
             protocol="lmstudio",
             base_url="http://localhost:1234",
-            model_aliases={"default": "configured-model", "configured-model": "configured-model"},
+            headers={} if headers is None else headers,
+            model_aliases=(
+                {"default": "configured-model", "configured-model": "configured-model"}
+                if model_aliases is None
+                else model_aliases
+            ),
             enabled=enabled,
         )
     )
 
 
-def _task7_app(database: Path) -> tuple[RuntimeRegistryV2, object]:
+def _task7_app(
+    database: Path,
+    *,
+    runner: object | None = None,
+    with_task7_proof: bool = True,
+) -> tuple[RuntimeRegistryV2, object]:
     _save_provider(database)
     registry = RuntimeRegistryV2(RuntimeV2Repository(database))
     capabilities = runtime_capabilities(
@@ -72,14 +92,33 @@ def _task7_app(database: Path) -> tuple[RuntimeRegistryV2, object]:
     app = create_app(
         AppSettings(
             database=database,
-            runner=_V1Runner(),
+            runner=runner or _V1Runner(),
             owner_id="api",
             python_term_router=main.PythonTermQueryRouter(
-                registry, _gate_proof=proof
+                registry, _gate_proof=proof if with_task7_proof else None
             ),
         )
     )
     return registry, app
+
+
+class _V1AdmissionBarrierRunner(_V1Runner):
+    """Make the cross-runtime admission order repeatable without sleeps."""
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def resolve_profile(self, provider_id: str | None = None) -> ProviderProfileRecord:
+        self.entered.set()
+        if not self.release.wait(timeout=2):
+            raise AssertionError("v1 admission barrier was not released")
+        return ProviderProfileRecord(
+            id=provider_id or "provider-1",
+            name="Provider",
+            protocol="lmstudio",
+            base_url="http://localhost:1234",
+        )
 
 
 def test_existing_v1_conversations_keep_the_v1_runner_when_python_term_is_enabled(
@@ -104,27 +143,29 @@ def test_explicit_python_term_message_is_unavailable_without_task7_proof_and_cre
     tmp_path: Path,
 ) -> None:
     """The real HTTP new-Query path must fail closed before a command is pinned."""
-    app = main.build_app(
-        WorkbenchSettings(
-            runtime_dir=tmp_path,
-            engine_host_v2_enabled=True,
-            python_term_runtime_enabled=True,
-        )
-    )
+    database = tmp_path / "workbench.sqlite"
+    registry, app = _task7_app(database, with_task7_proof=False)
 
     with TestClient(app) as client:
         assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
         response = client.post(
             "/api/sessions/session-1/messages",
             headers={"Idempotency-Key": "python-term-command"},
-            json={"content": "hello", "runtime": "python-term"},
+            json={
+                "content": "hello",
+                "runtime": "python-term",
+                "provider_id": "provider-1",
+            },
         )
 
     assert response.status_code == 503
     assert response.json() == {"detail": "python term runtime unavailable"}
-    conversations = ConversationRepository(tmp_path / "workbench.sqlite")
+    conversations = ConversationRepository(database)
     assert conversations.load_turn_status("session-1", "python-term-command") is None
-    assert app.state.runtime_registry_v2.repository.get_pin("python-term-command") is None
+    runtime_command_id = python_term_command_id("session-1", "python-term-command")
+    assert registry.repository.get_pin(runtime_command_id) is None
+    assert conversations.list_messages("session-1") == []
+    assert registry.last_error_category("python-term") == "gate_metadata_unavailable"
 
 
 def test_message_without_runtime_selection_preserves_v1_turn_routing(
@@ -196,32 +237,7 @@ def test_existing_v1_command_id_cannot_create_a_later_python_term_pin(
 ) -> None:
     """A runtime-selection change must be rejected before it reaches v2 admission."""
     database = tmp_path / "identity.sqlite"
-    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
-    capabilities = runtime_capabilities(
-        "python-term",
-        build_id="python-term-task7-build",
-        query=True,
-        model=True,
-        checkpoints=True,
-        streaming=True,
-        event_cursor=True,
-    )
-    registry.register(capabilities)
-    proof = registry_module._issue_python_term_gate_proof_for_task7(  # type: ignore[attr-defined]
-        source_revision="task7-source-r1",
-        capabilities=capabilities,
-        gate_result_digest="7" * 64,
-    )
-    app = create_app(
-        AppSettings(
-            database=database,
-            runner=_V1Runner(),
-            owner_id="api",
-            python_term_router=main.PythonTermQueryRouter(
-                registry, _gate_proof=proof
-            ),
-        )
-    )
+    registry, app = _task7_app(database)
 
     with TestClient(app) as client:
         assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
@@ -233,11 +249,63 @@ def test_existing_v1_command_id_cannot_create_a_later_python_term_pin(
         response = client.post(
             "/api/sessions/session-1/messages",
             headers={"Idempotency-Key": "shared-command"},
-            json={"content": "hello", "runtime": "python-term"},
+            json={
+                "content": "hello",
+                "runtime": "python-term",
+                "provider_id": "provider-1",
+            },
         )
 
     assert response.status_code == 409
-    assert registry.repository.get_pin("shared-command") is None
+    assert registry.repository.get_pin(
+        python_term_command_id("session-1", "shared-command")
+    ) is None
+
+
+@pytest.mark.parametrize("round_number", range(4))
+def test_same_session_v1_and_python_term_requests_have_one_durable_admission(
+    tmp_path: Path, round_number: int
+) -> None:
+    """A blocked v1 admission makes the Python Term conflict order deterministic."""
+    database = tmp_path / f"cross-runtime-{round_number}.sqlite"
+    runner = _V1AdmissionBarrierRunner()
+    registry, app = _task7_app(database, runner=runner)
+    session_id = "session-1"
+    command_id = "cross-runtime-command"
+
+    with TestClient(app) as client:
+        assert client.post("/api/sessions", json={"session_id": session_id}).status_code == 200
+
+        def post(payload: dict[str, str]) -> object:
+            return client.post(
+                f"/api/sessions/{session_id}/messages",
+                headers={"Idempotency-Key": command_id},
+                json=payload,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            v1 = pool.submit(post, {"content": "hello", "provider_id": "provider-1"})
+            assert runner.entered.wait(timeout=2)
+            python_term = pool.submit(
+                post,
+                {
+                    "content": "hello",
+                    "provider_id": "provider-1",
+                    "runtime": "python-term",
+                },
+            )
+            runner.release.set()
+            v1_response = v1.result(timeout=2)
+            python_term_response = python_term.result(timeout=2)
+
+    assert v1_response.status_code == 202
+    assert python_term_response.status_code == 409
+    assert python_term_response.json() == {"detail": "python term command conflict"}
+    runtime_command_id = python_term_command_id(session_id, command_id)
+    assert registry.repository.get_pin(runtime_command_id) is None
+    turn = ConversationRepository(database).load_turn_status(session_id, command_id)
+    assert turn is not None
+    assert turn.state["runner_mode"] == "python"
 
 
 @pytest.mark.parametrize(
@@ -287,6 +355,161 @@ def test_python_term_rejects_unresolved_authorities_before_pin_or_turn(
     assert ConversationRepository(database).load_turn_status(
         "session-1", "unresolved-authority"
     ) is None
+
+
+def test_python_term_requires_a_saved_default_provider_model_before_pin_or_turn(
+    tmp_path: Path,
+) -> None:
+    """The public default cannot become an unconfigured execution model."""
+    database = tmp_path / "missing-default.sqlite"
+    registry, app = _task7_app(database)
+    _save_provider(database, model_aliases={"fast": "concrete-fast"})
+
+    with TestClient(app) as client:
+        assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
+        response = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "missing-default-command"},
+            json={
+                "content": "hello",
+                "runtime": "python-term",
+                "provider_id": "provider-1",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "python term runtime unavailable"}
+    runtime_command_id = python_term_command_id("session-1", "missing-default-command")
+    assert registry.repository.get_pin(runtime_command_id) is None
+    conversations = ConversationRepository(database)
+    assert conversations.load_turn_status("session-1", "missing-default-command") is None
+    assert conversations.list_messages("session-1") == []
+
+
+def test_python_term_persists_resolved_provider_model_in_all_durable_execution_records(
+    tmp_path: Path,
+) -> None:
+    """An alias is admission input only; the worker receives its concrete model."""
+    database = tmp_path / "resolved-model.sqlite"
+    registry, app = _task7_app(database)
+    _save_provider(
+        database,
+        model_aliases={"default": "concrete-default", "fast": "concrete-fast"},
+    )
+
+    with TestClient(app) as client:
+        assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
+        response = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "resolved-model-command"},
+            json={
+                "content": "hello",
+                "model": "fast",
+                "runtime": "python-term",
+                "provider_id": "provider-1",
+            },
+        )
+
+    assert response.status_code == 202
+    runtime_command_id = python_term_command_id("session-1", "resolved-model-command")
+    assert registry.repository.get_pin(runtime_command_id) is not None
+    turn = ConversationRepository(database).load_turn_status(
+        "session-1", "resolved-model-command"
+    )
+    assert turn is not None
+    assert turn.model == "concrete-fast"
+    assert turn.state["runtime_model"] == "concrete-fast"
+    queued = next(
+        event
+        for event in EventStore(database).read_stream("run:session-1")
+        if event.event_type == "conversation.turn.queued"
+    )
+    assert queued.payload["model"] == "concrete-fast"
+    with registry.repository.store.connect() as connection:
+        row = connection.execute(
+            "SELECT identity_json FROM runtime_v2_command_pins WHERE command_id = ?",
+            (runtime_command_id,),
+        ).fetchone()
+    assert row is not None
+    assert json.loads(row["identity_json"])["model"] == "concrete-fast"
+
+
+def test_python_term_changed_model_alias_conflicts_with_the_durable_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A retry must not silently rebind an accepted alias to another model."""
+    database = tmp_path / "changed-model-alias.sqlite"
+    registry, app = _task7_app(database)
+    _save_provider(database, model_aliases={"default": "concrete-a", "fast": "concrete-a"})
+    payload = {
+        "content": "hello",
+        "model": "fast",
+        "runtime": "python-term",
+        "provider_id": "provider-1",
+    }
+    with TestClient(app) as client:
+        assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
+        accepted = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "changed-model-alias-command"},
+            json=payload,
+        )
+
+    _save_provider(database, model_aliases={"default": "concrete-b", "fast": "concrete-b"})
+    with TestClient(app) as client:
+        changed = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "changed-model-alias-command"},
+            json=payload,
+        )
+
+    assert accepted.status_code == 202
+    assert changed.status_code == 409
+    assert changed.json() == {"detail": "python term command conflict"}
+    assert registry.repository.get_pin(
+        python_term_command_id("session-1", "changed-model-alias-command")
+    ) is not None
+
+
+def test_python_term_safe_provider_headers_are_part_of_its_durable_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Safe adapter metadata changes are an identity conflict, never a hidden retry."""
+    database = tmp_path / "provider-headers.sqlite"
+    registry, app = _task7_app(database)
+    _save_provider(database, headers={"X-Title": "first"})
+    payload = {
+        "content": "hello",
+        "runtime": "python-term",
+        "provider_id": "provider-1",
+    }
+    with TestClient(app) as client:
+        assert client.post("/api/sessions", json={"session_id": "session-1"}).status_code == 200
+        accepted = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "provider-headers-command"},
+            json=payload,
+        )
+        unchanged_retry = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "provider-headers-command"},
+            json=payload,
+        )
+
+    _save_provider(database, headers={"X-Title": "changed"})
+    with TestClient(app) as client:
+        changed = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "provider-headers-command"},
+            json=payload,
+        )
+
+    assert accepted.status_code == unchanged_retry.status_code == 202
+    assert changed.status_code == 409
+    assert changed.json() == {"detail": "python term command conflict"}
+    assert registry.repository.get_pin(
+        python_term_command_id("session-1", "provider-headers-command")
+    ) is not None
 
 
 def test_python_term_snapshots_authority_and_history_in_its_stable_retry_identity(

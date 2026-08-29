@@ -155,16 +155,12 @@ class PythonTermQueryRouter:
         build_id: str,
     ) -> tuple[QueryCommandV2, RunEnvelopeV2]:
         """Build an envelope solely from snapshots resolved by repository authority."""
-        provider_snapshot = {
-            "id": admission.provider.id,
-            "protocol": admission.provider.protocol,
-            "base_url": admission.provider.base_url,
-            "model_aliases": admission.provider.model_aliases,
-            "capabilities": sorted(str(item) for item in admission.provider.capabilities),
-            "enabled": admission.provider.enabled,
-            "thinking_enabled": admission.provider.thinking_enabled,
-            "reasoning_effort": admission.provider.reasoning_effort,
-        }
+        provider_snapshot = admission.provider.model_dump(
+            mode="json", exclude={"secret_id"}
+        )
+        provider_snapshot["capabilities"] = sorted(
+            provider_snapshot.get("capabilities", [])
+        )
         agent_snapshots = [
             profile.model_dump(mode="json") for profile in admission.agent_profiles
         ]

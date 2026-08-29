@@ -101,6 +101,64 @@ def _wait_for_status(database: Path, status: str) -> None:
     raise AssertionError(f"turn did not reach {status!r}")
 
 
+@pytest.mark.asyncio
+async def test_v1_retry_rebuilds_a_missing_queued_event_after_persisted_crash_window(
+    tmp_path: Path,
+) -> None:
+    """A reservation and Turn without its queue event must resume admission."""
+    database = tmp_path / "v1-retry-crash-window.sqlite"
+    repository = ConversationRepository(database)
+    events = EventStore(database)
+    api = ConversationAPI(repository, events, RetryOnceRunner())
+    api.create_session("session-1")
+
+    reservation_id = api._reserve(
+        "session-1",
+        "turn-1",
+        "message",
+        {
+            "content": "recover the event",
+            "model": "configured-model",
+            "provider_id": "provider-1",
+        },
+    )
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id=api._lifecycle_run_id("session-1"),
+        provider_id="provider-1",
+        model="configured-model",
+        prompt="recover the event",
+        initial_state=api._initial_turn_state("session-1"),
+    )
+
+    recovered = await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="recover the event",
+        model="configured-model",
+        provider_id="provider-1",
+    )
+
+    assert recovered["status"] == "queued"
+    assert recovered["cursor"].endswith(":0")
+    queued = [
+        event
+        for event in events.read_stream("run:session-1")
+        if event.event_type == "conversation.turn.queued"
+        and event.causation_id == reservation_id
+    ]
+    assert len(queued) == 1
+    with pytest.raises(ValueError, match="command identity cannot change"):
+        await api.enqueue_message(
+            session_id="session-1",
+            command_id="turn-1",
+            content="changed identity",
+            model="configured-model",
+            provider_id="provider-1",
+        )
+
+
 def test_message_returns_202_before_runner_finishes(tmp_path: Path) -> None:
     database = tmp_path / "api.sqlite"
     runner = BlockingRunner()

@@ -355,6 +355,7 @@ class ConversationAPI:
             )
         else:
             resolved_provider = self._resolve_provider_id(provider_id)
+        execution_model = admission.model if runtime == "python-term" else model
         reservation_id = self._reserve(
             session_id,
             command_id,
@@ -382,6 +383,7 @@ class ConversationAPI:
             initial_state["runtime_id"] = selected_runtime.runtime_id
             initial_state["runtime_build_id"] = selected_runtime.build_id
             initial_state["runtime_command_id"] = selected_runtime.runtime_command_id
+            initial_state["runtime_model"] = execution_model
         else:
             mode_for = getattr(self.runner, "mode_for", None)
             runner_mode = (
@@ -399,7 +401,7 @@ class ConversationAPI:
             command_id=command_id,
             run_id=self._lifecycle_run_id(session_id),
             provider_id=resolved_provider,
-            model=model,
+            model=execution_model,
             prompt=content,
             initial_state=initial_state,
         )
@@ -409,7 +411,7 @@ class ConversationAPI:
             {
                 "command_id": command_id,
                 "status": "queued",
-                "model": model,
+                "model": execution_model,
                 "provider_id": resolved_provider,
             },
             command_id,
@@ -617,11 +619,12 @@ class ConversationAPI:
                 runtime_id = turn.state.get("runtime_id")
                 runtime_build_id = turn.state.get("runtime_build_id")
                 runtime_command_id = turn.state.get("runtime_command_id")
+                runtime_model = turn.state.get("runtime_model")
                 if runtime_id != "python-term" or not isinstance(
                     runtime_build_id, str
                 ) or runtime_command_id != python_term_command_id(
                     session_id, command_id
-                ):
+                ) or runtime_model != turn.model:
                     raise TurnSnapshotCorruption("invalid Python Term runtime pin")
                 raise TurnSnapshotCorruption("Python Term executor is unavailable")
             state = dict(turn.state)
@@ -1027,7 +1030,7 @@ class ConversationAPI:
     def _configured_provider_model(profile: ProviderProfileRecord, model: str) -> str:
         aliases = profile.model_aliases
         if model == "default":
-            resolved = aliases.get("default", "default")
+            resolved = aliases.get("default")
         elif model in aliases:
             resolved = aliases[model]
         elif model in aliases.values():
@@ -1688,11 +1691,13 @@ class ConversationAPI:
             ),
             None,
         )
+        if queued is None:
+            return None
         return {
             "session_id": session_id,
             "command_id": command_id,
             "status": turn.status,
-            "cursor": f"{queued.sequence}:0" if queued is not None else None,
+            "cursor": f"{queued.sequence}:0",
         }
 
     def _require_session(self, session_id: str) -> None:

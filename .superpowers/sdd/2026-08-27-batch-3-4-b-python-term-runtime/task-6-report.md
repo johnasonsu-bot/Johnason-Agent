@@ -175,3 +175,57 @@ Provider grant。Task 5 测试进程报告 `OPENAI_API_KEY is not set, skipping 
 5. 完整 unit：`2125 passed in 116.53s`（exit 0）。初次 full-unit run 暴露 v1 duplicate retry
    等待 worker lock 的死等；以 `-vv -x` 定位后新增上述 read-only v1 retry 回归，再获完整 GREEN。
 6. Canvas：Vite/TypeScript build 成功，Playwright `38 passed (1.6m)`（exit 0）。
+
+## Round 3 修复（2026-08-29）
+
+### RED → GREEN
+
+1. RED：Provider identity 仅手选少量字段，安全 adapter header 的变化不会改变已接受
+   command 的身份。GREEN：以 `ProviderProfileRecord.model_dump(mode="json")` 取得完整
+   canonical non-secret projection，并显式排除 `secret_id`、不访问 Vault；capability 集合排序后
+   参与 canonical digest。`X-Title` 等已验证安全 metadata 改变时，同 command 固定返回
+   Python Term conflict；未变 retry 仍幂等。
+2. RED：`default` 在没有保存 alias 时会作为 raw model 被接受，named alias 也会把 raw alias
+   持久化到 turn 与 queued event。GREEN：default 必须由 Provider profile 的 `default` alias
+   解析；alias/concrete 都必须位于权威 contract。解析后的 concrete model 写入 envelope、turn、
+   queued event 与不可变 `runtime_model` routing metadata；worker 后续只从 durable turn model
+   构建命令。
+3. RED：v1 command reservation 与 turn 已持久化、但 `conversation.turn.queued` 尚未落盘时，retry
+   被错误地当作完成并返回 `cursor=None`。GREEN：该窗口返回 `None` 进入同一把 session lock 内的
+   幂等 admission，重建唯一 queued event；已有 queue event 的 retry 保持只读，不重跑模型或
+   复制 message。变更 identity 仍是 409。
+4. RED：no-proof 和 v1→Python Term 覆盖没有使用真实内部 pin ID/完整 authority，缺少可重复的
+   同 session 跨 runtime 并发覆盖。GREEN：测试以
+   `python_term_command_id(session_id, external_command_id)` 断言，no-proof fixture 使用有效
+   Provider/model/session 与真实 capability、但 `proof=None`，到达 `gate_metadata_unavailable`
+   后断言无 pin/turn/message。四轮 Event barrier 的 v1-vs-Python Term HTTP interleaving 保证
+   一个 accept、Python Term loser 固定 409、无 orphan internal pin，未使用 sleep。
+
+### 兼容与安全边界
+
+- `secret_id`（以及任何 Vault 解引用）不进入 Provider projection；Provider URL、safe headers
+  与其它 non-secret profile fields 仅参与 envelope 的 canonical digest，不被 renderer/HTTP
+  diagnostic 回显。
+- 旧 v1 路由与其已存在 queued retry 行为保持不变；仅缺 queued event 的 crash window 恢复到锁内
+  admission。Python Term 不走 v1 fast path，也不 fallback 到 v1 executor。
+- `runtime_model` 加入不可变 routing metadata，抵抗将已 pin 的 Python Term turn 改回 raw alias。
+- 生产 composition 仍不创建、注册或暴露 Task 7 proof，也不会将 capability registration 当作
+  eligibility。测试里的 private fixed proof 只用于已获授权的 fixture；no-proof 用例明确传入
+  `None` 并验证 fixed 503，不能形成 GO 结论。
+
+### Round 3 验证证据
+
+1. RED：v1 crash-window 单测 `1 failed`（`cursor=None`）；新增 Round 3 focused 收集时另有
+   concrete model 与 safe-header cases `3 failed, 6 passed`。均在实现前记录。
+2. Queue + Task 6 focused：`72 passed in 6.06s`（exit 0）。
+3. Host/API/Conversation focused：`142 passed in 13.77s`（exit 0）。
+4. Task 5：runtime `27 passed in 13.93s`、recovery `37 passed in 28.62s`（均 exit 0；合计 64）。
+5. 完整 unit：`2126 passed in 113.74s`（exit 0）。
+6. Canvas：Vite/TypeScript build 成功，Playwright `38 passed (1.6m)`（exit 0）。
+7. `compileall`（main、api、conversation repository、Host v2、Python Term）与
+   `git diff --check`：exit 0。
+
+### Round 3 Concern
+
+- Task 7 gate metadata 与 executor composition 仍未实现；因此生产 explicit Python Term request
+  仍按设计 fail closed，Round 3 的 fixture proof 绝不代表 production eligibility 或 GO。
