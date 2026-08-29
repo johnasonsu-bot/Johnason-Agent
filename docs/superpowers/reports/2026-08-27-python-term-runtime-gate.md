@@ -34,7 +34,7 @@ meta/E2E、diff 和 credential scan，并用独立 report-only commit 更新本�
 | Provider 失败 | durable failed/cancelled 单调封口，不进入永久 retry；只有未形成终态的 typed conflict 可重试 |
 | DeepSeek续传 | reasoning continuation 私有绑定 response/tool-call identity，tool result 后单次消费，不进入公共输出/日志/Conversation state |
 | Effect 对账 | unknown write 不压成 failed；Conversation 进入可恢复 paused，控制面确认 durable Effect 后重新领用并可完成 |
-| 对账控制面 | REST `Idempotency-Key` 持久绑定 session/command/Effect/outcome/summary digest 与首个公开响应；同 payload 并发/重启稳定重放，不同 payload 409 且不回显摘要；不同 key 的同语义确认幂等 |
+| 对账控制面 | REST `Idempotency-Key` 持久绑定 session/command/Effect/outcome/summary digest 与首个公开响应；同 payload 并发/重启稳定重放，不同 payload 409 且不回显摘要；不同 key 的同语义确认幂等；Worker 完成并压缩可变 Turn 终态后仍由 command ledger 独立重放首次响应 |
 | 私有 proof | 仅验证外部 Ed25519 签名；绑定完整源码、依赖锁、测试/场景矩阵、SDK、runtime/build/protocol、capability/result digest；不暴露给 renderer/HTTP/IPC |
 
 ## 确定性场景

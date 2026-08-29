@@ -293,6 +293,16 @@ class ConversationAPI:
         stops between those durable writes, retrying this command reuses the
         exact committed Effect and completes the Conversation transition.
         """
+        _, cached = self.conversations.lookup_python_term_reconciliation_command(
+            idempotency_key=idempotency_key,
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=request.outcome,
+            summary=request.summary,
+        )
+        if cached is not None:
+            return cached
         turn = self.conversations.load_turn_status(session_id, command_id)
         if turn is None:
             raise KeyError((session_id, command_id))

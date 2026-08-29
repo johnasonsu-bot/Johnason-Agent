@@ -276,6 +276,8 @@ command、Effect、outcome 与 summary digest，并持久化首个公开响应�
 在并发和重启后返回稳定原响应；同 key 不同 payload 返回 409 且错误文本不回显 summary。
 不同 key 对已确认 Effect 的同一语义结果幂等，冲突 outcome、错误 Effect 或跨会话/跨
 命令绑定返回冲突。多个 pending Effect 全部确认后才重新入队。
+首个响应写入 command ledger 后，其重放不再依赖可变 Turn 快照；即使 Worker 已完成且
+终态投影被压缩，重启后相同 key 与相同 payload 仍返回首次保存的稳定响应。
 Effect 先持久化、Conversation 后推进；两者之间崩溃时重复同一确认会复用 durable
 Effect 并补齐 Conversation 转换。
 

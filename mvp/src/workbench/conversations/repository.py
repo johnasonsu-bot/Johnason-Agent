@@ -1198,6 +1198,53 @@ class ConversationRepository:
             raise TurnSnapshotCorruption("reconciliation command response is invalid")
         return response
 
+    def lookup_python_term_reconciliation_command(
+        self,
+        *,
+        idempotency_key: str,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        outcome: str,
+        summary: str,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Read one command ledger entry without reserving a new identity.
+
+        The boolean distinguishes an absent key from an existing reservation
+        whose response has not yet been committed.
+        """
+        summary_digest, request_digest = self._python_term_reconciliation_identity(
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=outcome,
+            summary=summary,
+        )
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM python_term_reconciliation_commands
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return False, None
+        if (
+            row["session_id"] != session_id
+            or row["command_id"] != command_id
+            or row["effect_id"] != effect_id
+            or row["outcome"] != outcome
+            or row["summary_digest"] != summary_digest
+            or row["request_digest"] != request_digest
+        ):
+            raise ValueError("reconciliation command identity cannot change")
+        response_json = row["response_json"]
+        if response_json is None:
+            return True, None
+        response = json.loads(response_json)
+        if not isinstance(response, dict):
+            raise TurnSnapshotCorruption("reconciliation command response is invalid")
+        return True, response
+
     def complete_python_term_reconciliation_command(
         self,
         *,

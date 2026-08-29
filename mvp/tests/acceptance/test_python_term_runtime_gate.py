@@ -1354,6 +1354,65 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
     assert restarted_conversations.claim_next_turn(owner_id="worker-2") is not None
     await restarted_api.process_queued_turn("session-1", "command-1")
 
+    # A terminal Turn projection is mutable and may be compacted independently
+    # from the append-only REST command ledger.  Replaying a completed command
+    # must therefore not depend on the old runtime snapshot still being present.
+    with restarted_conversations.store.connect() as connection:
+        row = connection.execute(
+            """SELECT state_json FROM conversation_turns
+            WHERE session_id = 'session-1' AND command_id = 'command-1'"""
+        ).fetchone()
+        assert row is not None
+        compacted_state = json.loads(row["state_json"])
+        compacted_state.pop("python_term_execution", None)
+        compacted_state.pop("reconciliation_effect_ids", None)
+        compacted_state.pop("reconciled_effect_ids", None)
+        connection.execute(
+            """UPDATE conversation_turns SET state_json = ?
+            WHERE session_id = 'session-1' AND command_id = 'command-1'""",
+            (json.dumps(compacted_state, sort_keys=True),),
+        )
+
+    post_completion_registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    post_completion_composition = compose_python_term_production(
+        registry=post_completion_registry,
+        repository=PythonTermRepository(database),
+        gateway=ModelGateway({"test": Provider()}),
+        profiles=(profile,),
+        runtime_dir=tmp_path.resolve(),
+    )
+    post_completion_api = ConversationAPI(
+        conversations=ConversationRepository(database),
+        events=EventStore(database),
+        runner=object(),
+        providers=ProviderRepository(database),
+        python_term_router=main.PythonTermQueryRouter(
+            post_completion_registry,
+            _gate_proof=post_completion_composition.gate_proof,
+        ),
+        python_term_executor=post_completion_composition.executor,
+    )
+    post_completion_app = FastAPI()
+    post_completion_app.include_router(conversation_router(post_completion_api))
+    with TestClient(post_completion_app) as client:
+        completed_retry = client.post(
+            "/api/sessions/session-1/turns/command-1/"
+            "effects/effect-unknown-2/reconcile",
+            headers={"Idempotency-Key": "reconcile-2"},
+            json={"outcome": "not_applied", "summary": "write confirmed absent"},
+        )
+        completed_retry_conflict = client.post(
+            "/api/sessions/session-1/turns/command-1/"
+            "effects/effect-unknown-2/reconcile",
+            headers={"Idempotency-Key": "reconcile-2"},
+            json={"outcome": "not_applied", "summary": "private changed summary"},
+        )
+
+    assert completed_retry.status_code == 200, completed_retry.text
+    assert completed_retry.json() == final.json()
+    assert completed_retry_conflict.status_code == 409
+    assert "private changed summary" not in completed_retry_conflict.text
+
     completed = restarted_conversations.load_turn_status("session-1", "command-1")
     restarted_python_repository = PythonTermRepository(database)
     term = restarted_python_repository.get_term(compiled.term.term_id)
