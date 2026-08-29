@@ -149,6 +149,13 @@ class SequentialResumeRequest(BaseModel):
     decision: Literal["approved"]
 
 
+class PythonTermReconciliationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: Literal["applied", "not_applied"]
+    summary: str = Field(min_length=1, max_length=1024)
+
+
 class DevelopmentInterruptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -216,6 +223,15 @@ class PythonTermConversationExecutor(Protocol):
 
     async def execute_snapshot(self, snapshot: dict[str, Any]) -> object: ...
 
+    def reconcile_effect_for_turn(
+        self,
+        *,
+        term_id: str,
+        effect_id: str,
+        outcome: Literal["applied", "not_applied"],
+        summary: str,
+    ) -> None: ...
+
 
 def python_term_command_id(session_id: str, command_id: str) -> str:
     """Derive the Host-v2-only pin key without exposing it as a public command id."""
@@ -261,6 +277,63 @@ class ConversationAPI:
         if self.engine is not None:
             self._ensure_lifecycle_run(session_id)
         return self.conversations.create_session(session_id)
+
+    def reconcile_python_term_effect(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        request: PythonTermReconciliationRequest,
+    ) -> dict[str, Any]:
+        """Confirm one unknown write outcome through control-plane authority.
+
+        The Effect commit precedes the Conversation transition.  If the process
+        stops between those durable writes, retrying this command reuses the
+        exact committed Effect and completes the Conversation transition.
+        """
+        turn = self.conversations.load_turn_status(session_id, command_id)
+        if turn is None:
+            raise KeyError((session_id, command_id))
+        if self.python_term_executor is None:
+            raise RuntimeError("Python Term executor is unavailable")
+        snapshot = turn.state.get("python_term_execution")
+        pending = turn.state.get("reconciliation_effect_ids", [])
+        reconciled = turn.state.get("reconciled_effect_ids", [])
+        if (
+            not isinstance(snapshot, dict)
+            or not isinstance(pending, list)
+            or not isinstance(reconciled, list)
+            or (effect_id not in pending and effect_id not in reconciled)
+        ):
+            raise TurnSnapshotCorruption(
+                "turn is not awaiting this Python Term reconciliation"
+            )
+        envelope = snapshot.get("envelope")
+        term_id = envelope.get("term_id") if isinstance(envelope, dict) else None
+        if not isinstance(term_id, str) or not term_id:
+            raise TurnSnapshotCorruption("Python Term reconciliation binding is invalid")
+        self.python_term_executor.reconcile_effect_for_turn(
+            term_id=term_id,
+            effect_id=effect_id,
+            outcome=request.outcome,
+            summary=request.summary,
+        )
+        refreshed = self.conversations.record_python_term_reconciliation(
+            session_id,
+            command_id,
+            effect_id=effect_id,
+        )
+        pending_value = refreshed.state.get("reconciliation_effect_ids", [])
+        if not isinstance(pending_value, list):
+            raise TurnSnapshotCorruption("Python Term reconciliation state is invalid")
+        return {
+            "session_id": session_id,
+            "command_id": command_id,
+            "effect_id": effect_id,
+            "status": refreshed.status,
+            "pending_effect_ids": pending_value,
+        }
 
     async def enqueue_message(
         self,
@@ -746,6 +819,18 @@ class ConversationAPI:
                         "events": [],
                         "python_term_projected_cursor": projected_cursor,
                         "python_term_projected_result": accumulated,
+                        **(
+                            {
+                                "reconciled_effect_ids": turn.state[
+                                    "reconciled_effect_ids"
+                                ],
+                                "reconciliation_effect_ids": turn.state.get(
+                                    "reconciliation_effect_ids", []
+                                ),
+                            }
+                            if "reconciled_effect_ids" in turn.state
+                            else {}
+                        ),
                     },
                     result=accumulated,
                 )
@@ -2306,6 +2391,30 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         except KeyError as exc:
             raise HTTPException(404, "orchestration not found") from exc
         except (TurnSnapshotCorruption, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @router.post(
+        "/sessions/{session_id}/turns/{command_id}/effects/{effect_id}/reconcile"
+    )
+    def reconcile_python_term_effect(
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        payload: PythonTermReconciliationRequest,
+        idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        if not idempotency_key:
+            raise HTTPException(400, "Idempotency-Key header is required")
+        try:
+            return api.reconcile_python_term_effect(
+                session_id=session_id,
+                command_id=command_id,
+                effect_id=effect_id,
+                request=payload,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "Python Term reconciliation target not found") from exc
+        except (TurnSnapshotCorruption, RuntimeError, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
 
     @router.post(

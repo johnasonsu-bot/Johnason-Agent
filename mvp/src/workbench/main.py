@@ -51,7 +51,8 @@ from workbench.runtime.engine_host.v2.repository import (
 from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
-    PythonTermGateTrust,
+    PythonTermDevelopmentTrust,
+    compose_python_term_development,
     compose_python_term_production,
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
@@ -462,7 +463,7 @@ def build_app(
         )
         try:
             trust = (
-                PythonTermGateTrust.development(
+                PythonTermDevelopmentTrust.development(
                     runtime_dir=resolved.runtime_dir,
                     public_key_path=(
                         resolved.runtime_dir / "python-term-dev-public-key.txt"
@@ -474,13 +475,20 @@ def build_app(
                 if resolved.python_term_development_trust
                 else None
             )
-            composition = compose_python_term_production(
-                registry=runtime_registry_v2,
-                repository=repository,
-                gateway=gateway,
-                profiles=tuple(providers.list()),
-                runtime_dir=resolved.runtime_dir,
-                trust=trust,
+            composition_arguments = {
+                "registry": runtime_registry_v2,
+                "repository": repository,
+                "gateway": gateway,
+                "profiles": tuple(providers.list()),
+                "runtime_dir": resolved.runtime_dir,
+            }
+            composition = (
+                compose_python_term_development(
+                    **composition_arguments,
+                    development_trust=trust,
+                )
+                if trust is not None
+                else compose_python_term_production(**composition_arguments)
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             # Missing Provider bindings or unavailable PTY containment keeps the

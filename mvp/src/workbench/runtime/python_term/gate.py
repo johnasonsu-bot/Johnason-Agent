@@ -118,20 +118,32 @@ def _gate_key_id(public_key: bytes) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class PythonTermGateTrust:
+class _PythonTermGateTrust:
     proof_path: Path
     public_key: bytes
     key_id: str
     trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"]
 
-    @classmethod
-    def production(cls) -> PythonTermGateTrust:
-        return cls(
-            proof_path=_SIGNED_GATE_PROOF_PATH,
-            public_key=_TRUSTED_BUILD_PUBLIC_KEY,
-            key_id=_gate_key_id(_TRUSTED_BUILD_PUBLIC_KEY),
-            trust_status="PRODUCTION_TRUSTED",
-        )
+
+@dataclass(frozen=True, slots=True)
+class PythonTermDevelopmentTrust:
+    """Explicit local-only trust material rooted inside HERMES_RUNTIME_DIR."""
+
+    _trust: _PythonTermGateTrust
+
+    def __post_init__(self) -> None:
+        if (
+            type(self._trust) is not _PythonTermGateTrust
+            or self._trust.trust_status != "DEV_UNTRUSTED"
+            or self._trust.key_id != _gate_key_id(self._trust.public_key)
+            or self._trust.proof_path == _SIGNED_GATE_PROOF_PATH
+            or self._trust.public_key == _TRUSTED_BUILD_PUBLIC_KEY
+        ):
+            raise ValueError("development trust cannot become production")
+
+    @property
+    def key_id(self) -> str:
+        return self._trust.key_id
 
     @classmethod
     def development(
@@ -140,7 +152,7 @@ class PythonTermGateTrust:
         runtime_dir: Path,
         public_key_path: Path,
         proof_path: Path,
-    ) -> PythonTermGateTrust:
+    ) -> PythonTermDevelopmentTrust:
         root = runtime_dir.resolve(strict=True)
         resolved_public = public_key_path.resolve(strict=True)
         resolved_proof = proof_path.resolve(strict=True)
@@ -152,11 +164,33 @@ class PythonTermGateTrust:
         except (binascii.Error, ValueError) as exc:
             raise ValueError("development trust public key is invalid") from exc
         return cls(
-            proof_path=resolved_proof,
-            public_key=public_key,
-            key_id=_gate_key_id(public_key),
-            trust_status="DEV_UNTRUSTED",
+            _PythonTermGateTrust(
+                proof_path=resolved_proof,
+                public_key=public_key,
+                key_id=_gate_key_id(public_key),
+                trust_status="DEV_UNTRUSTED",
+            )
         )
+
+
+def _production_gate_trust() -> _PythonTermGateTrust:
+    """Return the sole fixed production verifier identity."""
+    return _PythonTermGateTrust(
+        proof_path=_SIGNED_GATE_PROOF_PATH,
+        public_key=_TRUSTED_BUILD_PUBLIC_KEY,
+        key_id=_gate_key_id(_TRUSTED_BUILD_PUBLIC_KEY),
+        trust_status="PRODUCTION_TRUSTED",
+    )
+
+
+def _selected_gate_trust(
+    development_trust: PythonTermDevelopmentTrust | None,
+) -> _PythonTermGateTrust:
+    if development_trust is None:
+        return _production_gate_trust()
+    if type(development_trust) is not PythonTermDevelopmentTrust:
+        raise TypeError("development trust must use the isolated trust type")
+    return development_trust._trust
 
 
 @dataclass(frozen=True, slots=True)
@@ -565,9 +599,23 @@ class PythonTermConversationRuntimeExecutor:
             if effect.status == "reconciliation_required"
         )
 
-    def reconcile_effect(
-        self, effect_id: str, result: PublicToolResult
+    def reconcile_effect_for_turn(
+        self,
+        *,
+        term_id: str,
+        effect_id: str,
+        outcome: Literal["applied", "not_applied"],
+        summary: str,
     ) -> None:
+        effect = self._runtime.repository.get_tool_effect(effect_id)
+        if effect is None:
+            raise KeyError(effect_id)
+        if effect.term_id != term_id:
+            raise ValueError("Tool Effect does not belong to this turn")
+        result = PublicToolResult(
+            status="completed" if outcome == "applied" else "failed",
+            summary=summary,
+        )
         self._runtime.repository.confirm_reconciled_tool_effect(
             effect_id, result
         )
@@ -687,46 +735,96 @@ async def _workspace_read_executor(
     return PublicToolResult(status="completed", summary=text[:4096])
 
 
-def _python_term_gate_manifest_files() -> dict[str, bytes]:
-    mvp_root = Path(__file__).resolve().parents[4]
-    paths = {
-        *mvp_root.glob("src/workbench/**/*.py"),
-        *mvp_root.glob("tests/**/*.py"),
-        mvp_root / "pyproject.toml",
-        mvp_root / "uv.lock",
-        mvp_root / "scripts" / "run_python_term_runtime_gate.py",
-        mvp_root / "scripts" / "sign_python_term_runtime_gate.py",
-    }
-    return {
-        path.relative_to(mvp_root).as_posix(): path.read_bytes()
-        for path in paths
-        if path.is_file()
-    }
+def _canonical_build_manifest(document: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
 
 
-def _digest_python_term_gate_manifest(files: Mapping[str, bytes]) -> str:
-    digest = hashlib.sha256()
-    for path, content in sorted(files.items()):
-        digest.update(path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(content)
-        digest.update(b"\0")
-    return "mvp-tree:" + digest.hexdigest()[:40]
+def verify_python_term_build_manifest(*, package_root: Path | None = None) -> str:
+    """Verify installed package files against build-generated immutable evidence."""
+    root = (
+        Path(__file__).resolve().parents[2]
+        if package_root is None
+        else package_root.resolve(strict=True)
+    )
+    manifest_path = root / "runtime" / "python_term" / "gate_manifest.json"
+    try:
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Python Term build manifest is unavailable") from exc
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "package",
+        "files",
+        "build_inputs",
+    }:
+        raise RuntimeError("Python Term build manifest is invalid")
+    if document["schema_version"] != 1 or document["package"] != "workbench":
+        raise RuntimeError("Python Term build manifest is invalid")
+    files = document["files"]
+    build_inputs = document["build_inputs"]
+    if not isinstance(files, list) or not files or not isinstance(build_inputs, list):
+        raise RuntimeError("Python Term build manifest is invalid")
+    seen: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "size"}:
+            raise RuntimeError("Python Term build manifest is invalid")
+        path = entry["path"]
+        digest = entry["sha256"]
+        size = entry["size"]
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+            or path in seen
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+        ):
+            raise RuntimeError("Python Term build manifest is invalid")
+        seen.add(path)
+        target = root.joinpath(*path.split("/"))
+        try:
+            content = target.read_bytes()
+        except OSError as exc:
+            raise RuntimeError("Python Term manifest file is unavailable") from exc
+        if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+            raise RuntimeError("Python Term manifest file digest changed")
+    if [entry.get("path") for entry in files if isinstance(entry, dict)] != sorted(seen):
+        raise RuntimeError("Python Term build manifest is not canonical")
+    for entry in build_inputs:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "sha256", "size"}
+            or not isinstance(entry["path"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(entry["sha256"])) is None
+            or isinstance(entry["size"], bool)
+            or not isinstance(entry["size"], int)
+            or entry["size"] < 0
+        ):
+            raise RuntimeError("Python Term build manifest is invalid")
+    revision = hashlib.sha256(_canonical_build_manifest(document)).hexdigest()
+    return "mvp-build:" + revision[:40]
 
 
 def python_term_gate_source_revision() -> str:
-    """Digest the full production source, dependency lock and test matrix."""
-    return _digest_python_term_gate_manifest(_python_term_gate_manifest_files())
+    """Verify and identify the immutable installed runtime build."""
+    return verify_python_term_build_manifest()
 
 
-def compose_python_term_production(
+def _compose_python_term(
     *,
     registry: RuntimeRegistryV2,
     repository: PythonTermRepository,
     gateway: ModelGateway,
     profiles: tuple[ProviderProfileRecord, ...],
     runtime_dir: Path,
-    trust: PythonTermGateTrust | None = None,
+    development_trust: PythonTermDevelopmentTrust | None = None,
 ) -> PythonTermProductionComposition:
     """Build the one fixed Provider/Tool/PTY composition and its private proof."""
     if type(registry) is not RuntimeRegistryV2:
@@ -754,9 +852,8 @@ def compose_python_term_production(
         streaming=True,
         event_cursor=True,
     )
-    selected_trust = trust or PythonTermGateTrust.production()
     verdict = load_signed_python_term_gate_verdict(
-        preflight_capabilities, trust=selected_trust
+        preflight_capabilities, development_trust=development_trust
     )
 
     workspace_manifest = ToolManifestEntryV2(
@@ -837,7 +934,47 @@ def compose_python_term_production(
         executor=PythonTermConversationRuntimeExecutor(runtime),
         verdict=verdict,
         gate_proof=proof,
-        trust_status=selected_trust.trust_status,
+        trust_status=_selected_gate_trust(development_trust).trust_status,
+    )
+
+
+def compose_python_term_production(
+    *,
+    registry: RuntimeRegistryV2,
+    repository: PythonTermRepository,
+    gateway: ModelGateway,
+    profiles: tuple[ProviderProfileRecord, ...],
+    runtime_dir: Path,
+) -> PythonTermProductionComposition:
+    """Build production only against the module-fixed verifier root."""
+    return _compose_python_term(
+        registry=registry,
+        repository=repository,
+        gateway=gateway,
+        profiles=profiles,
+        runtime_dir=runtime_dir,
+    )
+
+
+def compose_python_term_development(
+    *,
+    registry: RuntimeRegistryV2,
+    repository: PythonTermRepository,
+    gateway: ModelGateway,
+    profiles: tuple[ProviderProfileRecord, ...],
+    runtime_dir: Path,
+    development_trust: PythonTermDevelopmentTrust,
+) -> PythonTermProductionComposition:
+    """Build an explicitly untrusted local composition for user testing."""
+    if type(development_trust) is not PythonTermDevelopmentTrust:
+        raise TypeError("development trust must use the isolated trust type")
+    return _compose_python_term(
+        registry=registry,
+        repository=repository,
+        gateway=gateway,
+        profiles=profiles,
+        runtime_dir=runtime_dir,
+        development_trust=development_trust,
     )
 
 
@@ -952,10 +1089,10 @@ def _canonical_signed_payload(payload: Mapping[str, object]) -> bytes:
 def load_signed_python_term_gate_verdict(
     capabilities: RuntimeCapabilitiesV2,
     *,
-    trust: PythonTermGateTrust | None = None,
+    development_trust: PythonTermDevelopmentTrust | None = None,
 ) -> PythonTermGateVerdict:
     """Verify an externally signed build proof; local production fails closed."""
-    selected_trust = trust or PythonTermGateTrust.production()
+    selected_trust = _selected_gate_trust(development_trust)
     try:
         envelope = json.loads(selected_trust.proof_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -1095,9 +1232,10 @@ __all__ = [
     "REQUIRED_GATE_SCENARIOS",
     "GateObservableSessionLock",
     "PythonTermGateScenario",
-    "PythonTermGateTrust",
+    "PythonTermDevelopmentTrust",
     "PythonTermGateVerdict",
     "build_python_term_gate_verdict",
+    "compose_python_term_development",
     "compose_python_term_production",
     "load_signed_python_term_gate_verdict",
     "python_term_gate_signing_document",

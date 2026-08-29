@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -24,7 +25,7 @@ from fastapi.testclient import TestClient
 from workbench.agui.mapper import map_domain_event
 from workbench.api.engine_host import engine_host_v2_router
 from workbench.runtime.python_term import gate as gate_module
-from workbench.api.conversations import ConversationAPI
+from workbench.api.conversations import ConversationAPI, conversation_router
 from workbench.conversations.repository import ConversationRepository
 from workbench.runtime.engine_host.v2 import registry as registry_module
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
@@ -181,20 +182,58 @@ def test_gate_rejects_a_tampered_externally_signed_payload(
 
 
 def test_gate_manifest_covers_contracts_provider_lock_tests_and_scenario_commands() -> None:
-    files = gate_module._python_term_gate_manifest_files()
-    required = {
-        "src/workbench/models/contracts.py",
-        "src/workbench/models/deepseek.py",
+    manifest_path = Path(gate_module.__file__).with_name("gate_manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    files = {item["path"] for item in manifest["files"]}
+    inputs = {item["path"] for item in manifest["build_inputs"]}
+
+    assert {
+        "models/contracts.py",
+        "models/deepseek.py",
+        "api/conversations.py",
+        "runtime/python_term/gate.py",
+    } <= files
+    assert {
+        "pyproject.toml",
         "uv.lock",
-        "tests/acceptance/test_python_term_runtime_gate.py",
+        "tests/**/*.py",
+        "scripts/build_python_term_gate_manifest.py",
+        "scripts/hatch_build.py",
         "scripts/run_python_term_runtime_gate.py",
+        "scripts/sign_python_term_runtime_gate.py",
+    } <= inputs
+
+
+def test_build_manifest_verifies_a_copied_install_without_repository_inputs(
+    tmp_path: Path,
+) -> None:
+    source_package = Path(gate_module.__file__).resolve().parents[2]
+    installed_package = tmp_path / "site-packages" / "workbench"
+    shutil.copytree(source_package, installed_package)
+
+    assert not (tmp_path / "tests").exists()
+    assert not (tmp_path / "uv.lock").exists()
+    revision = gate_module.verify_python_term_build_manifest(
+        package_root=installed_package
+    )
+    assert revision == python_term_gate_source_revision()
+    manifest = json.loads(
+        (installed_package / "runtime/python_term/gate_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {item["path"] for item in manifest["build_inputs"]} >= {
+        "pyproject.toml",
+        "uv.lock",
+        "tests/**/*.py",
     }
-    assert required <= files.keys()
-    original = gate_module._digest_python_term_gate_manifest(files)
-    for path in required:
-        mutated = dict(files)
-        mutated[path] += b"\n# gate mutation\n"
-        assert gate_module._digest_python_term_gate_manifest(mutated) != original
+
+    contracts = installed_package / "models/contracts.py"
+    contracts.write_bytes(contracts.read_bytes() + b"\n# copied-install mutation\n")
+    with pytest.raises(RuntimeError, match="manifest file digest"):
+        gate_module.verify_python_term_build_manifest(
+            package_root=installed_package
+        )
 
 
 def test_external_signer_and_development_verify_mode_are_isolated_from_production(
@@ -295,11 +334,79 @@ def test_development_trust_rejects_paths_outside_runtime_dir(tmp_path: Path) -> 
     public_key.write_text(base64.b64encode(b"x" * 32).decode(), encoding="ascii")
 
     with pytest.raises(ValueError, match="inside the runtime directory"):
-        gate_module.PythonTermGateTrust.development(
+        gate_module.PythonTermDevelopmentTrust.development(
             runtime_dir=runtime_dir,
             public_key_path=public_key,
             proof_path=outside,
         )
+
+
+def test_production_composition_rejects_caller_forged_production_trust(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "forged.sqlite"
+    profile = ProviderProfileRecord(
+        id="provider-1",
+        name="Test",
+        protocol="test",
+        base_url="http://127.0.0.1:1",
+        model_aliases={"default": "model-1"},
+    )
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    capabilities = _production_capabilities()
+    verdict = build_python_term_gate_verdict(
+        source_revision=python_term_gate_source_revision(),
+        capabilities=capabilities,
+        scenarios=_passing_scenarios(),
+    )
+    payload = python_term_gate_signing_document(verdict)
+    proof_path = tmp_path / "forged-proof.json"
+    proof_path.write_text(
+        json.dumps(
+            {
+                "key_id": gate_module._gate_key_id(public_key),
+                "payload": payload,
+                "signature": base64.b64encode(
+                    private_key.sign(gate_module._canonical_signed_payload(payload))
+                ).decode(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    forged = {
+        "proof_path": proof_path,
+        "public_key": public_key,
+        "key_id": gate_module._gate_key_id(public_key),
+        "trust_status": "PRODUCTION_TRUSTED",
+    }
+
+    with pytest.raises(ValueError, match="development trust cannot become production"):
+        gate_module.PythonTermDevelopmentTrust(
+            gate_module._PythonTermGateTrust(**forged)
+        )
+
+    with pytest.raises(TypeError):
+        compose_python_term_production(
+            registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+            repository=PythonTermRepository(database),
+            gateway=ModelGateway({}),
+            profiles=(profile,),
+            runtime_dir=tmp_path,
+            trust=forged,
+        )
+
+
+def test_production_trust_root_identity_is_fixed() -> None:
+    trust = gate_module._production_gate_trust()
+
+    assert trust.proof_path == Path(gate_module.__file__).with_name(
+        "signed_gate_proof.json"
+    )
+    assert trust.public_key == gate_module._TRUSTED_BUILD_PUBLIC_KEY
+    assert trust.key_id == gate_module._gate_key_id(
+        gate_module._TRUSTED_BUILD_PUBLIC_KEY
+    )
 
 
 def test_development_trust_is_explicit_in_public_runtime_diagnostics(
@@ -916,22 +1023,26 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
     failed_projection = PublicToolResult(
         status="failed", summary="Write outcome requires reconciliation"
     )
-    effect = ToolEffectRecord(
-        effect_id="effect-unknown",
-        term_id=compiled.term.term_id,
-        step_id=compiled.steps[0].step_id,
-        tool_call_id="call-unknown",
-        request_digest="8" * 64,
-        write_effect=True,
-        dispatch_state="ambiguous",
-        status="reconciliation_required",
-        result_code="unknown_write_outcome",
-        result_digest=canonical_digest(
-            {"code": "unknown_write_outcome", "result": failed_projection}
-        ),
-        public_result=failed_projection,
+    effects = tuple(
+        ToolEffectRecord(
+            effect_id=f"effect-unknown-{index}",
+            term_id=compiled.term.term_id,
+            step_id=compiled.steps[0].step_id,
+            tool_call_id=f"call-unknown-{index}",
+            request_digest=str(index) * 64,
+            write_effect=True,
+            dispatch_state="ambiguous",
+            status="reconciliation_required",
+            result_code="unknown_write_outcome",
+            result_digest=canonical_digest(
+                {"code": "unknown_write_outcome", "result": failed_projection}
+            ),
+            public_result=failed_projection,
+        )
+        for index in (1, 2)
     )
-    python_repository.save_tool_effect(effect)
+    for effect in effects:
+        python_repository.save_tool_effect(effect)
     assert conversations.claim_next_turn(owner_id="worker-1") is not None
 
     await api.process_queued_turn("session-1", "command-1")
@@ -939,23 +1050,108 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
     paused = conversations.load_turn_status("session-1", "command-1")
     assert paused is not None and paused.status == "interrupted"
     assert paused.state["reason"] == "reconciliation_required"
-    assert python_repository.get_tool_effect(effect.effect_id).status == "reconciliation_required"
+    assert paused.state["reconciliation_effect_ids"] == [
+        "effect-unknown-1",
+        "effect-unknown-2",
+    ]
+    app = FastAPI()
+    app.include_router(conversation_router(api))
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "write confirmed applied"},
+        )
+        duplicate = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "write confirmed applied"},
+        )
+        conflict = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-conflict"},
+            json={"outcome": "not_applied", "summary": "different outcome"},
+        )
+        wrong_effect = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-missing/reconcile",
+            headers={"Idempotency-Key": "reconcile-wrong"},
+            json={"outcome": "applied", "summary": "wrong effect"},
+        )
+        cross_command = client.post(
+            "/api/sessions/session-1/turns/command-other/effects/effect-unknown-2/reconcile",
+            headers={"Idempotency-Key": "reconcile-cross-command"},
+            json={"outcome": "applied", "summary": "cross command"},
+        )
+        cross_session = client.post(
+            "/api/sessions/session-other/turns/command-1/effects/effect-unknown-2/reconcile",
+            headers={"Idempotency-Key": "reconcile-cross-session"},
+            json={"outcome": "applied", "summary": "cross session"},
+        )
 
-    composition.executor.reconcile_effect(
-        effect.effect_id,
-        PublicToolResult(status="completed", summary="write confirmed applied"),
-    )
-    conversations.resume_python_term_reconciliation(
-        "session-1", "command-1", effect_id=effect.effect_id
-    )
-    assert conversations.claim_next_turn(owner_id="worker-2") is not None
-    await api.process_queued_turn("session-1", "command-1")
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "interrupted"
+    assert first.json()["pending_effect_ids"] == ["effect-unknown-2"]
+    assert duplicate.status_code == 200 and duplicate.json() == first.json()
+    assert conflict.status_code == 409
+    assert wrong_effect.status_code == 409
+    assert cross_command.status_code in {404, 409}
+    assert cross_session.status_code in {404, 409}
+    still_paused = conversations.load_turn_status("session-1", "command-1")
+    assert still_paused is not None and still_paused.status == "interrupted"
 
-    completed = conversations.load_turn_status("session-1", "command-1")
-    term = python_repository.get_term(compiled.term.term_id)
-    timeline = events.read_stream("run:session-1")
+    restarted_registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    restarted_composition = compose_python_term_production(
+        registry=restarted_registry,
+        repository=PythonTermRepository(database),
+        gateway=ModelGateway({"test": Provider()}),
+        profiles=(profile,),
+        runtime_dir=tmp_path.resolve(),
+    )
+    restarted_conversations = ConversationRepository(database)
+    restarted_api = ConversationAPI(
+        conversations=restarted_conversations,
+        events=EventStore(database),
+        runner=object(),
+        providers=ProviderRepository(database),
+        python_term_router=main.PythonTermQueryRouter(
+            restarted_registry, _gate_proof=restarted_composition.gate_proof
+        ),
+        python_term_executor=restarted_composition.executor,
+    )
+    restarted_app = FastAPI()
+    restarted_app.include_router(conversation_router(restarted_api))
+    with TestClient(restarted_app) as client:
+        final = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-2/reconcile",
+            headers={"Idempotency-Key": "reconcile-2"},
+            json={"outcome": "not_applied", "summary": "write confirmed absent"},
+        )
+        final_duplicate = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-2/reconcile",
+            headers={"Idempotency-Key": "reconcile-2"},
+            json={"outcome": "not_applied", "summary": "write confirmed absent"},
+        )
+
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "queued"
+    assert final.json()["pending_effect_ids"] == []
+    assert final_duplicate.status_code == 200
+    assert final_duplicate.json() == final.json()
+    assert restarted_conversations.claim_next_turn(owner_id="worker-2") is not None
+    await restarted_api.process_queued_turn("session-1", "command-1")
+
+    completed = restarted_conversations.load_turn_status("session-1", "command-1")
+    restarted_python_repository = PythonTermRepository(database)
+    term = restarted_python_repository.get_term(compiled.term.term_id)
+    timeline = EventStore(database).read_stream("run:session-1")
     assert completed is not None and completed.status == "completed"
     assert term is not None and term.status == "completed"
+    assert restarted_python_repository.get_tool_effect(
+        "effect-unknown-1"
+    ).public_result.status == "completed"
+    assert restarted_python_repository.get_tool_effect(
+        "effect-unknown-2"
+    ).public_result.status == "failed"
     assert completed.result is not None
     by_sequence = {event.sequence: event for event in timeline}
     assert completed.result == [

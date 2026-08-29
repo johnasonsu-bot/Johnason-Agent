@@ -1037,7 +1037,7 @@ class ConversationRepository:
         assert refreshed is not None
         return self._turn_status(refreshed)
 
-    def resume_python_term_reconciliation(
+    def record_python_term_reconciliation(
         self,
         session_id: str,
         command_id: str,
@@ -1055,29 +1055,42 @@ class ConversationRepository:
                 raise KeyError((session_id, command_id))
             state = json.loads(row["state_json"])
             pending = state.get("reconciliation_effect_ids")
+            reconciled = state.get("reconciled_effect_ids", [])
             if (
-                row["status"] != "interrupted"
-                or state.get("runner_mode") != "python_term"
-                or state.get("reason") != "reconciliation_required"
+                state.get("runner_mode") != "python_term"
                 or not isinstance(pending, list)
-                or effect_id not in pending
+                or not isinstance(reconciled, list)
+                or (effect_id not in pending and effect_id not in reconciled)
             ):
                 raise TurnSnapshotCorruption(
                     "turn is not awaiting this Python Term reconciliation"
                 )
-            state["phase"] = "before_model"
-            state.pop("reason", None)
-            state["reconciled_effect_ids"] = sorted(
-                set(state.get("reconciled_effect_ids", ())) | {effect_id}
-            )
-            state["reconciliation_effect_ids"] = [
-                item for item in pending if item != effect_id
-            ]
+            if effect_id in reconciled:
+                connection.commit()
+                return self._turn_status(row)
+            if (
+                row["status"] != "interrupted"
+                or state.get("reason") != "reconciliation_required"
+            ):
+                raise TurnSnapshotCorruption(
+                    "turn reconciliation state cannot advance"
+                )
+            remaining = [item for item in pending if item != effect_id]
+            state["reconciled_effect_ids"] = sorted(set(reconciled) | {effect_id})
+            state["reconciliation_effect_ids"] = remaining
+            next_status = "interrupted"
+            if remaining:
+                state["phase"] = "paused"
+            else:
+                next_status = "queued"
+                state["phase"] = "before_model"
+                state.pop("reason", None)
             changed = connection.execute(
                 """UPDATE conversation_turns
-                SET status = 'queued', state_json = ?, updated_at = ?
+                SET status = ?, state_json = ?, updated_at = ?
                 WHERE session_id = ? AND command_id = ? AND status = 'interrupted'""",
                 (
+                    next_status,
                     json.dumps(state, sort_keys=True),
                     time.time(),
                     session_id,
@@ -1085,7 +1098,7 @@ class ConversationRepository:
                 ),
             )
             if changed.rowcount != 1:
-                raise RuntimeError("reconciliation resume lost its turn fence")
+                raise RuntimeError("reconciliation update lost its turn fence")
             refreshed = connection.execute(
                 """SELECT * FROM conversation_turns
                 WHERE session_id = ? AND command_id = ?""",

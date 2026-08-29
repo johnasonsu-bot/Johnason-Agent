@@ -29,6 +29,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/workbench"]
 
+[tool.hatch.build.hooks.custom]
+path = "scripts/hatch_build.py"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

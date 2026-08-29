@@ -19,7 +19,8 @@ from workbench.runtime.engine_host.v2.contracts import RuntimeCapabilitiesV2
 from workbench.runtime.python_term.gate import (
     REQUIRED_GATE_SCENARIOS,
     PythonTermGateScenario,
-    PythonTermGateTrust,
+    PythonTermDevelopmentTrust,
+    _production_gate_trust,
     build_python_term_gate_verdict,
     load_signed_python_term_gate_verdict,
     python_term_gate_signing_document,
@@ -155,7 +156,9 @@ def _arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _selected_trust(arguments: argparse.Namespace) -> PythonTermGateTrust:
+def _selected_trust(
+    arguments: argparse.Namespace,
+) -> PythonTermDevelopmentTrust | None:
     development = (
         arguments.development_runtime_dir,
         arguments.development_public_key,
@@ -164,14 +167,14 @@ def _selected_trust(arguments: argparse.Namespace) -> PythonTermGateTrust:
     if any(value is not None for value in development):
         if not all(value is not None for value in development):
             raise ValueError("development trust requires runtime, public key and proof")
-        return PythonTermGateTrust.development(
+        return PythonTermDevelopmentTrust.development(
             runtime_dir=arguments.development_runtime_dir,
             public_key_path=arguments.development_public_key,
             proof_path=arguments.proof,
         )
     if arguments.proof is not None:
         raise ValueError("production proof path cannot be overridden")
-    return PythonTermGateTrust.production()
+    return None
 
 
 def _verify_current_build(arguments: argparse.Namespace) -> tuple[dict[str, object], int]:
@@ -183,8 +186,11 @@ def _verify_current_build(arguments: argparse.Namespace) -> tuple[dict[str, obje
     )
     try:
         trust = _selected_trust(arguments)
-        trust_status = trust.trust_status
-        verdict = load_signed_python_term_gate_verdict(capabilities, trust=trust)
+        if trust is not None:
+            trust_status = "DEV_UNTRUSTED"
+        verdict = load_signed_python_term_gate_verdict(
+            capabilities, development_trust=trust
+        )
     except (OSError, RuntimeError, TypeError, ValueError):
         return {
             "source_revision": python_term_gate_source_revision(),
@@ -194,9 +200,13 @@ def _verify_current_build(arguments: argparse.Namespace) -> tuple[dict[str, obje
     return {
         "source_revision": verdict.source_revision,
         "result_digest": verdict.result_digest,
-        "key_id": trust.key_id,
+        "key_id": (
+            _production_gate_trust().key_id
+            if trust is None
+            else trust.key_id
+        ),
         "Decision": verdict.decision,
-        "trust_status": trust.trust_status,
+        "trust_status": trust_status,
     }, 0
 
 
@@ -231,8 +241,11 @@ def main() -> int:
         signing_payload = python_term_gate_signing_document(verdict)
         try:
             trust = _selected_trust(arguments)
-            trust_status = trust.trust_status
-            packaged = load_signed_python_term_gate_verdict(capabilities, trust=trust)
+            if trust is not None:
+                trust_status = "DEV_UNTRUSTED"
+            packaged = load_signed_python_term_gate_verdict(
+                capabilities, development_trust=trust
+            )
         except (OSError, RuntimeError, TypeError, ValueError):
             decision = "BLOCKED_EXTERNAL_SIGNATURE_REQUIRED"
             trust_status = (

@@ -2207,8 +2207,8 @@ class PythonTermRepository:
     ) -> ToolEffectRecord:
         """Record a control-plane-confirmed write result without re-executing it."""
         validated_result = self._validate_model(result, PublicToolResult)
-        if validated_result.status != "completed":
-            raise ValueError("reconciled Tool Effect result must be completed")
+        if validated_result.status not in {"completed", "failed"}:
+            raise ValueError("reconciled Tool Effect result is invalid")
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM python_tool_effects WHERE effect_id = ?",
@@ -2220,6 +2220,13 @@ class PythonTermRepository:
             self._load_owning_aggregate(
                 connection, existing.term_id, existing.step_id
             )
+            if existing.status == "committed":
+                if (
+                    existing.result_digest == canonical_digest(validated_result)
+                    and existing.public_result == validated_result
+                ):
+                    return existing
+                raise RepositoryConflict("Tool Effect reconciliation outcome changed")
             if (
                 not existing.write_effect
                 or existing.status != "reconciliation_required"

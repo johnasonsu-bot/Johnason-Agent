@@ -34,6 +34,7 @@ meta/E2E、diff 和 credential scan，并用独立 report-only commit 更新本�
 | Provider 失败 | durable failed/cancelled 单调封口，不进入永久 retry；只有未形成终态的 typed conflict 可重试 |
 | DeepSeek续传 | reasoning continuation 私有绑定 response/tool-call identity，tool result 后单次消费，不进入公共输出/日志/Conversation state |
 | Effect 对账 | unknown write 不压成 failed；Conversation 进入可恢复 paused，控制面确认 durable Effect 后重新领用并可完成 |
+| 对账控制面 | 公开 REST 命令严格绑定 session/command/Term/Effect；相同 outcome 幂等、冲突和跨绑定拒绝、多 pending 全解后恢复，重启后仍可确认 |
 | 私有 proof | 仅验证外部 Ed25519 签名；绑定完整源码、依赖锁、测试/场景矩阵、SDK、runtime/build/protocol、capability/result digest；不暴露给 renderer/HTTP/IPC |
 
 ## 确定性场景
@@ -51,12 +52,15 @@ meta/E2E、diff 和 credential scan，并用独立 report-only commit 更新本�
 8. `session_lock_ownership`
 9. `proof_binding`
 
-本轮预提交工作树结果：9/9 `PASS`。门禁输出的 source revision 为内容寻址的
-`mvp-tree` digest，避免后续 report-only 文档提交改变生产源码绑定。
-source manifest 覆盖 `src/workbench/**/*.py`、`tests/**/*.py`、`pyproject.toml`、
-`uv.lock` 与门禁 runner。contracts、Provider adapter、场景命令或依赖锁发生 mutation
-都会使旧签名失效。签名 proof 缺失、损坏或与当前源码/能力不符时，在 executor
-注册前 fail closed。仓库中的旧 `gate_receipt.json` 已标记为不可信兼容占位。
+本轮预提交工作树结果：9/9 `PASS`。构建脚本先生成内容寻址的不可变 manifest，
+覆盖安装包内全部 Workbench Runtime 文件，并把 `tests/**/*.py`、`pyproject.toml`、
+`uv.lock` 与三个 gate scripts 作为构建输入 digest 固化。manifest 随 wheel/package
+安装；运行时验证安装文件，不读取源码仓 tests 或 lockfile。contracts、Provider
+adapter、场景命令、依赖锁或安装文件发生 mutation 都会使验证或旧签名失效。
+签名 proof 缺失、损坏或与当前构建/能力不符时，在 executor 注册前 fail closed。
+仓库中的旧 `gate_receipt.json` 已标记为不可信兼容占位。
+Hatch build hook 在 wheel 组装前强制刷新 manifest；复制安装布局与实际 offline wheel
+均验证 manifest 已打包且安装文件 digest 一致。
 
 独立 signer 仅从标准输入接收 CI/KMS 提供的私钥，proof 包含 `key_id`；生产服务、
 runner、参数、环境变量、仓库、HTTP、IPC 与 renderer 都没有签发私钥入口。runner
@@ -66,6 +70,8 @@ runner、参数、环境变量、仓库、HTTP、IPC 与 renderer 都没有签�
 
 用户测试环境另有显式 development trust：临时公钥与 proof 只能位于独立
 `HERMES_RUNTIME_DIR`，诊断固定显示 `DEV_UNTRUSTED`，不能更改或复用生产固定信任根。
+production composition 不接收调用方 trust；development 使用不可升级为 production
+的独立类型和入口。
 
 ## 外部 live smoke
 
@@ -76,7 +82,7 @@ live smoke 结果必须在固定 revision 门禁轮次单独回填；它不进�
 
 | 门禁 | 固定 revision 结果 |
 |---|---|
-| Task 7 focused acceptance | 待修复轮次 2 实现提交后固定 revision 重跑 |
+| Task 7 focused acceptance | 待修复轮次 3 实现提交后固定 revision 重跑 |
 | 标准 backend | 待实现提交后重跑 |
 | 独立 frontend | 待实现提交后重跑 |
 | Development Graph meta/E2E | 待实现提交后重跑 |

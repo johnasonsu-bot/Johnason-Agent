@@ -149,6 +149,10 @@ cd mvp
 本地没有生产签发私钥，因此此时仍为
 `Decision: BLOCKED_EXTERNAL_SIGNATURE_REQUIRED`。生产仅验证 Ed25519 签名，
 签名覆盖完整运行时源码、依赖锁、测试/场景矩阵和 capability/result digest。
+构建阶段先生成并打包不可变 Runtime manifest；生产启动只校验已安装 package 文件
+与 manifest，不要求源码仓中的 `tests/` 或 `uv.lock` 仍然存在。production composition
+没有调用方 trust 参数；本地 development trust 通过独立入口组装且始终标为
+`DEV_UNTRUSTED`。
 发布流水线必须把私钥通过 signer 的标准输入注入，并把带 `key_id` 的 proof
 随构建发布；私钥不能出现在参数、环境变量、仓库或客户端。runner 会自动验证
 当前 proof，只有签名与完整 manifest 精确匹配才以 0 退出并报告 GO。

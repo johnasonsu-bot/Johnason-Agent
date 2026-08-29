@@ -225,6 +225,7 @@ Python Term 默认关闭。启用时，只有外部签名 build proof 与注册�
 
 ```bash
 cd mvp
+.venv/bin/python scripts/build_python_term_gate_manifest.py
 .venv/bin/python scripts/run_python_term_runtime_gate.py
 ```
 
@@ -250,6 +251,24 @@ cd mvp
 `python-term-dev-public-key.txt` 与 `python-term-dev-signed-proof.json`，并显式设置
 `WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST=true`。此路径在公开 Runtime 诊断中固定标为
 `DEV_UNTRUSTED`，且不能覆盖生产 proof 路径或生产固定信任根。
+生产 composition 不接受任何 trust 参数；development 使用独立类型与独立 composition
+入口，无法通过标签升级为 production。
+
+未知写入结果必须通过公开控制面确认，不能由客户端直接修改 Runtime/Conversation
+repository：
+
+```http
+POST /api/sessions/{session_id}/turns/{command_id}/effects/{effect_id}/reconcile
+Idempotency-Key: <opaque-command-id>
+Content-Type: application/json
+
+{"outcome":"applied|not_applied","summary":"公开、无敏感信息的确认摘要"}
+```
+
+命令严格绑定 session、command、Term 与 Effect；重复相同确认幂等，冲突 outcome、
+错误 Effect 或跨会话/跨命令绑定返回冲突。多个 pending Effect 全部确认后才重新入队。
+Effect 先持久化、Conversation 后推进；两者之间崩溃时重复同一确认会复用 durable
+Effect 并补齐 Conversation 转换。
 
 运行合同门禁：
 
@@ -344,6 +363,7 @@ GO_LANGGRAPH_RUNTIME
 ### 10.5 Python Term Runtime 门禁
 
 ```bash
+.venv/bin/python scripts/build_python_term_gate_manifest.py
 .venv/bin/python scripts/run_python_term_runtime_gate.py
 ```
 
@@ -361,6 +381,11 @@ CI 签发后可用 `--verify-only` 验证当前完整 manifest；只有匹配 pr
 `GO_PYTHON_TERM_RUNTIME`/exit 0。development proof 必须同时提供
 `--development-runtime-dir`、`--development-public-key` 和 `--proof`，结果会显式标为
 `DEV_UNTRUSTED`。
+
+构建 manifest 随 wheel/package 安装，运行时验证安装文件 hash；`pyproject.toml`、
+`uv.lock`、测试矩阵与 gate scripts 只作为签名 manifest 内的构建证据 digest，安装后
+无需保留这些仓库文件。Hatch wheel build hook 会在组装 wheel 前强制刷新 manifest；
+发布流水线仍应显式执行生成命令，以便在签名和打包前审阅固定 payload。
 
 ### 10.6 Electron/Playwright
 
