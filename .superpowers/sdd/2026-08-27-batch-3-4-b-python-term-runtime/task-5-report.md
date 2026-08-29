@@ -386,3 +386,69 @@ Task 5 使用确定性 SDK model seam；无 `OPENAI_API_KEY` 时只有 SDK 跳�
 - side-table migration 保留原 `python_tool_effects` active-slot schema 以兼容既有数据库；所有新增
   lineage/attempt 写入均与 active slot 变更处于同一 SQLite transaction，未引入双写窗口。
 - 本轮没有读取、记录或写入 API key、Token、密码、provider 参数或原始异常。
+
+---
+
+## Fix round 5/5 — 多代 successor checkpoint chain 与 Round-3 lineage migration
+
+### 状态
+
+- 四态：IMPLEMENTED / TASK 5 GREEN / FULL UNIT GREEN / READY FOR REVIEW。
+- reviewer 基线：`19816723108434c74995efde26feaebcc69d96ca`。
+- 本轮以独立非改史提交收口，commit hash 见交付回报；未 amend、rebase、reset 或删除历史。
+- 范围仅包含 Task 5 runtime/repository 与 recovery integration tests；未修改 Host v1、Task 6
+  路由、前端事件、产品终态模型或 controller 的 `progress.md`。
+
+### RED → GREEN
+
+1. checkpoint attempt 0、当前 lineage 0→1→2 的 pending/released/committed-before-result
+   crash-window 组首次为 `3 failed, 3 passed, 28 deselected`：attempt 2 只能引用 old checkpoint
+   而不能引用本轮已验证的 attempt 1。按 attempt 严格递增构建 trusted chain 后为
+   `6 passed, 28 deselected`；重复 recovery 保持一个 active slot、连续 attempts 0/1/2，且最多
+   一个 committed executor result。digest、gap、sibling 三类篡改均 fail closed。
+2. Round-3 物理替换 successor fixture 首次为 `2 failed, 34 deselected`：迁移没有 predecessor
+   lineage 表，缺失 checkpoint evidence 也未在 repository open 时拒绝。加入 checkpoint-proven
+   immutable lineage 后，成功升级与 missing-evidence 场景转绿。
+3. 加入 corrupt-evidence 与 unrelated legacy row 后，原子性压力组再次为
+   `2 failed, 35 deselected`：legacy Effect JSON 会在 lineage 校验失败前部分升级。将 legacy
+   Effect migration 与 lineage migration 收进同一个外层 `BEGIN IMMEDIATE` 后，该组为
+   `2 passed, 35 deselected`；最终本轮 focused 为 `9 passed, 28 deselected`。
+
+### 实现与安全边界
+
+- checkpoint transition 以旧 evidence 为初始 trusted nodes，按 attempt 递增验证新增节点；只有
+  direct predecessor 已受信时才能扩展。每一 hop 都要求完整 predecessor digest anchor、相同
+  logical call/request/version/read-write 语义、exact attempt+1、严格递增 fence、record/evidence
+  state 一致及 durable `tool.call`；gap、cycle、sibling、rollback、digest/state tamper 均拒绝。
+- Round-3 active attempt>0 必须先补齐连续 predecessor chain。迁移只读取 latest checkpoint，先
+  验证 owning aggregate、checkpoint digest、Effect collection digest/order/uniqueness、stable
+  identity、request/classification、direct adjacency、fence 与对应 cursor 前的 durable
+  `tool.call`，再写入 append-only `python_tool_effect_checkpoint_lineage`，最后注册 active attempt。
+- Round-3 checkpoint evidence 不包含 predecessor lease expiry，迁移不会猜测或伪造完整
+  `ToolEffectRecord`。它保存已验证的完整 checkpoint evidence，并以 successor 原有的 canonical
+  `predecessor_record_digest` 作为不可变 record anchor；后续 checkpoint 将该 evidence-only
+  predecessor 与当前完整 records 一起保留。missing、inconsistent 或 ambiguous evidence 在迁移
+  事务内抛出具体 `RepositoryCorruption`，所有 Effect JSON 与 side tables 一并回滚。
+- attempt registry、完整 retired lineage 与 checkpoint-only lineage 在每次 reopen 时一起校验；
+  duplicate ID、phantom attempt、gap/branch/cycle 均拒绝。两类 Effect migration 共用一个事务，
+  重复 reopen 幂等，不存在 active successor 先注册、predecessor 后补写的窗口。
+
+### 最终验证
+
+在最后一版生产/测试代码上新鲜执行，全部 exit 0：
+
+1. 本轮 focused：`9 passed, 28 deselected in 7.76s`。
+2. Task 5 integration：`64 passed in 52.21s`。
+3. Task 3 Tool/Effect focused：`77 passed in 24.24s`。
+4. Task 4 PTY/Host focused：`31 passed in 6.41s`。
+5. 单进程完整 unit：`2125 passed, 1 warning in 134.50s`。
+6. `.venv/bin/python -m compileall -q src/workbench/runtime/python_term
+   src/workbench/runtime/engine_host/v2 src/workbench/agui`：exit 0。
+7. `git diff --check`：exit 0。
+
+### Concerns
+
+- 无阻塞 concern。
+- full unit 的 1 条 `RuntimeWarning` 来自 `never_approves` coroutine 未 await；测试组无失败，
+  本轮没有为该范围外告警扩展生产改动。
+- 本轮没有读取、记录或写入 API key、Token、密码、provider 参数或原始异常。

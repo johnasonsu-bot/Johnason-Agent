@@ -537,10 +537,18 @@ class PythonTermRuntime:
             checkpoint_effects = self.repository.list_tool_effects(
                 term.term_id, checkpoint.step_id
             )
+            checkpoint_lineage = (
+                self.repository.list_tool_effect_checkpoint_lineage(
+                    term.term_id, checkpoint.step_id
+                )
+            )
             expected = self._checkpoint_evidence(
                 context,
                 cursor=checkpoint.cursor,
                 effects=checkpoint_effects,
+                preserved_effect_evidence=tuple(
+                    item for item, _ in checkpoint_lineage
+                ),
             )
             evidence = checkpoint.evidence
             checkpoint_step = next(
@@ -591,6 +599,10 @@ class PythonTermRuntime:
                         step_is_running=checkpoint_step.status == "running",
                         durable_tool_calls=durable_tool_calls,
                         current_records=checkpoint_effects,
+                        preserved_record_digests={
+                            item.effect_id: record_digest
+                            for item, record_digest in checkpoint_lineage
+                        },
                     )
                 )
             )
@@ -763,11 +775,19 @@ class PythonTermRuntime:
         step_is_running: bool,
         durable_tool_calls: frozenset[str],
         current_records: Sequence[ToolEffectRecord],
+        preserved_record_digests: Mapping[str, str],
     ) -> bool:
         previous_by_id = {item.effect_id: item for item in previous}
         current_by_id = {item.effect_id: item for item in current}
         records_by_id = {item.effect_id: item for item in current_records}
         if len(records_by_id) != len(current_records):
+            return False
+        if records_by_id.keys() & preserved_record_digests.keys():
+            return False
+        if (
+            records_by_id.keys() | preserved_record_digests.keys()
+            != current_by_id.keys()
+        ):
             return False
         if not previous_by_id.keys() <= current_by_id.keys():
             return False
@@ -811,12 +831,29 @@ class PythonTermRuntime:
                 return False
             if (after.status == "committed") != (after.result_code is None):
                 return False
-        for effect_id in current_by_id.keys() - previous_by_id.keys():
-            added = current_by_id[effect_id]
-            predecessor_before = (
+        trusted_by_id = dict(previous_by_id)
+        validated_successor_by_predecessor: dict[str, str] = {}
+        for trusted in previous:
+            if trusted.predecessor_effect_id is None:
+                continue
+            if trusted.predecessor_effect_id in validated_successor_by_predecessor:
+                return False
+            validated_successor_by_predecessor[
+                trusted.predecessor_effect_id
+            ] = trusted.effect_id
+        added_effects = sorted(
+            (
+                current_by_id[effect_id]
+                for effect_id in current_by_id.keys() - previous_by_id.keys()
+            ),
+            key=lambda item: (item.effect_attempt, item.tool_call_id, item.effect_id),
+        )
+        for added in added_effects:
+            effect_id = added.effect_id
+            trusted_predecessor = (
                 None
                 if added.predecessor_effect_id is None
-                else previous_by_id.get(added.predecessor_effect_id)
+                else trusted_by_id.get(added.predecessor_effect_id)
             )
             predecessor_after = (
                 None
@@ -829,6 +866,53 @@ class PythonTermRuntime:
                 else records_by_id.get(added.predecessor_effect_id)
             )
             successor_record = records_by_id.get(effect_id)
+            predecessor_digest = (
+                preserved_record_digests.get(added.predecessor_effect_id)
+                if predecessor_record is None
+                else canonical_digest(predecessor_record)
+            )
+            predecessor_state_is_valid = (
+                predecessor_after is not None
+                and predecessor_after.status == "reserved"
+                and predecessor_after.dispatch_state
+                in (
+                    {"pending"}
+                    if predecessor_after.write_effect
+                    else {"pending", "released"}
+                )
+            )
+            predecessor_record_is_valid = (
+                predecessor_after is not None
+                and (
+                    (
+                        predecessor_record is None
+                        and added.predecessor_effect_id
+                        in preserved_record_digests
+                    )
+                    or (
+                        predecessor_record is not None
+                        and predecessor_record.status == "reserved"
+                        and predecessor_record.dispatch_state
+                        in (
+                            {"pending"}
+                            if predecessor_record.write_effect
+                            else {"pending", "released"}
+                        )
+                        and predecessor_after.stable_identity_digest
+                        == predecessor_record.stable_identity_digest
+                        and predecessor_after.effect_attempt
+                        == predecessor_record.effect_attempt
+                        and predecessor_after.tool_call_id
+                        == predecessor_record.tool_call_id
+                        and predecessor_after.request_digest
+                        == predecessor_record.request_digest
+                        and predecessor_after.request_digest_version
+                        == predecessor_record.request_digest_version
+                        and predecessor_after.write_effect
+                        == predecessor_record.write_effect
+                    )
+                )
+            )
             successor_state_is_valid = (
                 (
                     added.status == "reserved"
@@ -849,47 +933,65 @@ class PythonTermRuntime:
             )
             successor_is_valid = (
                 step_is_running
-                and predecessor_before is not None
+                and trusted_predecessor is not None
                 and predecessor_after is not None
-                and predecessor_record is not None
                 and successor_record is not None
-                and predecessor_record.status == "reserved"
-                and predecessor_record.dispatch_state
-                in (
-                    {"pending"}
-                    if predecessor_record.write_effect
-                    else {"pending", "released"}
+                and added.predecessor_effect_id
+                not in validated_successor_by_predecessor
+                and predecessor_state_is_valid
+                and predecessor_record_is_valid
+                and (
+                    predecessor_record is None
+                    or (
+                        successor_record.term_id == predecessor_record.term_id
+                        and successor_record.step_id == predecessor_record.step_id
+                        and successor_record.effect_identity_version
+                        == predecessor_record.effect_identity_version
+                    )
                 )
-                and successor_record.term_id == predecessor_record.term_id
-                and successor_record.step_id == predecessor_record.step_id
-                and successor_record.tool_call_id
-                == predecessor_record.tool_call_id
-                and successor_record.request_digest
-                == predecessor_record.request_digest
-                and successor_record.request_digest_version
-                == predecessor_record.request_digest_version
-                and successor_record.effect_identity_version
-                == predecessor_record.effect_identity_version
-                and successor_record.write_effect == predecessor_record.write_effect
-                and successor_record.effect_attempt
-                == predecessor_record.effect_attempt + 1
                 and successor_record.predecessor_effect_id
-                == predecessor_record.effect_id
+                == added.predecessor_effect_id
                 and successor_record.predecessor_record_digest
-                == canonical_digest(predecessor_record)
+                == predecessor_digest
                 and added.predecessor_record_digest
-                == canonical_digest(predecessor_record)
+                == predecessor_digest
+                and added.stable_identity_digest
+                == successor_record.stable_identity_digest
+                and added.effect_attempt
+                == trusted_predecessor.effect_attempt + 1
                 and added.effect_attempt == predecessor_after.effect_attempt + 1
+                and added.effect_attempt == successor_record.effect_attempt
                 and added.fence_generation > predecessor_after.fence_generation
+                and added.fence_generation == successor_record.fence_generation
+                and added.fence_id == successor_record.fence_id
+                and added.execution_owner_id
+                == successor_record.execution_owner_id
+                and added.step_claim_digest
+                == successor_record.step_claim_digest
                 and added.tool_call_id == predecessor_after.tool_call_id
+                and added.tool_call_id == successor_record.tool_call_id
                 and added.request_digest == predecessor_after.request_digest
+                and added.request_digest == successor_record.request_digest
                 and added.request_digest_version
                 == predecessor_after.request_digest_version
+                and added.request_digest_version
+                == successor_record.request_digest_version
                 and added.write_effect == predecessor_after.write_effect
+                and added.write_effect == successor_record.write_effect
+                and added.dispatch_state == successor_record.dispatch_state
+                and added.status == successor_record.status
+                and added.result_code == successor_record.result_code
+                and added.result_digest == successor_record.result_digest
+                and added.result_evidence_digest
+                == successor_record.result_evidence_digest
                 and added.tool_call_id in durable_tool_calls
                 and successor_state_is_valid
             )
             if successor_is_valid:
+                trusted_by_id[effect_id] = added
+                validated_successor_by_predecessor[
+                    added.predecessor_effect_id
+                ] = effect_id
                 continue
             if (
                 not step_is_running
@@ -2186,6 +2288,12 @@ class PythonTermRuntime:
             effects=self.repository.list_tool_effects(
                 context.term_id, context.step_id
             ),
+            preserved_effect_evidence=tuple(
+                item
+                for item, _ in self.repository.list_tool_effect_checkpoint_lineage(
+                    context.term_id, context.step_id
+                )
+            ),
             source_events=source_events,
         )
         checkpoint = StepCheckpointRecord(
@@ -2208,6 +2316,9 @@ class PythonTermRuntime:
         *,
         cursor: int,
         effects: Sequence[ToolEffectRecord],
+        preserved_effect_evidence: Sequence[
+            ToolEffectCheckpointEvidence
+        ] = (),
         source_events: Sequence[SdkSourceEventEvidence] = (),
     ) -> RuntimeCheckpointEvidence:
         context_digest = canonical_digest(
@@ -2227,7 +2338,7 @@ class PythonTermRuntime:
                 "prompt_manifest_digest": context.prompt_manifest_digest,
             }
         )
-        effect_evidence = tuple(
+        current_effect_evidence = tuple(
             ToolEffectCheckpointEvidence(
                 evidence_version=2,
                 effect_id=effect.effect_id,
@@ -2254,6 +2365,12 @@ class PythonTermRuntime:
                 result_evidence_digest=effect.result_evidence_digest,
             )
             for effect in effects
+        )
+        effect_evidence = tuple(
+            sorted(
+                (*preserved_effect_evidence, *current_effect_evidence),
+                key=lambda item: (item.tool_call_id, item.effect_id),
+            )
         )
         return RuntimeCheckpointEvidence(
             evidence_version=2,

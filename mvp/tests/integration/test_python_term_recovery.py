@@ -118,6 +118,320 @@ def _expire_effect_and_step_claim(
     return expired
 
 
+def _build_two_generation_read_successor_chain(
+    tmp_path,
+    *,
+    database_name: str,
+    final_phase: str,
+):
+    """Leave checkpoint attempt 0 trusted while durable lineage advances to 2."""
+    repository = PythonTermRepository(tmp_path / database_name)
+    runtime = PythonTermRuntime(repository)
+    inputs = _runtime_inputs(tmp_path, runtime)
+    context = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    ).contexts[0]
+    predecessor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="read-predecessor-step-owner",
+        lease_seconds=60,
+    )
+    assert predecessor_claim is not None
+    runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    proposal = ToolEffectRecord(
+        effect_id="effect-read-attempt-0",
+        term_id=context.term_id,
+        step_id=context.step_id,
+        tool_call_id="call-read-successor",
+        request_digest="8" * 64,
+        step_claim_digest=predecessor_claim.identity_digest,
+        status="reserved",
+    )
+    attempt_0, created = repository.reserve_tool_effect(
+        proposal,
+        execution_owner_id="read-attempt-0-effect-owner",
+        lease_duration_ms=60_000,
+        step_claim=predecessor_claim,
+    )
+    assert created
+    runtime._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": "read_value",
+            "tool_call_id": attempt_0.tool_call_id,
+            "read_only": True,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    attempt_0 = repository.release_tool_dispatch_gate(
+        attempt_0,
+        step_claim=predecessor_claim,
+        dispatch_required=True,
+    )
+    assert attempt_0 is not None
+
+    attempts = [attempt_0]
+    predecessor = attempt_0
+    for effect_attempt in (1, 2):
+        predecessor = _expire_effect_and_step_claim(repository, predecessor)
+        attempts[-1] = predecessor
+        successor_claim = repository.claim_step(
+            context.term_id,
+            context.step_id,
+            owner_id=f"read-attempt-{effect_attempt}-step-owner",
+            lease_seconds=60,
+        )
+        assert successor_claim is not None
+        successor_proposal = predecessor.model_copy(
+            update={
+                "effect_id": f"effect-read-attempt-{effect_attempt}",
+                "step_claim_digest": successor_claim.identity_digest,
+                "execution_owner_id": None,
+                "lease_expires_at_ms": None,
+                "fence_id": None,
+                "fence_generation": 0,
+                "dispatch_state": "pending",
+                "effect_attempt": effect_attempt,
+                "predecessor_effect_id": predecessor.effect_id,
+                "predecessor_record_digest": canonical_digest(predecessor),
+            }
+        )
+        successor, won = repository.replace_read_effect_with_successor(
+            predecessor,
+            successor_proposal,
+            execution_owner_id=f"read-attempt-{effect_attempt}-effect-owner",
+            lease_duration_ms=60_000,
+            step_claim=successor_claim,
+        )
+        assert won
+        if effect_attempt == 1 or final_phase in {"released", "committed"}:
+            successor = repository.release_tool_dispatch_gate(
+                successor,
+                step_claim=successor_claim,
+                dispatch_required=True,
+            )
+            assert successor is not None
+        if effect_attempt == 2 and final_phase == "committed":
+            result = PublicToolResult(status="completed", summary="Read completed")
+            terminal = successor.model_copy(
+                update={
+                    "status": "committed",
+                    "execution_owner_id": None,
+                    "lease_expires_at_ms": None,
+                    "result_digest": canonical_digest(result),
+                    "public_result": result,
+                }
+            )
+            successor, finished = repository.finish_tool_effect(
+                terminal,
+                expected_owner_id=f"read-attempt-{effect_attempt}-effect-owner",
+                expected_fence_token=successor.fence_token,
+                expected_fence_generation=successor.fence_generation,
+                step_claim=successor_claim,
+            )
+            assert finished
+        attempts.append(successor)
+        predecessor = successor
+    return repository, runtime, inputs, context, tuple(attempts)
+
+
+def _build_round3_replaced_successor_database(
+    tmp_path,
+    *,
+    database_name: str,
+    keep_checkpoint_evidence: bool,
+    corrupt_checkpoint_evidence: bool = False,
+    include_legacy_effect: bool = False,
+):
+    """Create the 11c7c27 active-slot shape after its attempt-1 replacement."""
+    database = tmp_path / database_name
+    repository = PythonTermRepository(database)
+    runtime = PythonTermRuntime(repository)
+    inputs = _runtime_inputs(tmp_path, runtime)
+    context = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    ).contexts[0]
+    predecessor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="round3-predecessor-step-owner",
+        lease_seconds=60,
+    )
+    assert predecessor_claim is not None
+    predecessor, created = repository.reserve_tool_effect(
+        ToolEffectRecord(
+            effect_id="effect-round3-attempt-0",
+            term_id=context.term_id,
+            step_id=context.step_id,
+            tool_call_id="call-round3-successor",
+            request_digest="8" * 64,
+            step_claim_digest=predecessor_claim.identity_digest,
+            status="reserved",
+        ),
+        execution_owner_id="round3-predecessor-effect-owner",
+        lease_duration_ms=60_000,
+        step_claim=predecessor_claim,
+    )
+    assert created
+    runtime._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": "read_value",
+            "tool_call_id": predecessor.tool_call_id,
+            "read_only": True,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    predecessor = _expire_effect_and_step_claim(repository, predecessor)
+    successor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="round3-successor-step-owner",
+        lease_seconds=60,
+    )
+    assert successor_claim is not None
+    successor_proposal = predecessor.model_copy(
+        update={
+            "effect_id": "effect-round3-attempt-1",
+            "step_claim_digest": successor_claim.identity_digest,
+            "execution_owner_id": None,
+            "lease_expires_at_ms": None,
+            "fence_id": None,
+            "fence_generation": 0,
+            "effect_attempt": 1,
+            "predecessor_effect_id": predecessor.effect_id,
+            "predecessor_record_digest": canonical_digest(predecessor),
+        }
+    )
+    successor, won = repository.replace_read_effect_with_successor(
+        predecessor,
+        successor_proposal,
+        execution_owner_id="round3-successor-effect-owner",
+        lease_duration_ms=60_000,
+        step_claim=successor_claim,
+    )
+    assert won
+    legacy_effect_id = "effect-round3-unrelated-legacy"
+    if include_legacy_effect:
+        legacy_result = PublicToolResult(
+            status="completed", summary="Legacy read completed"
+        )
+        repository.save_tool_effect(
+            ToolEffectRecord(
+                effect_id=legacy_effect_id,
+                effect_identity_version="hmac-sha256-v1",
+                term_id=context.term_id,
+                step_id=context.step_id,
+                tool_call_id="call-round3-unrelated-legacy",
+                request_digest="7" * 64,
+                request_digest_version="hmac-sha256-v1",
+                step_claim_digest=successor_claim.identity_digest,
+                write_effect=False,
+                dispatch_state="released",
+                status="committed",
+                result_digest=canonical_digest(legacy_result),
+                public_result=legacy_result,
+            )
+        )
+
+    with sqlite3.connect(database) as connection:
+        if include_legacy_effect:
+            legacy_row = connection.execute(
+                "SELECT effect_json FROM python_tool_effects WHERE effect_id = ?",
+                (legacy_effect_id,),
+            ).fetchone()
+            legacy_payload = json.loads(legacy_row[0])
+            for field in (
+                "step_claim_digest",
+                "result_code",
+                "dispatch_state",
+                "effect_attempt",
+                "predecessor_effect_id",
+                "predecessor_record_digest",
+                "legacy_record_digest",
+                "legacy_effect_collection_digest",
+            ):
+                legacy_payload.pop(field, None)
+            connection.execute(
+                "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+                (canonical_json(legacy_payload), legacy_effect_id),
+            )
+        if not keep_checkpoint_evidence:
+            connection.execute(
+                "DELETE FROM python_step_checkpoints WHERE term_id = ?",
+                (context.term_id,),
+            )
+        elif corrupt_checkpoint_evidence:
+            checkpoint_row = connection.execute(
+                """SELECT checkpoint_ref, checkpoint_json
+                FROM python_step_checkpoints WHERE term_id = ?
+                ORDER BY cursor DESC LIMIT 1""",
+                (context.term_id,),
+            ).fetchone()
+            checkpoint_payload = json.loads(checkpoint_row[1])
+            evidence = checkpoint_payload["evidence"]
+            evidence["effect_evidence"][0]["request_digest"] = "9" * 64
+            evidence["effect_digest"] = canonical_digest(
+                tuple(evidence["effect_evidence"])
+            )
+            evidence["effect_record_digests"] = [
+                canonical_digest(item) for item in evidence["effect_evidence"]
+            ]
+            checkpoint_digest = canonical_digest(evidence)
+            checkpoint_payload["checkpoint_digest"] = checkpoint_digest
+            connection.execute(
+                """UPDATE python_step_checkpoints
+                SET checkpoint_digest = ?, checkpoint_json = ?
+                WHERE checkpoint_ref = ?""",
+                (
+                    checkpoint_digest,
+                    canonical_json(checkpoint_payload),
+                    checkpoint_row[0],
+                ),
+            )
+            for table in ("python_terms", "python_steps"):
+                aggregate_row = connection.execute(
+                    f"SELECT rowid, record_json FROM {table} WHERE term_id = ?",
+                    (context.term_id,),
+                ).fetchone()
+                aggregate_payload = json.loads(aggregate_row[1])
+                aggregate_payload["checkpoint_digest"] = checkpoint_digest
+                connection.execute(
+                    f"UPDATE {table} SET record_json = ? WHERE rowid = ?",
+                    (canonical_json(aggregate_payload), aggregate_row[0]),
+                )
+        for trigger in (
+            "python_tool_effect_attempts_no_update",
+            "python_tool_effect_attempts_no_delete",
+            "python_tool_effect_lineage_no_update",
+            "python_tool_effect_lineage_no_delete",
+            "python_tool_effect_checkpoint_lineage_no_update",
+            "python_tool_effect_checkpoint_lineage_no_delete",
+        ):
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        connection.execute(
+            "DROP TABLE IF EXISTS python_tool_effect_checkpoint_lineage"
+        )
+        connection.execute("DROP TABLE python_tool_effect_lineage")
+        connection.execute("DROP TABLE python_tool_effect_attempts")
+    return database, inputs, context, predecessor, successor
+
+
 def _command(*, two_steps: bool = False) -> QueryCommandV2:
     payload = (
         {
@@ -475,123 +789,17 @@ async def test_crash_after_durable_gate_release_marks_write_dispatch_ambiguous(
 
 
 @pytest.mark.parametrize("successor_phase", ["pending", "released", "committed"])
-def test_read_successor_preserves_predecessor_checkpoint_across_crash_windows(
+def test_multi_generation_read_successor_chain_recovers_across_crash_windows(
     tmp_path, successor_phase
 ) -> None:
-    """Every successor phase must retain the exact predecessor recovery proof."""
-    repository = PythonTermRepository(
-        tmp_path / f"read-successor-{successor_phase}.sqlite"
-    )
-    runtime = PythonTermRuntime(repository)
-    inputs = _runtime_inputs(tmp_path, runtime)
-    context = runtime.compile_start(
-        _command(), agents=(_descriptor(),), **inputs
-    ).contexts[0]
-    predecessor_claim = repository.claim_step(
-        context.term_id,
-        context.step_id,
-        owner_id="read-predecessor-step-owner",
-        lease_seconds=60,
-    )
-    assert predecessor_claim is not None
-    runtime._commit_event(
-        context,
-        event_type="runtime.status",
-        payload={"status": "running"},
-        step_status="running",
-        execution_claim=predecessor_claim,
-    )
-    proposal = ToolEffectRecord(
-        effect_id="effect-read-predecessor",
-        term_id=context.term_id,
-        step_id=context.step_id,
-        tool_call_id="call-read-successor",
-        request_digest="8" * 64,
-        step_claim_digest=predecessor_claim.identity_digest,
-        status="reserved",
-    )
-    predecessor, created = repository.reserve_tool_effect(
-        proposal,
-        execution_owner_id="read-predecessor-effect-owner",
-        lease_duration_ms=60_000,
-        step_claim=predecessor_claim,
-    )
-    assert created
-    runtime._commit_event(
-        context,
-        event_type="tool.call",
-        payload={
-            "tool_id": "read_value",
-            "tool_call_id": predecessor.tool_call_id,
-            "read_only": True,
-            "name": "Tool invocation",
-            "summary": "Tool execution requested",
-        },
-        step_status="running",
-        execution_claim=predecessor_claim,
-    )
-    predecessor = repository.release_tool_dispatch_gate(
-        predecessor,
-        step_claim=predecessor_claim,
-        dispatch_required=True,
-    )
-    assert predecessor is not None
-    expired_predecessor = _expire_effect_and_step_claim(repository, predecessor)
-    successor_claim = repository.claim_step(
-        context.term_id,
-        context.step_id,
-        owner_id="read-successor-step-owner",
-        lease_seconds=60,
-    )
-    assert successor_claim is not None
-    successor_proposal = expired_predecessor.model_copy(
-        update={
-            "effect_id": "effect-read-successor",
-            "step_claim_digest": successor_claim.identity_digest,
-            "execution_owner_id": None,
-            "lease_expires_at_ms": None,
-            "fence_id": None,
-            "fence_generation": 0,
-            "dispatch_state": "pending",
-            "effect_attempt": 1,
-            "predecessor_effect_id": expired_predecessor.effect_id,
-            "predecessor_record_digest": canonical_digest(expired_predecessor),
-        }
-    )
-    successor, won = repository.replace_read_effect_with_successor(
-        expired_predecessor,
-        successor_proposal,
-        execution_owner_id="read-successor-effect-owner",
-        lease_duration_ms=60_000,
-        step_claim=successor_claim,
-    )
-    assert won
-    if successor_phase in {"released", "committed"}:
-        successor = repository.release_tool_dispatch_gate(
-            successor,
-            step_claim=successor_claim,
-            dispatch_required=True,
+    """A checkpoint rooted at attempt 0 must trust the complete 0 -> 1 -> 2 chain."""
+    repository, runtime, inputs, context, attempts = (
+        _build_two_generation_read_successor_chain(
+            tmp_path,
+            database_name=f"read-successor-{successor_phase}.sqlite",
+            final_phase=successor_phase,
         )
-        assert successor is not None
-    if successor_phase == "committed":
-        result = PublicToolResult(status="completed", summary="Read completed")
-        terminal = successor.model_copy(
-            update={
-                "status": "committed",
-                "execution_owner_id": None,
-                "lease_expires_at_ms": None,
-                "result_digest": canonical_digest(result),
-                "public_result": result,
-            }
-        )
-        successor, finished = repository.finish_tool_effect(
-            terminal,
-            expected_owner_id="read-successor-effect-owner",
-            expected_fence_token=successor.fence_token,
-            expected_fence_generation=successor.fence_generation,
-            step_claim=successor_claim,
-        )
-        assert finished
+    )
 
     for _ in range(2):
         decision = runtime.recover(
@@ -599,14 +807,59 @@ def test_read_successor_preserves_predecessor_checkpoint_across_crash_windows(
         )
         assert decision.action == "retry_step"
     effects = repository.list_tool_effects(context.term_id, context.step_id)
-    assert tuple(effect.effect_id for effect in effects) == (
-        expired_predecessor.effect_id,
-        successor.effect_id,
+    assert {effect.effect_id for effect in effects} == {
+        attempt.effect_id for attempt in attempts
+    }
+    assert [effect.effect_attempt for effect in sorted(
+        effects, key=lambda effect: effect.effect_attempt
+    )] == [0, 1, 2]
+    assert max(effects, key=lambda effect: effect.effect_attempt).effect_id == (
+        attempts[-1].effect_id
     )
-    assert repository.get_tool_effect(expired_predecessor.effect_id) == (
-        expired_predecessor
+    assert sum(effect.status == "committed" for effect in effects) <= 1
+    with sqlite3.connect(repository.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM python_tool_effects WHERE term_id = ? AND step_id = ?",
+            (context.term_id, context.step_id),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("tamper", ["digest", "gap", "sibling"])
+def test_multi_generation_successor_chain_rejects_tamper_gap_or_sibling(
+    tmp_path, tamper
+) -> None:
+    """A chain must not trust a broken digest, skipped attempt, or sibling branch."""
+    repository, runtime, inputs, context, attempts = (
+        _build_two_generation_read_successor_chain(
+            tmp_path,
+            database_name=f"read-successor-{tamper}.sqlite",
+            final_phase="pending",
+        )
     )
-    assert sum(effect.effect_attempt == 1 for effect in effects) == 1
+    attempt_0, attempt_1, active = attempts
+    if tamper == "digest":
+        tampered = active.model_copy(
+            update={"predecessor_record_digest": "f" * 64}
+        )
+    elif tamper == "gap":
+        tampered = active.model_copy(update={"effect_attempt": 3})
+    else:
+        tampered = active.model_copy(
+            update={
+                "effect_attempt": 1,
+                "predecessor_effect_id": attempt_0.effect_id,
+                "predecessor_record_digest": canonical_digest(attempt_0),
+            }
+        )
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+            (canonical_json(tampered), active.effect_id),
+        )
+
+    with pytest.raises(PythonTermResumeRejected):
+        runtime.recover(_command(), agents=(_descriptor(),), **inputs)
+    assert len(repository.list_tool_effects(context.term_id, context.step_id)) == 3
 
 
 @pytest.mark.asyncio
@@ -1411,6 +1664,95 @@ async def test_resume_rejects_changed_agent_model_or_handoff_descriptor(
     assert replacement_model.calls == ()
     assert target_model.calls == ()
     assert repository.list_events("term-1") == before
+
+
+def test_round3_replaced_successor_migrates_checkpoint_lineage_and_recovers(
+    tmp_path,
+) -> None:
+    """The 11c7c27 active attempt must regain its checkpoint-proven predecessor."""
+    database, _, context, predecessor, successor = (
+        _build_round3_replaced_successor_database(
+            tmp_path,
+            database_name="round3-replaced-successor.sqlite",
+            keep_checkpoint_evidence=True,
+        )
+    )
+
+    migrated = PythonTermRepository(database)
+    reopened = PythonTermRepository(database)
+
+    assert reopened.get_tool_effect(successor.effect_id) == successor
+    with sqlite3.connect(database) as connection:
+        attempt_rows = connection.execute(
+            """SELECT effect_id, effect_attempt FROM python_tool_effect_attempts
+            ORDER BY effect_attempt"""
+        ).fetchall()
+        checkpoint_lineage = connection.execute(
+            """SELECT effect_id, effect_attempt, record_digest
+            FROM python_tool_effect_checkpoint_lineage ORDER BY effect_attempt"""
+        ).fetchall()
+        active_rows = connection.execute(
+            "SELECT effect_id FROM python_tool_effects"
+        ).fetchall()
+    assert attempt_rows == [
+        (predecessor.effect_id, 0),
+        (successor.effect_id, 1),
+    ]
+    assert checkpoint_lineage == [
+        (predecessor.effect_id, 0, successor.predecessor_record_digest)
+    ]
+    assert active_rows == [(successor.effect_id,)]
+
+    resumed_runtime = PythonTermRuntime(migrated)
+    resumed_inputs = _runtime_inputs(tmp_path, resumed_runtime)
+    for _ in range(2):
+        decision = resumed_runtime.recover(
+            _command(), agents=(_descriptor(),), **resumed_inputs
+        )
+        assert decision.action == "retry_step"
+        assert decision.step_id == context.step_id
+
+
+@pytest.mark.parametrize("evidence_fault", ["missing", "corrupt"])
+def test_round3_replaced_successor_migration_fails_closed_on_bad_checkpoint(
+    tmp_path, evidence_fault
+) -> None:
+    """An orphan active successor must not leave partial lineage rows on failure."""
+    database, _, _, _, successor = _build_round3_replaced_successor_database(
+        tmp_path,
+        database_name=f"round3-{evidence_fault}-predecessor.sqlite",
+        keep_checkpoint_evidence=evidence_fault != "missing",
+        corrupt_checkpoint_evidence=evidence_fault == "corrupt",
+        include_legacy_effect=True,
+    )
+    with sqlite3.connect(database) as connection:
+        before_effect_json = dict(
+            connection.execute(
+                "SELECT effect_id, effect_json FROM python_tool_effects"
+            ).fetchall()
+        )
+
+    with pytest.raises(
+        RepositoryCorruption, match="predecessor checkpoint evidence"
+    ):
+        PythonTermRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        after_effect_json = dict(
+            connection.execute(
+                "SELECT effect_id, effect_json FROM python_tool_effects"
+            ).fetchall()
+        )
+        migration_tables = connection.execute(
+            """SELECT name FROM sqlite_master WHERE type = 'table'
+            AND name IN (
+                'python_tool_effect_attempts',
+                'python_tool_effect_lineage',
+                'python_tool_effect_checkpoint_lineage'
+            ) ORDER BY name"""
+        ).fetchall()
+    assert after_effect_json == before_effect_json
+    assert migration_tables == []
 
 
 def test_9968b3a_database_fixture_migrates_effect_and_resumes_as_v2(

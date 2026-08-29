@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
@@ -20,12 +21,14 @@ from .contracts import (
     ExecutionStatus,
     PublicEventProjection,
     PublicToolResult,
+    RuntimeCheckpointEvidence,
     StepCheckpointRecord,
     StepExecutionClaim,
     StepEventRecord,
     StepEventTransitionRecord,
     StepRecord,
     TermRecord,
+    ToolEffectCheckpointEvidence,
     ToolEffectRecord,
     canonical_digest,
     canonical_json,
@@ -42,6 +45,67 @@ class RepositoryCorruption(RuntimeError):
 
 _EXECUTION_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _EFFECT_TERMINAL = frozenset({"committed", "rejected", "reconciliation_required"})
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointToolEffectLineage:
+    """Immutable predecessor proof reconstructed from a trusted checkpoint."""
+
+    term_id: str
+    step_id: str
+    effect_identity_version: str
+    record_digest: str
+    evidence: ToolEffectCheckpointEvidence
+
+    @property
+    def effect_id(self) -> str:
+        return self.evidence.effect_id
+
+    @property
+    def tool_call_id(self) -> str:
+        return self.evidence.tool_call_id
+
+    @property
+    def effect_attempt(self) -> int:
+        return self.evidence.effect_attempt
+
+    @property
+    def predecessor_effect_id(self) -> str | None:
+        return self.evidence.predecessor_effect_id
+
+    @property
+    def predecessor_record_digest(self) -> str | None:
+        return self.evidence.predecessor_record_digest
+
+    @property
+    def stable_identity_digest(self) -> str:
+        return self.evidence.stable_identity_digest
+
+    @property
+    def request_digest(self) -> str:
+        return self.evidence.request_digest
+
+    @property
+    def request_digest_version(self) -> str:
+        return self.evidence.request_digest_version
+
+    @property
+    def write_effect(self) -> bool:
+        return self.evidence.write_effect
+
+    @property
+    def fence_generation(self) -> int:
+        return self.evidence.fence_generation
+
+    @property
+    def status(self) -> str:
+        return self.evidence.status
+
+    @property
+    def dispatch_state(self) -> str:
+        return self.evidence.dispatch_state
+
+
 _RecordT = TypeVar(
     "_RecordT",
     TermRecord,
@@ -62,8 +126,19 @@ class PythonTermRepository:
         connection = self.connect()
         try:
             migrate_phase1(connection)
-            self._migrate_legacy_tool_effects(connection)
-            self._migrate_tool_effect_lineage(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._migrate_legacy_tool_effects(
+                    connection, transaction_owned=True
+                )
+                self._migrate_tool_effect_lineage(
+                    connection, transaction_owned=True
+                )
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
         finally:
             connection.close()
 
@@ -76,8 +151,14 @@ class PythonTermRepository:
             raise RepositoryCorruption("SQLite trusted clock is unavailable")
         return value
 
-    def _migrate_legacy_tool_effects(self, connection: sqlite3.Connection) -> None:
-        connection.execute("BEGIN IMMEDIATE")
+    def _migrate_legacy_tool_effects(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        transaction_owned: bool = False,
+    ) -> None:
+        if not transaction_owned:
+            connection.execute("BEGIN IMMEDIATE")
         try:
             rows = connection.execute(
                 """SELECT * FROM python_tool_effects
@@ -294,12 +375,19 @@ class PythonTermRepository:
                     raise RepositoryConflict(
                         "legacy Tool Effect migration lost its row fence"
                     )
-            connection.commit()
+            if not transaction_owned:
+                connection.commit()
         except Exception:
-            connection.rollback()
+            if not transaction_owned:
+                connection.rollback()
             raise
 
-    def _migrate_tool_effect_lineage(self, connection: sqlite3.Connection) -> None:
+    def _migrate_tool_effect_lineage(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        transaction_owned: bool = False,
+    ) -> None:
         """Add immutable generation identity and retired-record evidence.
 
         ``python_tool_effects`` remains the one active slot for a logical call so
@@ -307,7 +395,8 @@ class PythonTermRepository:
         every attempt unique and preserve the complete predecessor record when
         that active slot advances to a successor.
         """
-        connection.execute("BEGIN IMMEDIATE")
+        if not transaction_owned:
+            connection.execute("BEGIN IMMEDIATE")
         try:
             statements = (
                 """CREATE TABLE IF NOT EXISTS python_tool_effect_attempts (
@@ -337,6 +426,25 @@ class PythonTermRepository:
                     FOREIGN KEY (term_id, step_id)
                         REFERENCES python_steps(term_id, step_id)
                 )""",
+                """CREATE TABLE IF NOT EXISTS
+                python_tool_effect_checkpoint_lineage (
+                    effect_id TEXT PRIMARY KEY,
+                    term_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    effect_attempt INTEGER NOT NULL,
+                    effect_identity_version TEXT NOT NULL,
+                    request_digest TEXT NOT NULL,
+                    request_digest_version TEXT NOT NULL,
+                    write_effect INTEGER NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    evidence_digest TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    retired_at REAL NOT NULL,
+                    UNIQUE (term_id, step_id, tool_call_id, effect_attempt),
+                    FOREIGN KEY (term_id, step_id)
+                        REFERENCES python_steps(term_id, step_id)
+                )""",
                 """CREATE TRIGGER IF NOT EXISTS
                 python_tool_effect_attempts_no_update
                 BEFORE UPDATE ON python_tool_effect_attempts
@@ -361,6 +469,24 @@ class PythonTermRepository:
                 BEGIN
                     SELECT RAISE(ABORT, 'Tool Effect lineage is append-only');
                 END""",
+                """CREATE TRIGGER IF NOT EXISTS
+                python_tool_effect_checkpoint_lineage_no_update
+                BEFORE UPDATE ON python_tool_effect_checkpoint_lineage
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'Tool Effect checkpoint lineage is append-only'
+                    );
+                END""",
+                """CREATE TRIGGER IF NOT EXISTS
+                python_tool_effect_checkpoint_lineage_no_delete
+                BEFORE DELETE ON python_tool_effect_checkpoint_lineage
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'Tool Effect checkpoint lineage is append-only'
+                    );
+                END""",
             )
             for statement in statements:
                 connection.execute(statement)
@@ -378,20 +504,500 @@ class PythonTermRepository:
                     ORDER BY term_id, step_id, tool_call_id, effect_id"""
                 ).fetchall()
             )
+            checkpoint_lineage = tuple(
+                self._decode_checkpoint_effect_lineage(row)
+                for row in connection.execute(
+                    """SELECT * FROM python_tool_effect_checkpoint_lineage
+                    ORDER BY term_id, step_id, tool_call_id, effect_attempt"""
+                ).fetchall()
+            )
             records = active + retired
-            if len({record.effect_id for record in records}) != len(records):
+            all_ids = {
+                *(record.effect_id for record in records),
+                *(item.evidence.effect_id for item in checkpoint_lineage),
+            }
+            if len(all_ids) != len(records) + len(checkpoint_lineage):
                 raise RepositoryCorruption("Tool Effect lineage duplicates an active ID")
-            for record in records:
-                self._register_tool_effect_attempt(connection, record)
+            completed_checkpoint_lineage = self._complete_tool_effect_lineage(
+                connection,
+                records=records,
+                checkpoint_lineage=checkpoint_lineage,
+            )
+            nodes: list[ToolEffectRecord | _CheckpointToolEffectLineage] = [
+                *records,
+                *completed_checkpoint_lineage,
+            ]
+            for node in sorted(
+                nodes,
+                key=lambda item: self._tool_effect_node_sort_key(item),
+            ):
+                self._register_tool_effect_attempt_identity(
+                    connection,
+                    self._tool_effect_node_attempt_identity(node),
+                )
             attempt_rows = connection.execute(
                 "SELECT * FROM python_tool_effect_attempts"
             ).fetchall()
-            if len(attempt_rows) != len(records):
+            if (
+                len(attempt_rows) != len(nodes)
+                or {row["effect_id"] for row in attempt_rows}
+                != {node.effect_id for node in nodes}
+            ):
                 raise RepositoryCorruption("Tool Effect attempt registry has phantom rows")
-            connection.commit()
+            if not transaction_owned:
+                connection.commit()
         except Exception:
-            connection.rollback()
+            if not transaction_owned:
+                connection.rollback()
             raise
+
+    def _complete_tool_effect_lineage(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        records: Sequence[ToolEffectRecord],
+        checkpoint_lineage: Sequence[_CheckpointToolEffectLineage],
+    ) -> tuple[_CheckpointToolEffectLineage, ...]:
+        """Validate every attempt chain and reconstruct only checkpoint-proven gaps."""
+        nodes_by_id: dict[
+            str, ToolEffectRecord | _CheckpointToolEffectLineage
+        ] = {}
+        nodes_by_attempt: dict[
+            tuple[str, str, str, int],
+            ToolEffectRecord | _CheckpointToolEffectLineage,
+        ] = {}
+
+        def add_node(
+            node: ToolEffectRecord | _CheckpointToolEffectLineage,
+        ) -> None:
+            effect_id = node.effect_id
+            attempt_key = (
+                node.term_id,
+                node.step_id,
+                node.tool_call_id,
+                node.effect_attempt,
+            )
+            if effect_id in nodes_by_id or attempt_key in nodes_by_attempt:
+                raise RepositoryCorruption(
+                    "Tool Effect attempt chain contains a sibling branch"
+                )
+            nodes_by_id[effect_id] = node
+            nodes_by_attempt[attempt_key] = node
+
+        for node in (*records, *checkpoint_lineage):
+            add_node(node)
+
+        recovered = list(checkpoint_lineage)
+        validated: set[str] = set()
+        validating: set[str] = set()
+
+        def validate_chain(
+            successor: ToolEffectRecord | _CheckpointToolEffectLineage,
+        ) -> None:
+            successor_id = successor.effect_id
+            if successor_id in validated:
+                return
+            if successor_id in validating:
+                raise RepositoryCorruption("Tool Effect attempt chain contains a cycle")
+            validating.add(successor_id)
+            successor_attempt = successor.effect_attempt
+            predecessor_id = successor.predecessor_effect_id
+            predecessor_digest = successor.predecessor_record_digest
+            if successor_attempt == 0:
+                if predecessor_id is not None or predecessor_digest is not None:
+                    raise RepositoryCorruption(
+                        "Tool Effect initial attempt has predecessor lineage"
+                    )
+            else:
+                if predecessor_id is None or predecessor_digest is None:
+                    raise RepositoryCorruption(
+                        "Tool Effect predecessor checkpoint evidence is missing"
+                    )
+                predecessor = nodes_by_id.get(predecessor_id)
+                if predecessor is None:
+                    predecessor = self._recover_checkpoint_effect_predecessor(
+                        connection, successor
+                    )
+                    add_node(predecessor)
+                    recovered.append(predecessor)
+                expected_key = (
+                    successor.term_id,
+                    successor.step_id,
+                    successor.tool_call_id,
+                    successor_attempt - 1,
+                )
+                if nodes_by_attempt.get(expected_key) is not predecessor:
+                    raise RepositoryCorruption(
+                        "Tool Effect predecessor chain has a gap or sibling"
+                    )
+                self._validate_tool_effect_successor_hop(
+                    connection,
+                    predecessor=predecessor,
+                    successor=successor,
+                )
+                validate_chain(predecessor)
+            validating.remove(successor_id)
+            validated.add(successor_id)
+
+        for node in sorted(
+            tuple(nodes_by_id.values()),
+            key=lambda item: self._tool_effect_node_sort_key(item),
+            reverse=True,
+        ):
+            validate_chain(node)
+        return tuple(recovered)
+
+    def _recover_checkpoint_effect_predecessor(
+        self,
+        connection: sqlite3.Connection,
+        successor: ToolEffectRecord | _CheckpointToolEffectLineage,
+    ) -> _CheckpointToolEffectLineage:
+        """Recover an omitted Round-3 predecessor from the latest valid checkpoint."""
+        term_id = successor.term_id
+        step_id = successor.step_id
+        tool_call_id = successor.tool_call_id
+        predecessor_id = successor.predecessor_effect_id
+        predecessor_digest = successor.predecessor_record_digest
+        predecessor_attempt = successor.effect_attempt - 1
+        row = connection.execute(
+            """SELECT * FROM python_step_checkpoints
+            WHERE term_id = ? AND step_id = ?
+            ORDER BY cursor DESC LIMIT 1""",
+            (term_id, step_id),
+        ).fetchone()
+        if row is None:
+            raise RepositoryCorruption(
+                "Tool Effect predecessor checkpoint evidence is missing"
+            )
+        checkpoint = self._decode_checkpoint(row)
+        self._load_owning_aggregate(
+            connection, term_id, step_id, required=True
+        )
+        evidence = checkpoint.evidence
+        if not isinstance(evidence, RuntimeCheckpointEvidence) or not (
+            self._checkpoint_effect_collection_is_coherent(evidence)
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect predecessor checkpoint evidence is inconsistent"
+            )
+        candidates = tuple(
+            item
+            for item in evidence.effect_evidence
+            if item.tool_call_id == tool_call_id
+            and item.effect_attempt == predecessor_attempt
+        )
+        if (
+            len(candidates) != 1
+            or candidates[0].effect_id != predecessor_id
+            or predecessor_digest is None
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect predecessor checkpoint evidence is ambiguous"
+            )
+        predecessor_evidence = candidates[0]
+        effect_identity_version = successor.effect_identity_version
+        recovered = _CheckpointToolEffectLineage(
+            term_id=term_id,
+            step_id=step_id,
+            effect_identity_version=effect_identity_version,
+            record_digest=predecessor_digest,
+            evidence=predecessor_evidence,
+        )
+        self._validate_checkpoint_effect_lineage_node(recovered)
+        if (
+            predecessor_evidence.request_digest
+            != successor.request_digest
+            or predecessor_evidence.request_digest_version
+            != successor.request_digest_version
+            or predecessor_evidence.write_effect
+            != successor.write_effect
+            or predecessor_evidence.fence_generation
+            >= successor.fence_generation
+            or not self._durable_tool_call_exists(
+                connection,
+                term_id=term_id,
+                step_id=step_id,
+                tool_call_id=tool_call_id,
+                write_effect=predecessor_evidence.write_effect,
+                maximum_cursor=checkpoint.cursor,
+            )
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect predecessor checkpoint evidence disagrees"
+            )
+        return self._persist_checkpoint_effect_lineage(connection, recovered)
+
+    @staticmethod
+    def _checkpoint_effect_collection_is_coherent(
+        evidence: RuntimeCheckpointEvidence,
+    ) -> bool:
+        effects = evidence.effect_evidence
+        return (
+            tuple((item.tool_call_id, item.effect_id) for item in effects)
+            == tuple(
+                sorted((item.tool_call_id, item.effect_id) for item in effects)
+            )
+            and len({item.effect_id for item in effects}) == len(effects)
+            and evidence.effect_digest == canonical_digest(effects)
+            and evidence.effect_record_digests
+            == tuple(canonical_digest(item) for item in effects)
+        )
+
+    def _validate_tool_effect_successor_hop(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        predecessor: ToolEffectRecord | _CheckpointToolEffectLineage,
+        successor: ToolEffectRecord | _CheckpointToolEffectLineage,
+    ) -> None:
+        if (
+            predecessor.status != "reserved"
+            or predecessor.dispatch_state
+            not in (
+                {"pending"}
+                if predecessor.write_effect
+                else {"pending", "released"}
+            )
+            or successor.term_id != predecessor.term_id
+            or successor.step_id != predecessor.step_id
+            or successor.tool_call_id != predecessor.tool_call_id
+            or successor.request_digest != predecessor.request_digest
+            or successor.request_digest_version
+            != predecessor.request_digest_version
+            or successor.effect_identity_version
+            != predecessor.effect_identity_version
+            or successor.write_effect != predecessor.write_effect
+            or successor.effect_attempt != predecessor.effect_attempt + 1
+            or successor.predecessor_effect_id != predecessor.effect_id
+            or successor.predecessor_record_digest
+            != self._tool_effect_node_record_digest(predecessor)
+            or successor.fence_generation <= predecessor.fence_generation
+            or not self._durable_tool_call_exists(
+                connection,
+                term_id=successor.term_id,
+                step_id=successor.step_id,
+                tool_call_id=successor.tool_call_id,
+                write_effect=successor.write_effect,
+            )
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect predecessor chain identity or digest disagrees"
+            )
+
+    def _durable_tool_call_exists(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        term_id: str,
+        step_id: str,
+        tool_call_id: str,
+        write_effect: bool,
+        maximum_cursor: int | None = None,
+    ) -> bool:
+        parameters: list[object] = [term_id, step_id]
+        cursor_clause = ""
+        if maximum_cursor is not None:
+            cursor_clause = " AND cursor <= ?"
+            parameters.append(maximum_cursor)
+        rows = connection.execute(
+            """SELECT * FROM python_step_events
+            WHERE term_id = ? AND step_id = ? AND event_type = 'tool.call'"""
+            + cursor_clause
+            + " ORDER BY cursor",
+            tuple(parameters),
+        ).fetchall()
+        return any(
+            transition.event.payload.get("tool_call_id") == tool_call_id
+            and transition.event.payload.get("read_only") is (not write_effect)
+            for transition in (self._decode_transition(row) for row in rows)
+        )
+
+    def _persist_checkpoint_effect_lineage(
+        self,
+        connection: sqlite3.Connection,
+        lineage: _CheckpointToolEffectLineage,
+    ) -> _CheckpointToolEffectLineage:
+        evidence = lineage.evidence
+        row = connection.execute(
+            """SELECT * FROM python_tool_effect_checkpoint_lineage
+            WHERE effect_id = ? OR
+            (term_id = ? AND step_id = ? AND tool_call_id = ?
+             AND effect_attempt = ?)""",
+            (
+                evidence.effect_id,
+                lineage.term_id,
+                lineage.step_id,
+                evidence.tool_call_id,
+                evidence.effect_attempt,
+            ),
+        ).fetchone()
+        if row is not None:
+            persisted = self._decode_checkpoint_effect_lineage(row)
+            if persisted != lineage:
+                raise RepositoryCorruption(
+                    "Tool Effect predecessor checkpoint lineage disagrees"
+                )
+            return persisted
+        try:
+            connection.execute(
+                """INSERT INTO python_tool_effect_checkpoint_lineage(
+                effect_id, term_id, step_id, tool_call_id, effect_attempt,
+                effect_identity_version, request_digest,
+                request_digest_version, write_effect, record_digest,
+                evidence_digest, evidence_json, retired_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    evidence.effect_id,
+                    lineage.term_id,
+                    lineage.step_id,
+                    evidence.tool_call_id,
+                    evidence.effect_attempt,
+                    lineage.effect_identity_version,
+                    evidence.request_digest,
+                    evidence.request_digest_version,
+                    int(evidence.write_effect),
+                    lineage.record_digest,
+                    canonical_digest(evidence),
+                    canonical_json(evidence),
+                    time.time(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RepositoryCorruption(
+                "Tool Effect predecessor checkpoint lineage conflicts"
+            ) from exc
+        return lineage
+
+    def _decode_checkpoint_effect_lineage(
+        self, row: sqlite3.Row
+    ) -> _CheckpointToolEffectLineage:
+        evidence = self._parse_model(
+            row["evidence_json"],
+            ToolEffectCheckpointEvidence,
+            "Tool Effect checkpoint lineage",
+        )
+        lineage = _CheckpointToolEffectLineage(
+            term_id=row["term_id"],
+            step_id=row["step_id"],
+            effect_identity_version=row["effect_identity_version"],
+            record_digest=row["record_digest"],
+            evidence=evidence,
+        )
+        if (
+            row["effect_id"] != evidence.effect_id
+            or row["tool_call_id"] != evidence.tool_call_id
+            or row["effect_attempt"] != evidence.effect_attempt
+            or row["request_digest"] != evidence.request_digest
+            or row["request_digest_version"]
+            != evidence.request_digest_version
+            or row["write_effect"] != int(evidence.write_effect)
+            or row["evidence_digest"] != canonical_digest(evidence)
+            or row["evidence_json"] != canonical_json(evidence)
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect checkpoint lineage columns or digest disagree"
+            )
+        self._validate_checkpoint_effect_lineage_node(lineage)
+        return lineage
+
+    @staticmethod
+    def _validate_checkpoint_effect_lineage_node(
+        lineage: _CheckpointToolEffectLineage,
+    ) -> None:
+        evidence = lineage.evidence
+        expected_stable_identity = canonical_digest(
+            {
+                "record_version": 2,
+                "effect_id": evidence.effect_id,
+                "effect_identity_version": lineage.effect_identity_version,
+                "term_id": lineage.term_id,
+                "step_id": lineage.step_id,
+                "tool_call_id": evidence.tool_call_id,
+                "write_effect": evidence.write_effect,
+                "effect_attempt": evidence.effect_attempt,
+                "predecessor_effect_id": evidence.predecessor_effect_id,
+                "predecessor_record_digest": evidence.predecessor_record_digest,
+            }
+        )
+        expected_result_evidence = canonical_digest(
+            {
+                "status": evidence.status,
+                "dispatch_state": evidence.dispatch_state,
+                "result_code": evidence.result_code,
+                "result_digest": evidence.result_digest,
+                "result_digest_version": "canonical-sha256-v1",
+                "public_result": None,
+            }
+        )
+        digest_is_valid = (
+            isinstance(lineage.record_digest, str)
+            and len(lineage.record_digest) == 64
+            and all(character in "0123456789abcdef" for character in lineage.record_digest)
+        )
+        lineage_shape_is_valid = (
+            (
+                evidence.effect_attempt == 0
+                and evidence.predecessor_effect_id is None
+                and evidence.predecessor_record_digest is None
+            )
+            or (
+                evidence.effect_attempt > 0
+                and evidence.predecessor_effect_id is not None
+                and evidence.predecessor_record_digest is not None
+                and evidence.predecessor_effect_id != evidence.effect_id
+            )
+        )
+        if not (
+            digest_is_valid
+            and lineage.effect_identity_version
+            in {"opaque-v1", "hmac-sha256-v1", "legacy-unkeyed-sha256-v0"}
+            and evidence.stable_identity_digest == expected_stable_identity
+            and lineage_shape_is_valid
+            and evidence.status == "reserved"
+            and evidence.dispatch_state in {"pending", "released"}
+            and evidence.execution_owner_id is not None
+            and evidence.fence_id is not None
+            and evidence.fence_generation > 0
+            and evidence.result_code is None
+            and evidence.result_digest is None
+            and evidence.result_evidence_digest == expected_result_evidence
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect predecessor checkpoint evidence is invalid"
+            )
+
+    @staticmethod
+    def _tool_effect_node_sort_key(
+        node: ToolEffectRecord | _CheckpointToolEffectLineage,
+    ) -> tuple[str, str, str, int, str]:
+        return (
+            node.term_id,
+            node.step_id,
+            node.tool_call_id,
+            node.effect_attempt,
+            node.effect_id,
+        )
+
+    @staticmethod
+    def _tool_effect_node_record_digest(
+        node: ToolEffectRecord | _CheckpointToolEffectLineage,
+    ) -> str:
+        return canonical_digest(node) if isinstance(node, ToolEffectRecord) else node.record_digest
+
+    @staticmethod
+    def _tool_effect_node_attempt_identity(
+        node: ToolEffectRecord | _CheckpointToolEffectLineage,
+    ) -> tuple[object, ...]:
+        return (
+            node.effect_id,
+            node.term_id,
+            node.step_id,
+            node.tool_call_id,
+            node.effect_attempt,
+            node.predecessor_effect_id,
+            node.predecessor_record_digest,
+            node.stable_identity_digest,
+        )
 
     @staticmethod
     def _effect_attempt_identity(effect: ToolEffectRecord) -> tuple[object, ...]:
@@ -411,17 +1017,36 @@ class PythonTermRepository:
         connection: sqlite3.Connection,
         effect: ToolEffectRecord,
     ) -> None:
+        self._register_tool_effect_attempt_identity(
+            connection, self._effect_attempt_identity(effect)
+        )
+
+    def _register_tool_effect_attempt_identity(
+        self,
+        connection: sqlite3.Connection,
+        identity: tuple[object, ...],
+    ) -> None:
+        (
+            effect_id,
+            term_id,
+            step_id,
+            tool_call_id,
+            effect_attempt,
+            predecessor_effect_id,
+            predecessor_record_digest,
+            stable_identity_digest,
+        ) = identity
         row = connection.execute(
             """SELECT * FROM python_tool_effect_attempts
             WHERE effect_id = ? OR
             (term_id = ? AND step_id = ? AND tool_call_id = ?
              AND effect_attempt = ?)""",
             (
-                effect.effect_id,
-                effect.term_id,
-                effect.step_id,
-                effect.tool_call_id,
-                effect.effect_attempt,
+                effect_id,
+                term_id,
+                step_id,
+                tool_call_id,
+                effect_attempt,
             ),
         ).fetchone()
         if row is None:
@@ -432,7 +1057,7 @@ class PythonTermRepository:
                     predecessor_effect_id, predecessor_record_digest,
                     stable_identity_digest, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (*self._effect_attempt_identity(effect), time.time()),
+                    (*identity, time.time()),
                 )
             except sqlite3.IntegrityError as exc:
                 raise RepositoryConflict(
@@ -449,7 +1074,7 @@ class PythonTermRepository:
             row["predecessor_record_digest"],
             row["stable_identity_digest"],
         )
-        if persisted != self._effect_attempt_identity(effect):
+        if persisted != identity:
             raise RepositoryCorruption("Tool Effect attempt identity disagrees")
 
     def _preserve_retired_tool_effect(
@@ -2191,6 +2816,27 @@ class PythonTermRepository:
                         effect.effect_id,
                     ),
                 )
+            )
+
+    def list_tool_effect_checkpoint_lineage(
+        self, term_id: str, step_id: str
+    ) -> tuple[tuple[ToolEffectCheckpointEvidence, str], ...]:
+        """Return immutable evidence-only predecessors from a Round-3 migration."""
+        with self._read_snapshot() as connection:
+            rows = connection.execute(
+                """SELECT * FROM python_tool_effect_checkpoint_lineage
+                WHERE term_id = ? AND step_id = ?
+                ORDER BY tool_call_id, effect_attempt, effect_id""",
+                (term_id, step_id),
+            ).fetchall()
+            self._load_owning_aggregate(
+                connection, term_id, step_id, required=bool(rows)
+            )
+            lineage = tuple(
+                self._decode_checkpoint_effect_lineage(row) for row in rows
+            )
+            return tuple(
+                (item.evidence, item.record_digest) for item in lineage
             )
 
     def _require_term(
