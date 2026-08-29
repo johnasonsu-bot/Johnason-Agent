@@ -12,7 +12,12 @@ from workbench.workflow.store import WorkflowStore
 
 
 TERMINAL_TURN_STATES = {"completed", "failed", "reconciliation_required"}
-TURN_ROUTING_METADATA = ("runner_mode", "host_run_id")
+TURN_ROUTING_METADATA = (
+    "runner_mode",
+    "host_run_id",
+    "runtime_id",
+    "runtime_build_id",
+)
 
 
 class TurnSnapshotCorruption(ValueError):

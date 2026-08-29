@@ -70,6 +70,8 @@ test("uses a narrow IPC bridge for the Electron-owned backend", async ({}, testI
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "PUT", path: "/providers" }))).rejects.toThrow();
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/health" }))).rejects.toThrow();
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "DELETE", path: "/providers/not.valid" }))).rejects.toThrow();
+    await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/v1/engine-host" }))).resolves.toMatchObject({ status: 200 });
+    await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "POST", path: "/v1/engine-host" }))).rejects.toThrow();
   } finally {
     await app.close();
   }

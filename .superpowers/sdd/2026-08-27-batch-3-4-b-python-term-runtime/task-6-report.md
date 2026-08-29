@@ -40,10 +40,10 @@
 
 ## Task 7 gate 的接口说明
 
-Task 7 尚未实现，因此本 Task 未声明或伪造 `GO_PYTHON_TERM_RUNTIME`。路由只接受
-`RuntimeGateMetadataV2`，它固定并验证 `runtime_id`、`build_id`、protocol `2.0` 和
-capability digest；digest 在同一 control-plane registration transaction 内重新计算并比较。
-该 metadata 不包含 gate verdict、Provider grant、可执行命令、环境或凭据。
+Task 7 尚未实现，因此本 Task 未声明或伪造 `GO_PYTHON_TERM_RUNTIME`。Round 1 后移除了
+公开 `RuntimeGateMetadataV2`；路由只接受私有固定 control-plane verifier seam 的 proof，
+它绑定 source revision、runtime/build/protocol、capability digest 和 gate-result digest，且不从
+HTTP、IPC 或 caller metadata 接受输入。该 proof 不包含 Provider grant、可执行命令、环境或凭据。
 
 主应用当前的固定 Python Term composition 没有 model/Tool Router authority，因此真实
 capability 只声明 `checkpoints` 与 `event_cursor`，无法接受 Query。Task 7 或后续受控
@@ -68,6 +68,62 @@ Provider grant。Task 5 测试进程报告 `OPENAI_API_KEY is not set, skipping 
 
 ## Concern
 
-- 无阻塞 concern。
-- `RuntimeGateMetadataV2` 是 control-plane 可验证的资格输入而不是 Task 7 gate verdict；
-  Task 7 仍需独立运行并诚实记录最终门禁结论。
+- 该初版 concern 已由下方 Round 1 修复取代；Task 7 仍需独立运行并诚实记录最终门禁结论。
+
+## Round 1 修复（2026-08-29）
+
+### RED → GREEN
+
+1. RED：公开 `RuntimeGateMetadataV2.from_capabilities()` 与 `main.py` 的自动构造可由
+   capability snapshot 自签，且会在 `app.state` 暴露；未实现 Task 7 时这会错误地产生
+   admission 资格。GREEN：删除该公开类型/工厂和自动发行；生产 composition 仅注册真实
+   runtime 作只读诊断。私有固定 verifier seam 的 proof 同时绑定 source revision、
+   runtime/build/protocol、capability digest 和 gate-result digest。正常 composition 不调用
+   issuer；HTTP、IPC 与 renderer 均没有 proof 输入。
+2. RED：显式 `POST /api/sessions/{session_id}/messages` 没有 runtime 选择，因而不能在
+   enqueue 前执行 Host v2 route。GREEN：`runtime: "python-term"` 走
+   `AppSettings -> ConversationAPI` 的窄 router protocol，由固定 control-plane builder
+   生成最小、冻结、无 Tool/Skill/Workspace authority 的 QueryCommandV2/RunEnvelopeV2。
+   无 Task 7 proof 时固定返回 `503 {"detail":"python term runtime unavailable"}`，且不建立
+   conversation turn 或 runtime pin；遗漏 runtime 字段保持 v1。另一个 RED 用例确认已存在的
+   v1 Idempotency-Key 不能在随后显式请求中先创建 Python Term pin 再报 conflict；GREEN 在
+   v2 admission 前只读校验 reservation identity。
+3. RED：requirements 只覆盖部分 manifest。GREEN：从完整 envelope 统一映射 query/model、
+   tools、skills、plugins、实际 workspace grant usage、interventions、pause/resume、
+   compaction、checkpoints、streaming、plan/todo、prompt sections、tool interceptors 和
+   event cursor。表驱动 RED→GREEN 覆盖 summarize、prompt sections、plugins 与 workspace；
+   未广告 capability 在 pin 前 fail closed。
+4. RED：Electron 未转发两个 v2 flags、IPC 未允许 v2 read-only endpoint，Canvas 未显示
+   typed v2 diagnostic。GREEN：child allowlist 仅新增
+   `WORKBENCH_ENGINE_HOST_V2_ENABLED`、`WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED` 并保留原始
+   字符串；IPC 仅允许 `GET /api/v1/engine-host`；既有诊断区显示 typed `Host v2` 摘要，未新增
+   写端点或配置 UI。
+
+### 兼容与安全边界
+
+- `runtime_id` / `runtime_build_id` 与 `runner_mode="python_term"` 作为不可变 turn routing
+  metadata 持久化。已接受 command 不会回退 v1；当前没有 Task 7 executor composition 时，
+  worker 明确 fail closed，不会把 Python Term pin 交给 v1 runner。
+- 旧消息缺省 runtime selection 的请求路径、selector 和 runner mode 保持原样。renderer API
+  仅增加可选 `runtimeId?: "python-term"` 参数，不改变默认 payload。
+- 错误诊断不再通过 exception message 分类。registry 使用固定 typed code，并只公开原有的
+  allowlist category；API 对不可用状态返回固定、非敏感 detail。
+- 私有 issuer identity 是为了阻止 caller-shaped/lookalike metadata 被误接纳，并不声称抵抗
+  任意进程内反射。Task 7 必须以该 fixed seam 提供其自身可验证 gate 结果，才可能让新的生产
+  command 获得 proof；本 Task 没有产出或伪造 `GO_PYTHON_TERM_RUNTIME`。
+
+### Round 1 验证证据
+
+1. `pytest -q tests/integration/test_python_term_routing.py tests/acceptance/test_python_term_compatibility.py`：`22 passed in 3.21s`。
+2. Host/API/Conversation 回归（registry、v1/v2 diagnostic、conformance、queue 与上述 Task 6
+   用例）：`108 passed in 11.97s`。
+3. Task 5 回归 `tests/integration/test_python_term_runtime.py tests/integration/test_python_term_recovery.py`：`64 passed in 42.42s`。
+4. `pytest -q tests/unit`：`2125 passed in 114.22s`。
+5. Canvas `npm test`：TypeScript/Vite build 成功，Playwright `38 passed (1.6m)`。
+6. `compileall`（main、api、conversations、Host v2、Python Term）与 `git diff --check`：exit 0。
+
+### Round 1 Concern
+
+- 未实现 Task 7 gate metadata/GO，也不以 capability registration 代替 proof。当前生产 explicit
+  Python Term request 因此按设计不可用；Task 7 需要提供固定控制面的 proof 与实际 executor
+  composition，才可打开 admission/execution。

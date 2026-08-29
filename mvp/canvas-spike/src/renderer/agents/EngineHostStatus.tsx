@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { engineHostApi, type EngineHostStatus as EngineHostStatusValue } from "../api";
+import {
+  engineHostApi,
+  type EngineHostStatus as EngineHostStatusValue,
+  type EngineHostV2Diagnostic,
+} from "../api";
 
 const capabilityLabels: Record<keyof NonNullable<EngineHostStatusValue["capabilities"]>, string> = {
   model: "Model",
@@ -12,13 +16,16 @@ const capabilityLabels: Record<keyof NonNullable<EngineHostStatusValue["capabili
 
 export function EngineHostStatus() {
   const [status, setStatus] = useState<EngineHostStatusValue | null>(null);
+  const [v2Status, setV2Status] = useState<EngineHostV2Diagnostic | null>(null);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      setStatus(await engineHostApi.status());
+      const [v1, v2] = await Promise.all([engineHostApi.status(), engineHostApi.v2Status()]);
+      setStatus(v1);
+      setV2Status(v2);
       setError("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法读取 Engine Host 状态");
@@ -53,6 +60,14 @@ export function EngineHostStatus() {
       {capabilities.length > 0 && <div className="engine-host-capabilities" aria-label="Engine Host 能力">
         {capabilities.map(([name]) => <span key={name}>{capabilityLabels[name as keyof typeof capabilityLabels]}</span>)}
       </div>}
+      <div className="engine-host-capabilities" aria-label="Host v2 只读诊断">
+        <span>{`Host v2 · ${v2Status?.v2.enabled ? "enabled" : "disabled"}`}</span>
+        {v2Status?.v2.runtimes.map((runtime) => (
+          <span key={`${runtime.runtime_id}:${runtime.build_id}`}>
+            {`${runtime.runtime_id} · ${runtime.state}`}
+          </span>
+        ))}
+      </div>
     </>}
     <p className="engine-host-readonly">只读诊断 · 不提供命令、环境变量或凭据编辑</p>
   </section>;

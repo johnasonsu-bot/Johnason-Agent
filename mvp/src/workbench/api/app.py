@@ -18,6 +18,7 @@ from workbench.api.artifacts import artifact_router
 from workbench.api.commands import CreateRunRequest, InterventionRequest
 from workbench.api.conversations import (
     ConversationAPI,
+    PythonTermConversationRouter,
     SequentialOrchestrationProcessor,
     conversation_router,
 )
@@ -72,6 +73,7 @@ class AppSettings:
     host_generation: str | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_processor: object | None = None
+    python_term_router: PythonTermConversationRouter | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -117,6 +119,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         project_contexts=ProjectContextRepository(settings.database),
         sequential_processor=sequential_processor,
         development_jobs=development_jobs,
+        python_term_router=settings.python_term_router,
     )
     conversation_worker = ConversationTaskWorker(
         conversation_api.conversations, conversation_api

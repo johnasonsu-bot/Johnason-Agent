@@ -21,6 +21,7 @@ test("shows the read-only Engine Host contract state", async ({}, testInfo) => {
     await expect(card).toBeVisible();
     await expect(card).toContainText("Python Runtime");
     await expect(card).toContainText("disabled");
+    await expect(card).toContainText("Host v2 · disabled");
     await expect(card.getByRole("button", { name: "刷新 Engine Host 状态" })).toBeVisible();
     await expect(card.getByRole("textbox")).toHaveCount(0);
     await expect(card.getByRole("combobox")).toHaveCount(0);

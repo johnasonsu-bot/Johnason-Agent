@@ -103,8 +103,23 @@ export type EngineHostStatus = {
   runner_mode: "python" | "engine_host";
 };
 
+export type EngineHostV2Diagnostic = {
+  v2: {
+    enabled: boolean;
+    protocol: "2.0";
+    runtimes: Array<{
+      runtime_id: string;
+      build_id: string;
+      state: "ready" | "disabled" | "unavailable";
+      capabilities: string[];
+      last_error_category?: "capability_unavailable" | "command_rejected" | "gate_metadata_unavailable" | "registry_integrity";
+    }>;
+  };
+};
+
 export const engineHostApi = {
   status: () => request<EngineHostStatus>("/engine-host/status"),
+  v2Status: () => request<EngineHostV2Diagnostic>("/v1/engine-host"),
 };
 
 export type ConversationEvent = { type?: string; name?: string; delta?: string; result?: string; toolCallName?: string; value?: Record<string, unknown>; runId?: string; sequence?: number; eventId?: string; cursor?: string };
@@ -126,7 +141,17 @@ export const artifactApi = {
 export type AgentBinding = { agent_id: string; expected_version: number };
 export type ConversationResponse = { session_id: string; command_id: string; status: string; cursor?: string | null; events?: ConversationEvent[]; plan_id?: string; graph_run_id?: string };
 
-const sendMessage = (sessionId: string, content: string, commandId: string, model = "default", providerId?: string, agentBindings: AgentBinding[] = []) => request<ConversationResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: "POST", body: JSON.stringify(agentBindings.length ? { content, agent_bindings: agentBindings } : { content, model, provider_id: providerId }), headers: { "Idempotency-Key": commandId } });
+const sendMessage = (sessionId: string, content: string, commandId: string, model = "default", providerId?: string, agentBindings: AgentBinding[] = [], runtimeId?: "python-term") => {
+  const body: Record<string, unknown> = agentBindings.length
+    ? { content, agent_bindings: agentBindings }
+    : { content, model, provider_id: providerId };
+  if (runtimeId !== undefined) body.runtime = runtimeId;
+  return request<ConversationResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    headers: { "Idempotency-Key": commandId },
+  });
+};
 
 export function isRetryableConversationError(error: unknown): boolean {
   if (!(error instanceof ApiRequestError) || error.status !== 503) return false;

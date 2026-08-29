@@ -26,6 +26,8 @@ record("engine-host-env:" + JSON.stringify({
   enabled: process.env.WORKBENCH_ENGINE_HOST_ENABLED,
   command: process.env.WORKBENCH_ENGINE_HOST_COMMAND_JSON,
   allowlist: process.env.WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON,
+  v2Enabled: process.env.WORKBENCH_ENGINE_HOST_V2_ENABLED,
+  pythonTermEnabled: process.env.WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED,
 }));
 let bootstrap = "";
 process.stdin.setEncoding("utf8");
@@ -107,6 +109,8 @@ test("engine host JSON settings cross the sanitized backend environment unchange
       WORKBENCH_ENGINE_HOST_ENABLED: "true",
       WORKBENCH_ENGINE_HOST_COMMAND_JSON: command,
       WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON: allowlist,
+      WORKBENCH_ENGINE_HOST_V2_ENABLED: "true",
+      WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED: "false",
     },
   });
 
@@ -114,7 +118,13 @@ test("engine host JSON settings cross the sanitized backend environment unchange
     await app.firstWindow();
     await expect.poll(async () => eventsText(events)).toContain("ready");
     await expect.poll(async () => eventsText(events)).toContain(
-      `engine-host-env:${JSON.stringify({ enabled: "true", command, allowlist })}`,
+      `engine-host-env:${JSON.stringify({
+        enabled: "true",
+        command,
+        allowlist,
+        v2Enabled: "true",
+        pythonTermEnabled: "false",
+      })}`,
     );
   } finally {
     await app.close();

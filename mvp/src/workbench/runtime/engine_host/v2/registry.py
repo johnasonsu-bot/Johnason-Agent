@@ -13,7 +13,6 @@ from typing import Literal
 from pydantic import ConfigDict, StrictBool
 
 from workbench.runtime.engine_host.v2.contracts import (
-    Digest,
     FrozenModel,
     QueryCommandV2,
     RunEnvelopeV2,
@@ -58,6 +57,20 @@ _DIAGNOSTIC_ERROR_CATEGORIES = frozenset(
 
 class NoConformantRuntime(RuntimeError):
     """No registered v2 runtime can safely accept the requested command."""
+
+
+class PythonTermRoutingError(NoConformantRuntime):
+    """A fixed, non-secret Python Term admission result."""
+
+    def __init__(self, code: Literal["capability_unavailable", "command_rejected", "gate_metadata_unavailable"]) -> None:
+        self.code = code
+        self.diagnostic_category = code
+        message = {
+            "capability_unavailable": "Python Term capability is unavailable",
+            "command_rejected": "Python Term command was rejected",
+            "gate_metadata_unavailable": "Python Term gate proof is unavailable",
+        }[code]
+        super().__init__(message)
 
 
 class RuntimeRegistryIntegrityError(RuntimeError):
@@ -170,33 +183,77 @@ class RuntimeRequirementsV2(FrozenModel):
     event_cursor: StrictBool = False
 
 
-class RuntimeGateMetadataV2(FrozenModel):
-    """Fixed, verifiable metadata required before a gated runtime is selected.
+_PYTHON_TERM_GATE_ISSUER = object()
 
-    This record is intentionally not a runtime gate decision.  It lets the
-    control plane compare one concrete runtime build and capability snapshot
-    without accepting mutable process configuration, provider grants, or a
-    caller supplied "GO" assertion.
+
+@dataclass(frozen=True, slots=True)
+class _PythonTermGateProofV2:
+    """Private Task 7 proof consumed only by the fixed control-plane verifier.
+
+    The issuer identity makes accidental/caller-shaped metadata fail closed.  It
+    is deliberately not described as a defense against arbitrary in-process
+    reflection: trusted composition remains the boundary for this private seam.
     """
 
+    source_revision: str
     runtime_id: str
     build_id: str
-    protocol_version: Literal["2.0"] = "2.0"
-    capability_digest: Digest
+    protocol_version: Literal["2.0"]
+    capability_digest: str
+    gate_result_digest: str
+    _issuer: object
 
-    @classmethod
-    def from_capabilities(
-        cls, capabilities: RuntimeCapabilitiesV2
-    ) -> "RuntimeGateMetadataV2":
-        if not isinstance(capabilities, RuntimeCapabilitiesV2):
-            raise TypeError("capabilities must be a RuntimeCapabilitiesV2")
-        _, capability_digest = canonical_capability_snapshot(capabilities)
-        return cls(
-            runtime_id=capabilities.runtime_id,
-            build_id=capabilities.build_id,
-            protocol_version=capabilities.protocol_version,
-            capability_digest=capability_digest,
-        )
+
+def _issue_python_term_gate_proof_for_task7(
+    *,
+    source_revision: str,
+    capabilities: RuntimeCapabilitiesV2,
+    gate_result_digest: str,
+) -> _PythonTermGateProofV2:
+    """Private fixed issuer seam for the future Task 7 control-plane result.
+
+    Task 6 production composition never calls this helper.  It exists solely
+    so the Task 7-owned verifier can bind its immutable source revision and
+    result digest to one runtime registration before a new command is pinned.
+    """
+    if (
+        not isinstance(source_revision, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", source_revision)
+        or not isinstance(capabilities, RuntimeCapabilitiesV2)
+        or not isinstance(gate_result_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", gate_result_digest) is None
+    ):
+        raise TypeError("invalid private Python Term gate proof input")
+    _, capability_digest = canonical_capability_snapshot(capabilities)
+    return _PythonTermGateProofV2(
+        source_revision=source_revision,
+        runtime_id=capabilities.runtime_id,
+        build_id=capabilities.build_id,
+        protocol_version=capabilities.protocol_version,
+        capability_digest=capability_digest,
+        gate_result_digest=gate_result_digest,
+        _issuer=_PYTHON_TERM_GATE_ISSUER,
+    )
+
+
+def _verify_python_term_gate_proof(
+    proof: object,
+    capabilities: RuntimeCapabilitiesV2,
+) -> bool:
+    """Verify the private Task 7 binding without accepting HTTP/IPC metadata."""
+    if not isinstance(proof, _PythonTermGateProofV2):
+        return False
+    if proof._issuer is not _PYTHON_TERM_GATE_ISSUER:
+        return False
+    _, capability_digest = canonical_capability_snapshot(capabilities)
+    return (
+        bool(proof.source_revision)
+        and proof.runtime_id == capabilities.runtime_id
+        and proof.build_id == capabilities.build_id
+        and proof.protocol_version == capabilities.protocol_version
+        and proof.capability_digest == capability_digest
+        and re.fullmatch(r"[0-9a-f]{64}", proof.gate_result_digest) is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -475,54 +532,53 @@ class RuntimeRegistryV2:
         """Resolve an accepted command only to its durable runtime/build pair."""
         return self._selection_for_pin(command_id)
 
+    def python_term_registration(self) -> RuntimeCapabilitiesV2:
+        """Return the current Python Term build only for fixed control-plane assembly."""
+        with self._lock, self.repository.store.connect() as connection:
+            registration = next(
+                (
+                    item
+                    for item in self._registrations(connection)
+                    if item.capabilities.runtime_id == "python-term"
+                    and item.state == "ready"
+                ),
+                None,
+            )
+        if registration is None:
+            raise NoConformantRuntime("Python Term runtime registration is unavailable")
+        return registration.capabilities
+
     def route_python_term_query(
         self,
         command: QueryCommandV2,
         envelope: RunEnvelopeV2,
-        gate_metadata: RuntimeGateMetadataV2,
+        *,
+        gate_proof: object | None = None,
     ) -> RuntimeSelectionV2:
         """Select and pin only a new, explicitly requested Python Term query.
 
         An existing command never re-enters runtime selection: its persisted
         runtime/build pin is returned even after the live registration changes.
-        New commands require a Host v2 capability match and metadata that can
-        be checked against the same registration transaction.
+        New commands require a Host v2 capability match and a private Task 7
+        control-plane proof checked in the same registration transaction.
         """
         if not isinstance(command, QueryCommandV2):
             raise TypeError("command must be a QueryCommandV2")
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
-        if not isinstance(gate_metadata, RuntimeGateMetadataV2):
-            raise TypeError("gate_metadata must be a RuntimeGateMetadataV2")
         if command.type != "query.start" or command.command_id != envelope.command_id:
             self._record_diagnostic_error("python-term", "command_rejected")
-            raise NoConformantRuntime("Python Term command was rejected") from None
-        if (
-            envelope.runtime.runtime_id != "python-term"
-            or gate_metadata.runtime_id != "python-term"
-        ):
+            raise PythonTermRoutingError("command_rejected") from None
+        if envelope.runtime.runtime_id != "python-term":
             self._record_diagnostic_error("python-term", "gate_metadata_unavailable")
-            raise NoConformantRuntime(
-                "Python Term runtime metadata is unavailable for command admission"
-            ) from None
-        requirements = RuntimeRequirementsV2(
-            preferred_runtime_id="python-term",
-            query=True,
-            model=True,
-            tools=bool(envelope.tool_manifest),
-            skills=bool(envelope.skill_pins),
-            plugins=bool(envelope.plugin_pins),
-            workspace=bool(envelope.tool_manifest),
-            checkpoints=True,
-            streaming=True,
-            event_cursor=True,
-        )
+            raise PythonTermRoutingError("gate_metadata_unavailable") from None
+        requirements = _requirements_for_python_term_envelope(envelope)
         try:
             with self._lock:
                 admitted = self.repository._admit_command(
-                    envelope,
-                    lambda connection: self._select_python_term_for_admission(
-                        envelope, requirements, gate_metadata, connection
+                envelope,
+                lambda connection: self._select_python_term_for_admission(
+                        envelope, requirements, gate_proof, connection
                     ),
                 )
                 if admitted.selection is None:
@@ -543,13 +599,11 @@ class RuntimeRegistryV2:
         except RuntimeRegistryIntegrityError:
             self._record_diagnostic_error("python-term", "registry_integrity")
             raise
-        except NoConformantRuntime as error:
-            category = (
-                "gate_metadata_unavailable"
-                if "metadata" in str(error)
-                else "capability_unavailable"
-            )
-            self._record_diagnostic_error("python-term", category)
+        except PythonTermRoutingError as error:
+            self._record_diagnostic_error("python-term", error.diagnostic_category)
+            raise
+        except NoConformantRuntime:
+            self._record_diagnostic_error("python-term", "capability_unavailable")
             raise
 
     def last_error_category(self, runtime_id: str) -> str | None:
@@ -638,14 +692,12 @@ class RuntimeRegistryV2:
         self,
         envelope: RunEnvelopeV2,
         requirements: RuntimeRequirementsV2,
-        gate_metadata: RuntimeGateMetadataV2,
+        gate_proof: object | None,
         connection: sqlite3.Connection,
     ) -> RuntimeSelectionV2:
         chosen = self._select_for_admission(envelope, requirements, connection)
         if chosen.runtime_id != "python-term":
-            raise NoConformantRuntime(
-                "Python Term cannot fall back to another runtime before admission"
-            )
+            raise PythonTermRoutingError("capability_unavailable")
         registration = next(
             (
                 item
@@ -655,20 +707,9 @@ class RuntimeRegistryV2:
             None,
         )
         if registration is None:
-            raise NoConformantRuntime(
-                "Python Term capability metadata is unavailable for command admission"
-            )
-        _, capability_digest = canonical_capability_snapshot(registration.capabilities)
-        if (
-            gate_metadata.runtime_id != registration.capabilities.runtime_id
-            or gate_metadata.build_id != registration.capabilities.build_id
-            or gate_metadata.protocol_version
-            != registration.capabilities.protocol_version
-            or gate_metadata.capability_digest != capability_digest
-        ):
-            raise NoConformantRuntime(
-                "Python Term capability metadata does not match the registration"
-            )
+            raise PythonTermRoutingError("gate_metadata_unavailable")
+        if not _verify_python_term_gate_proof(gate_proof, registration.capabilities):
+            raise PythonTermRoutingError("gate_metadata_unavailable")
         return chosen
 
     def _registrations(
@@ -738,6 +779,60 @@ def _meets_requirements(
     return all(
         not getattr(requirements, name) or getattr(capabilities, name)
         for name in _CAPABILITY_NAMES
+    )
+
+
+def _extension_requests(envelope: RunEnvelopeV2, *names: str) -> bool:
+    """Normalize explicit optional envelope requests without inferring authority."""
+    for name in names:
+        value = envelope.extensions.get(name)
+        if value is True:
+            return True
+        if isinstance(value, (str, tuple, list, dict)) and bool(value):
+            return True
+    return False
+
+
+def _requirements_for_python_term_envelope(
+    envelope: RunEnvelopeV2,
+) -> RuntimeRequirementsV2:
+    """Map the complete frozen envelope to the capabilities needed for admission."""
+    workspace = envelope.workspace_grant
+    workspace_used = bool(
+        workspace.readable_paths
+        or workspace.writable_paths
+        or workspace.command_policy != "deny"
+        or workspace.network_policy != "deny"
+    )
+    prompt_sections = bool(
+        envelope.context_budget.protected_prompt_section_ids
+        or any(pin.prompt_section_ids for pin in envelope.skill_pins)
+        or _extension_requests(envelope, "prompt_sections")
+    )
+    return RuntimeRequirementsV2(
+        preferred_runtime_id="python-term",
+        query=True,
+        model=True,
+        tools=bool(envelope.tool_manifest),
+        skills=bool(envelope.skill_pins),
+        plugins=bool(envelope.plugin_pins),
+        workspace=workspace_used,
+        interventions=_extension_requests(
+            envelope, "interventions", "interventions_requested"
+        ),
+        pause_resume=_extension_requests(
+            envelope, "pause_resume", "pause_resume_requested"
+        ),
+        compaction=envelope.context_budget.compaction_policy == "summarize",
+        checkpoints=True,
+        streaming=True,
+        plan=_extension_requests(envelope, "plan", "plan_requested"),
+        todo=_extension_requests(envelope, "todo", "todo_requested"),
+        prompt_sections=prompt_sections,
+        tool_interceptors=_extension_requests(
+            envelope, "tool_interceptors", "tool_interceptors_requested"
+        ),
+        event_cursor=True,
     )
 
 

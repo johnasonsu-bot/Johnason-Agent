@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -18,6 +19,11 @@ from fastapi import FastAPI
 from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.adapters.hermes.runtime import AgentRuntime, WorkflowInterventions
 from workbench.api.app import AppSettings, create_app
+from workbench.api.conversations import (
+    AgentBindingRequest,
+    ProjectContextBindingRequest,
+    PythonTermRuntimeUnavailable,
+)
 from workbench.api.engine_host import engine_host_v2_router
 from workbench.conversations.repository import ConversationRepository
 from workbench.credentials.service import VaultService
@@ -28,10 +34,10 @@ from workbench.models.openai_compatible import OpenAICompatibleProvider
 from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.client import EngineHostClient
 from workbench.runtime.engine_host.selector import RunnerSelector
-from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 from workbench.runtime.engine_host.v2.registry import (
     NoConformantRuntime,
-    RuntimeGateMetadataV2,
+    RuntimeRegistryIntegrityError,
+    RuntimeRegistryV2,
     RuntimeSelectionV2,
 )
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
@@ -55,21 +61,189 @@ class PythonTermQueryRouter:
     def __init__(
         self,
         registry: RuntimeRegistryV2 | None,
-        gate_metadata: RuntimeGateMetadataV2 | None,
+        *,
+        _gate_proof: object | None = None,
     ) -> None:
         self._registry = registry
-        self._gate_metadata = gate_metadata
+        self.__gate_proof = _gate_proof
 
     def route_new_query(
         self, command: QueryCommandV2, envelope: RunEnvelopeV2
     ) -> RuntimeSelectionV2:
-        if self._registry is None or self._gate_metadata is None:
+        if self._registry is None:
             raise NoConformantRuntime(
-                "Python Term routing is disabled or lacks verifiable metadata"
+                "Python Term routing is disabled"
             ) from None
         return self._registry.route_python_term_query(
-            command, envelope, self._gate_metadata
+            command, envelope, gate_proof=self.__gate_proof
         )
+
+    def route_conversation_query(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        provider_id: str,
+        model: str,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
+    ) -> tuple[str, str]:
+        """Build and route the only supported explicit Conversation Query v2 input."""
+        if self._registry is None:
+            raise PythonTermRuntimeUnavailable()
+        try:
+            selected = self._resume_or_registration(command_id)
+            command, envelope = self._conversation_query(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                provider_id=provider_id,
+                model=model,
+                agent_bindings=agent_bindings,
+                project_context=project_context,
+                runtime_id=selected.runtime_id,
+                build_id=selected.build_id,
+            )
+            selected = self._registry.route_python_term_query(
+                command, envelope, gate_proof=self.__gate_proof
+            )
+        except (NoConformantRuntime, RuntimeRegistryIntegrityError, TypeError, ValueError):
+            # The browser only learns the fixed availability result.  No
+            # registration, gate, provider, or validation detail crosses this
+            # request boundary.
+            raise PythonTermRuntimeUnavailable() from None
+        if selected.runtime_id != "python-term":
+            raise PythonTermRuntimeUnavailable()
+        return selected.runtime_id, selected.build_id
+
+    def _resume_or_registration(self, command_id: str) -> RuntimeSelectionV2:
+        assert self._registry is not None
+        try:
+            pinned = self._registry.resume(command_id)
+        except NoConformantRuntime:
+            capabilities = self._registry.python_term_registration()
+            return RuntimeSelectionV2(
+                runtime_id=capabilities.runtime_id,
+                build_id=capabilities.build_id,
+                state="ready",
+                capabilities=(),
+                command_id=None,
+            )
+        if pinned.runtime_id != "python-term":
+            raise NoConformantRuntime("command has a different durable runtime pin")
+        return pinned
+
+    @staticmethod
+    def _digest(value: object) -> str:
+        serialized = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _conversation_query(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        provider_id: str,
+        model: str,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
+        runtime_id: str,
+        build_id: str,
+    ) -> tuple[QueryCommandV2, RunEnvelopeV2]:
+        """Freeze a minimal no-authority envelope from Conversation-owned inputs."""
+        binding = {
+            "session_id": session_id,
+            "command_id": command_id,
+            "content": content,
+            "provider_id": provider_id,
+            "model": model,
+            "agents": [item.model_dump(mode="json") for item in agent_bindings],
+            "project": (
+                project_context.model_dump(mode="json")
+                if project_context is not None
+                else None
+            ),
+        }
+        identity = self._digest(binding)
+        session_ref = f"conversation-session-{self._digest(session_id)[:32]}"
+        run_ref = f"conversation-run-{identity[:32]}"
+        envelope = RunEnvelopeV2.model_validate(
+            {
+                "runtime": {
+                    "runtime_id": runtime_id,
+                    "build_id": build_id,
+                    "config_digest": self._digest(
+                        {
+                            "runtime_id": runtime_id,
+                            "build_id": build_id,
+                            "protocol": "2.0",
+                        }
+                    ),
+                    "host_generation": "conversation-control-plane-v2",
+                },
+                "session_id": session_ref,
+                "run_id": run_ref,
+                "term_id": f"conversation-term-{identity[:32]}",
+                "step_id": f"conversation-step-{identity[:32]}",
+                "command_id": command_id,
+                "attempt": 0,
+                "agent_id": "conversation-agent",
+                "agent_role": "worker",
+                "provider_ref": f"provider-{self._digest(provider_id)[:32]}",
+                "model": f"model-{self._digest(model)[:32]}",
+                "model_options_digest": self._digest(
+                    {"provider_id": provider_id, "model": model}
+                ),
+                "message_snapshot_digest": self._digest(
+                    {"role": "user", "content": content}
+                ),
+                "context": {
+                    "snapshot_ref": f"conversation-context-{identity[:32]}",
+                    "snapshot_digest": self._digest(
+                        {
+                            "project": binding["project"],
+                            "agents": binding["agents"],
+                        }
+                    ),
+                    "version": project_context.version if project_context else 0,
+                },
+                "context_budget": {
+                    "max_input_tokens": 4096,
+                    "reserved_output_tokens": 0,
+                    "protected_message_ids": (),
+                    "protected_prompt_section_ids": (),
+                    "compaction_policy": "none",
+                    "summary_ref": None,
+                },
+                "tool_manifest": (),
+                "tool_manifest_digest": self._digest(()),
+                "skill_pins": (),
+                "skill_manifest_digest": self._digest(()),
+                "plugin_pins": (),
+                "plugin_manifest_digest": self._digest(()),
+                "permission_policy_digest": self._digest(
+                    {"workspace": "empty", "command": "deny", "network": "deny"}
+                ),
+                "workspace_grant": {
+                    "grant_id": f"conversation-grant-{identity[:32]}",
+                    "workspace_snapshot_ref": f"empty-workspace-{identity[:32]}",
+                    "readable_paths": (),
+                    "writable_paths": (),
+                    "command_policy": "deny",
+                    "network_policy": "deny",
+                    "expires_at_ms": 4_102_444_800_000,
+                },
+                "checkpoint_cursor": 0,
+                "deadline_ms": 60_000,
+                "traceparent": f"conversation-trace-{identity[:32]}",
+                "extensions": {},
+            }
+        )
+        return QueryCommandV2(type="query.start", command_id=command_id), envelope
 
 
 def build_app(
@@ -131,6 +305,19 @@ def build_app(
             provider_allowlist=resolved.engine_host_provider_allowlist,
         )
         runner_lifecycle = selected_runner
+    runtime_registry_v2 = (
+        RuntimeRegistryV2(RuntimeV2Repository(resolved.database))
+        if resolved.engine_host_v2_enabled
+        else None
+    )
+    python_term_runtime = None
+    if runtime_registry_v2 is not None and resolved.python_term_runtime_enabled:
+        # Registration is diagnostic-only until Task 7 provides its fixed,
+        # control-plane-owned proof.  No model, Tool Router, argv, or runtime
+        # environment authority is constructed here.
+        python_term_runtime = PythonTermRuntime(PythonTermRepository(resolved.database))
+        python_term_runtime.register(runtime_registry_v2)
+    python_term_query_router = PythonTermQueryRouter(runtime_registry_v2)
     app = create_app(
         AppSettings(
             database=resolved.database,
@@ -144,27 +331,8 @@ def build_app(
             runner_lifecycle=runner_lifecycle,
             host_generation=getattr(selected_runner, "host_generation", None),
             development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
+            python_term_router=python_term_query_router,
         )
-    )
-    runtime_registry_v2 = (
-        RuntimeRegistryV2(RuntimeV2Repository(resolved.database))
-        if resolved.engine_host_v2_enabled
-        else None
-    )
-    python_term_runtime = None
-    python_term_runtime_gate_metadata = None
-    if runtime_registry_v2 is not None and resolved.python_term_runtime_enabled:
-        # This composition deliberately receives no provider, Tool Router, argv,
-        # or environment authority.  Its advertised capability snapshot is real
-        # and therefore says query/model are unavailable until a later fixed
-        # control-plane composition supplies those owned seams.
-        python_term_runtime = PythonTermRuntime(PythonTermRepository(resolved.database))
-        python_term_runtime.register(runtime_registry_v2)
-        python_term_runtime_gate_metadata = RuntimeGateMetadataV2.from_capabilities(
-            python_term_runtime.capabilities
-        )
-    python_term_query_router = PythonTermQueryRouter(
-        runtime_registry_v2, python_term_runtime_gate_metadata
     )
     include_router = getattr(app, "include_router", None)
     if callable(include_router):
@@ -177,8 +345,6 @@ def build_app(
     app.state.execution_runner = selected_runner
     app.state.runtime_registry_v2 = runtime_registry_v2
     app.state.python_term_runtime = python_term_runtime
-    app.state.python_term_runtime_gate_metadata = python_term_runtime_gate_metadata
-    app.state.python_term_query_router = python_term_query_router
     return app
 
 

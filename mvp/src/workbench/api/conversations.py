@@ -116,6 +116,7 @@ class MessageRequest(BaseModel):
     content: str
     model: str = "default"
     provider_id: str | None = None
+    runtime: Literal["python-term"] | None = None
     agent_bindings: tuple[AgentBindingRequest, ...] = ()
     project_context: ProjectContextBindingRequest | None = None
 
@@ -161,6 +162,31 @@ class RetryableTurnError(RuntimeError):
         super().__init__(message)
 
 
+class PythonTermRuntimeUnavailable(RuntimeError):
+    """Fixed public outcome when Task 7 admission proof is not present."""
+
+    public_detail = "python term runtime unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.public_detail)
+
+
+class PythonTermConversationRouter(Protocol):
+    """Narrow control-plane seam; request handlers never inspect app state."""
+
+    def route_conversation_query(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        provider_id: str,
+        model: str,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
+    ) -> tuple[str, str]: ...
+
+
 @dataclass
 class ConversationAPI:
     """Serializes commands per session while allowing separate sessions to progress."""
@@ -174,6 +200,7 @@ class ConversationAPI:
     project_contexts: ProjectContextRepository | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_jobs: DevelopmentJobRepository | None = None
+    python_term_router: PythonTermConversationRouter | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
     def create_session(self, session_id: str) -> ConversationSession:
@@ -189,13 +216,14 @@ class ConversationAPI:
         content: str,
         model: str,
         provider_id: str | None = None,
+        runtime: Literal["python-term"] | None = None,
         agent_bindings: tuple[AgentBindingRequest, ...] = (),
         project_context: ProjectContextBindingRequest | None = None,
     ) -> dict[str, Any]:
         """Persist a turn and return before any model request is awaited."""
         self._require_session(session_id)
         self._require_lifecycle_ownership(session_id)
-        if agent_bindings:
+        if agent_bindings and runtime is None:
             return self._enqueue_sequential_message(
                 session_id=session_id,
                 command_id=command_id,
@@ -205,12 +233,40 @@ class ConversationAPI:
                 agent_bindings=agent_bindings,
                 project_context=project_context,
             )
-        resolved_provider = self._resolve_provider_id(provider_id)
+        reservation_identity: dict[str, Any] = {
+            "content": content,
+            "model": model,
+            "provider_id": provider_id,
+        }
+        if runtime is not None:
+            reservation_identity["runtime"] = runtime
+        self._ensure_message_reservation_compatible(
+            session_id, command_id, reservation_identity
+        )
+        selected_runtime: tuple[str, str] | None = None
+        if runtime == "python-term":
+            if self.python_term_router is None:
+                raise PythonTermRuntimeUnavailable()
+            # The minimal v2 envelope carries only the request's opaque provider
+            # selector; it must not resolve or infer a Provider grant before the
+            # Task 7 gate has admitted the command.
+            resolved_provider = provider_id or "default"
+            selected_runtime = self.python_term_router.route_conversation_query(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                provider_id=resolved_provider,
+                model=model,
+                agent_bindings=agent_bindings,
+                project_context=project_context,
+            )
+        else:
+            resolved_provider = self._resolve_provider_id(provider_id)
         reservation_id = self._reserve(
             session_id,
             command_id,
             "message",
-            {"content": content, "model": model, "provider_id": provider_id},
+            reservation_identity,
         )
         terminal = self._terminal_response(session_id, command_id, reservation_id)
         if terminal is not None:
@@ -226,14 +282,19 @@ class ConversationAPI:
             )
         )
         initial_state = self._initial_turn_state(session_id)
-        mode_for = getattr(self.runner, "mode_for", None)
-        runner_mode = (
-            mode_for(session_id, resolved_provider, model)
-            if callable(mode_for)
-            else "python"
-        )
-        if runner_mode not in {"python", "engine_host"}:
-            raise ValueError("runner selector returned an invalid mode")
+        if selected_runtime is not None:
+            runner_mode = "python_term"
+            initial_state["runtime_id"] = selected_runtime[0]
+            initial_state["runtime_build_id"] = selected_runtime[1]
+        else:
+            mode_for = getattr(self.runner, "mode_for", None)
+            runner_mode = (
+                mode_for(session_id, resolved_provider, model)
+                if callable(mode_for)
+                else "python"
+            )
+            if runner_mode not in {"python", "engine_host"}:
+                raise ValueError("runner selector returned an invalid mode")
         initial_state["runner_mode"] = runner_mode
         if runner_mode == "engine_host":
             initial_state["host_run_id"] = host_run_id_for(session_id, command_id)
@@ -454,8 +515,16 @@ class ConversationAPI:
                 await self._process_sequential_turn(turn, orchestration)
                 return
             runner_mode = turn.state.get("runner_mode", "python")
-            if runner_mode not in {"python", "engine_host"}:
+            if runner_mode not in {"python", "engine_host", "python_term"}:
                 raise TurnSnapshotCorruption("invalid persisted runner mode")
+            if runner_mode == "python_term":
+                runtime_id = turn.state.get("runtime_id")
+                runtime_build_id = turn.state.get("runtime_build_id")
+                if runtime_id != "python-term" or not isinstance(
+                    runtime_build_id, str
+                ):
+                    raise TurnSnapshotCorruption("invalid Python Term runtime pin")
+                raise TurnSnapshotCorruption("Python Term executor is unavailable")
             state = dict(turn.state)
             state_changed = False
             if "runner_mode" not in turn.state:
@@ -1514,6 +1583,31 @@ class ConversationAPI:
         result = self.events.append(event, command_id=key)
         return result.event_id
 
+    def _ensure_message_reservation_compatible(
+        self, session_id: str, command_id: str, identity: dict[str, Any]
+    ) -> None:
+        """Reject a changed runtime selection before it can create a v2 pin."""
+        key = self._reservation_id(session_id, command_id)
+        with self.events.store.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT domain_events.event_json FROM command_results
+                JOIN domain_events ON domain_events.event_id = command_results.event_id
+                WHERE command_results.command_id = ?
+                """,
+                (key,),
+            ).fetchone()
+        if existing is None:
+            return
+        event = DomainEvent.model_validate_json(existing["event_json"])
+        expected = {
+            "session_id": session_id,
+            "kind": "message",
+            "identity_digest": self._digest(identity),
+        }
+        if event.event_type != "conversation.command.accepted" or event.payload != expected:
+            raise ValueError("command identity cannot change")
+
     def _reservation_event_id(self, session_id: str, command_id: str) -> str:
         key = self._reservation_id(session_id, command_id)
         with self.events.store.connect() as connection:
@@ -1650,6 +1744,7 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
                 content=payload.content,
                 model=payload.model,
                 provider_id=payload.provider_id,
+                runtime=payload.runtime,
                 agent_bindings=payload.agent_bindings,
                 project_context=payload.project_context,
             )
@@ -1660,6 +1755,8 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
             raise HTTPException(404, "session not found") from exc
         except SessionPausedError as exc:
             raise HTTPException(409, "session is paused") from exc
+        except PythonTermRuntimeUnavailable as exc:
+            raise HTTPException(503, exc.public_detail) from exc
         except RetryableTurnError as exc:
             raise HTTPException(503, str(exc), headers={"Retry-After": "1"}) from exc
         except RuntimeError as exc:

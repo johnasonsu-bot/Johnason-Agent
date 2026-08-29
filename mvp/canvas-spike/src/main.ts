@@ -11,6 +11,7 @@ const allowedApiRequests = new Set([
   "GET /api/vault/status", "POST /api/vault/create", "POST /api/vault/unlock", "POST /api/vault/lock", "POST /api/vault/recover",
   "GET /api/providers", "POST /api/providers",
   "GET /api/engine-host/status",
+  "GET /api/v1/engine-host",
 ]);
 
 interface ApiRequest { method: "GET" | "POST" | "PUT" | "DELETE"; path: string; body?: Record<string, unknown>; headers?: Record<string, string>; }
@@ -110,6 +111,8 @@ function childEnvironment(): NodeJS.ProcessEnv {
     "WORKBENCH_ENGINE_HOST_ENABLED",
     "WORKBENCH_ENGINE_HOST_COMMAND_JSON",
     "WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON",
+    "WORKBENCH_ENGINE_HOST_V2_ENABLED",
+    "WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED",
   ]) {
     if (process.env[name] !== undefined) safe[name] = process.env[name];
   }

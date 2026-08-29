@@ -21,7 +21,7 @@ class RunAgentTurn(BaseModel):
     model: str = "default"
     provider_id: str | None = None
     owner_id: str | None = None
-    runner_mode: Literal["python", "engine_host"] | None = None
+    runner_mode: Literal["python", "engine_host", "python_term"] | None = None
     host_run_id: str | None = None
     message_snapshot: tuple[ModelMessage, ...] = ()
     allowed_tool_ids: tuple[str, ...] | None = None
