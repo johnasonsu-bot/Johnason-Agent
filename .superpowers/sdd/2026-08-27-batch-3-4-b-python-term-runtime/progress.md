@@ -55,3 +55,12 @@ Task 5: fix round 1/5 (2 addressed, 4 open; commits 240954a..9968b3a)
 Task 5: fix round 2/5 (1 addressed, 3 open; 1 minor carried into round 3; commits 9968b3a..cd73402)
 Task 5: fix round 3/5 paused by user after focused implementation reached 54 Task 5 integration tests passing; Task 3/4/full regression, report, commit-quality review remain pending.
 Pause checkpoint: local-only snapshot requested before network loss; no GitHub push. Resume from the Task 3 focused regression, then Task 4/full unit/compile/diff and independent round-3 review.
+Task 5: fix round 3/5 (4 prior findings addressed in substance; 3 new Important recovery/lease findings open; commits cd73402..11c7c27)
+Task 5: Ruling — Effect lease freshness is a separate authorization boundary from the Step claim and must be checked against SQLite trusted time at durable release and immediately before dispatch — cost if wrong: a stale Effect owner can execute concurrently with its successor.
+Task 5: Ruling — read successor recovery must preserve verifiable predecessor lineage across checkpoints; physical replacement without a validated transition is rejected — cost if wrong: an additional immutable lineage row/schema transition, but crash recovery remains provable.
+Task 5: Ruling — a durable pending write has not crossed the dispatch gate and is safe to resume under an exact current fence; only released/ambiguous writes require reconciliation — cost if wrong: recovery code must distinguish dispatch states instead of conservatively blocking all reserved writes.
+Task 5: fix round 4/5 (3 addressed, 2 open; commits 11c7c27..1981672)
+Task 5: Ruling — checkpoint lineage validation must accept a continuous multi-hop successor chain rooted in prior trusted evidence, not only one generation — cost if wrong: more explicit ordered-chain validation, but repeated crashes remain recoverable without accepting branches.
+Task 5: Ruling — legacy active attempts above zero are invalid unless their missing predecessor chain can be reconstructed from fully validated latest-checkpoint evidence in the same migration transaction; otherwise migration fails closed — cost if wrong: some Round-3 development databases require explicit reconciliation instead of silent upgrade.
+Task 5: fix round 5/5 (2 addressed, 0 open; commits 1981672..1dac595)
+Task 5: complete (commits e6067dd..1dac595, final scoped review clean)
