@@ -10,6 +10,7 @@
 - Provider Center、加密 Vault、LM Studio/DeepSeek/OpenAI-compatible 模型入口；
 - 持久单 Agent 会话、SSE 重放、暂停/恢复、人工补充；
 - Python Runtime 与可选 Engine Host Runner；
+- 显式选择的 Python Term/Step Runtime：真实固定 Agents SDK Runner、控制面模型/Vault 路径、固定 Tool/PTY executor、持久化 Term/Step/Event/Checkpoint/Effect 与无静默 v1 fallback；
 - Artifact Store、Data Platform connector 和基础智能画布；
 - LangGraph Batch 3.0 运行门：审批、四分支并发、局部审核、一次定向返工、Merge、全局审核、Checkpoint 恢复和并发 Fence。
 
@@ -200,6 +201,32 @@ revision 的标准 backend、独立 frontend、Development Graph meta/E2E、全�
 - Goose Query Runtime 接入门禁；
 - DSH Plugin Runtime 接入门禁。
 
+### 8.2 Python Term Runtime
+
+Python Term 默认关闭。启用时，只有门禁 proof 与注册能力完全匹配，显式选择
+`python-term` 的新 command 才会持久化 runtime/build pin；一旦 accepted，执行失败
+进入既有 durable retry/reconciliation 状态，不会转入 Host v1。
+
+生产 composition 使用：
+
+- 固定 revision 的 `openai-agents-python` 真实 Runner；
+- Provider Gateway 和 Vault 作为唯一模型认证路径；
+- 控制面声明并组装的 `workspace.read` 与受监督 PTY executor；
+- `PythonTermRuntime` 的私有 Agent context、结构化 Handoff、StepContext、Event、
+  Checkpoint、Effect 和 cursor 边界；
+- 不暴露给 HTTP、IPC 或 renderer 的私有 gate proof。
+
+运行 9 场景确定性门禁：
+
+```bash
+cd mvp
+.venv/bin/python scripts/run_python_term_runtime_gate.py
+```
+
+输出分别列出 source/SDK revision、每个场景的 PASS/FAIL、命令摘要、结果 digest
+和最终 Decision。LM Studio `127.0.0.1:1234` live smoke 只通过 Provider Gateway；
+服务不可用时为 `LIVE_PROVIDER_NOT_EVALUATED`，不改变确定性门禁结论。
+
 运行合同门禁：
 
 ```bash
@@ -290,14 +317,29 @@ GO_LANGGRAPH_RUNTIME
 
 运行门覆盖：用户批准前无 Worker 副作用、四分支并发、局部拒绝与返工、Merge/Global Verifier 各一次、真实进程终止后从 SQLite 恢复、同线程并发 Fence、安全投影和固定拒绝文件。
 
-### 10.5 Electron/Playwright
+### 10.5 Python Term Runtime 门禁
+
+```bash
+.venv/bin/python scripts/run_python_term_runtime_gate.py
+```
+
+该门直接运行真实 Runtime/SDK/控制面 executor，不接受 contract fake、fixture
+binary、mock import 或调用方 capability 自签。预期只有全部确定性场景通过时输出：
+
+```text
+Decision: GO_PYTHON_TERM_RUNTIME
+Goose runtime status: NOT_YET_EVALUATED
+DSH runtime status: NOT_YET_EVALUATED
+```
+
+### 10.6 Electron/Playwright
 
 ```bash
 cd canvas-spike
 npm test
 ```
 
-### 10.6 真实 LM Studio
+### 10.7 真实 LM Studio
 
 ```bash
 cd mvp
@@ -306,7 +348,7 @@ LMSTUDIO_MODEL="<loaded-model-id>" \
 .venv/bin/python -m pytest tests/integration/test_lmstudio_tool_calling.py -v
 ```
 
-### 10.7 Data Platform 验收
+### 10.8 Data Platform 验收
 
 在当前 shell 中提供本地 Data Platform 连接信息，不要写入仓库：
 
@@ -357,4 +399,5 @@ cd mvp
 - [项目能力与差距交互图谱](../docs/operations/project-operation-knowledge-graph.html)
 - [Engine Host 合同验收](../docs/superpowers/reports/2026-08-11-engine-host-contract-validation.md)
 - [LangGraph 运行门报告](../docs/superpowers/reports/2026-08-12-langgraph-runtime-gate.md)
+- [Python Term Runtime 门禁报告](../docs/superpowers/reports/2026-08-27-python-term-runtime-gate.md)
 - [Batch 3.1 顺序多 Agent 计划](../docs/superpowers/plans/2026-08-12-batch-3-1-sequential-multi-agent-baseline.md)

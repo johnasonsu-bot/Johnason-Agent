@@ -50,6 +50,7 @@ from workbench.runtime.engine_host.v2.repository import (
 )
 from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
 from workbench.runtime.python_term import PythonTermRuntime
+from workbench.runtime.python_term.gate import compose_python_term_production
 from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
@@ -121,7 +122,85 @@ class PythonTermQueryRouter:
             runtime_id=selected.runtime_id,
             build_id=selected.build_id,
             runtime_command_id=admission.runtime_command_id,
+            execution_snapshot=self._conversation_execution_snapshot(
+                admission, command, envelope
+            ),
         )
+
+    def _conversation_execution_snapshot(
+        self,
+        admission: PythonTermConversationAdmission,
+        command: QueryCommandV2,
+        envelope: RunEnvelopeV2,
+    ) -> dict[str, object]:
+        """Persist only the frozen, secret-free inputs required by the worker."""
+        profiles = admission.agent_profiles
+        if len(profiles) == 1:
+            profile = profiles[0]
+            agents = (
+                {
+                    "agent_id": profile.agent_id,
+                    "name": profile.display_name,
+                    "provider_ref": f"provider-profile:{admission.provider.id}",
+                    "model": admission.model,
+                    "instructions": None,
+                },
+            )
+        else:
+            agents = (
+                {
+                    "agent_id": envelope.agent_id,
+                    "name": "Conversation Agent",
+                    "provider_ref": f"provider-profile:{admission.provider.id}",
+                    "model": admission.model,
+                    "instructions": None,
+                },
+            )
+        project = admission.project_context
+        project_id = project.project_id if project is not None else "conversation-project"
+        project_version = project.version if project is not None else 0
+        project_digest = self._digest(
+            project.model_dump(mode="json") if project is not None else None
+        )
+        return {
+            "command": command.model_dump(mode="json"),
+            "envelope": envelope.model_dump(mode="json"),
+            "agents": agents,
+            "handoffs": (),
+            "model_messages": tuple(
+                {"role": message.role, "content": message.content}
+                for message in admission.messages
+            ),
+            "conversation_context": {
+                "session_id": envelope.session_id,
+                "snapshot_ref": envelope.context.snapshot_ref,
+                "snapshot_digest": envelope.context.snapshot_digest,
+                "version": envelope.context.version,
+            },
+            "project_context": {
+                "project_id": project_id,
+                "version": project_version,
+                "snapshot_digest": project_digest,
+            },
+            "work_state": {
+                "term_id": envelope.term_id,
+                "agent_id": envelope.agent_id,
+                "root_ref": f".runtime/terms/{envelope.term_id}",
+                "metadata_digest": self._digest(
+                    {"term_id": envelope.term_id, "agent_id": envelope.agent_id}
+                ),
+            },
+            "permission_policy": {
+                "tool_policy": "deny",
+                "filesystem_policy": "deny",
+            },
+            "environment_allowlist": (),
+            "effect_scope": {
+                "scope_id": f"conversation-scope-{envelope.term_id[-32:]}",
+                "write_effects": False,
+                "allowed_tool_ids": (),
+            },
+        }
 
     def _resume_or_registration(self, command_id: str) -> RuntimeSelectionV2:
         assert self._registry is not None
@@ -172,6 +251,10 @@ class PythonTermQueryRouter:
                 "role": message.role,
                 "content": message.content,
             }
+            for message in admission.messages
+        ]
+        model_message_snapshot = [
+            {"role": message.role, "content": message.content}
             for message in admission.messages
         ]
         project_snapshot = (
@@ -237,7 +320,7 @@ class PythonTermQueryRouter:
                 "model_options_digest": self._digest(
                     {"provider": provider_snapshot, "model": admission.model}
                 ),
-                "message_snapshot_digest": self._digest(message_snapshot),
+                "message_snapshot_digest": self._digest(model_message_snapshot),
                 "context": {
                     "snapshot_ref": session_ref,
                     "snapshot_digest": self._digest(
@@ -268,7 +351,7 @@ class PythonTermQueryRouter:
                 "plugin_pins": (),
                 "plugin_manifest_digest": self._digest(()),
                 "permission_policy_digest": self._digest(
-                    {"workspace": "empty", "command": "deny", "network": "deny"}
+                    {"tool_policy": "deny", "filesystem_policy": "deny"}
                 ),
                 "workspace_grant": {
                     "grant_id": f"conversation-grant-{identity[:32]}",
@@ -363,13 +446,30 @@ def build_app(
         else None
     )
     python_term_runtime = None
+    python_term_executor = None
+    python_term_gate_proof = None
     if runtime_registry_v2 is not None and resolved.python_term_runtime_enabled:
-        # Registration is diagnostic-only until Task 7 provides its fixed,
-        # control-plane-owned proof.  No model, Tool Router, argv, or runtime
-        # environment authority is constructed here.
-        python_term_runtime = PythonTermRuntime(PythonTermRepository(resolved.database))
-        python_term_runtime.register(runtime_registry_v2)
-    python_term_query_router = PythonTermQueryRouter(runtime_registry_v2)
+        repository = PythonTermRepository(resolved.database)
+        try:
+            composition = compose_python_term_production(
+                registry=runtime_registry_v2,
+                repository=repository,
+                gateway=gateway,
+                profiles=tuple(providers.list()),
+                runtime_dir=resolved.runtime_dir,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            # Missing Provider bindings or unavailable PTY containment keeps the
+            # runtime diagnostic-only and cannot create a command pin.
+            python_term_runtime = PythonTermRuntime(repository)
+            python_term_runtime.register(runtime_registry_v2)
+        else:
+            python_term_runtime = composition.runtime
+            python_term_executor = composition.executor
+            python_term_gate_proof = composition.gate_proof
+    python_term_query_router = PythonTermQueryRouter(
+        runtime_registry_v2, _gate_proof=python_term_gate_proof
+    )
     app = create_app(
         AppSettings(
             database=resolved.database,
@@ -384,6 +484,7 @@ def build_app(
             host_generation=getattr(selected_runner, "host_generation", None),
             development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
             python_term_router=python_term_query_router,
+            python_term_executor=python_term_executor,
         )
     )
     include_router = getattr(app, "include_router", None)

@@ -4,7 +4,7 @@
 
 当前分支：`feat/hermes-mvp-phase1`。当前可运行产品位于 [`mvp/`](mvp/)，根目录其余 `docs/` 内容保留了上游教程和项目演进文档。
 
-> 当前状态：本地单 Agent 会话、模型供应商、持久化任务、Engine Host 合同和 LangGraph Batch 3.0 运行门已经落地；会话内真正的顺序/并行多 Agent 编排仍属于 Batch 3.1–3.3，不能把前端的多 Agent 选择界面视为编排已经完成。
+> 当前状态：本地单 Agent 会话、模型供应商、持久化任务、Engine Host v2 合同、LangGraph Batch 3.0 运行门和显式选择的 Python Term/Step 运行时已经落地；会话内真正的顺序/并行多 Agent 编排仍属于 Batch 3.1–3.3，不能把前端的多 Agent 选择界面视为编排已经完成。
 
 ## 当前功能的三个要素
 
@@ -24,6 +24,7 @@
 - 本地模型：LM Studio 的 OpenAI-compatible HTTP 接口；
 - 云端模型：DeepSeek 与通用 OpenAI-compatible Provider；
 - Python Agent Runtime：真实模型调用、Tool calling 和多轮会话上下文；
+- Python Term/Step Runtime：固定 `openai-agents-python` revision、冻结的运行身份、Agent 私有上下文、结构化 Handoff、Workspace/Tool/PTY 策略、Effect exactly-once、Checkpoint/游标恢复，以及显式 runtime pin 后禁止静默回退；
 - Go/外部 Engine Host 合同：NDJSON 协议、生命周期、背压、取消、失败分类和 Python fallback 边界；
 - LangGraph Batch 3.0：人工计划审批、四分支动态并行、局部审核、定向返工、Merge、全局审核和重启恢复。
 
@@ -135,6 +136,20 @@ Real runtime status: NOT_YET_EVALUATED
 
 该 GO 只覆盖 Host v2 合同门；Fake 的通过不等于真实 Python Codex-Compatible、
 Goose Query 或 DSH Plugin Runtime 已接入。真实运行时状态仍需独立验收。
+
+Python Term Runtime 的确定性门禁会运行真实 `PythonTermRuntime`、固定 Agents SDK
+Runner 和由控制面组装的 Tool/PTY executor。执行：
+
+```bash
+cd mvp
+.venv/bin/python scripts/run_python_term_runtime_gate.py
+```
+
+门禁只有在 9 个确定性场景全部通过时才输出
+`Decision: GO_PYTHON_TERM_RUNTIME`；本地 LM Studio smoke 单独报告，不可用时不会
+冒充或阻塞确定性结果。生产 admission 的私有 proof 不通过 HTTP、IPC 或 renderer
+传递。当前实现证据与最终固定 revision 结果见
+[`Python Term Runtime 门禁报告`](docs/superpowers/reports/2026-08-27-python-term-runtime-gate.md)。
 
 复现核心门：
 

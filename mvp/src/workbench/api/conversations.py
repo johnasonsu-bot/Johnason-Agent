@@ -50,6 +50,7 @@ from workbench.runtime.engine_host.client import (
 )
 from workbench.runtime.engine_host.contracts import HostProtocolError
 from workbench.runtime.engine_host.selector import host_run_id_for
+from workbench.runtime.engine_host.v2.mapper import map_runtime_event
 from workbench.workflow.engine import (
     PauseRun,
     ResumeRun,
@@ -207,6 +208,13 @@ class PythonTermConversationRoute:
     runtime_id: str
     build_id: str
     runtime_command_id: str
+    execution_snapshot: dict[str, Any] = field(default_factory=dict)
+
+
+class PythonTermConversationExecutor(Protocol):
+    """Control-plane-owned worker seam for one durable Python Term snapshot."""
+
+    async def execute_snapshot(self, snapshot: dict[str, Any]) -> object: ...
 
 
 def python_term_command_id(session_id: str, command_id: str) -> str:
@@ -246,6 +254,7 @@ class ConversationAPI:
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_jobs: DevelopmentJobRepository | None = None
     python_term_router: PythonTermConversationRouter | None = None
+    python_term_executor: PythonTermConversationExecutor | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
     def create_session(self, session_id: str) -> ConversationSession:
@@ -301,6 +310,10 @@ class ConversationAPI:
         project_context: ProjectContextBindingRequest | None,
     ) -> dict[str, Any]:
         """Run all same-session admission work under the local backend lock."""
+        lock = self._session_lock(session_id)
+        assert_owned = getattr(lock, "assert_owned", None)
+        if callable(assert_owned):
+            assert_owned()
         self._require_session(session_id)
         self._require_lifecycle_ownership(session_id)
         if agent_bindings and runtime is None:
@@ -391,6 +404,7 @@ class ConversationAPI:
             initial_state["runtime_build_id"] = selected_runtime.build_id
             initial_state["runtime_command_id"] = selected_runtime.runtime_command_id
             initial_state["runtime_model"] = execution_model
+            initial_state["python_term_execution"] = selected_runtime.execution_snapshot
         else:
             mode_for = getattr(self.runner, "mode_for", None)
             runner_mode = (
@@ -633,7 +647,51 @@ class ConversationAPI:
                     session_id, command_id
                 ) or runtime_model != turn.model:
                     raise TurnSnapshotCorruption("invalid Python Term runtime pin")
-                raise TurnSnapshotCorruption("Python Term executor is unavailable")
+                snapshot = turn.state.get("python_term_execution")
+                if self.python_term_executor is None or not isinstance(snapshot, dict):
+                    raise TurnSnapshotCorruption("Python Term executor is unavailable")
+                execution = await self.python_term_executor.execute_snapshot(snapshot)
+                runtime_events = getattr(execution, "events", None)
+                status = getattr(execution, "status", None)
+                final_output = getattr(execution, "final_output", None)
+                if not isinstance(runtime_events, tuple) or status not in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                }:
+                    raise TurnSnapshotCorruption("invalid Python Term execution result")
+                projected: list[dict[str, Any]] = []
+                for runtime_event in runtime_events:
+                    for domain_event in map_runtime_event(runtime_event):
+                        appended = self._append(
+                            session_id,
+                            domain_event.event_type,
+                            dict(domain_event.payload),
+                            f"{command_id}:python-term:{domain_event.sequence}",
+                            ordinal=domain_event.sequence,
+                            causation_id=reservation_id,
+                        )
+                        if appended:
+                            projected.append(appended)
+                if isinstance(final_output, str) and final_output:
+                    self.conversations.append_message(
+                        ConversationMessage(
+                            session_id=session_id,
+                            command_id=f"{command_id}:assistant",
+                            role="assistant",
+                            content=final_output,
+                        )
+                    )
+                terminal_status = "completed" if status == "completed" else "failed"
+                self.conversations.finish_turn(
+                    session_id,
+                    command_id,
+                    owner_id=turn.owner_id,
+                    status=terminal_status,
+                    state={"phase": terminal_status, "events": []},
+                    result=projected,
+                )
+                return
             state = dict(turn.state)
             state_changed = False
             if "runner_mode" not in turn.state:

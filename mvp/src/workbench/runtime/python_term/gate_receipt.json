@@ -1,0 +1,55 @@
+{
+  "source_revision": "mvp-tree:efd6c576b6ef83ba5564dc9ff0e03a986da822ad",
+  "sdk_revision": "e773b15488c491d907d42756d91e470f280a3d7e",
+  "runtime_id": "python-term",
+  "build_id": "python-term-0.1.0-agents-e773b15488c491d907d42756d91e470f280a3d7e",
+  "protocol_version": "2.0",
+  "scenarios": [
+    {
+      "scenario_id": "sdk_provenance",
+      "status": "PASS",
+      "command_summary": "pytest:sdk_provenance"
+    },
+    {
+      "scenario_id": "frozen_identity",
+      "status": "PASS",
+      "command_summary": "pytest:frozen_identity"
+    },
+    {
+      "scenario_id": "private_context_and_step_isolation",
+      "status": "PASS",
+      "command_summary": "pytest:private_context_and_step_isolation"
+    },
+    {
+      "scenario_id": "tool_workspace_pty_policy",
+      "status": "PASS",
+      "command_summary": "pytest:tool_workspace_pty_policy"
+    },
+    {
+      "scenario_id": "effect_exactly_once_and_reconciliation",
+      "status": "PASS",
+      "command_summary": "pytest:effect_exactly_once_and_reconciliation"
+    },
+    {
+      "scenario_id": "cursor_checkpoint_restart_projection",
+      "status": "PASS",
+      "command_summary": "pytest:cursor_checkpoint_restart_projection"
+    },
+    {
+      "scenario_id": "host_v1_flag_and_no_fallback",
+      "status": "PASS",
+      "command_summary": "pytest:host_v1_flag_and_no_fallback"
+    },
+    {
+      "scenario_id": "session_lock_ownership",
+      "status": "PASS",
+      "command_summary": "pytest:session_lock_ownership"
+    },
+    {
+      "scenario_id": "proof_binding",
+      "status": "PASS",
+      "command_summary": "pytest:proof_binding"
+    }
+  ],
+  "result_digest": "0ed3ba0c8f32cacca20de1b34add7b32b80c2ecd7a4251d82b6b51c400ca5165"
+}
