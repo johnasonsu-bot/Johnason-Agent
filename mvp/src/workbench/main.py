@@ -29,11 +29,47 @@ from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.client import EngineHostClient
 from workbench.runtime.engine_host.selector import RunnerSelector
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.engine_host.v2.registry import (
+    NoConformantRuntime,
+    RuntimeGateMetadataV2,
+    RuntimeSelectionV2,
+)
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
+from workbench.runtime.python_term import PythonTermRuntime
+from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
 from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
 from workbench.orchestration.development_processor import DurableDevelopmentProcessor
+
+
+class PythonTermQueryRouter:
+    """Additive control-plane seam for explicitly selected Host v2 Queries.
+
+    Existing conversations and graph runs keep their v1 runner.  A future
+    command creator may opt in only through this narrow Query/Envelope path;
+    it cannot supply process settings, environment, or a gate verdict.
+    """
+
+    def __init__(
+        self,
+        registry: RuntimeRegistryV2 | None,
+        gate_metadata: RuntimeGateMetadataV2 | None,
+    ) -> None:
+        self._registry = registry
+        self._gate_metadata = gate_metadata
+
+    def route_new_query(
+        self, command: QueryCommandV2, envelope: RunEnvelopeV2
+    ) -> RuntimeSelectionV2:
+        if self._registry is None or self._gate_metadata is None:
+            raise NoConformantRuntime(
+                "Python Term routing is disabled or lacks verifiable metadata"
+            ) from None
+        return self._registry.route_python_term_query(
+            command, envelope, self._gate_metadata
+        )
 
 
 def build_app(
@@ -115,6 +151,21 @@ def build_app(
         if resolved.engine_host_v2_enabled
         else None
     )
+    python_term_runtime = None
+    python_term_runtime_gate_metadata = None
+    if runtime_registry_v2 is not None and resolved.python_term_runtime_enabled:
+        # This composition deliberately receives no provider, Tool Router, argv,
+        # or environment authority.  Its advertised capability snapshot is real
+        # and therefore says query/model are unavailable until a later fixed
+        # control-plane composition supplies those owned seams.
+        python_term_runtime = PythonTermRuntime(PythonTermRepository(resolved.database))
+        python_term_runtime.register(runtime_registry_v2)
+        python_term_runtime_gate_metadata = RuntimeGateMetadataV2.from_capabilities(
+            python_term_runtime.capabilities
+        )
+    python_term_query_router = PythonTermQueryRouter(
+        runtime_registry_v2, python_term_runtime_gate_metadata
+    )
     include_router = getattr(app, "include_router", None)
     if callable(include_router):
         include_router(
@@ -125,6 +176,9 @@ def build_app(
     app.state.agent_runtime = agent_runtime
     app.state.execution_runner = selected_runner
     app.state.runtime_registry_v2 = runtime_registry_v2
+    app.state.python_term_runtime = python_term_runtime
+    app.state.python_term_runtime_gate_metadata = python_term_runtime_gate_metadata
+    app.state.python_term_query_router = python_term_query_router
     return app
 
 
@@ -287,6 +341,11 @@ def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings
         if normalized not in {"true", "false", "1", "0"}:
             raise ValueError("engine host v2 enabled must be true or false")
         updates["engine_host_v2_enabled"] = normalized in {"true", "1"}
+    python_term_enabled = os.environ.get("WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED")
+    if python_term_enabled is not None:
+        if python_term_enabled not in {"true", "false"}:
+            raise ValueError("python term runtime enabled must be true or false")
+        updates["python_term_runtime_enabled"] = python_term_enabled == "true"
     command = os.environ.get("WORKBENCH_ENGINE_HOST_COMMAND_JSON")
     if command is not None:
         updates["engine_host_command"] = _json_string_array("command", command)

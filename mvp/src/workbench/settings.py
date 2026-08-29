@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
 
 from workbench.runtime.engine_host.v2.security import validate_runtime_argv
 
@@ -43,6 +43,7 @@ class WorkbenchSettings(BaseModel):
     engine_host_provider_allowlist: tuple[str, ...] = ("lmstudio",)
     engine_host_v2_enabled: bool = False
     engine_host_v2_runtimes: tuple[RuntimeProcessConfig, ...] = ()
+    python_term_runtime_enabled: StrictBool = False
 
     @property
     def database(self) -> Path:

@@ -13,7 +13,9 @@ from typing import Literal
 from pydantic import ConfigDict, StrictBool
 
 from workbench.runtime.engine_host.v2.contracts import (
+    Digest,
     FrozenModel,
+    QueryCommandV2,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
     ToolManifestEntryV2,
@@ -44,6 +46,14 @@ _CAPABILITY_NAMES = (
     "event_cursor",
 )
 _REGISTRATION_STATES = frozenset({"ready", "disabled"})
+_DIAGNOSTIC_ERROR_CATEGORIES = frozenset(
+    {
+        "capability_unavailable",
+        "command_rejected",
+        "gate_metadata_unavailable",
+        "registry_integrity",
+    }
+)
 
 
 class NoConformantRuntime(RuntimeError):
@@ -160,6 +170,35 @@ class RuntimeRequirementsV2(FrozenModel):
     event_cursor: StrictBool = False
 
 
+class RuntimeGateMetadataV2(FrozenModel):
+    """Fixed, verifiable metadata required before a gated runtime is selected.
+
+    This record is intentionally not a runtime gate decision.  It lets the
+    control plane compare one concrete runtime build and capability snapshot
+    without accepting mutable process configuration, provider grants, or a
+    caller supplied "GO" assertion.
+    """
+
+    runtime_id: str
+    build_id: str
+    protocol_version: Literal["2.0"] = "2.0"
+    capability_digest: Digest
+
+    @classmethod
+    def from_capabilities(
+        cls, capabilities: RuntimeCapabilitiesV2
+    ) -> "RuntimeGateMetadataV2":
+        if not isinstance(capabilities, RuntimeCapabilitiesV2):
+            raise TypeError("capabilities must be a RuntimeCapabilitiesV2")
+        _, capability_digest = canonical_capability_snapshot(capabilities)
+        return cls(
+            runtime_id=capabilities.runtime_id,
+            build_id=capabilities.build_id,
+            protocol_version=capabilities.protocol_version,
+            capability_digest=capability_digest,
+        )
+
+
 @dataclass(frozen=True)
 class RuntimeSelectionV2:
     """The non-secret runtime identity returned to a command or diagnostic caller."""
@@ -186,6 +225,7 @@ class RuntimeRegistryV2:
         self.repository = repository
         self._lock = threading.RLock()
         self._advertised: dict[str, RuntimeCapabilitiesV2] = {}
+        self._diagnostic_errors: dict[str, str] = {}
         self.__executor_runtime_id: str | None = None
         self.__executor_host_generation = 1
         self.__executor_descriptors: dict[
@@ -435,6 +475,96 @@ class RuntimeRegistryV2:
         """Resolve an accepted command only to its durable runtime/build pair."""
         return self._selection_for_pin(command_id)
 
+    def route_python_term_query(
+        self,
+        command: QueryCommandV2,
+        envelope: RunEnvelopeV2,
+        gate_metadata: RuntimeGateMetadataV2,
+    ) -> RuntimeSelectionV2:
+        """Select and pin only a new, explicitly requested Python Term query.
+
+        An existing command never re-enters runtime selection: its persisted
+        runtime/build pin is returned even after the live registration changes.
+        New commands require a Host v2 capability match and metadata that can
+        be checked against the same registration transaction.
+        """
+        if not isinstance(command, QueryCommandV2):
+            raise TypeError("command must be a QueryCommandV2")
+        if not isinstance(envelope, RunEnvelopeV2):
+            raise TypeError("envelope must be a RunEnvelopeV2")
+        if not isinstance(gate_metadata, RuntimeGateMetadataV2):
+            raise TypeError("gate_metadata must be a RuntimeGateMetadataV2")
+        if command.type != "query.start" or command.command_id != envelope.command_id:
+            self._record_diagnostic_error("python-term", "command_rejected")
+            raise NoConformantRuntime("Python Term command was rejected") from None
+        if (
+            envelope.runtime.runtime_id != "python-term"
+            or gate_metadata.runtime_id != "python-term"
+        ):
+            self._record_diagnostic_error("python-term", "gate_metadata_unavailable")
+            raise NoConformantRuntime(
+                "Python Term runtime metadata is unavailable for command admission"
+            ) from None
+        requirements = RuntimeRequirementsV2(
+            preferred_runtime_id="python-term",
+            query=True,
+            model=True,
+            tools=bool(envelope.tool_manifest),
+            skills=bool(envelope.skill_pins),
+            plugins=bool(envelope.plugin_pins),
+            workspace=bool(envelope.tool_manifest),
+            checkpoints=True,
+            streaming=True,
+            event_cursor=True,
+        )
+        try:
+            with self._lock:
+                admitted = self.repository._admit_command(
+                    envelope,
+                    lambda connection: self._select_python_term_for_admission(
+                        envelope, requirements, gate_metadata, connection
+                    ),
+                )
+                if admitted.selection is None:
+                    pinned = self._selection_for_pin(admitted.pin.command_id)
+                    if pinned.runtime_id != "python-term":
+                        raise NoConformantRuntime(
+                            "Python Term command has a different durable runtime pin"
+                        )
+                    return pinned
+                selected = admitted.selection
+                return RuntimeSelectionV2(
+                    runtime_id=selected.runtime_id,
+                    build_id=selected.build_id,
+                    state=selected.state,
+                    capabilities=selected.capabilities,
+                    command_id=envelope.command_id,
+                )
+        except RuntimeRegistryIntegrityError:
+            self._record_diagnostic_error("python-term", "registry_integrity")
+            raise
+        except NoConformantRuntime as error:
+            category = (
+                "gate_metadata_unavailable"
+                if "metadata" in str(error)
+                else "capability_unavailable"
+            )
+            self._record_diagnostic_error("python-term", category)
+            raise
+
+    def last_error_category(self, runtime_id: str) -> str | None:
+        """Return a fixed public category, never an exception or process detail."""
+        if not isinstance(runtime_id, str) or not runtime_id:
+            raise ValueError("runtime_id must be a non-empty string")
+        with self._lock:
+            return self._diagnostic_errors.get(runtime_id)
+
+    def _record_diagnostic_error(self, runtime_id: str, category: str) -> None:
+        if category not in _DIAGNOSTIC_ERROR_CATEGORIES:
+            raise ValueError("diagnostic error category is invalid")
+        with self._lock:
+            self._diagnostic_errors[runtime_id] = category
+
     def _selection_for_pin(self, command_id: str) -> RuntimeSelectionV2:
         """Resume from the command pin, never from a later live registration choice."""
         pin = self.repository.get_pin(command_id)
@@ -501,6 +631,43 @@ class RuntimeRegistryV2:
         ):
             raise NoConformantRuntime(
                 "envelope runtime must match the selected runtime before admission"
+            )
+        return chosen
+
+    def _select_python_term_for_admission(
+        self,
+        envelope: RunEnvelopeV2,
+        requirements: RuntimeRequirementsV2,
+        gate_metadata: RuntimeGateMetadataV2,
+        connection: sqlite3.Connection,
+    ) -> RuntimeSelectionV2:
+        chosen = self._select_for_admission(envelope, requirements, connection)
+        if chosen.runtime_id != "python-term":
+            raise NoConformantRuntime(
+                "Python Term cannot fall back to another runtime before admission"
+            )
+        registration = next(
+            (
+                item
+                for item in self._registrations(connection)
+                if item.capabilities.runtime_id == chosen.runtime_id
+            ),
+            None,
+        )
+        if registration is None:
+            raise NoConformantRuntime(
+                "Python Term capability metadata is unavailable for command admission"
+            )
+        _, capability_digest = canonical_capability_snapshot(registration.capabilities)
+        if (
+            gate_metadata.runtime_id != registration.capabilities.runtime_id
+            or gate_metadata.build_id != registration.capabilities.build_id
+            or gate_metadata.protocol_version
+            != registration.capabilities.protocol_version
+            or gate_metadata.capability_digest != capability_digest
+        ):
+            raise NoConformantRuntime(
+                "Python Term capability metadata does not match the registration"
             )
         return chosen
 

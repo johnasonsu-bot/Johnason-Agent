@@ -71,6 +71,15 @@ class EngineHostV2RuntimeDiagnostic(BaseModel):
     build_id: str
     state: Literal["ready", "disabled", "unavailable"]
     capabilities: tuple[str, ...]
+    last_error_category: (
+        Literal[
+            "capability_unavailable",
+            "command_rejected",
+            "gate_metadata_unavailable",
+            "registry_integrity",
+        ]
+        | None
+    ) = None
 
 
 class EngineHostV2Diagnostic(BaseModel):
@@ -94,7 +103,9 @@ def engine_host_v2_router(registry: RuntimeRegistryV2 | None, *, enabled: bool) 
 
     router = APIRouter(prefix="/api/v1/engine-host", tags=["engine-host"])
 
-    @router.get("", response_model=EngineHostDiagnosticV2Envelope)
+    @router.get(
+        "", response_model=EngineHostDiagnosticV2Envelope, response_model_exclude_none=True
+    )
     def status() -> EngineHostDiagnosticV2Envelope:
         try:
             snapshots = () if registry is None else registry.snapshot()
@@ -113,6 +124,9 @@ def engine_host_v2_router(registry: RuntimeRegistryV2 | None, *, enabled: bool) 
                         build_id=item.build_id,
                         state=item.state,
                         capabilities=item.capabilities,
+                        last_error_category=registry.last_error_category(item.runtime_id)
+                        if registry is not None
+                        else None,
                     )
                     for item in snapshots
                 ),
