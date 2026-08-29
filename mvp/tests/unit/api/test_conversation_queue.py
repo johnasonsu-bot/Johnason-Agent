@@ -85,6 +85,22 @@ class RetryOnceRunner:
         yield AgentEvent(kind="turn_finished", session_id=command.session_id, run_id=command.run_id)
 
 
+class MutableProviderRunner(RetryOnceRunner):
+    """Resolve the current default independently from an already durable Turn."""
+
+    def __init__(self, provider_id: str) -> None:
+        super().__init__()
+        self.provider_id = provider_id
+
+    def resolve_profile(self, provider_id: str | None = None) -> ProviderProfileRecord:
+        return ProviderProfileRecord(
+            id=provider_id or self.provider_id,
+            name="Provider",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234",
+        )
+
+
 def _start_session(client: TestClient) -> None:
     response = client.post("/api/sessions", json={"session_id": "session-1"})
     assert response.status_code == 200
@@ -157,6 +173,159 @@ async def test_v1_retry_rebuilds_a_missing_queued_event_after_persisted_crash_wi
             model="configured-model",
             provider_id="provider-1",
         )
+
+
+@pytest.mark.asyncio
+async def test_v1_retry_repairs_missing_queued_before_returning_terminal(
+    tmp_path: Path,
+) -> None:
+    """Terminal projection cannot hide a missing durable queue event."""
+    database = tmp_path / "v1-terminal-before-retry.sqlite"
+    repository = ConversationRepository(database)
+    events = EventStore(database)
+    api = ConversationAPI(repository, events, RetryOnceRunner())
+    api.create_session("session-1")
+    identity = {
+        "content": "recover terminal history",
+        "model": "configured-model",
+        "provider_id": "provider-1",
+    }
+    reservation_id = api._reserve(
+        "session-1", "turn-1", "message", identity
+    )
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id=api._lifecycle_run_id("session-1"),
+        provider_id="provider-1",
+        model="configured-model",
+        prompt=identity["content"],
+        initial_state=api._initial_turn_state("session-1"),
+    )
+    claimed = repository.claim_next_turn(owner_id="worker")
+    assert claimed is not None
+    repository.finish_turn(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        status="completed",
+        state=claimed.state,
+        result=[],
+    )
+    api._append(
+        "session-1",
+        "conversation.turn.finished",
+        {"command_id": "turn-1", "response_status": "completed"},
+        "turn-1",
+        ordinal=1,
+        causation_id=reservation_id,
+    )
+
+    recovered = await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content=identity["content"],
+        model=identity["model"],
+        provider_id=identity["provider_id"],
+    )
+
+    assert recovered["status"] == "completed"
+    queued = [
+        event
+        for event in events.read_stream("run:session-1")
+        if event.event_type == "conversation.turn.queued"
+        and event.causation_id == reservation_id
+    ]
+    assert len(queued) == 1
+    assert queued[0].payload == {
+        "command_id": "turn-1",
+        "status": "queued",
+        "model": "configured-model",
+        "provider_id": "provider-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_v1_retry_repairs_from_durable_turn_after_default_provider_changes(
+    tmp_path: Path,
+) -> None:
+    """Accepted Turn identity, not the live default, owns queue recovery."""
+    database = tmp_path / "v1-default-provider-change.sqlite"
+    repository = ConversationRepository(database)
+    events = EventStore(database)
+    runner = MutableProviderRunner("provider-old")
+    api = ConversationAPI(repository, events, runner)
+    api.create_session("session-1")
+    reservation_id = api._reserve(
+        "session-1",
+        "turn-1",
+        "message",
+        {
+            "content": "recover old provider",
+            "model": "configured-model",
+            "provider_id": None,
+        },
+    )
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id=api._lifecycle_run_id("session-1"),
+        provider_id="provider-old",
+        model="configured-model",
+        prompt="recover old provider",
+        initial_state=api._initial_turn_state("session-1"),
+    )
+    runner.provider_id = "provider-new"
+
+    recovered = await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="recover old provider",
+        model="configured-model",
+        provider_id=None,
+    )
+
+    assert recovered["status"] == "queued"
+    queued = [
+        event
+        for event in events.read_stream("run:session-1")
+        if event.event_type == "conversation.turn.queued"
+        and event.causation_id == reservation_id
+    ]
+    assert len(queued) == 1
+    assert queued[0].payload["provider_id"] == "provider-old"
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None
+    assert turn.provider_id == "provider-old"
+
+
+@pytest.mark.asyncio
+async def test_v1_retry_with_existing_queued_event_is_read_only(
+    tmp_path: Path,
+) -> None:
+    """A normal retry reuses its queue cursor without adding another event."""
+    database = tmp_path / "v1-existing-queued.sqlite"
+    events = EventStore(database)
+    api = ConversationAPI(ConversationRepository(database), events, RetryOnceRunner())
+    api.create_session("session-1")
+    request = {
+        "session_id": "session-1",
+        "command_id": "turn-1",
+        "content": "already queued",
+        "model": "configured-model",
+        "provider_id": "provider-1",
+    }
+
+    accepted = await api.enqueue_message(**request)
+    retried = await api.enqueue_message(**request)
+
+    assert accepted["cursor"] == retried["cursor"]
+    queued = [
+        event
+        for event in events.read_stream("run:session-1")
+        if event.event_type == "conversation.turn.queued"
+    ]
+    assert len(queued) == 1
 
 
 def test_message_returns_202_before_runner_finishes(tmp_path: Path) -> None:

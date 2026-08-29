@@ -229,3 +229,47 @@ Provider grant。Task 5 测试进程报告 `OPENAI_API_KEY is not set, skipping 
 
 - Task 7 gate metadata 与 executor composition 仍未实现；因此生产 explicit Python Term request
   仍按设计 fail closed，Round 3 的 fixture proof 绝不代表 production eligibility 或 GO。
+
+## Round 4 修复（2026-08-29）
+
+### RED → GREEN
+
+1. RED：v1 reservation 与 Turn 已持久化、worker 先完成、但 queued event 缺失时，fast path
+   会直接返回 terminal，导致 queued 永久缺失；默认 Provider 在接受后变化时，锁内路径还会重新
+   解析 live Provider，并以 `turn identity cannot change` 中止恢复。GREEN：fast path 必须先确认
+   queued 存在才可返回 terminal；缺失时进入既有 session lock，以 accepted reservation 的
+   causation 和 durable Turn 的 `provider_id` / `model` 追加唯一、确定性的 queued event，然后才
+   返回 terminal、paused 或 accepted 状态。恢复不再读取当前/default Provider。已有 queued retry
+   仍保持只读并复用原 cursor。
+2. 原并发测试仅阻塞 v1 Provider resolution，不能证明第二请求已抵达 session admission 边界，且
+   没有覆盖 Python Term 先赢。替换为显式 async gate：两个请求分别到达同一 `_session_lock`
+   边界后才按测试指定顺序放行。v1 先赢时 Python Term 返回 typed conflict、无内部 pin；Python
+   Term 先赢时 v1 返回固定 identity conflict，唯一 pin、Turn、message 与 reservation 全部属于
+   Python Term winner。临时移除 session lock 的突变验证使两个 winner 用例均在可观察边界稳定
+   失败；恢复串行化后 2/2 通过，无 sleep 或重复调度。
+3. 扩大回归暴露既有 safe-header retry 断言把幂等结果固定为 HTTP 202；后台 worker 可能在 retry
+   前完成而合法返回 HTTP 200。测试现分别断言首次接受为 202、同身份 retry 为 accepted/terminal
+   两种合法状态，并继续要求 Provider header 改变固定返回 409。
+
+### Round 4 验证证据
+
+1. RED focused：`2 failed, 4 passed, 35 deselected`；失败分别为 terminal-before-retry 未修复
+   queued，以及默认 Provider 改变后的 Turn identity 冲突。GREEN 后同组 `6 passed, 35
+   deselected`。
+2. 会话锁突变：临时移除 `_session_lock` 后双向 winner 覆盖 `2 failed`（均在显式 admission
+   boundary 超时）；恢复正式实现后 `2 passed, 19 deselected`。
+3. Queue + Task 6 focused：`73 passed in 5.83s`（exit 0）。
+4. Host/API/Conversation 回归：`165 passed in 15.69s`（exit 0）。
+5. Task 5 runtime/recovery：`64 passed in 43.05s`（exit 0）。
+6. 完整 unit：`2129 passed in 115.38s`（exit 0）。
+7. Canvas：Vite/TypeScript build 完成，Playwright `38 passed (1.6m)`（exit 0）。
+8. `compileall`（main、api、conversation repository、Host v2、Python Term）与
+   `git diff --check`：exit 0。
+
+### Round 4 Concern
+
+- Task 7 gate metadata 与 executor composition 仍未实现；生产 explicit Python Term request
+  继续 fail closed。本轮测试使用的私有 fixture proof 只验证 Task 6 admission/recovery，不形成
+  production eligibility 或 `GO_PYTHON_TERM_RUNTIME`。
+- same-session serialization 仍是单一 Electron backend 内的 asyncio lock 边界，不宣称跨进程或
+  分布式互斥；该边界与 Task 6 既有 ruling 一致。

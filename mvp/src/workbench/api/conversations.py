@@ -336,6 +336,13 @@ class ConversationAPI:
             if runtime == "python-term":
                 raise PythonTermAdmissionConflict() from None
             raise
+        if runtime is None and not agent_bindings:
+            recovered = self._repair_v1_missing_queued_event(
+                session_id=session_id,
+                command_id=command_id,
+            )
+            if recovered is not None:
+                return recovered
         selected_runtime: PythonTermConversationRoute | None = None
         if runtime == "python-term":
             if self.python_term_router is None:
@@ -1679,9 +1686,6 @@ class ConversationAPI:
         turn = self.conversations.load_turn_status(session_id, command_id)
         if turn is None:
             return None
-        terminal = self._terminal_response(session_id, command_id, event.event_id)
-        if terminal is not None:
-            return terminal
         queued = next(
             (
                 item
@@ -1693,11 +1697,77 @@ class ConversationAPI:
         )
         if queued is None:
             return None
+        terminal = self._terminal_response(session_id, command_id, event.event_id)
+        if terminal is not None:
+            return terminal
         return {
             "session_id": session_id,
             "command_id": command_id,
             "status": turn.status,
             "cursor": f"{queued.sequence}:0",
+        }
+
+    def _repair_v1_missing_queued_event(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+    ) -> dict[str, Any] | None:
+        """Repair accepted v1 history solely from its durable reservation and Turn."""
+        key = self._reservation_id(session_id, command_id)
+        with self.events.store.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT domain_events.event_json FROM command_results
+                JOIN domain_events ON domain_events.event_id = command_results.event_id
+                WHERE command_results.command_id = ?
+                """,
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        reservation = DomainEvent.model_validate_json(row["event_json"])
+        turn = self.conversations.load_turn_status(session_id, command_id)
+        if turn is None:
+            return None
+        queued = next(
+            (
+                event
+                for event in self.events.read_stream(f"run:{session_id}")
+                if event.event_type == "conversation.turn.queued"
+                and event.causation_id == reservation.event_id
+            ),
+            None,
+        )
+        if queued is None:
+            projected = self._append(
+                session_id,
+                "conversation.turn.queued",
+                {
+                    "command_id": command_id,
+                    "status": "queued",
+                    "model": turn.model,
+                    "provider_id": turn.provider_id,
+                },
+                command_id,
+                ordinal=-1,
+                causation_id=reservation.event_id,
+            )
+            sequence = projected.get("sequence")
+        else:
+            sequence = queued.sequence
+        terminal = self._terminal_response(
+            session_id, command_id, reservation.event_id
+        )
+        if terminal is not None:
+            return terminal
+        if self._status(session_id) == "paused":
+            raise SessionPausedError(session_id)
+        return {
+            "session_id": session_id,
+            "command_id": command_id,
+            "status": turn.status,
+            "cursor": f"{sequence}:0" if isinstance(sequence, int) else None,
         }
 
     def _require_session(self, session_id: str) -> None:

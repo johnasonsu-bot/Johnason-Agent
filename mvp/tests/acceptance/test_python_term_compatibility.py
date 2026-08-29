@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,7 +28,11 @@ from workbench.orchestration.project_context import (
 )
 from workbench.providers.repository import ProviderRepository
 from workbench.settings import WorkbenchSettings
-from workbench.api.conversations import python_term_command_id
+from workbench.api.conversations import (
+    ConversationAPI,
+    PythonTermAdmissionConflict,
+    python_term_command_id,
+)
 from workbench.workflow.event_store import EventStore
 from tests.fixtures.host_v2 import runtime_capabilities
 
@@ -102,23 +106,59 @@ def _task7_app(
     return registry, app
 
 
-class _V1AdmissionBarrierRunner(_V1Runner):
-    """Make the cross-runtime admission order repeatable without sleeps."""
+class _ObservableAdmissionGate:
+    """Expose each request reaching the session-lock boundary to the test."""
 
     def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
+        self._attempts: asyncio.Queue[int] = asyncio.Queue()
+        self._releases: list[asyncio.Event] = []
 
-    def resolve_profile(self, provider_id: str | None = None) -> ProviderProfileRecord:
-        self.entered.set()
-        if not self.release.wait(timeout=2):
-            raise AssertionError("v1 admission barrier was not released")
-        return ProviderProfileRecord(
-            id=provider_id or "provider-1",
-            name="Provider",
-            protocol="lmstudio",
-            base_url="http://localhost:1234",
-        )
+    async def __aenter__(self) -> None:
+        attempt = len(self._releases)
+        release = asyncio.Event()
+        self._releases.append(release)
+        await self._attempts.put(attempt)
+        await release.wait()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def next_attempt(self) -> int:
+        return await asyncio.wait_for(self._attempts.get(), timeout=2)
+
+    def release(self, attempt: int) -> None:
+        self._releases[attempt].set()
+
+
+def _task7_api(database: Path) -> tuple[RuntimeRegistryV2, ConversationAPI]:
+    _save_provider(database)
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    capabilities = runtime_capabilities(
+        "python-term",
+        build_id="python-term-task7-build",
+        query=True,
+        model=True,
+        checkpoints=True,
+        streaming=True,
+        event_cursor=True,
+    )
+    registry.register(capabilities)
+    proof = registry_module._issue_python_term_gate_proof_for_task7(  # type: ignore[attr-defined]
+        source_revision="task7-source-r1",
+        capabilities=capabilities,
+        gate_result_digest="7" * 64,
+    )
+    api = ConversationAPI(
+        conversations=ConversationRepository(database),
+        events=EventStore(database),
+        runner=_V1Runner(),
+        agents=AgentProfileRepository(database),
+        project_contexts=ProjectContextRepository(database),
+        providers=ProviderRepository(database),
+        python_term_router=main.PythonTermQueryRouter(registry, _gate_proof=proof),
+    )
+    api.create_session("session-1")
+    return registry, api
 
 
 def test_existing_v1_conversations_keep_the_v1_runner_when_python_term_is_enabled(
@@ -262,50 +302,68 @@ def test_existing_v1_command_id_cannot_create_a_later_python_term_pin(
     ) is None
 
 
-@pytest.mark.parametrize("round_number", range(4))
-def test_same_session_v1_and_python_term_requests_have_one_durable_admission(
-    tmp_path: Path, round_number: int
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ("v1", "python-term"))
+async def test_same_session_v1_and_python_term_admission_serializes_at_lock_boundary(
+    tmp_path: Path, winner: str
 ) -> None:
-    """A blocked v1 admission makes the Python Term conflict order deterministic."""
-    database = tmp_path / f"cross-runtime-{round_number}.sqlite"
-    runner = _V1AdmissionBarrierRunner()
-    registry, app = _task7_app(database, runner=runner)
+    """Both requests reach the lock; the released winner owns all durable state."""
+    database = tmp_path / f"cross-runtime-{winner}.sqlite"
+    registry, api = _task7_api(database)
     session_id = "session-1"
     command_id = "cross-runtime-command"
+    gate = _ObservableAdmissionGate()
+    api._locks[session_id] = gate  # type: ignore[assignment]
+    requests: dict[str, dict[str, Any]] = {
+        "v1": {
+            "session_id": session_id,
+            "command_id": command_id,
+            "content": "hello",
+            "model": "configured-model",
+            "provider_id": "provider-1",
+        },
+        "python-term": {
+            "session_id": session_id,
+            "command_id": command_id,
+            "content": "hello",
+            "model": "configured-model",
+            "provider_id": "provider-1",
+            "runtime": "python-term",
+        },
+    }
+    loser = "python-term" if winner == "v1" else "v1"
+    winner_task = asyncio.create_task(api.enqueue_message(**requests[winner]))
+    assert await gate.next_attempt() == 0
+    loser_task = asyncio.create_task(api.enqueue_message(**requests[loser]))
+    assert await gate.next_attempt() == 1
+    gate.release(0)
+    winner_result = await asyncio.wait_for(winner_task, timeout=2)
+    gate.release(1)
+    loser_error = PythonTermAdmissionConflict if loser == "python-term" else ValueError
+    with pytest.raises(loser_error, match="command (identity cannot change|conflict)"):
+        await asyncio.wait_for(loser_task, timeout=2)
 
-    with TestClient(app) as client:
-        assert client.post("/api/sessions", json={"session_id": session_id}).status_code == 200
-
-        def post(payload: dict[str, str]) -> object:
-            return client.post(
-                f"/api/sessions/{session_id}/messages",
-                headers={"Idempotency-Key": command_id},
-                json=payload,
-            )
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            v1 = pool.submit(post, {"content": "hello", "provider_id": "provider-1"})
-            assert runner.entered.wait(timeout=2)
-            python_term = pool.submit(
-                post,
-                {
-                    "content": "hello",
-                    "provider_id": "provider-1",
-                    "runtime": "python-term",
-                },
-            )
-            runner.release.set()
-            v1_response = v1.result(timeout=2)
-            python_term_response = python_term.result(timeout=2)
-
-    assert v1_response.status_code == 202
-    assert python_term_response.status_code == 409
-    assert python_term_response.json() == {"detail": "python term command conflict"}
+    assert winner_result["status"] == "queued"
     runtime_command_id = python_term_command_id(session_id, command_id)
-    assert registry.repository.get_pin(runtime_command_id) is None
     turn = ConversationRepository(database).load_turn_status(session_id, command_id)
     assert turn is not None
-    assert turn.state["runner_mode"] == "python"
+    messages = ConversationRepository(database).list_messages(session_id)
+    assert [(message.command_id, message.content) for message in messages] == [
+        (f"{command_id}:user", "hello")
+    ]
+    with EventStore(database).store.connect() as connection:
+        reservation_count = connection.execute(
+            """SELECT COUNT(*) AS count FROM command_results
+            WHERE command_id LIKE 'conversation-command:%'"""
+        ).fetchone()["count"]
+    assert reservation_count == 1
+    if winner == "v1":
+        assert turn.state["runner_mode"] == "python"
+        assert registry.repository.get_pin(runtime_command_id) is None
+    else:
+        assert turn.state["runner_mode"] == "python_term"
+        assert turn.state["runtime_command_id"] == runtime_command_id
+        assert registry.repository.get_pin(runtime_command_id) is not None
 
 
 @pytest.mark.parametrize(
@@ -504,7 +562,8 @@ def test_python_term_safe_provider_headers_are_part_of_its_durable_snapshot(
             json=payload,
         )
 
-    assert accepted.status_code == unchanged_retry.status_code == 202
+    assert accepted.status_code == 202
+    assert unchanged_retry.status_code in {200, 202}
     assert changed.status_code == 409
     assert changed.json() == {"detail": "python term command conflict"}
     assert registry.repository.get_pin(
