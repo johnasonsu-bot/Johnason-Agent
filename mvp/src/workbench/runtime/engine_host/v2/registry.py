@@ -44,6 +44,7 @@ _CAPABILITY_NAMES = (
     "tool_interceptors",
     "event_cursor",
 )
+_PLUGIN_CAPABILITY_NAMES = frozenset(_CAPABILITY_NAMES)
 _REGISTRATION_STATES = frozenset({"ready", "disabled"})
 _DIAGNOSTIC_ERROR_CATEGORIES = frozenset(
     {
@@ -62,13 +63,26 @@ class NoConformantRuntime(RuntimeError):
 class PythonTermRoutingError(NoConformantRuntime):
     """A fixed, non-secret Python Term admission result."""
 
-    def __init__(self, code: Literal["capability_unavailable", "command_rejected", "gate_metadata_unavailable"]) -> None:
+    def __init__(
+        self,
+        code: Literal[
+            "capability_unavailable",
+            "command_rejected",
+            "gate_metadata_unavailable",
+            "unknown_plugin_capability",
+        ],
+    ) -> None:
         self.code = code
-        self.diagnostic_category = code
+        self.diagnostic_category = (
+            "capability_unavailable"
+            if code == "unknown_plugin_capability"
+            else code
+        )
         message = {
             "capability_unavailable": "Python Term capability is unavailable",
             "command_rejected": "Python Term command was rejected",
             "gate_metadata_unavailable": "Python Term gate proof is unavailable",
+            "unknown_plugin_capability": "Python Term plugin capability is unavailable",
         }[code]
         super().__init__(message)
 
@@ -572,8 +586,8 @@ class RuntimeRegistryV2:
         if envelope.runtime.runtime_id != "python-term":
             self._record_diagnostic_error("python-term", "gate_metadata_unavailable")
             raise PythonTermRoutingError("gate_metadata_unavailable") from None
-        requirements = _requirements_for_python_term_envelope(envelope)
         try:
+            requirements = _requirements_for_python_term_envelope(envelope)
             with self._lock:
                 admitted = self.repository._admit_command(
                 envelope,
@@ -797,6 +811,13 @@ def _requirements_for_python_term_envelope(
     envelope: RunEnvelopeV2,
 ) -> RuntimeRequirementsV2:
     """Map the complete frozen envelope to the capabilities needed for admission."""
+    plugin_contributions: set[str] = set()
+    for pin in envelope.plugin_pins:
+        for capability in pin.capabilities:
+            if capability not in _PLUGIN_CAPABILITY_NAMES:
+                raise PythonTermRoutingError("unknown_plugin_capability")
+            plugin_contributions.add(capability)
+
     workspace = envelope.workspace_grant
     workspace_used = bool(
         workspace.readable_paths
@@ -809,8 +830,8 @@ def _requirements_for_python_term_envelope(
         or any(pin.prompt_section_ids for pin in envelope.skill_pins)
         or _extension_requests(envelope, "prompt_sections")
     )
-    return RuntimeRequirementsV2(
-        preferred_runtime_id="python-term",
+    requirements: dict[str, bool] = {name: False for name in _CAPABILITY_NAMES}
+    requirements.update(
         query=True,
         model=True,
         tools=bool(envelope.tool_manifest),
@@ -833,6 +854,11 @@ def _requirements_for_python_term_envelope(
             envelope, "tool_interceptors", "tool_interceptors_requested"
         ),
         event_cursor=True,
+    )
+    for capability in plugin_contributions:
+        requirements[capability] = True
+    return RuntimeRequirementsV2(
+        preferred_runtime_id="python-term", **requirements
     )
 
 

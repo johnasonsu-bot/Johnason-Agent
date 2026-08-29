@@ -117,6 +117,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         agents=agent_profiles,
         graph_control=GraphControlStore(settings.database),
         project_contexts=ProjectContextRepository(settings.database),
+        providers=ProviderRepository(settings.database),
         sequential_processor=sequential_processor,
         development_jobs=development_jobs,
         python_term_router=settings.python_term_router,

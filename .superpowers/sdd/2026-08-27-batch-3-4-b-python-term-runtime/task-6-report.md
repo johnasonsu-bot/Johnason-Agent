@@ -127,3 +127,51 @@ Provider grant。Task 5 测试进程报告 `OPENAI_API_KEY is not set, skipping 
 - 未实现 Task 7 gate metadata/GO，也不以 capability registration 代替 proof。当前生产 explicit
   Python Term request 因此按设计不可用；Task 7 需要提供固定控制面的 proof 与实际 executor
   composition，才可打开 admission/execution。
+
+## Round 2 修复（2026-08-29）
+
+### RED → GREEN
+
+1. RED：Conversation builder 仅哈希 HTTP 请求字段，并把它们伪造成 Provider、Model 与 Context
+   reference。GREEN：在 pin 前由既有 `ProviderRepository`、`AgentProfileRepository`、
+   `ProjectContextRepository` 与 `ConversationRepository` 读取权威快照。Provider 必须存在且
+   enabled，模型必须是已保存 alias/configured model；Agent 与 Project Context 必须匹配请求的
+   精确版本。Envelope 只保存可解析 opaque reference 和这些快照的 canonical digest，不持久化
+   message 内容、Provider URL、secret reference、grant 或凭据。候选 user message 以稳定身份纳入
+   digest，并且只在 admission 成功后追加。
+2. RED：Plugin pin 的 capability 列表没有参与 requirements。GREEN：所有已知 capability 都
+   归一映射到 `RuntimeRequirementsV2`；未知 contribution 返回 typed
+   `unknown_plugin_capability`，在 pin 前 fail closed。表驱动测试覆盖每项非空 contribution 与
+   mixed contributions。
+3. RED：v2 pin 以全局 external Idempotency-Key 为键，两个 session 会冲突；底层冲突文本还会
+   跨 HTTP 边界。GREEN：以 `(session_id, external command_id)` 派生内部 opaque
+   `runtime_command_id`，一致用于 Query、Envelope、pin、resume 和 immutable turn routing
+   metadata；Conversation event/API 仍使用 external command id。冲突映射为固定
+   `409 {"detail":"python term command conflict"}`，无数据库或 registry 文本泄露。
+4. RED：reservation precheck、pin 与 turn reservation 可跨同 session 请求交叉。GREEN：现有
+   `asyncio.Lock` 包住完整 admission（precheck、权威快照、route/pin、reservation、message/turn）。
+   已接受 legacy v1 同身份 retry 仅作只读结果恢复，不重跑模型或追加 message；它不会绕开
+   Python Term 的锁内 frozen-snapshot/pin 验证。该 lock 是单一 Electron backend 内的并发边界，
+   不是分布式锁。
+
+### 兼容与安全边界
+
+- 未带 runtime selection 的旧会话继续走 v1；v1 已接受 retry 保持其原有 command identity。
+  Python Term 绝不 fallback 到 v1，也不会使用 legacy retry fast path。
+- 两个 session 可重用相同 external key 而获得不同 v2 durable pins；同一 session 的身份变化
+  保持 fail closed。``runtime_command_id`` 也受 `TURN_ROUTING_METADATA` 不可变规则保护。
+- Task 7 gate eligibility 仍完全缺失：生产 composition 只注册只读诊断的真实 capability，绝不
+  自签或暴露 proof；缺 proof 的 explicit Python Term 请求在任何 pin/turn 前返回固定 503。
+
+### Round 2 验证证据
+
+1. RED 收集：新增 `python_term_command_id` contract 尚不存在时，Task 6 focused collection
+   失败（exit 2，0 tests executed）；随后完成实现并转 GREEN。
+2. Queue + Task 6 focused：`63 passed in 5.62s`（exit 0）。覆盖 v1 同 identity 不重跑/不重复
+   message、执行中改身份 409、Python Term stable retry、session-scoped pin、权威 authority 和
+   changed history/profile identity。
+3. Host/API/Conversation focused：`117 passed in 12.22s`（exit 0）。
+4. Task 5：`64 passed in 42.87s`（exit 0）。
+5. 完整 unit：`2125 passed in 116.53s`（exit 0）。初次 full-unit run 暴露 v1 duplicate retry
+   等待 worker lock 的死等；以 `-vv -x` 定位后新增上述 read-only v1 retry 回归，再获完整 GREEN。
+6. Canvas：Vite/TypeScript build 成功，Playwright `38 passed (1.6m)`（exit 0）。

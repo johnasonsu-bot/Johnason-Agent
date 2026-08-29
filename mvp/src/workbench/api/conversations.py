@@ -14,6 +14,7 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from workbench.agents.models import AgentProfileRecord
 from workbench.agents.repository import AgentProfileRepository
 from workbench.agui.mapper import map_domain_event
 from workbench.conversations.models import ConversationMessage, ConversationSession
@@ -24,6 +25,7 @@ from workbench.conversations.repository import (
 )
 from workbench.domain.models import EpochRecord, MissionRecord, ProjectRecord, RunRecord
 from workbench.models.contracts import ModelMessage
+from workbench.models.profiles import ProviderProfileRecord
 from workbench.orchestration.compiler import MentionSequenceCompiler
 from workbench.orchestration.contracts import (
     ExecutionPlan,
@@ -33,7 +35,11 @@ from workbench.orchestration.contracts import (
     PublicSummary,
 )
 from workbench.orchestration.control_store import GraphControlStore
-from workbench.orchestration.project_context import ProjectContextRepository
+from workbench.orchestration.project_context import (
+    ProjectContextRepository,
+    ProjectContextVersion,
+)
+from workbench.providers.repository import ProviderRepository
 from workbench.orchestration.development_jobs import DevelopmentJobRepository
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
@@ -171,20 +177,58 @@ class PythonTermRuntimeUnavailable(RuntimeError):
         super().__init__(self.public_detail)
 
 
+class PythonTermAdmissionConflict(RuntimeError):
+    """Fixed public outcome for a changed Python Term command identity."""
+
+    public_detail = "python term command conflict"
+
+    def __init__(self) -> None:
+        super().__init__(self.public_detail)
+
+
+@dataclass(frozen=True)
+class PythonTermConversationAdmission:
+    """Authoritative, frozen inputs for the narrow v2 control-plane seam."""
+
+    session_id: str
+    command_id: str
+    runtime_command_id: str
+    provider: ProviderProfileRecord
+    model: str
+    agent_profiles: tuple[AgentProfileRecord, ...]
+    project_context: ProjectContextVersion | None
+    messages: tuple[ConversationMessage, ...]
+
+
+@dataclass(frozen=True)
+class PythonTermConversationRoute:
+    """The durable Host v2 selection returned before a turn is enqueued."""
+
+    runtime_id: str
+    build_id: str
+    runtime_command_id: str
+
+
+def python_term_command_id(session_id: str, command_id: str) -> str:
+    """Derive the Host-v2-only pin key without exposing it as a public command id."""
+    if not isinstance(session_id, str) or not isinstance(command_id, str):
+        raise TypeError("session_id and command_id must be strings")
+    value = json.dumps(
+        {"session_id": session_id, "command_id": command_id},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "python-term-command:" + hashlib.sha256(value.encode()).hexdigest()
+
+
 class PythonTermConversationRouter(Protocol):
     """Narrow control-plane seam; request handlers never inspect app state."""
 
     def route_conversation_query(
         self,
         *,
-        session_id: str,
-        command_id: str,
-        content: str,
-        provider_id: str,
-        model: str,
-        agent_bindings: tuple[AgentBindingRequest, ...],
-        project_context: ProjectContextBindingRequest | None,
-    ) -> tuple[str, str]: ...
+        admission: PythonTermConversationAdmission,
+    ) -> PythonTermConversationRoute: ...
 
 
 @dataclass
@@ -198,6 +242,7 @@ class ConversationAPI:
     agents: AgentProfileRepository | None = None
     graph_control: GraphControlStore | None = None
     project_contexts: ProjectContextRepository | None = None
+    providers: ProviderRepository | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_jobs: DevelopmentJobRepository | None = None
     python_term_router: PythonTermConversationRouter | None = None
@@ -221,6 +266,41 @@ class ConversationAPI:
         project_context: ProjectContextBindingRequest | None = None,
     ) -> dict[str, Any]:
         """Persist a turn and return before any model request is awaited."""
+        if runtime is None and not agent_bindings:
+            retry = self._v1_message_retry_response(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                model=model,
+                provider_id=provider_id,
+            )
+            if retry is not None:
+                return retry
+        async with self._session_lock(session_id):
+            return self._enqueue_message_locked(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                model=model,
+                provider_id=provider_id,
+                runtime=runtime,
+                agent_bindings=agent_bindings,
+                project_context=project_context,
+            )
+
+    def _enqueue_message_locked(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None,
+        runtime: Literal["python-term"] | None,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
+    ) -> dict[str, Any]:
+        """Run all same-session admission work under the local backend lock."""
         self._require_session(session_id)
         self._require_lifecycle_ownership(session_id)
         if agent_bindings and runtime is None:
@@ -240,25 +320,38 @@ class ConversationAPI:
         }
         if runtime is not None:
             reservation_identity["runtime"] = runtime
-        self._ensure_message_reservation_compatible(
-            session_id, command_id, reservation_identity
-        )
-        selected_runtime: tuple[str, str] | None = None
+            reservation_identity["agent_bindings"] = [
+                binding.model_dump(mode="json") for binding in agent_bindings
+            ]
+            reservation_identity["project_context"] = (
+                project_context.model_dump(mode="json")
+                if project_context is not None
+                else None
+            )
+        try:
+            self._ensure_message_reservation_compatible(
+                session_id, command_id, reservation_identity
+            )
+        except ValueError:
+            if runtime == "python-term":
+                raise PythonTermAdmissionConflict() from None
+            raise
+        selected_runtime: PythonTermConversationRoute | None = None
         if runtime == "python-term":
             if self.python_term_router is None:
                 raise PythonTermRuntimeUnavailable()
-            # The minimal v2 envelope carries only the request's opaque provider
-            # selector; it must not resolve or infer a Provider grant before the
-            # Task 7 gate has admitted the command.
-            resolved_provider = provider_id or "default"
-            selected_runtime = self.python_term_router.route_conversation_query(
+            admission = self._python_term_admission(
                 session_id=session_id,
                 command_id=command_id,
                 content=content,
-                provider_id=resolved_provider,
                 model=model,
+                provider_id=provider_id,
                 agent_bindings=agent_bindings,
                 project_context=project_context,
+            )
+            resolved_provider = admission.provider.id
+            selected_runtime = self.python_term_router.route_conversation_query(
+                admission=admission,
             )
         else:
             resolved_provider = self._resolve_provider_id(provider_id)
@@ -274,7 +367,9 @@ class ConversationAPI:
         if self._status(session_id) == "paused":
             raise SessionPausedError(session_id)
         self.conversations.append_message(
-            ConversationMessage(
+            admission.messages[-1]
+            if runtime == "python-term"
+            else ConversationMessage(
                 session_id=session_id,
                 command_id=f"{command_id}:user",
                 role="user",
@@ -284,8 +379,9 @@ class ConversationAPI:
         initial_state = self._initial_turn_state(session_id)
         if selected_runtime is not None:
             runner_mode = "python_term"
-            initial_state["runtime_id"] = selected_runtime[0]
-            initial_state["runtime_build_id"] = selected_runtime[1]
+            initial_state["runtime_id"] = selected_runtime.runtime_id
+            initial_state["runtime_build_id"] = selected_runtime.build_id
+            initial_state["runtime_command_id"] = selected_runtime.runtime_command_id
         else:
             mode_for = getattr(self.runner, "mode_for", None)
             runner_mode = (
@@ -520,8 +616,11 @@ class ConversationAPI:
             if runner_mode == "python_term":
                 runtime_id = turn.state.get("runtime_id")
                 runtime_build_id = turn.state.get("runtime_build_id")
+                runtime_command_id = turn.state.get("runtime_command_id")
                 if runtime_id != "python-term" or not isinstance(
                     runtime_build_id, str
+                ) or runtime_command_id != python_term_command_id(
+                    session_id, command_id
                 ):
                     raise TurnSnapshotCorruption("invalid Python Term runtime pin")
                 raise TurnSnapshotCorruption("Python Term executor is unavailable")
@@ -841,6 +940,134 @@ class ConversationAPI:
             attempt=attempt,
             causation_id=reservation_id,
         )
+
+    def _python_term_admission(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
+    ) -> PythonTermConversationAdmission:
+        """Resolve only repository-backed authority before a v2 pin is considered."""
+        try:
+            provider = self._python_term_provider(provider_id)
+            configured_model = self._configured_provider_model(provider, model)
+            agent_profiles = self._python_term_agents(agent_bindings)
+            frozen_project = self._python_term_project_context(project_context)
+            history = tuple(self.conversations.list_messages(session_id))
+            next_sequence = history[-1].sequence + 1 if history else 1
+            candidate = ConversationMessage(
+                message_id="conversation-message:" + self._digest(
+                    {
+                        "session_id": session_id,
+                        "command_id": command_id,
+                        "role": "user",
+                        "content": content,
+                    }
+                )[:32],
+                session_id=session_id,
+                command_id=f"{command_id}:user",
+                sequence=next_sequence,
+                role="user",
+                content=content,
+            )
+            existing_candidates = tuple(
+                message
+                for message in history
+                if message.command_id == candidate.command_id
+            )
+            if existing_candidates:
+                if (
+                    len(existing_candidates) != 1
+                    or existing_candidates[0].role != candidate.role
+                    or existing_candidates[0].content != candidate.content
+                    or existing_candidates[0].message_id != candidate.message_id
+                ):
+                    raise ValueError("conversation candidate identity is unavailable")
+                messages = history
+            else:
+                messages = (*history, candidate)
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            raise PythonTermRuntimeUnavailable() from None
+        return PythonTermConversationAdmission(
+            session_id=session_id,
+            command_id=command_id,
+            runtime_command_id=python_term_command_id(session_id, command_id),
+            provider=provider,
+            model=configured_model,
+            agent_profiles=agent_profiles,
+            project_context=frozen_project,
+            messages=messages,
+        )
+
+    def _python_term_provider(self, provider_id: str | None) -> ProviderProfileRecord:
+        if self.providers is None:
+            raise RuntimeError("provider authority is unavailable")
+        resolved_provider = self._resolve_provider_id(provider_id)
+        try:
+            profile = self.providers.get(resolved_provider)
+        except KeyError:
+            if provider_id is not None or resolved_provider != "default":
+                raise
+            profile = next(
+                (candidate for candidate in self.providers.list() if candidate.enabled),
+                None,
+            )
+            if profile is None:
+                raise
+        if not profile.enabled:
+            raise ValueError("provider is disabled")
+        return profile
+
+    @staticmethod
+    def _configured_provider_model(profile: ProviderProfileRecord, model: str) -> str:
+        aliases = profile.model_aliases
+        if model == "default":
+            resolved = aliases.get("default", "default")
+        elif model in aliases:
+            resolved = aliases[model]
+        elif model in aliases.values():
+            resolved = model
+        else:
+            raise ValueError("model is not configured for provider")
+        if not isinstance(resolved, str) or not resolved:
+            raise ValueError("provider model configuration is invalid")
+        return resolved
+
+    def _python_term_agents(
+        self, bindings: tuple[AgentBindingRequest, ...]
+    ) -> tuple[AgentProfileRecord, ...]:
+        if not bindings:
+            return ()
+        if self.agents is None:
+            raise RuntimeError("Agent profile authority is unavailable")
+        profiles: list[AgentProfileRecord] = []
+        seen: set[str] = set()
+        for binding in bindings:
+            if binding.agent_id in seen:
+                raise ValueError("Agent bindings must be unique")
+            profile = self.agents.get(binding.agent_id, binding.expected_version)
+            if profile.version != binding.expected_version or not profile.enabled:
+                raise ValueError("Agent profile version is unavailable")
+            seen.add(binding.agent_id)
+            profiles.append(profile)
+        return tuple(profiles)
+
+    def _python_term_project_context(
+        self, binding: ProjectContextBindingRequest | None
+    ) -> ProjectContextVersion | None:
+        if binding is None:
+            return None
+        if self.project_contexts is None:
+            raise RuntimeError("Project Context authority is unavailable")
+        context = self.project_contexts.get(binding.project_id, binding.version)
+        if context.project_id != binding.project_id or context.version != binding.version:
+            raise ValueError("Project Context version is unavailable")
+        return context
 
     def _resolve_provider_id(self, provider_id: str | None) -> str:
         resolver = getattr(self.runner, "resolve_profile", None)
@@ -1410,6 +1637,64 @@ class ConversationAPI:
             ],
         }
 
+    def _v1_message_retry_response(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Read an already-accepted legacy retry without waiting for its worker turn.
+
+        Python Term requests deliberately never use this fast path: their frozen
+        repository snapshots must be rebuilt under the session admission lock.
+        """
+        key = self._reservation_id(session_id, command_id)
+        with self.events.store.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT domain_events.event_json FROM command_results
+                JOIN domain_events ON domain_events.event_id = command_results.event_id
+                WHERE command_results.command_id = ?
+                """,
+                (key,),
+            ).fetchone()
+        if existing is None:
+            return None
+        event = DomainEvent.model_validate_json(existing["event_json"])
+        expected = {
+            "session_id": session_id,
+            "kind": "message",
+            "identity_digest": self._digest(
+                {"content": content, "model": model, "provider_id": provider_id}
+            ),
+        }
+        if event.event_type != "conversation.command.accepted" or event.payload != expected:
+            raise ValueError("command identity cannot change")
+        turn = self.conversations.load_turn_status(session_id, command_id)
+        if turn is None:
+            return None
+        terminal = self._terminal_response(session_id, command_id, event.event_id)
+        if terminal is not None:
+            return terminal
+        queued = next(
+            (
+                item
+                for item in self.events.read_stream(f"run:{session_id}")
+                if item.event_type == "conversation.turn.queued"
+                and item.causation_id == event.event_id
+            ),
+            None,
+        )
+        return {
+            "session_id": session_id,
+            "command_id": command_id,
+            "status": turn.status,
+            "cursor": f"{queued.sequence}:0" if queued is not None else None,
+        }
+
     def _require_session(self, session_id: str) -> None:
         with self.conversations.store.connect() as connection:
             row = connection.execute(
@@ -1755,6 +2040,8 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
             raise HTTPException(404, "session not found") from exc
         except SessionPausedError as exc:
             raise HTTPException(409, "session is paused") from exc
+        except PythonTermAdmissionConflict as exc:
+            raise HTTPException(409, exc.public_detail) from exc
         except PythonTermRuntimeUnavailable as exc:
             raise HTTPException(503, exc.public_detail) from exc
         except RetryableTurnError as exc:

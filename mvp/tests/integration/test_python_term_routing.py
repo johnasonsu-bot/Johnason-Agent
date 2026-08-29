@@ -13,7 +13,9 @@ from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelo
 from workbench.runtime.engine_host.v2 import registry as registry_module
 from workbench.runtime.engine_host.v2.registry import (
     NoConformantRuntime,
+    PythonTermRoutingError,
     RuntimeRegistryV2,
+    _requirements_for_python_term_envelope,
 )
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from workbench.runtime.python_term.repository import PythonTermRepository
@@ -262,4 +264,104 @@ def test_complete_envelope_requirements_fail_closed_before_pin(
     with pytest.raises(NoConformantRuntime):
         registry.route_python_term_query(command, envelope, gate_proof=proof)
 
+    assert registry.repository.get_pin(envelope.command_id) is None
+
+
+@pytest.mark.parametrize(
+    ("contributions", "required"),
+    (
+        (("query",), ("query", "plugins")),
+        (("model",), ("model", "plugins")),
+        (("tools",), ("tools", "plugins")),
+        (("skills",), ("skills", "plugins")),
+        (("workspace",), ("workspace", "plugins")),
+        (("interventions",), ("interventions", "plugins")),
+        (("pause_resume",), ("pause_resume", "plugins")),
+        (("compaction",), ("compaction", "plugins")),
+        (("checkpoints",), ("checkpoints", "plugins")),
+        (("streaming",), ("streaming", "plugins")),
+        (("plan",), ("plan", "plugins")),
+        (("todo",), ("todo", "plugins")),
+        (("prompt_sections",), ("prompt_sections", "plugins")),
+        (("tool_interceptors",), ("tool_interceptors", "plugins")),
+        (("event_cursor",), ("event_cursor", "plugins")),
+        (
+            ("tools", "workspace", "pause_resume", "event_cursor"),
+            ("tools", "workspace", "pause_resume", "event_cursor", "plugins"),
+        ),
+    ),
+)
+def test_plugin_capability_contributions_are_complete_and_composable(
+    tmp_path: Path, contributions: tuple[str, ...], required: tuple[str, ...]
+) -> None:
+    """Plugin-declared requirements must be enforced even without other manifests."""
+    database = tmp_path / "plugin-capabilities.sqlite"
+    runtime = PythonTermRuntime(PythonTermRepository(database))
+    document = _python_term_envelope(runtime).model_dump(mode="json")
+    document["plugin_pins"] = [
+        {
+            "package_id": "plugin-1",
+            "version": "1",
+            "source_revision": "revision-1",
+            "digest": "9" * 64,
+            "capabilities": contributions,
+            "order": 0,
+        }
+    ]
+    document["plugin_manifest_digest"] = "8" * 64
+    envelope = RunEnvelopeV2.model_validate(document)
+
+    requirements = _requirements_for_python_term_envelope(envelope)
+
+    for name in required:
+        assert getattr(requirements, name) is True
+
+
+def test_unknown_plugin_capability_fails_closed_before_the_v2_pin(
+    tmp_path: Path,
+) -> None:
+    """Unrecognized required plugin authority must not be silently ignored."""
+    database = tmp_path / "unknown-plugin-capability.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    capabilities = runtime_capabilities(
+        "python-term",
+        query=True,
+        model=True,
+        plugins=True,
+        checkpoints=True,
+        streaming=True,
+        event_cursor=True,
+    )
+    registry.register(capabilities)
+    document = _python_term_envelope(
+        PythonTermRuntime(PythonTermRepository(database)),
+        command_id="unknown-plugin-capability",
+    ).model_dump(mode="json")
+    document["runtime"]["build_id"] = capabilities.build_id
+    document["plugin_pins"] = [
+        {
+            "package_id": "plugin-1",
+            "version": "1",
+            "source_revision": "revision-1",
+            "digest": "9" * 64,
+            "capabilities": ("unrecognized_capability",),
+            "order": 0,
+        }
+    ]
+    document["plugin_manifest_digest"] = "8" * 64
+    envelope = RunEnvelopeV2.model_validate(document)
+    proof = registry_module._issue_python_term_gate_proof_for_task7(  # type: ignore[attr-defined]
+        source_revision="task7-source-r1",
+        capabilities=capabilities,
+        gate_result_digest="7" * 64,
+    )
+
+    with pytest.raises(PythonTermRoutingError) as error:
+        registry.route_python_term_query(
+            QueryCommandV2(type="query.start", command_id=envelope.command_id),
+            envelope,
+            gate_proof=proof,
+        )
+
+    assert error.value.code == "unknown_plugin_capability"
     assert registry.repository.get_pin(envelope.command_id) is None

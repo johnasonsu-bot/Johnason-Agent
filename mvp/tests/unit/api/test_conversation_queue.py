@@ -122,6 +122,14 @@ def test_message_returns_202_before_runner_finishes(tmp_path: Path) -> None:
         assert replay.status_code == 200
         assert "turn_queued" in replay.text
 
+        changed = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "turn-1"},
+            json={"content": "different task", "model": "local-agent", "provider_id": "lmstudio"},
+        )
+        assert changed.status_code == 409
+        assert changed.json()["detail"] == "command identity cannot change"
+
         duplicate = client.post(
             "/api/sessions/session-1/messages",
             headers={"Idempotency-Key": "turn-1"},

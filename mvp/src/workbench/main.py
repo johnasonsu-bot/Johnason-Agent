@@ -20,8 +20,9 @@ from workbench.adapters.hermes.runner import AgentStepRunner
 from workbench.adapters.hermes.runtime import AgentRuntime, WorkflowInterventions
 from workbench.api.app import AppSettings, create_app
 from workbench.api.conversations import (
-    AgentBindingRequest,
-    ProjectContextBindingRequest,
+    PythonTermAdmissionConflict,
+    PythonTermConversationAdmission,
+    PythonTermConversationRoute,
     PythonTermRuntimeUnavailable,
 )
 from workbench.api.engine_host import engine_host_v2_router
@@ -40,7 +41,13 @@ from workbench.runtime.engine_host.v2.registry import (
     RuntimeRegistryV2,
     RuntimeSelectionV2,
 )
-from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from workbench.runtime.engine_host.v2.repository import (
+    CommandAttemptRegression,
+    CommandCapabilityUnavailable,
+    CommandIdentityConflict,
+    CorruptCommandPin,
+    RuntimeV2Repository,
+)
 from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.repository import PythonTermRepository
@@ -81,33 +88,28 @@ class PythonTermQueryRouter:
     def route_conversation_query(
         self,
         *,
-        session_id: str,
-        command_id: str,
-        content: str,
-        provider_id: str,
-        model: str,
-        agent_bindings: tuple[AgentBindingRequest, ...],
-        project_context: ProjectContextBindingRequest | None,
-    ) -> tuple[str, str]:
+        admission: PythonTermConversationAdmission,
+    ) -> PythonTermConversationRoute:
         """Build and route the only supported explicit Conversation Query v2 input."""
         if self._registry is None:
             raise PythonTermRuntimeUnavailable()
         try:
-            selected = self._resume_or_registration(command_id)
+            selected = self._resume_or_registration(admission.runtime_command_id)
             command, envelope = self._conversation_query(
-                session_id=session_id,
-                command_id=command_id,
-                content=content,
-                provider_id=provider_id,
-                model=model,
-                agent_bindings=agent_bindings,
-                project_context=project_context,
+                admission=admission,
                 runtime_id=selected.runtime_id,
                 build_id=selected.build_id,
             )
             selected = self._registry.route_python_term_query(
                 command, envelope, gate_proof=self.__gate_proof
             )
+        except (
+            CommandAttemptRegression,
+            CommandCapabilityUnavailable,
+            CommandIdentityConflict,
+            CorruptCommandPin,
+        ):
+            raise PythonTermAdmissionConflict() from None
         except (NoConformantRuntime, RuntimeRegistryIntegrityError, TypeError, ValueError):
             # The browser only learns the fixed availability result.  No
             # registration, gate, provider, or validation detail crosses this
@@ -115,7 +117,11 @@ class PythonTermQueryRouter:
             raise PythonTermRuntimeUnavailable() from None
         if selected.runtime_id != "python-term":
             raise PythonTermRuntimeUnavailable()
-        return selected.runtime_id, selected.build_id
+        return PythonTermConversationRoute(
+            runtime_id=selected.runtime_id,
+            build_id=selected.build_id,
+            runtime_command_id=admission.runtime_command_id,
+        )
 
     def _resume_or_registration(self, command_id: str) -> RuntimeSelectionV2:
         assert self._registry is not None
@@ -144,33 +150,70 @@ class PythonTermQueryRouter:
     def _conversation_query(
         self,
         *,
-        session_id: str,
-        command_id: str,
-        content: str,
-        provider_id: str,
-        model: str,
-        agent_bindings: tuple[AgentBindingRequest, ...],
-        project_context: ProjectContextBindingRequest | None,
+        admission: PythonTermConversationAdmission,
         runtime_id: str,
         build_id: str,
     ) -> tuple[QueryCommandV2, RunEnvelopeV2]:
-        """Freeze a minimal no-authority envelope from Conversation-owned inputs."""
+        """Build an envelope solely from snapshots resolved by repository authority."""
+        provider_snapshot = {
+            "id": admission.provider.id,
+            "protocol": admission.provider.protocol,
+            "base_url": admission.provider.base_url,
+            "model_aliases": admission.provider.model_aliases,
+            "capabilities": sorted(str(item) for item in admission.provider.capabilities),
+            "enabled": admission.provider.enabled,
+            "thinking_enabled": admission.provider.thinking_enabled,
+            "reasoning_effort": admission.provider.reasoning_effort,
+        }
+        agent_snapshots = [
+            profile.model_dump(mode="json") for profile in admission.agent_profiles
+        ]
+        message_snapshot = [
+            {
+                "message_id": message.message_id,
+                "command_id": message.command_id,
+                "sequence": message.sequence,
+                "role": message.role,
+                "content": message.content,
+            }
+            for message in admission.messages
+        ]
+        project_snapshot = (
+            admission.project_context.model_dump(mode="json")
+            if admission.project_context is not None
+            else None
+        )
         binding = {
-            "session_id": session_id,
-            "command_id": command_id,
-            "content": content,
-            "provider_id": provider_id,
-            "model": model,
-            "agents": [item.model_dump(mode="json") for item in agent_bindings],
-            "project": (
-                project_context.model_dump(mode="json")
-                if project_context is not None
-                else None
-            ),
+            "runtime_command_id": admission.runtime_command_id,
+            "provider": provider_snapshot,
+            "model": admission.model,
+            "agents": agent_snapshots,
+            "project": project_snapshot,
+            "messages": message_snapshot,
         }
         identity = self._digest(binding)
-        session_ref = f"conversation-session-{self._digest(session_id)[:32]}"
+        session_ref = f"conversation-session:{admission.session_id}"
         run_ref = f"conversation-run-{identity[:32]}"
+        if len(admission.agent_profiles) == 1:
+            primary_agent = admission.agent_profiles[0]
+            agent_id = primary_agent.agent_id
+            agent_role = primary_agent.role
+        elif admission.agent_profiles:
+            agent_id = "conversation-agent-set"
+            agent_role = "worker"
+        else:
+            agent_id = "conversation-default-agent"
+            agent_role = "worker"
+        agent_refs = [
+            f"agent-profile:{profile.agent_id}:{profile.version}"
+            for profile in admission.agent_profiles
+        ]
+        project_ref = (
+            f"project-context:{admission.project_context.project_id}:"
+            f"{admission.project_context.version}"
+            if admission.project_context is not None
+            else None
+        )
         envelope = RunEnvelopeV2.model_validate(
             {
                 "runtime": {
@@ -189,27 +232,30 @@ class PythonTermQueryRouter:
                 "run_id": run_ref,
                 "term_id": f"conversation-term-{identity[:32]}",
                 "step_id": f"conversation-step-{identity[:32]}",
-                "command_id": command_id,
+                "command_id": admission.runtime_command_id,
                 "attempt": 0,
-                "agent_id": "conversation-agent",
-                "agent_role": "worker",
-                "provider_ref": f"provider-{self._digest(provider_id)[:32]}",
-                "model": f"model-{self._digest(model)[:32]}",
+                "agent_id": agent_id,
+                "agent_role": agent_role,
+                "provider_ref": f"provider-profile:{admission.provider.id}",
+                "model": admission.model,
                 "model_options_digest": self._digest(
-                    {"provider_id": provider_id, "model": model}
+                    {"provider": provider_snapshot, "model": admission.model}
                 ),
-                "message_snapshot_digest": self._digest(
-                    {"role": "user", "content": content}
-                ),
+                "message_snapshot_digest": self._digest(message_snapshot),
                 "context": {
-                    "snapshot_ref": f"conversation-context-{identity[:32]}",
+                    "snapshot_ref": session_ref,
                     "snapshot_digest": self._digest(
                         {
-                            "project": binding["project"],
-                            "agents": binding["agents"],
+                            "messages": message_snapshot,
+                            "project": project_snapshot,
+                            "agents": agent_snapshots,
                         }
                     ),
-                    "version": project_context.version if project_context else 0,
+                    "version": (
+                        admission.project_context.version
+                        if admission.project_context is not None
+                        else 0
+                    ),
                 },
                 "context_budget": {
                     "max_input_tokens": 4096,
@@ -240,10 +286,20 @@ class PythonTermQueryRouter:
                 "checkpoint_cursor": 0,
                 "deadline_ms": 60_000,
                 "traceparent": f"conversation-trace-{identity[:32]}",
-                "extensions": {},
+                "extensions": {
+                    "agent_profile_refs": agent_refs,
+                    "agent_profiles_digest": self._digest(agent_snapshots),
+                    "project_context_ref": project_ref,
+                    "project_context_digest": self._digest(project_snapshot),
+                },
             }
         )
-        return QueryCommandV2(type="query.start", command_id=command_id), envelope
+        return (
+            QueryCommandV2(
+                type="query.start", command_id=admission.runtime_command_id
+            ),
+            envelope,
+        )
 
 
 def build_app(

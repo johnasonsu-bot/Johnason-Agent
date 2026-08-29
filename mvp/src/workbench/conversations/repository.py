@@ -17,6 +17,7 @@ TURN_ROUTING_METADATA = (
     "host_run_id",
     "runtime_id",
     "runtime_build_id",
+    "runtime_command_id",
 )
 
 
