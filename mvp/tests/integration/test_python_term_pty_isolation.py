@@ -19,6 +19,7 @@ from workbench.runtime.python_term.tool_router import (
 
 from tests.unit.runtime.python_term.test_tool_router import (
     _executor_registry,
+    _invoke_after_durable_release,
     _runtime_context,
     _tool,
 )
@@ -165,7 +166,8 @@ async def test_command_deny_and_ask_are_decided_before_pty_spawn(
     assert missing.value.code == "approval_required"
     assert ask_worker.spawn_count == 0
 
-    result = await ask_router.invoke(
+    result = await _invoke_after_durable_release(
+        ask_router,
         ask_context,
         "python-term-pty",
         ask_arguments,
@@ -200,11 +202,12 @@ print("isolated child")
     worker = worker_type(canonical_cwd=root.resolve())
     context, router, repository = _router(root, worker, command_policy="allow")
 
-    result = await router.invoke(
+    result = await _invoke_after_durable_release(
+        router,
         context,
         "python-term-pty",
         {"argv": [sys.executable, str(script)], "cwd": str(root.resolve())},
-        tool_call_id="pty-secret-isolation",
+        tool_call_id="pty-env-isolation",
     )
 
     assert isinstance(result, PublicToolResult)
@@ -263,7 +266,8 @@ async def test_pty_execution_failure_never_commits_write_effect(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             "python-term-pty",
             {
@@ -294,7 +298,8 @@ async def test_router_timeout_waits_for_pty_process_tree_quiescence(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             "python-term-pty",
             {
@@ -321,7 +326,8 @@ async def test_parent_task_cancel_waits_for_pty_quiescence(
     worker = worker_type(canonical_cwd=root.resolve())
     context, router, _ = _router(root, worker, command_policy="allow")
     task = asyncio.create_task(
-        router.invoke(
+        _invoke_after_durable_release(
+            router,
             context,
             "python-term-pty",
             {

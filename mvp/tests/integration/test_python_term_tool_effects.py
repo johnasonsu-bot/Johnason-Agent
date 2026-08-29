@@ -27,6 +27,7 @@ from workbench.runtime.python_term.tool_router import (
 from tests.unit.runtime.python_term.test_tool_router import (
     RecordingBroker,
     _executor_registry,
+    _invoke_after_durable_release,
     _registration,
     _runtime_context,
     _tool,
@@ -153,13 +154,15 @@ async def test_completed_write_reuses_authoritative_result_without_duplicate_eff
         tmp_path, manifest=manifest, executor=executor
     )
 
-    first = await router.invoke(
+    first = await _invoke_after_durable_release(
+        router,
         context, "write-file", {}, tool_call_id="call-write"
     )
     restarted = _restart_router(
         database, context, manifest, executor, router.request_digests
     )
-    second = await restarted.invoke(
+    second = await _invoke_after_durable_release(
+        restarted,
         context, "write-file", {}, tool_call_id="call-write"
     )
 
@@ -236,7 +239,8 @@ async def test_running_write_effect_cannot_commit_after_step_fence_takeover(
     stale = router.exposed_tools(context)[0].step_claim
 
     invocation = asyncio.create_task(
-        router.invoke(
+        _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -289,7 +293,9 @@ async def test_crash_after_write_reservation_reconciles_and_never_reexecutes(
     )
 
     with pytest.raises(SimulatedProcessCrash):
-        await router.invoke(context, "write-file", {}, tool_call_id="call-crash")
+        await _invoke_after_durable_release(
+            router, context, "write-file", {}, tool_call_id="call-crash"
+        )
     restarted = _restart_router(
         database,
         context,
@@ -325,7 +331,8 @@ async def test_effect_call_identity_rejects_changed_arguments(tmp_path: Path) ->
     )
     executor = RecordingBroker(PublicToolResult(status="completed", summary="written"))
     context, router, _ = _durable_router(tmp_path, manifest=manifest, executor=executor)
-    await router.invoke(
+    await _invoke_after_durable_release(
+        router,
         context, "write-file", {"value": "first"}, tool_call_id="same-call"
     )
 
@@ -348,7 +355,9 @@ async def test_idempotent_read_can_reexecute_after_crash(tmp_path: Path) -> None
     )
 
     with pytest.raises(SimulatedProcessCrash):
-        await router.invoke(context, "read-file", {}, tool_call_id="call-read")
+        await _invoke_after_durable_release(
+            router, context, "read-file", {}, tool_call_id="call-read"
+        )
     restarted = _restart_router(
         database,
         context,
@@ -357,7 +366,9 @@ async def test_idempotent_read_can_reexecute_after_crash(tmp_path: Path) -> None
         router.request_digests,
         clock_ms=lambda: 10_000,
     )
-    result = await restarted.invoke(context, "read-file", {}, tool_call_id="call-read")
+    result = await _invoke_after_durable_release(
+        restarted, context, "read-file", {}, tool_call_id="call-read"
+    )
 
     assert result.summary == "recovered"
     assert executor.calls == 2
@@ -372,7 +383,9 @@ async def test_non_idempotent_read_is_not_reexecuted_after_crash(tmp_path: Path)
     )
 
     with pytest.raises(SimulatedProcessCrash):
-        await router.invoke(context, "read-file", {}, tool_call_id="call-read")
+        await _invoke_after_durable_release(
+            router, context, "read-file", {}, tool_call_id="call-read"
+        )
     with pytest.raises(ToolRouteError) as raised:
         restarted = _restart_router(
             database,
@@ -412,7 +425,9 @@ async def test_write_timeout_is_unknown_and_never_automatically_retried(
     )
 
     with pytest.raises(ToolRouteError) as first:
-        await router.invoke(context, "write-file", {}, tool_call_id="call-timeout")
+        await _invoke_after_durable_release(
+            router, context, "write-file", {}, tool_call_id="call-timeout"
+        )
     with pytest.raises(ToolRouteError) as second:
         restarted = _restart_router(
             database,
@@ -451,11 +466,23 @@ async def test_concurrent_duplicate_write_waits_for_authoritative_result(
         tmp_path, manifest=manifest, executor=executor
     )
     first = asyncio.create_task(
-        router.invoke(context, manifest.tool_id, {}, tool_call_id="call-concurrent")
+        _invoke_after_durable_release(
+            router,
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-concurrent",
+        )
     )
     await executor.started.wait()
     second = asyncio.create_task(
-        router.invoke(context, manifest.tool_id, {}, tool_call_id="call-concurrent")
+        _invoke_after_durable_release(
+            router,
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-concurrent",
+        )
     )
     await asyncio.sleep(0.02)
 
@@ -477,26 +504,34 @@ async def test_takeover_exception_is_safely_normalized(
     forbidden = "untrusted-takeover-" + ("x" * 40)
     manifest = _tool("write-file", read_only=False, timeout_ms=5_000)
 
-    class BlockingWrite:
-        def __init__(self) -> None:
-            self.calls = 0
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def execute(self, executor_handle, context, arguments):
-            self.calls += 1
-            self.started.set()
-            await self.release.wait()
-            return PublicToolResult(status="completed", summary="written")
-
-    executor = BlockingWrite()
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="must not execute")
+    )
     context, router, _ = _durable_router(
         tmp_path, manifest=manifest, executor=executor
     )
     first = asyncio.create_task(
-        router.invoke(context, manifest.tool_id, {}, tool_call_id="call-takeover-error")
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-takeover-error",
+        )
     )
-    await executor.started.wait()
+    await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-takeover-error",
+        timeout_ms=1_000,
+    )
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    with sqlite3.connect(router.repository.path) as connection:
+        connection.execute(
+            "UPDATE python_tool_effects SET effect_json = json_set("
+            "effect_json, '$.lease_expires_at_ms', 1) "
+            "WHERE tool_call_id = 'call-takeover-error'"
+        )
 
     def fail_takeover(*args, **kwargs):
         raise RuntimeError(forbidden)
@@ -517,8 +552,7 @@ async def test_takeover_exception_is_safely_normalized(
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert forbidden not in rendered
-    executor.release.set()
-    await first
+    assert executor.calls == 0
 
 
 @pytest.mark.asyncio
@@ -551,11 +585,23 @@ async def test_recovery_owner_rechecks_workspace_expiry_before_execute(
         runtime_context_kwargs={"workspace_expires_at_ms": 2_000},
     )
     first = asyncio.create_task(
-        router.invoke(context, manifest.tool_id, {}, tool_call_id="call-expiry-wait")
+        _invoke_after_durable_release(
+            router,
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-expiry-wait",
+        )
     )
     await executor.started.wait()
     second = asyncio.create_task(
-        router.invoke(context, manifest.tool_id, {}, tool_call_id="call-expiry-wait")
+        _invoke_after_durable_release(
+            router,
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-expiry-wait",
+        )
     )
     await asyncio.sleep(0.01)
     now = 3_000
@@ -605,7 +651,8 @@ async def test_recovery_owner_reacquires_approval_after_lease_wait(
         return True
 
     first = asyncio.create_task(
-        router.invoke(
+        _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -615,7 +662,8 @@ async def test_recovery_owner_reacquires_approval_after_lease_wait(
     )
     await executor.started.wait()
     second = asyncio.create_task(
-        router.invoke(
+        _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -654,7 +702,8 @@ async def test_write_post_validation_failure_requires_reconciliation(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context, manifest.tool_id, {}, tool_call_id="call-invalid-result"
         )
 
@@ -680,7 +729,8 @@ async def test_arbitrary_result_boundary_exception_is_safely_reconciled(
 
     monkeypatch.setattr(PublicToolResult, "model_validate", explode)
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -721,7 +771,8 @@ async def test_write_commit_persistence_failure_falls_back_to_reconciliation(
     monkeypatch.setattr(router.repository, "finish_tool_effect", fail_commit_once)
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context, manifest.tool_id, {}, tool_call_id="call-commit-failure"
         )
 
@@ -751,7 +802,8 @@ async def test_terminal_persistence_failure_never_claims_reconciliation(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -791,7 +843,8 @@ async def test_get_after_commit_failure_is_safely_normalized(
     monkeypatch.setattr(router.repository, "finish_tool_effect", fail_commit_only)
     monkeypatch.setattr(router.repository, "get_tool_effect", fail_get)
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -833,7 +886,8 @@ async def test_commit_stage_cancellation_persists_then_reraises(
     )
 
     with pytest.raises(asyncio.CancelledError):
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},
@@ -878,7 +932,13 @@ async def test_external_cancellation_persists_unknown_write_and_reraises(
         tmp_path, manifest=manifest, executor=executor
     )
     task = asyncio.create_task(
-        router.invoke(context, manifest.tool_id, {}, tool_call_id="call-cancelled")
+        _invoke_after_durable_release(
+            router,
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-cancelled",
+        )
     )
     await executor.started.wait()
     task.cancel()
@@ -926,7 +986,8 @@ async def test_keyed_request_identity_does_not_persist_enumerable_arguments(
     requested_path = str(tmp_path.resolve() / "enumerable-low-entropy-target")
     arguments = {"choice": "yes", "path": requested_path}
 
-    await router.invoke(
+    await _invoke_after_durable_release(
+        router,
         context, manifest.tool_id, arguments, tool_call_id="call-keyed-digest"
     )
 
@@ -948,16 +1009,18 @@ async def test_keyed_request_identity_does_not_persist_enumerable_arguments(
 def test_repository_fence_prevents_stale_owner_terminal_commit(tmp_path: Path) -> None:
     manifest = _tool("write-file", read_only=False)
     executor = RecordingBroker(PublicToolResult(status="completed", summary="unused"))
-    context, _, database = _durable_router(
+    context, router, database = _durable_router(
         tmp_path, manifest=manifest, executor=executor
     )
     repository = PythonTermRepository(database)
+    step_claim = router.exposed_tools(context)[0].step_claim
     proposal = ToolEffectRecord(
         effect_id="effect-fenced",
         term_id=context.term_id,
         step_id=context.step_id,
         tool_call_id="call-fenced",
         request_digest=canonical_digest({"request": "fenced"}),
+        step_claim_digest=step_claim.identity_digest,
         write_effect=True,
         status="reserved",
     )
@@ -965,6 +1028,7 @@ def test_repository_fence_prevents_stale_owner_terminal_commit(tmp_path: Path) -
         proposal,
         execution_owner_id="owner-a",
         lease_duration_ms=1,
+        step_claim=step_claim,
     )
     assert created is True
     import time
@@ -977,15 +1041,23 @@ def test_repository_fence_prevents_stale_owner_terminal_commit(tmp_path: Path) -
         expected_fence_generation=owner_a.fence_generation,
         execution_owner_id="owner-b",
         lease_duration_ms=1_000,
+        step_claim=step_claim,
     )
     assert won is True
     assert owner_b.fence_generation == owner_a.fence_generation + 1
     assert owner_b.fence_token != owner_a.fence_token
+    released_owner_b = repository.release_tool_dispatch_gate(
+        owner_b,
+        step_claim=step_claim,
+        dispatch_required=True,
+    )
+    assert released_owner_b is not None
 
     result = PublicToolResult(status="completed", summary="stale")
     stale_terminal = owner_a.model_copy(
         update={
             "status": "committed",
+            "dispatch_state": "released",
             "execution_owner_id": None,
             "lease_expires_at_ms": None,
             "public_result": result,
@@ -1004,7 +1076,7 @@ def test_repository_fence_prevents_stale_owner_terminal_commit(tmp_path: Path) -
     assert current.status == "reserved"
 
 
-def test_legacy_effect_rows_are_retired_without_corruption_or_replay(
+def test_legacy_effect_rows_gain_explicit_v2_dispatch_evidence(
     tmp_path: Path,
 ) -> None:
     manifest = _tool("write-file", read_only=False)
@@ -1068,12 +1140,21 @@ def test_legacy_effect_rows_are_retired_without_corruption_or_replay(
     )
 
     assert all(effect is not None for effect in migrated)
-    assert {effect.status for effect in migrated if effect is not None} == {
-        "reconciliation_required"
-    }
+    by_id = {effect.effect_id: effect for effect in migrated if effect is not None}
+    assert by_id["effect-legacy-reserved"].status == "reserved"
+    assert by_id["effect-legacy-reserved"].dispatch_state == "ambiguous"
+    assert by_id["effect-legacy-committed"].status == "committed"
+    assert by_id["effect-legacy-committed"].dispatch_state == "released"
+    assert all(effect.legacy_record_digest is not None for effect in by_id.values())
+    assert len(
+        {effect.legacy_effect_collection_digest for effect in by_id.values()}
+    ) == 1
     assert {effect.record_version for effect in migrated if effect is not None} == {2}
     assert {
         effect.request_digest_version for effect in migrated if effect is not None
+    } == {"legacy-unkeyed-sha256-v0"}
+    assert {
+        effect.effect_identity_version for effect in migrated if effect is not None
     } == {"legacy-unkeyed-sha256-v0"}
     reopened = PythonTermRepository(database)
     assert tuple(
@@ -1126,7 +1207,14 @@ def test_legacy_migration_serializes_with_concurrent_legacy_commit(
     original_digest = repository_module.canonical_digest
 
     def blocking_digest(value: object) -> str:
-        if isinstance(value, dict) and value.get("code") == "legacy_effect_retired":
+        if (
+            isinstance(value, tuple)
+            and any(
+                isinstance(item, dict)
+                and item.get("effect_id") == legacy["effect_id"]
+                for item in value
+            )
+        ):
             transforming.set()
             if not release_migration.wait(timeout=2):
                 raise AssertionError("migration test release timed out")
@@ -1195,7 +1283,9 @@ def test_legacy_migration_serializes_with_concurrent_legacy_commit(
     migrated = PythonTermRepository(database).get_tool_effect(legacy["effect_id"])
     assert migrated is not None
     assert migrated.record_version == 2
-    assert migrated.status == "reconciliation_required"
+    assert migrated.status == "reserved"
+    assert migrated.dispatch_state == "ambiguous"
+    assert migrated.legacy_record_digest is not None
 
 
 @pytest.mark.asyncio
@@ -1232,7 +1322,8 @@ async def test_suppressed_cancellation_stays_supervised_until_quiescent(
         tmp_path, manifest=manifest, executor=executor
     )
     invocation = asyncio.create_task(
-        router.invoke(
+        _invoke_after_durable_release(
+            router,
             context,
             manifest.tool_id,
             {},

@@ -238,6 +238,40 @@ def _router(
     return router, repository
 
 
+async def _invoke_after_durable_release(
+    router: ToolRouter,
+    context,
+    tool_id: str,
+    arguments: dict[str, object],
+    *,
+    tool_call_id: str,
+    **invoke_options,
+) -> PublicToolResult:
+    """Model Runtime's public reserve/checkpoint/release sequence in Router tests."""
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            tool_id,
+            arguments,
+            tool_call_id=tool_call_id,
+            **invoke_options,
+        )
+    )
+    try:
+        permit = await router.await_dispatch_gate(
+            context_identity_digest=context.identity_digest,
+            tool_call_id=tool_call_id,
+            timeout_ms=1_000,
+        )
+        assert router.release_dispatch_gate(permit)
+        return await invocation
+    except BaseException:
+        if not invocation.done():
+            invocation.cancel()
+        await asyncio.gather(invocation, return_exceptions=True)
+        raise
+
+
 @pytest.mark.asyncio
 async def test_unlisted_tools_are_not_exposed_or_directly_invocable(tmp_path: Path) -> None:
     context, envelope = _runtime_context(tmp_path)
@@ -525,7 +559,8 @@ async def test_ask_policy_executes_only_after_explicit_approval(tmp_path: Path) 
         {"read-file": _registration(context.tool_manifest[0])},
     )
 
-    result = await router.invoke(
+    result = await _invoke_after_durable_release(
+        router,
         context,
         "read-file",
         {},
@@ -606,11 +641,12 @@ async def test_sensitive_or_path_output_is_rejected_and_never_persisted(
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             "read-file",
             {},
-            tool_call_id="call-secret-output",
+            tool_call_id="call-output-reject",
         )
 
     assert raised.value.code == "result_rejected"
@@ -1102,7 +1138,8 @@ async def test_fixed_dispatcher_cannot_be_replaced_after_composition(
     )
     _claim_and_admit(repository, router, context)
 
-    result = await router.invoke(
+    result = await _invoke_after_durable_release(
+        router,
         context,
         context.tool_manifest[0].tool_id,
         {},
@@ -1500,7 +1537,8 @@ async def test_untrusted_executor_error_has_no_exception_context(tmp_path: Path)
     )
 
     with pytest.raises(ToolRouteError) as raised:
-        await router.invoke(
+        await _invoke_after_durable_release(
+            router,
             context,
             context.tool_manifest[0].tool_id,
             {},

@@ -654,6 +654,7 @@ class ToolRouter:
             str, tuple[StepExecutionClaim, dict[str, _AdmittedTool]]
         ] = {}
         self._dispatch_gates: dict[tuple[str, str], _ToolDispatchGate] = {}
+        self._active_effect_tasks: dict[str, asyncio.Task[object]] = {}
 
     @property
     def executor_broker(self) -> None:
@@ -1644,6 +1645,7 @@ class ToolRouter:
                 effect_id=reservation.effect_id,
             ) from None
         if created:
+            self._register_active_effect_task(effect.effect_id)
             return effect, None, False
         while True:
             replay = self._terminal_replay(manifest, effect, reservation.write_effect)
@@ -1664,14 +1666,41 @@ class ToolRouter:
                 step_claim is None
                 or effect.step_claim_digest != step_claim.identity_digest
             )
+            same_execution_owner = (
+                not claim_changed and effect.execution_owner_id == owner_id
+            )
+            if same_execution_owner and self._active_effect_task_is_running(
+                effect.effect_id
+            ):
+                if self._remaining_ms(deadline_at_ms) <= 0:
+                    raise ToolRouteError(
+                        "deadline_exceeded", "Tool Step deadline elapsed",
+                        effect_id=effect.effect_id,
+                    ) from None
+                await asyncio.sleep(
+                    min(
+                        _WAIT_POLL_SECONDS,
+                        self._remaining_ms(deadline_at_ms) / 1000,
+                    )
+                )
+                refreshed = self._safe_get_effect(effect.effect_id)
+                if refreshed is None:
+                    raise ToolRouteError(
+                        "effect_corrupt", "Tool Effect disappeared while active",
+                        effect_id=effect.effect_id,
+                    ) from None
+                effect = refreshed
+                continue
             if (
                 not claim_changed
                 and effect.dispatch_state == "pending"
                 and effect.execution_owner_id == owner_id
+                and self.repository.tool_effect_lease_is_current(effect)
             ):
                 # A retry under the exact Step and deterministic Effect owner can
                 # safely rebuild the in-process gate around the durable pending
                 # reservation without changing either fence.
+                self._register_active_effect_task(effect.effect_id)
                 return effect, None, False
             if claim_changed or effect.dispatch_state != "pending":
                 if effect.write_effect:
@@ -1750,6 +1779,7 @@ class ToolRouter:
                         effect_id=effect.effect_id,
                     ) from None
                 if won:
+                    self._register_active_effect_task(effect.effect_id)
                     return effect, None, True
                 continue
             takeover_failed = False
@@ -1782,6 +1812,7 @@ class ToolRouter:
                     effect_id=effect.effect_id,
                 ) from None
             if won:
+                self._register_active_effect_task(replacement.effect_id)
                 return replacement, None, True
             effect = replacement
             if self._remaining_ms(deadline_at_ms) <= 0:
@@ -1792,6 +1823,30 @@ class ToolRouter:
             await asyncio.sleep(
                 min(_WAIT_POLL_SECONDS, self._remaining_ms(deadline_at_ms) / 1000)
             )
+
+    def _register_active_effect_task(self, effect_id: str) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise ToolRouteError(
+                "effect_reservation_failed", "Tool execution task is unavailable",
+                effect_id=effect_id,
+            ) from None
+        self._active_effect_tasks[effect_id] = task
+
+        def retire(completed: asyncio.Task[object]) -> None:
+            if self._active_effect_tasks.get(effect_id) is completed:
+                self._active_effect_tasks.pop(effect_id, None)
+
+        task.add_done_callback(retire)
+
+    def _active_effect_task_is_running(self, effect_id: str) -> bool:
+        task = self._active_effect_tasks.get(effect_id)
+        if task is None:
+            return False
+        if task.done():
+            self._active_effect_tasks.pop(effect_id, None)
+            return False
+        return task is not asyncio.current_task()
 
     @staticmethod
     def _terminal_replay(

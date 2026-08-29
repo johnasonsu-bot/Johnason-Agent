@@ -192,6 +192,14 @@ class PythonTermRepository:
                     migrated = ToolEffectRecord.model_validate(
                         {
                             **raw,
+                            "effect_identity_version": raw.get(
+                                "effect_identity_version",
+                                "legacy-unkeyed-sha256-v0",
+                            ),
+                            "request_digest_version": raw.get(
+                                "request_digest_version",
+                                "legacy-unkeyed-sha256-v0",
+                            ),
                             "step_claim_digest": raw.get(
                                 "step_claim_digest", EMPTY_MANIFEST_DIGEST
                             ),
@@ -207,6 +215,14 @@ class PythonTermRepository:
                     migrated = ToolEffectRecord.model_validate(
                         {
                             **raw,
+                            "effect_identity_version": raw.get(
+                                "effect_identity_version",
+                                "legacy-unkeyed-sha256-v0",
+                            ),
+                            "request_digest_version": raw.get(
+                                "request_digest_version",
+                                "legacy-unkeyed-sha256-v0",
+                            ),
                             "step_claim_digest": raw.get(
                                 "step_claim_digest", EMPTY_MANIFEST_DIGEST
                             ),
@@ -738,6 +754,30 @@ class PythonTermRepository:
         except RepositoryConflict:
             return False
         return True
+
+    def tool_effect_lease_is_current(self, effect: ToolEffectRecord) -> bool:
+        """Check one exact durable Effect owner/fence against SQLite trusted time."""
+        validated = self._validate_model(effect, ToolEffectRecord)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (validated.effect_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, current.term_id, current.step_id
+            )
+            return (
+                canonical_json(current) == canonical_json(validated)
+                and current.status == "reserved"
+                and current.execution_owner_id is not None
+                and current.fence_token is not None
+                and current.lease_expires_at_ms is not None
+                and current.lease_expires_at_ms
+                > self._database_now_ms(connection)
+            )
 
     def release_tool_dispatch_gate(
         self,

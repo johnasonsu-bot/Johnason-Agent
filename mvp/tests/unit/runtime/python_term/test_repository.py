@@ -807,6 +807,7 @@ def test_tool_effect_terminal_state_cannot_be_replayed_or_changed(tmp_path) -> N
         step_id="step-1",
         tool_call_id="call-1",
         request_digest="d" * 64,
+        dispatch_state="released",
         status="reserved",
     )
     result = PublicToolResult(status="completed", summary="tool completed")
@@ -989,6 +990,7 @@ def test_exact_event_checkpoint_and_effect_replays_remain_idempotent_after_termi
         step_id="step-1",
         tool_call_id="call-before-terminal",
         request_digest="d" * 64,
+        dispatch_state="released",
         status="reserved",
     )
     result = PublicToolResult(status="completed", summary="tool completed")
