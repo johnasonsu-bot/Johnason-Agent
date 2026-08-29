@@ -658,11 +658,18 @@ class ConversationAPI:
                     "completed",
                     "failed",
                     "cancelled",
+                    "reconciliation_required",
                 }:
                     raise TurnSnapshotCorruption("invalid Python Term execution result")
                 projected_cursor = turn.state.get("python_term_projected_cursor", 0)
                 if not isinstance(projected_cursor, int) or projected_cursor < 0:
                     raise TurnSnapshotCorruption("invalid Python Term projected cursor")
+                accumulated = turn.state.get("python_term_projected_result", [])
+                if not isinstance(accumulated, list) or not all(
+                    isinstance(item, dict) for item in accumulated
+                ):
+                    raise TurnSnapshotCorruption("invalid Python Term projected result")
+                accumulated = [dict(item) for item in accumulated]
                 projected: list[dict[str, Any]] = []
                 for runtime_event in runtime_events:
                     cursor = getattr(runtime_event, "cursor", None)
@@ -681,15 +688,44 @@ class ConversationAPI:
                         )
                         if appended:
                             projected.append(appended)
+                            accumulated.append(appended)
                     projected_cursor = cursor
                     projected_state = dict(turn.state)
                     projected_state["python_term_projected_cursor"] = projected_cursor
+                    projected_state["python_term_projected_result"] = accumulated
                     self.conversations.save_turn_state(
                         session_id,
                         command_id,
                         owner_id=turn.owner_id,
                         state=projected_state,
                     )
+                if status == "reconciliation_required":
+                    effect_ids = getattr(execution, "reconciliation_effect_ids", None)
+                    if (
+                        not isinstance(effect_ids, tuple)
+                        or not effect_ids
+                        or not all(isinstance(item, str) and item for item in effect_ids)
+                    ):
+                        raise TurnSnapshotCorruption(
+                            "invalid Python Term reconciliation result"
+                        )
+                    paused_state = dict(turn.state)
+                    paused_state.update(
+                        {
+                            "phase": "paused",
+                            "reason": "reconciliation_required",
+                            "python_term_projected_cursor": projected_cursor,
+                            "python_term_projected_result": accumulated,
+                            "reconciliation_effect_ids": list(effect_ids),
+                        }
+                    )
+                    self.conversations.pause_turn_for_interrupt(
+                        session_id,
+                        command_id,
+                        owner_id=turn.owner_id,
+                        state=paused_state,
+                    )
+                    return
                 if isinstance(final_output, str) and final_output:
                     self.conversations.append_message(
                         ConversationMessage(
@@ -709,8 +745,9 @@ class ConversationAPI:
                         "phase": terminal_status,
                         "events": [],
                         "python_term_projected_cursor": projected_cursor,
+                        "python_term_projected_result": accumulated,
                     },
-                    result=projected,
+                    result=accumulated,
                 )
                 return
             state = dict(turn.state)

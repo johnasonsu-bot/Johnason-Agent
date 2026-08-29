@@ -217,6 +217,8 @@ Python Term 默认关闭。启用时，只有外部签名 build proof 与注册�
 - 不暴露给 HTTP、IPC 或 renderer 的私有 gate proof；
 - SQLite durable Event/cursor 驱动的崩溃补投影、Provider 永久失败单调终结；
 - DeepSeek reasoning continuation 的 response/tool-call 私有绑定与单次消费；
+- 未知写副作用进入可恢复的 `paused/reconciliation_required`，由控制面确认 Effect
+  后重新领用并继续，而不是压成永久失败或盲目重放；
 - `workspace.read` regular-file 校验与 64 KiB + 1 有界读取。
 
 运行 9 场景确定性门禁：
@@ -229,6 +231,25 @@ cd mvp
 输出分别列出 source/SDK revision、每个场景的 PASS/FAIL、命令摘要、结果 digest
 和最终 Decision。LM Studio `127.0.0.1:1234` live smoke 只通过 Provider Gateway；
 服务不可用时为 `LIVE_PROVIDER_NOT_EVALUATED`，不改变确定性门禁结论。
+
+外部 signer 独立于生产服务，只从标准输入读取 base64 Ed25519 私钥，输出带
+`key_id` 的 signed proof；私钥不得经 argv、环境变量、仓库、HTTP、IPC 或 renderer
+传入。CI/发布系统需为生产固定公钥配置对应 secret，并在相同 payload 上执行：
+
+```bash
+.venv/bin/python scripts/sign_python_term_runtime_gate.py \
+  /controlled/gate-payload.json \
+  src/workbench/runtime/python_term/signed_gate_proof.json
+.venv/bin/python scripts/run_python_term_runtime_gate.py --verify-only
+```
+
+第一条命令的私钥必须由 CI secret manager 直接写入标准输入；上例故意不展示或
+持久化私钥。没有外部 proof、key 不匹配或 manifest 改变时，验证均 fail closed。
+
+仅用于本地手工测试时，可以在独立 `HERMES_RUNTIME_DIR` 内放置
+`python-term-dev-public-key.txt` 与 `python-term-dev-signed-proof.json`，并显式设置
+`WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST=true`。此路径在公开 Runtime 诊断中固定标为
+`DEV_UNTRUSTED`，且不能覆盖生产 proof 路径或生产固定信任根。
 
 运行合同门禁：
 
@@ -335,6 +356,11 @@ Decision: BLOCKED_EXTERNAL_SIGNATURE_REQUIRED
 Goose runtime status: NOT_YET_EVALUATED
 DSH runtime status: NOT_YET_EVALUATED
 ```
+
+CI 签发后可用 `--verify-only` 验证当前完整 manifest；只有匹配 proof 才返回
+`GO_PYTHON_TERM_RUNTIME`/exit 0。development proof 必须同时提供
+`--development-runtime-dir`、`--development-public-key` 和 `--proof`，结果会显式标为
+`DEV_UNTRUSTED`。
 
 ### 10.6 Electron/Playwright
 

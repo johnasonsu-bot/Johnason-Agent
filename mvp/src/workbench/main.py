@@ -50,7 +50,10 @@ from workbench.runtime.engine_host.v2.repository import (
 )
 from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
 from workbench.runtime.python_term import PythonTermRuntime
-from workbench.runtime.python_term.gate import compose_python_term_production
+from workbench.runtime.python_term.gate import (
+    PythonTermGateTrust,
+    compose_python_term_production,
+)
 from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
@@ -448,15 +451,36 @@ def build_app(
     python_term_runtime = None
     python_term_executor = None
     python_term_gate_proof = None
+    python_term_trust_status = None
     if runtime_registry_v2 is not None and resolved.python_term_runtime_enabled:
         repository = PythonTermRepository(resolved.database)
+        # Production keeps the existing minimal diagnostic contract.  The
+        # additive marker exists only to make development trust impossible to
+        # mistake for a production-admitted runtime.
+        python_term_trust_status = (
+            "DEV_UNTRUSTED" if resolved.python_term_development_trust else None
+        )
         try:
+            trust = (
+                PythonTermGateTrust.development(
+                    runtime_dir=resolved.runtime_dir,
+                    public_key_path=(
+                        resolved.runtime_dir / "python-term-dev-public-key.txt"
+                    ),
+                    proof_path=(
+                        resolved.runtime_dir / "python-term-dev-signed-proof.json"
+                    ),
+                )
+                if resolved.python_term_development_trust
+                else None
+            )
             composition = compose_python_term_production(
                 registry=runtime_registry_v2,
                 repository=repository,
                 gateway=gateway,
                 profiles=tuple(providers.list()),
                 runtime_dir=resolved.runtime_dir,
+                trust=trust,
             )
         except (OSError, RuntimeError, TypeError, ValueError):
             # Missing Provider bindings or unavailable PTY containment keeps the
@@ -491,7 +515,13 @@ def build_app(
     if callable(include_router):
         include_router(
             engine_host_v2_router(
-                runtime_registry_v2, enabled=resolved.engine_host_v2_enabled
+                runtime_registry_v2,
+                enabled=resolved.engine_host_v2_enabled,
+                runtime_trust_status=(
+                    None
+                    if python_term_trust_status is None
+                    else {"python-term": python_term_trust_status}
+                ),
             )
         )
     app.state.agent_runtime = agent_runtime
@@ -665,6 +695,11 @@ def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings
         if python_term_enabled not in {"true", "false"}:
             raise ValueError("python term runtime enabled must be true or false")
         updates["python_term_runtime_enabled"] = python_term_enabled == "true"
+    development_trust = os.environ.get("WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST")
+    if development_trust is not None:
+        if development_trust not in {"true", "false"}:
+            raise ValueError("python term development trust must be true or false")
+        updates["python_term_development_trust"] = development_trust == "true"
     command = os.environ.get("WORKBENCH_ENGINE_HOST_COMMAND_JSON")
     if command is not None:
         updates["engine_host_command"] = _json_string_array("command", command)

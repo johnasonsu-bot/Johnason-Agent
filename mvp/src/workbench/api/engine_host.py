@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Literal, Protocol
 
 from fastapi import APIRouter
@@ -71,6 +72,7 @@ class EngineHostV2RuntimeDiagnostic(BaseModel):
     build_id: str
     state: Literal["ready", "disabled", "unavailable"]
     capabilities: tuple[str, ...]
+    trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"] | None = None
     last_error_category: (
         Literal[
             "capability_unavailable",
@@ -98,7 +100,14 @@ class EngineHostDiagnosticV2Envelope(BaseModel):
     v2: EngineHostV2Diagnostic
 
 
-def engine_host_v2_router(registry: RuntimeRegistryV2 | None, *, enabled: bool) -> APIRouter:
+def engine_host_v2_router(
+    registry: RuntimeRegistryV2 | None,
+    *,
+    enabled: bool,
+    runtime_trust_status: Mapping[
+        str, Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"]
+    ] | None = None,
+) -> APIRouter:
     """Expose the additive v2 registry diagnostic without changing v1 routes."""
 
     router = APIRouter(prefix="/api/v1/engine-host", tags=["engine-host"])
@@ -124,6 +133,11 @@ def engine_host_v2_router(registry: RuntimeRegistryV2 | None, *, enabled: bool) 
                         build_id=item.build_id,
                         state=item.state,
                         capabilities=item.capabilities,
+                        trust_status=(
+                            None
+                            if runtime_trust_status is None
+                            else runtime_trust_status.get(item.runtime_id)
+                        ),
                         last_error_category=registry.last_error_category(item.runtime_id)
                         if registry is not None
                         else None,

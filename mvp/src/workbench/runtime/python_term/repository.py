@@ -2202,6 +2202,61 @@ class PythonTermRepository:
                 ),
             )
 
+    def confirm_reconciled_tool_effect(
+        self, effect_id: str, result: PublicToolResult
+    ) -> ToolEffectRecord:
+        """Record a control-plane-confirmed write result without re-executing it."""
+        validated_result = self._validate_model(result, PublicToolResult)
+        if validated_result.status != "completed":
+            raise ValueError("reconciled Tool Effect result must be completed")
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(effect_id)
+            existing = self._decode_effect(row)
+            self._load_owning_aggregate(
+                connection, existing.term_id, existing.step_id
+            )
+            if (
+                not existing.write_effect
+                or existing.status != "reconciliation_required"
+                or existing.execution_owner_id is not None
+            ):
+                raise RepositoryConflict(
+                    "Tool Effect is not awaiting write reconciliation"
+                )
+            reconciled = self._validate_model(
+                existing.model_copy(
+                    update={
+                        "status": "committed",
+                        "dispatch_state": "released",
+                        "result_code": None,
+                        "result_digest": canonical_digest(validated_result),
+                        "public_result": validated_result,
+                    }
+                ),
+                ToolEffectRecord,
+            )
+            changed = connection.execute(
+                """UPDATE python_tool_effects
+                SET status = 'committed', result_digest = ?, effect_json = ?,
+                    public_result_json = ?, updated_at = ?
+                WHERE effect_id = ? AND status = 'reconciliation_required'""",
+                (
+                    reconciled.result_digest,
+                    canonical_json(reconciled),
+                    canonical_json(reconciled.public_result),
+                    time.time(),
+                    effect_id,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RepositoryConflict("Tool Effect reconciliation fence was lost")
+            return reconciled
+
     def reserve_tool_effect(
         self,
         effect: ToolEffectRecord,

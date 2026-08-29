@@ -4,20 +4,32 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 from agents.testing import ScriptedModel, assistant_message
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+)
 
 from tests.fixtures.host_v2 import runtime_capabilities
 import workbench.main as main
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from workbench.agui.mapper import map_domain_event
+from workbench.api.engine_host import engine_host_v2_router
 from workbench.runtime.python_term import gate as gate_module
 from workbench.api.conversations import ConversationAPI
 from workbench.conversations.repository import ConversationRepository
 from workbench.runtime.engine_host.v2 import registry as registry_module
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
 from workbench.models.contracts import ContinuationMetadata, ModelResponse, ToolCall
 from workbench.models.gateway import ModelGateway
 from workbench.models.profiles import ProviderProfileRecord
@@ -34,8 +46,20 @@ from workbench.runtime.python_term.gate import (
     python_term_gate_source_revision,
     _workspace_read_executor,
 )
-from workbench.runtime.python_term.runtime import RUNTIME_BUILD_ID
+from workbench.runtime.python_term.runtime import RUNTIME_BUILD_ID, PythonTermRuntime
 from workbench.runtime.python_term.repository import PythonTermRepository
+from workbench.runtime.python_term.contracts import (
+    AgentDescriptor,
+    ConversationContextRef,
+    EffectScope,
+    HandoffDescriptor,
+    PermissionPolicy,
+    ProjectContextRef,
+    PublicToolResult,
+    TermWorkStateRef,
+    ToolEffectRecord,
+    canonical_digest,
+)
 from workbench.runtime.python_term.sdk_adapter import AgentsSdkFacade
 from workbench.workflow.event_store import EventStore
 
@@ -101,7 +125,11 @@ def _install_test_signed_build_proof(
     proof_path = tmp_path / "signed-build-proof.json"
     proof_path.write_text(
         json.dumps(
-            {"payload": payload, "signature": base64.b64encode(signature).decode()},
+            {
+                "key_id": gate_module._gate_key_id(public_key),
+                "payload": payload,
+                "signature": base64.b64encode(signature).decode(),
+            },
             sort_keys=True,
         ),
         encoding="utf-8",
@@ -167,6 +195,133 @@ def test_gate_manifest_covers_contracts_provider_lock_tests_and_scenario_command
         mutated = dict(files)
         mutated[path] += b"\n# gate mutation\n"
         assert gate_module._digest_python_term_gate_manifest(mutated) != original
+
+
+def test_external_signer_and_development_verify_mode_are_isolated_from_production(
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "isolated-runtime"
+    runtime_dir.mkdir()
+    capabilities = _production_capabilities()
+    verdict = build_python_term_gate_verdict(
+        source_revision=python_term_gate_source_revision(),
+        capabilities=capabilities,
+        scenarios=_passing_scenarios(),
+    )
+    payload_path = runtime_dir / "candidate.json"
+    payload_path.write_text(
+        json.dumps(python_term_gate_signing_document(verdict)), encoding="utf-8"
+    )
+    proof_path = runtime_dir / "signed-proof.json"
+    public_key_path = runtime_dir / "dev-public-key.txt"
+    private_key = Ed25519PrivateKey.generate()
+    private_bytes = private_key.private_bytes(
+        Encoding.Raw, PrivateFormat.Raw, NoEncryption()
+    )
+    public_key_path.write_text(
+        base64.b64encode(
+            private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        ).decode(),
+        encoding="ascii",
+    )
+    signer = Path(__file__).resolve().parents[2] / "scripts" / "sign_python_term_runtime_gate.py"
+
+    signed = subprocess.run(
+        [sys.executable, str(signer), str(payload_path), str(proof_path)],
+        input=base64.b64encode(private_bytes).decode() + "\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert signed.returncode == 0, signed.stderr
+    envelope = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert set(envelope) == {"key_id", "payload", "signature"}
+    assert base64.b64encode(private_bytes).decode() not in (
+        signed.stdout + signed.stderr + proof_path.read_text(encoding="utf-8")
+    )
+    verified = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[2] / "scripts" / "run_python_term_runtime_gate.py"),
+            "--verify-only",
+            "--development-runtime-dir", str(runtime_dir),
+            "--development-public-key", str(public_key_path),
+            "--proof", str(proof_path),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert verified.returncode == 0, verified.stderr
+    decision = json.loads(verified.stdout)
+    assert decision["Decision"] == "GO_PYTHON_TERM_RUNTIME"
+    assert decision["trust_status"] == "DEV_UNTRUSTED"
+
+    wrong_key = Ed25519PrivateKey.generate().public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    public_key_path.write_text(base64.b64encode(wrong_key).decode(), encoding="ascii")
+    rejected = subprocess.run(
+        verified.args,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert rejected.returncode == 1
+    assert json.loads(rejected.stdout)["Decision"] == "BLOCKED"
+
+    proof_path.unlink()
+    missing = subprocess.run(
+        verified.args,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert missing.returncode == 1
+    assert json.loads(missing.stdout)["Decision"] == "BLOCKED"
+
+
+def test_development_trust_rejects_paths_outside_runtime_dir(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    outside = tmp_path / "outside-proof.json"
+    outside.write_text("{}", encoding="utf-8")
+    public_key = runtime_dir / "public-key.txt"
+    public_key.write_text(base64.b64encode(b"x" * 32).decode(), encoding="ascii")
+
+    with pytest.raises(ValueError, match="inside the runtime directory"):
+        gate_module.PythonTermGateTrust.development(
+            runtime_dir=runtime_dir,
+            public_key_path=public_key,
+            proof_path=outside,
+        )
+
+
+def test_development_trust_is_explicit_in_public_runtime_diagnostics(
+    tmp_path: Path,
+) -> None:
+    registry = RuntimeRegistryV2(RuntimeV2Repository(tmp_path / "diag.sqlite"))
+    runtime = PythonTermRuntime(PythonTermRepository(tmp_path / "diag.sqlite"))
+    runtime.register(registry)
+    app = FastAPI()
+    app.include_router(
+        engine_host_v2_router(
+            registry,
+            enabled=True,
+            runtime_trust_status={"python-term": "DEV_UNTRUSTED"},
+        )
+    )
+
+    response = TestClient(app).get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    runtime_item = response.json()["v2"]["runtimes"][0]
+    assert runtime_item["trust_status"] == "DEV_UNTRUSTED"
 
 
 @pytest.mark.parametrize(
@@ -372,6 +527,68 @@ async def test_control_plane_sdk_model_restores_private_deepseek_tool_continuati
         previous_response_id=first.response_id,
     )
     assert replay[0].continuation is None
+
+
+@pytest.mark.asyncio
+async def test_deepseek_continuation_requires_response_identity_and_is_concurrency_safe() -> None:
+    class Provider:
+        calls = 0
+        continued: list[str | None] = []
+
+        async def complete(self, request, profile):
+            self.calls += 1
+            if self.calls <= 2:
+                return ModelResponse(
+                    tool_calls=[ToolCall(id="same-call", name="lookup", arguments={})],
+                    continuation=ContinuationMetadata(
+                        reasoning_content=f"private-{self.calls}"
+                    ),
+                )
+            continuation = request.messages[0].continuation
+            self.continued.append(
+                None if continuation is None else continuation.reasoning_content
+            )
+            return ModelResponse(text="continued")
+
+    provider = Provider()
+    profile = ProviderProfileRecord(
+        id="provider-1", name="DeepSeek", protocol="test",
+        base_url="http://127.0.0.1:1", model_aliases={"default": "model-1"},
+    )
+    model = ControlPlaneSdkModel(ModelGateway({"test": provider}), profile, "model-1")
+    first, second = await asyncio.gather(
+        model.get_response(
+            None, "one", object(), [], None, [], object(),
+            previous_response_id=None, conversation_id="run-one", prompt=None,
+        ),
+        model.get_response(
+            None, "two", object(), [], None, [], object(),
+            previous_response_id=None, conversation_id="run-two", prompt=None,
+        ),
+    )
+    tool_exchange = [
+        {"type": "function_call", "call_id": "same-call", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "same-call", "output": "ok"},
+    ]
+
+    missing_identity = model._messages(
+        None, tool_exchange, previous_response_id=None
+    )
+    assert missing_identity[0].continuation is None
+    await asyncio.gather(
+        model.get_response(
+            None, tool_exchange, object(), [], None, [], object(),
+            previous_response_id=first.response_id,
+            conversation_id="run-one", prompt=None,
+        ),
+        model.get_response(
+            None, tool_exchange, object(), [], None, [], object(),
+            previous_response_id=second.response_id,
+            conversation_id="run-two", prompt=None,
+        ),
+    )
+
+    assert sorted(provider.continued) == ["private-1", "private-2"]
 
 
 @pytest.mark.asyncio
@@ -627,3 +844,121 @@ async def test_runtime_commit_before_projection_recovers_complete_timeline(
     assert turn is not None and turn.status == "completed"
     assert turn.state["python_term_projected_cursor"] > 0
     assert any(event.event_type == "agent.message.completed" for event in timeline)
+    assert turn.result is not None
+    by_sequence = {event.sequence: event for event in timeline}
+    assert turn.result == [
+        map_domain_event(by_sequence[item["sequence"]])[0]
+        for item in turn.result
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Provider:
+        async def complete(self, request, profile):
+            return ModelResponse(text="completed after reconciliation")
+
+    database = tmp_path / "reconciliation.sqlite"
+    profile = ProviderProfileRecord(
+        id="provider-1", name="Test", protocol="test",
+        base_url="http://127.0.0.1:1", model_aliases={"default": "model-1"},
+    )
+    ProviderRepository(database).save(profile)
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    _install_test_signed_build_proof(monkeypatch, tmp_path)
+    python_repository = PythonTermRepository(database)
+    composition = compose_python_term_production(
+        registry=registry,
+        repository=python_repository,
+        gateway=ModelGateway({"test": Provider()}),
+        profiles=(profile,),
+        runtime_dir=tmp_path.resolve(),
+    )
+    conversations = ConversationRepository(database)
+    events = EventStore(database)
+    api = ConversationAPI(
+        conversations=conversations,
+        events=events,
+        runner=object(),
+        providers=ProviderRepository(database),
+        python_term_router=main.PythonTermQueryRouter(
+            registry, _gate_proof=composition.gate_proof
+        ),
+        python_term_executor=composition.executor,
+    )
+    api.create_session("session-1")
+    await api.enqueue_message(
+        session_id="session-1", command_id="command-1", content="hello",
+        model="default", provider_id="provider-1", runtime="python-term",
+    )
+    queued = conversations.load_turn_status("session-1", "command-1")
+    assert queued is not None
+    snapshot = queued.state["python_term_execution"]
+    assert isinstance(snapshot, dict)
+    messages = snapshot["model_messages"]
+    environment = snapshot["environment_allowlist"]
+    compiled = composition.runtime.compile_start(
+        QueryCommandV2.model_validate(snapshot["command"]),
+        envelope=RunEnvelopeV2.model_validate(snapshot["envelope"]),
+        agents=tuple(AgentDescriptor.model_validate(item) for item in snapshot["agents"]),
+        handoffs=tuple(HandoffDescriptor.model_validate(item) for item in snapshot["handoffs"]),
+        model_messages=tuple(messages),
+        conversation_context=ConversationContextRef.model_validate(snapshot["conversation_context"]),
+        project_context=ProjectContextRef.model_validate(snapshot["project_context"]),
+        work_state=TermWorkStateRef.model_validate(snapshot["work_state"]),
+        permission_policy=PermissionPolicy.model_validate(snapshot["permission_policy"]),
+        environment_allowlist=tuple(environment),
+        effect_scope=EffectScope.model_validate(snapshot["effect_scope"]),
+    )
+    failed_projection = PublicToolResult(
+        status="failed", summary="Write outcome requires reconciliation"
+    )
+    effect = ToolEffectRecord(
+        effect_id="effect-unknown",
+        term_id=compiled.term.term_id,
+        step_id=compiled.steps[0].step_id,
+        tool_call_id="call-unknown",
+        request_digest="8" * 64,
+        write_effect=True,
+        dispatch_state="ambiguous",
+        status="reconciliation_required",
+        result_code="unknown_write_outcome",
+        result_digest=canonical_digest(
+            {"code": "unknown_write_outcome", "result": failed_projection}
+        ),
+        public_result=failed_projection,
+    )
+    python_repository.save_tool_effect(effect)
+    assert conversations.claim_next_turn(owner_id="worker-1") is not None
+
+    await api.process_queued_turn("session-1", "command-1")
+
+    paused = conversations.load_turn_status("session-1", "command-1")
+    assert paused is not None and paused.status == "interrupted"
+    assert paused.state["reason"] == "reconciliation_required"
+    assert python_repository.get_tool_effect(effect.effect_id).status == "reconciliation_required"
+
+    composition.executor.reconcile_effect(
+        effect.effect_id,
+        PublicToolResult(status="completed", summary="write confirmed applied"),
+    )
+    conversations.resume_python_term_reconciliation(
+        "session-1", "command-1", effect_id=effect.effect_id
+    )
+    assert conversations.claim_next_turn(owner_id="worker-2") is not None
+    await api.process_queued_turn("session-1", "command-1")
+
+    completed = conversations.load_turn_status("session-1", "command-1")
+    term = python_repository.get_term(compiled.term.term_id)
+    timeline = events.read_stream("run:session-1")
+    assert completed is not None and completed.status == "completed"
+    assert term is not None and term.status == "completed"
+    assert completed.result is not None
+    by_sequence = {event.sequence: event for event in timeline}
+    assert completed.result == [
+        map_domain_event(by_sequence[item["sequence"]])[0]
+        for item in completed.result
+    ]

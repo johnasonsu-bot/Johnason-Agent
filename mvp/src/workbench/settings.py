@@ -44,6 +44,7 @@ class WorkbenchSettings(BaseModel):
     engine_host_v2_enabled: bool = False
     engine_host_v2_runtimes: tuple[RuntimeProcessConfig, ...] = ()
     python_term_runtime_enabled: StrictBool = False
+    python_term_development_trust: StrictBool = False
 
     @property
     def database(self) -> Path:

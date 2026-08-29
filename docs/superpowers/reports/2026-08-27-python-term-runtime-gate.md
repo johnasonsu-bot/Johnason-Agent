@@ -33,6 +33,7 @@ meta/E2E、diff 和 credential scan，并用独立 report-only commit 更新本�
 | Session lock | test-only wrapper 包装真实 `asyncio.Lock`，在 `_enqueue_message_locked` 入口验证 owner；绕过 mutation 当场失败 |
 | Provider 失败 | durable failed/cancelled 单调封口，不进入永久 retry；只有未形成终态的 typed conflict 可重试 |
 | DeepSeek续传 | reasoning continuation 私有绑定 response/tool-call identity，tool result 后单次消费，不进入公共输出/日志/Conversation state |
+| Effect 对账 | unknown write 不压成 failed；Conversation 进入可恢复 paused，控制面确认 durable Effect 后重新领用并可完成 |
 | 私有 proof | 仅验证外部 Ed25519 签名；绑定完整源码、依赖锁、测试/场景矩阵、SDK、runtime/build/protocol、capability/result digest；不暴露给 renderer/HTTP/IPC |
 
 ## 确定性场景
@@ -57,6 +58,15 @@ source manifest 覆盖 `src/workbench/**/*.py`、`tests/**/*.py`、`pyproject.to
 都会使旧签名失效。签名 proof 缺失、损坏或与当前源码/能力不符时，在 executor
 注册前 fail closed。仓库中的旧 `gate_receipt.json` 已标记为不可信兼容占位。
 
+独立 signer 仅从标准输入接收 CI/KMS 提供的私钥，proof 包含 `key_id`；生产服务、
+runner、参数、环境变量、仓库、HTTP、IPC 与 renderer 都没有签发私钥入口。runner
+默认自动校验当前构建 proof，也可使用 `--verify-only`；缺 proof、错误 key、签名
+篡改或 manifest 不匹配均为 BLOCKED/exit 1。生产发布流水线仍须配置与固定公钥匹配
+的受控 secret；在该外部条件满足前，本报告不声称生产 GO。
+
+用户测试环境另有显式 development trust：临时公钥与 proof 只能位于独立
+`HERMES_RUNTIME_DIR`，诊断固定显示 `DEV_UNTRUSTED`，不能更改或复用生产固定信任根。
+
 ## 外部 live smoke
 
 live smoke 结果必须在固定 revision 门禁轮次单独回填；它不进入外部签名 payload，
@@ -66,7 +76,7 @@ live smoke 结果必须在固定 revision 门禁轮次单独回填；它不进�
 
 | 门禁 | 固定 revision 结果 |
 |---|---|
-| Task 7 focused acceptance | `19 passed`（修复轮次 1 工作树） |
+| Task 7 focused acceptance | 待修复轮次 2 实现提交后固定 revision 重跑 |
 | 标准 backend | 待实现提交后重跑 |
 | 独立 frontend | 待实现提交后重跑 |
 | Development Graph meta/E2E | 待实现提交后重跑 |

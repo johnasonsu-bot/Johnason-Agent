@@ -111,6 +111,54 @@ _TRUSTED_BUILD_PUBLIC_KEY = base64.b64decode(
 )
 
 
+def _gate_key_id(public_key: bytes) -> str:
+    if type(public_key) is not bytes or len(public_key) != 32:
+        raise ValueError("Python Term trust public key is invalid")
+    return "ed25519:" + hashlib.sha256(public_key).hexdigest()[:32]
+
+
+@dataclass(frozen=True, slots=True)
+class PythonTermGateTrust:
+    proof_path: Path
+    public_key: bytes
+    key_id: str
+    trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"]
+
+    @classmethod
+    def production(cls) -> PythonTermGateTrust:
+        return cls(
+            proof_path=_SIGNED_GATE_PROOF_PATH,
+            public_key=_TRUSTED_BUILD_PUBLIC_KEY,
+            key_id=_gate_key_id(_TRUSTED_BUILD_PUBLIC_KEY),
+            trust_status="PRODUCTION_TRUSTED",
+        )
+
+    @classmethod
+    def development(
+        cls,
+        *,
+        runtime_dir: Path,
+        public_key_path: Path,
+        proof_path: Path,
+    ) -> PythonTermGateTrust:
+        root = runtime_dir.resolve(strict=True)
+        resolved_public = public_key_path.resolve(strict=True)
+        resolved_proof = proof_path.resolve(strict=True)
+        if not resolved_public.is_relative_to(root) or not resolved_proof.is_relative_to(root):
+            raise ValueError("development trust files must be inside the runtime directory")
+        encoded = resolved_public.read_text(encoding="ascii").strip()
+        try:
+            public_key = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("development trust public key is invalid") from exc
+        return cls(
+            proof_path=resolved_proof,
+            public_key=public_key,
+            key_id=_gate_key_id(public_key),
+            trust_status="DEV_UNTRUSTED",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class PythonTermGateScenario:
     scenario_id: str
@@ -149,6 +197,15 @@ class PythonTermProductionComposition:
     executor: PythonTermConversationRuntimeExecutor
     verdict: PythonTermGateVerdict
     gate_proof: object
+    trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"]
+
+
+@dataclass(frozen=True, slots=True)
+class PythonTermConversationExecution:
+    status: Literal["completed", "failed", "cancelled", "reconciliation_required"]
+    events: tuple[RuntimeEventV2, ...]
+    final_output: str | None
+    reconciliation_effect_ids: tuple[str, ...] = ()
 
 
 class ControlPlaneSdkModel(Model):
@@ -170,7 +227,7 @@ class ControlPlaneSdkModel(Model):
         self._profile = profile.model_copy(deep=True)
         self._model = model
         self._continuations: dict[
-            str, tuple[str, str, str, ContinuationMetadata]
+            tuple[str, str], tuple[str, str, ContinuationMetadata]
         ] = {}
 
     @staticmethod
@@ -200,17 +257,18 @@ class ControlPlaneSdkModel(Model):
         arguments: dict[str, object],
         previous_response_id: str | None,
     ) -> None:
-        private = self._continuations.get(call_id)
+        if not previous_response_id:
+            return
+        private = self._continuations.get((previous_response_id, call_id))
         if private is None:
             return
-        response_id, expected_name, expected_arguments, continuation = private
+        expected_name, expected_arguments, continuation = private
         encoded_arguments = json.dumps(
             arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
         if (
             expected_name != name
             or expected_arguments != encoded_arguments
-            or previous_response_id not in {None, response_id}
         ):
             return
         message._continuation = continuation.model_copy(deep=True)
@@ -267,7 +325,10 @@ class ControlPlaneSdkModel(Model):
                             content=self._text_content(output) or str(output),
                         )
                     )
-                    self._continuations.pop(call_id, None)
+                    if previous_response_id:
+                        self._continuations.pop(
+                            (previous_response_id, call_id), None
+                        )
         if not messages:
             raise ValueError("SDK model input contains no supported messages")
         return messages
@@ -370,8 +431,7 @@ class ControlPlaneSdkModel(Model):
         response_id = f"provider-response-{secrets.token_hex(16)}"
         if response.continuation is not None:
             for call in response.tool_calls:
-                self._continuations[call.id] = (
-                    response_id,
+                self._continuations[(response_id, call.id)] = (
                     call.name,
                     json.dumps(
                         call.arguments,
@@ -495,6 +555,23 @@ class PythonTermConversationRuntimeExecutor:
             replayed=True,
         )
 
+    def _reconciliation_effect_ids(self, term_id: str) -> tuple[str, ...]:
+        return tuple(
+            effect.effect_id
+            for step in self._runtime.repository.list_steps(term_id)
+            for effect in self._runtime.repository.list_tool_effects(
+                term_id, step.step_id
+            )
+            if effect.status == "reconciliation_required"
+        )
+
+    def reconcile_effect(
+        self, effect_id: str, result: PublicToolResult
+    ) -> None:
+        self._runtime.repository.confirm_reconciled_tool_effect(
+            effect_id, result
+        )
+
     async def execute_snapshot(self, snapshot: dict[str, object]) -> object:
         if not isinstance(snapshot, dict):
             raise TypeError("Python Term execution snapshot must be an object")
@@ -548,6 +625,16 @@ class PythonTermConversationRuntimeExecutor:
             )
         except (PythonTermRuntimeError, PythonTermResumeRejected) as error:
             durable = self._durable_execution(envelope.term_id)
+            reconciliation_effect_ids = self._reconciliation_effect_ids(
+                envelope.term_id
+            )
+            if reconciliation_effect_ids:
+                return PythonTermConversationExecution(
+                    status="reconciliation_required",
+                    events=() if durable is None else durable.events,
+                    final_output=None,
+                    reconciliation_effect_ids=reconciliation_effect_ids,
+                )
             if durable is not None and durable.status in {
                 "completed",
                 "failed",
@@ -608,6 +695,7 @@ def _python_term_gate_manifest_files() -> dict[str, bytes]:
         mvp_root / "pyproject.toml",
         mvp_root / "uv.lock",
         mvp_root / "scripts" / "run_python_term_runtime_gate.py",
+        mvp_root / "scripts" / "sign_python_term_runtime_gate.py",
     }
     return {
         path.relative_to(mvp_root).as_posix(): path.read_bytes()
@@ -638,6 +726,7 @@ def compose_python_term_production(
     gateway: ModelGateway,
     profiles: tuple[ProviderProfileRecord, ...],
     runtime_dir: Path,
+    trust: PythonTermGateTrust | None = None,
 ) -> PythonTermProductionComposition:
     """Build the one fixed Provider/Tool/PTY composition and its private proof."""
     if type(registry) is not RuntimeRegistryV2:
@@ -665,7 +754,10 @@ def compose_python_term_production(
         streaming=True,
         event_cursor=True,
     )
-    verdict = load_signed_python_term_gate_verdict(preflight_capabilities)
+    selected_trust = trust or PythonTermGateTrust.production()
+    verdict = load_signed_python_term_gate_verdict(
+        preflight_capabilities, trust=selected_trust
+    )
 
     workspace_manifest = ToolManifestEntryV2(
         tool_id="workspace.read",
@@ -745,6 +837,7 @@ def compose_python_term_production(
         executor=PythonTermConversationRuntimeExecutor(runtime),
         verdict=verdict,
         gate_proof=proof,
+        trust_status=selected_trust.trust_status,
     )
 
 
@@ -858,14 +951,23 @@ def _canonical_signed_payload(payload: Mapping[str, object]) -> bytes:
 
 def load_signed_python_term_gate_verdict(
     capabilities: RuntimeCapabilitiesV2,
+    *,
+    trust: PythonTermGateTrust | None = None,
 ) -> PythonTermGateVerdict:
     """Verify an externally signed build proof; local production fails closed."""
+    selected_trust = trust or PythonTermGateTrust.production()
     try:
-        envelope = json.loads(_SIGNED_GATE_PROOF_PATH.read_text(encoding="utf-8"))
+        envelope = json.loads(selected_trust.proof_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("Python Term signed build proof is unavailable") from exc
-    if not isinstance(envelope, dict) or set(envelope) != {"payload", "signature"}:
+    if not isinstance(envelope, dict) or set(envelope) != {
+        "key_id",
+        "payload",
+        "signature",
+    }:
         raise RuntimeError("Python Term signed build proof is invalid")
+    if envelope.get("key_id") != selected_trust.key_id:
+        raise RuntimeError("Python Term signed build proof key is not trusted")
     raw = envelope.get("payload")
     encoded_signature = envelope.get("signature")
     if not isinstance(raw, dict) or not isinstance(encoded_signature, str):
@@ -884,7 +986,7 @@ def load_signed_python_term_gate_verdict(
         raise RuntimeError("Python Term signed build proof is invalid")
     try:
         signature = base64.b64decode(encoded_signature, validate=True)
-        Ed25519PublicKey.from_public_bytes(_TRUSTED_BUILD_PUBLIC_KEY).verify(
+        Ed25519PublicKey.from_public_bytes(selected_trust.public_key).verify(
             signature, _canonical_signed_payload(raw)
         )
     except (binascii.Error, ValueError, InvalidSignature) as exc:
@@ -993,6 +1095,7 @@ __all__ = [
     "REQUIRED_GATE_SCENARIOS",
     "GateObservableSessionLock",
     "PythonTermGateScenario",
+    "PythonTermGateTrust",
     "PythonTermGateVerdict",
     "build_python_term_gate_verdict",
     "compose_python_term_production",

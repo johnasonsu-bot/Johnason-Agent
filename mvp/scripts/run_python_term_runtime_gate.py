@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -18,7 +19,9 @@ from workbench.runtime.engine_host.v2.contracts import RuntimeCapabilitiesV2
 from workbench.runtime.python_term.gate import (
     REQUIRED_GATE_SCENARIOS,
     PythonTermGateScenario,
+    PythonTermGateTrust,
     build_python_term_gate_verdict,
+    load_signed_python_term_gate_verdict,
     python_term_gate_signing_document,
     python_term_gate_source_revision,
 )
@@ -143,7 +146,66 @@ async def _live_lmstudio_smoke() -> dict[str, object]:
         await gateway.aclose()
 
 
+def _arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--proof", type=Path)
+    parser.add_argument("--development-runtime-dir", type=Path)
+    parser.add_argument("--development-public-key", type=Path)
+    return parser.parse_args()
+
+
+def _selected_trust(arguments: argparse.Namespace) -> PythonTermGateTrust:
+    development = (
+        arguments.development_runtime_dir,
+        arguments.development_public_key,
+        arguments.proof,
+    )
+    if any(value is not None for value in development):
+        if not all(value is not None for value in development):
+            raise ValueError("development trust requires runtime, public key and proof")
+        return PythonTermGateTrust.development(
+            runtime_dir=arguments.development_runtime_dir,
+            public_key_path=arguments.development_public_key,
+            proof_path=arguments.proof,
+        )
+    if arguments.proof is not None:
+        raise ValueError("production proof path cannot be overridden")
+    return PythonTermGateTrust.production()
+
+
+def _verify_current_build(arguments: argparse.Namespace) -> tuple[dict[str, object], int]:
+    capabilities = _capabilities()
+    trust_status = (
+        "DEV_UNTRUSTED"
+        if arguments.development_runtime_dir is not None
+        else "PRODUCTION_TRUSTED"
+    )
+    try:
+        trust = _selected_trust(arguments)
+        trust_status = trust.trust_status
+        verdict = load_signed_python_term_gate_verdict(capabilities, trust=trust)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "source_revision": python_term_gate_source_revision(),
+            "Decision": "BLOCKED",
+            "trust_status": trust_status,
+        }, 1
+    return {
+        "source_revision": verdict.source_revision,
+        "result_digest": verdict.result_digest,
+        "key_id": trust.key_id,
+        "Decision": verdict.decision,
+        "trust_status": trust.trust_status,
+    }, 0
+
+
 def main() -> int:
+    arguments = _arguments()
+    if arguments.verify_only:
+        document, code = _verify_current_build(arguments)
+        print(json.dumps(document, ensure_ascii=False, indent=2))
+        return code
     source_revision = python_term_gate_source_revision()
     scenarios: list[PythonTermGateScenario] = []
     evidence: list[dict[str, object]] = []
@@ -165,9 +227,26 @@ def main() -> int:
             json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     else:
-        decision = "BLOCKED_EXTERNAL_SIGNATURE_REQUIRED"
         result_digest = verdict.result_digest
         signing_payload = python_term_gate_signing_document(verdict)
+        try:
+            trust = _selected_trust(arguments)
+            trust_status = trust.trust_status
+            packaged = load_signed_python_term_gate_verdict(capabilities, trust=trust)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            decision = "BLOCKED_EXTERNAL_SIGNATURE_REQUIRED"
+            trust_status = (
+                "DEV_UNTRUSTED"
+                if arguments.development_runtime_dir is not None
+                else "PRODUCTION_TRUSTED"
+            )
+        else:
+            decision = (
+                packaged.decision
+                if packaged == verdict
+                else "BLOCKED_EXTERNAL_SIGNATURE_REQUIRED"
+            )
+            trust_status = trust.trust_status
     document = {
         "source_revision": source_revision,
         "sdk_revision": PINNED_AGENTS_SDK_REVISION,
@@ -179,11 +258,12 @@ def main() -> int:
         "result_digest": result_digest,
         "external_signature_payload": signing_payload,
         "Decision": decision,
+        "trust_status": trust_status if signing_payload is not None else "PRODUCTION_TRUSTED",
         "Goose runtime status": "NOT_YET_EVALUATED",
         "DSH runtime status": "NOT_YET_EVALUATED",
     }
     print(json.dumps(document, ensure_ascii=False, indent=2))
-    return 1
+    return 0 if decision == "GO_PYTHON_TERM_RUNTIME" else 1
 
 
 if __name__ == "__main__":

@@ -1037,6 +1037,64 @@ class ConversationRepository:
         assert refreshed is not None
         return self._turn_status(refreshed)
 
+    def resume_python_term_reconciliation(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        effect_id: str,
+    ) -> TurnStatus:
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((session_id, command_id))
+            state = json.loads(row["state_json"])
+            pending = state.get("reconciliation_effect_ids")
+            if (
+                row["status"] != "interrupted"
+                or state.get("runner_mode") != "python_term"
+                or state.get("reason") != "reconciliation_required"
+                or not isinstance(pending, list)
+                or effect_id not in pending
+            ):
+                raise TurnSnapshotCorruption(
+                    "turn is not awaiting this Python Term reconciliation"
+                )
+            state["phase"] = "before_model"
+            state.pop("reason", None)
+            state["reconciled_effect_ids"] = sorted(
+                set(state.get("reconciled_effect_ids", ())) | {effect_id}
+            )
+            state["reconciliation_effect_ids"] = [
+                item for item in pending if item != effect_id
+            ]
+            changed = connection.execute(
+                """UPDATE conversation_turns
+                SET status = 'queued', state_json = ?, updated_at = ?
+                WHERE session_id = ? AND command_id = ? AND status = 'interrupted'""",
+                (
+                    json.dumps(state, sort_keys=True),
+                    time.time(),
+                    session_id,
+                    command_id,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("reconciliation resume lost its turn fence")
+            refreshed = connection.execute(
+                """SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            connection.commit()
+        assert refreshed is not None
+        return self._turn_status(refreshed)
+
     def fail_corrupt_turn(
         self,
         session_id: str,
