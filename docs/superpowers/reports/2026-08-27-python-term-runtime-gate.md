@@ -6,11 +6,12 @@ Task 7 已建立可重复运行的 Python Term Runtime 确定性门禁，并打�
 Conversation durable queue 到真实 `PythonTermRuntime`、固定 Agents SDK Runner、
 Provider Gateway，再回写会话终态与 assistant message 的生产执行链。
 
-当前工作树执行 `mvp/scripts/run_python_term_runtime_gate.py` 的 9 个确定性场景均为
-`PASS`，结果为：
+当前实现的确定性测试矩阵可重复运行，但生产 admission 只信任由 CI/发布系统
+持有私钥签发的 Ed25519 build proof。本地代码和门禁 runner 均不含签发私钥，
+runner 只输出待外部签名 payload。因此本轮真实结论是：
 
 ```text
-Decision: GO_PYTHON_TERM_RUNTIME
+Decision: BLOCKED_EXTERNAL_SIGNATURE_REQUIRED
 Goose runtime status: NOT_YET_EVALUATED
 DSH runtime status: NOT_YET_EVALUATED
 ```
@@ -27,10 +28,12 @@ meta/E2E、diff 和 credential scan，并用独立 report-only commit 更新本�
 | 模型与凭据 | Agents SDK Model adapter 只调用既有 Provider Gateway；凭据继续由 Vault/控制面拥有 |
 | Runtime | 真实 `PythonTermRuntime` 执行冻结的 Term/Step/Agent/Handoff/Workspace/Permission/Effect snapshot |
 | Tool / Workspace / PTY | executor 由控制面固定声明并组装；Tool Router 和受监督 PTY 保持默认拒绝与路径/命令策略 |
-| 持久化 | durable runtime/build pin、Event、Checkpoint、cursor、Effect 与终态投影沿用控制面事实源 |
+| 持久化 | Python Term SQLite Event/cursor 是投影事实源；Conversation 保存 projected cursor，崩溃恢复只补投影缺口 |
 | 无 fallback | explicit `python-term` accepted 后只由 Python Term worker 执行，失败不转入 v1 |
 | Session lock | test-only wrapper 包装真实 `asyncio.Lock`，在 `_enqueue_message_locked` 入口验证 owner；绕过 mutation 当场失败 |
-| 私有 proof | 只从与当前源码/能力匹配的打包门禁 receipt 生成，绑定 source、SDK、runtime/build/protocol、capability digest、完整 gate-result digest；不暴露给 renderer/HTTP/IPC |
+| Provider 失败 | durable failed/cancelled 单调封口，不进入永久 retry；只有未形成终态的 typed conflict 可重试 |
+| DeepSeek续传 | reasoning continuation 私有绑定 response/tool-call identity，tool result 后单次消费，不进入公共输出/日志/Conversation state |
+| 私有 proof | 仅验证外部 Ed25519 签名；绑定完整源码、依赖锁、测试/场景矩阵、SDK、runtime/build/protocol、capability/result digest；不暴露给 renderer/HTTP/IPC |
 
 ## 确定性场景
 
@@ -49,18 +52,21 @@ meta/E2E、diff 和 credential scan，并用独立 report-only commit 更新本�
 
 本轮预提交工作树结果：9/9 `PASS`。门禁输出的 source revision 为内容寻址的
 `mvp-tree` digest，避免后续 report-only 文档提交改变生产源码绑定。
-生产 composition 不含硬编码 PASS 自签路径；receipt 缺失、损坏或与当前源码/能力
-不符时，会在 executor 注册前 fail closed。
+source manifest 覆盖 `src/workbench/**/*.py`、`tests/**/*.py`、`pyproject.toml`、
+`uv.lock` 与门禁 runner。contracts、Provider adapter、场景命令或依赖锁发生 mutation
+都会使旧签名失效。签名 proof 缺失、损坏或与当前源码/能力不符时，在 executor
+注册前 fail closed。仓库中的旧 `gate_receipt.json` 已标记为不可信兼容占位。
 
 ## 外部 live smoke
 
-本轮通过 Provider Gateway 发现本机 LM Studio 并完成 live smoke，状态为 `PASS`。
-该结果单独记录，不进入 9 个确定性场景的 GO 判定，也不保存模型凭据或响应正文。
+live smoke 结果必须在固定 revision 门禁轮次单独回填；它不进入外部签名 payload，
+也不保存模型凭据或响应正文。
 
 ## 固定 revision 待回填
 
 | 门禁 | 固定 revision 结果 |
 |---|---|
+| Task 7 focused acceptance | `19 passed`（修复轮次 1 工作树） |
 | 标准 backend | 待实现提交后重跑 |
 | 独立 frontend | 待实现提交后重跑 |
 | Development Graph meta/E2E | 待实现提交后重跑 |

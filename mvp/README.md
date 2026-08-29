@@ -203,7 +203,7 @@ revision 的标准 backend、独立 frontend、Development Graph meta/E2E、全�
 
 ### 8.2 Python Term Runtime
 
-Python Term 默认关闭。启用时，只有门禁 proof 与注册能力完全匹配，显式选择
+Python Term 默认关闭。启用时，只有外部签名 build proof 与注册能力完全匹配，显式选择
 `python-term` 的新 command 才会持久化 runtime/build pin；一旦 accepted，执行失败
 进入既有 durable retry/reconciliation 状态，不会转入 Host v1。
 
@@ -214,7 +214,10 @@ Python Term 默认关闭。启用时，只有门禁 proof 与注册能力完全�
 - 控制面声明并组装的 `workspace.read` 与受监督 PTY executor；
 - `PythonTermRuntime` 的私有 Agent context、结构化 Handoff、StepContext、Event、
   Checkpoint、Effect 和 cursor 边界；
-- 不暴露给 HTTP、IPC 或 renderer 的私有 gate proof。
+- 不暴露给 HTTP、IPC 或 renderer 的私有 gate proof；
+- SQLite durable Event/cursor 驱动的崩溃补投影、Provider 永久失败单调终结；
+- DeepSeek reasoning continuation 的 response/tool-call 私有绑定与单次消费；
+- `workspace.read` regular-file 校验与 64 KiB + 1 有界读取。
 
 运行 9 场景确定性门禁：
 
@@ -324,10 +327,11 @@ GO_LANGGRAPH_RUNTIME
 ```
 
 该门直接运行真实 Runtime/SDK/控制面 executor，不接受 contract fake、fixture
-binary、mock import 或调用方 capability 自签。预期只有全部确定性场景通过时输出：
+binary、mock import 或调用方 capability 自签。确定性场景通过后只输出待外部签名
+payload；本地不持有生产私钥，预期输出：
 
 ```text
-Decision: GO_PYTHON_TERM_RUNTIME
+Decision: BLOCKED_EXTERNAL_SIGNATURE_REQUIRED
 Goose runtime status: NOT_YET_EVALUATED
 DSH runtime status: NOT_YET_EVALUATED
 ```

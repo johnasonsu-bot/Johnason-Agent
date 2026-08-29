@@ -8,15 +8,22 @@ IPC and renderer inputs never carry a verdict or proof.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import json
+import os
 import re
+import stat
 import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 import secrets
 from typing import Literal
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from agents import Handoff, Model, Tool
 from agents.items import ModelResponse as SdkModelResponse
@@ -32,6 +39,7 @@ from openai.types.responses.response_usage import (
 )
 
 from workbench.models.contracts import (
+    ContinuationMetadata,
     ModelMessage,
     ModelRequest,
     ToolCall,
@@ -43,6 +51,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     QueryCommandV2,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
+    RuntimeEventV2,
     ToolManifestEntryV2,
 )
 from workbench.runtime.engine_host.v2.python_term_control_plane import (
@@ -68,7 +77,13 @@ from workbench.runtime.python_term.contracts import (
 )
 from workbench.runtime.python_term.pty_worker import PtyWorker
 from workbench.runtime.python_term.repository import PythonTermRepository
-from workbench.runtime.python_term.runtime import RUNTIME_BUILD_ID, PythonTermRuntime
+from workbench.runtime.python_term.runtime import (
+    RUNTIME_BUILD_ID,
+    PythonTermExecution,
+    PythonTermResumeRejected,
+    PythonTermRuntime,
+    PythonTermRuntimeError,
+)
 from workbench.runtime.python_term.sdk_adapter import (
     PINNED_AGENTS_SDK_REVISION,
     FixedModelProvider,
@@ -90,7 +105,10 @@ REQUIRED_GATE_SCENARIOS = (
     "session_lock_ownership",
     "proof_binding",
 )
-_GATE_RECEIPT_PATH = Path(__file__).with_name("gate_receipt.json")
+_SIGNED_GATE_PROOF_PATH = Path(__file__).with_name("signed_gate_proof.json")
+_TRUSTED_BUILD_PUBLIC_KEY = base64.b64decode(
+    "O5z21GioHLEc9u2lQyGlR5kiLaouA0DrCPq73BtJzvw="
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +169,9 @@ class ControlPlaneSdkModel(Model):
         self._gateway = gateway
         self._profile = profile.model_copy(deep=True)
         self._model = model
+        self._continuations: dict[
+            str, tuple[str, str, str, ContinuationMetadata]
+        ] = {}
 
     @staticmethod
     def _text_content(value: object) -> str | None:
@@ -170,9 +191,36 @@ class ControlPlaneSdkModel(Model):
                     parts.append(text)
         return "".join(parts) or None
 
-    @classmethod
+    def _restore_continuation(
+        self,
+        message: ModelMessage,
+        *,
+        call_id: str,
+        name: str,
+        arguments: dict[str, object],
+        previous_response_id: str | None,
+    ) -> None:
+        private = self._continuations.get(call_id)
+        if private is None:
+            return
+        response_id, expected_name, expected_arguments, continuation = private
+        encoded_arguments = json.dumps(
+            arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        if (
+            expected_name != name
+            or expected_arguments != encoded_arguments
+            or previous_response_id not in {None, response_id}
+        ):
+            return
+        message._continuation = continuation.model_copy(deep=True)
+
     def _messages(
-        cls, system_instructions: str | None, value: str | list[object]
+        self,
+        system_instructions: str | None,
+        value: str | list[object],
+        *,
+        previous_response_id: str | None,
     ) -> list[ModelMessage]:
         messages: list[ModelMessage] = []
         if system_instructions:
@@ -185,7 +233,7 @@ class ControlPlaneSdkModel(Model):
             content = item.get("content") if isinstance(item, Mapping) else getattr(item, "content", None)
             item_type = item.get("type") if isinstance(item, Mapping) else getattr(item, "type", None)
             if role in {"system", "user", "assistant"}:
-                messages.append(ModelMessage(role=role, content=cls._text_content(content)))
+                messages.append(ModelMessage(role=role, content=self._text_content(content)))
             elif item_type == "function_call":
                 name = item.get("name") if isinstance(item, Mapping) else getattr(item, "name", None)
                 arguments = item.get("arguments") if isinstance(item, Mapping) else getattr(item, "arguments", None)
@@ -196,12 +244,18 @@ class ControlPlaneSdkModel(Model):
                     except json.JSONDecodeError:
                         parsed = {}
                     if isinstance(parsed, dict):
-                        messages.append(
-                            ModelMessage(
-                                role="assistant",
-                                tool_calls=[ToolCall(id=call_id, name=name, arguments=parsed)],
-                            )
+                        message = ModelMessage(
+                            role="assistant",
+                            tool_calls=[ToolCall(id=call_id, name=name, arguments=parsed)],
                         )
+                        self._restore_continuation(
+                            message,
+                            call_id=call_id,
+                            name=name,
+                            arguments=parsed,
+                            previous_response_id=previous_response_id,
+                        )
+                        messages.append(message)
             elif item_type == "function_call_output":
                 call_id = item.get("call_id") if isinstance(item, Mapping) else getattr(item, "call_id", None)
                 output = item.get("output") if isinstance(item, Mapping) else getattr(item, "output", None)
@@ -210,9 +264,10 @@ class ControlPlaneSdkModel(Model):
                         ModelMessage(
                             role="tool",
                             tool_call_id=call_id,
-                            content=cls._text_content(output) or str(output),
+                            content=self._text_content(output) or str(output),
                         )
                     )
+                    self._continuations.pop(call_id, None)
         if not messages:
             raise ValueError("SDK model input contains no supported messages")
         return messages
@@ -298,16 +353,36 @@ class ControlPlaneSdkModel(Model):
         conversation_id: str | None,
         prompt: object | None,
     ) -> SdkModelResponse:
-        del output_schema, tracing, previous_response_id, conversation_id, prompt
+        del output_schema, tracing, conversation_id, prompt
         request = ModelRequest(
             model=self._model,
-            messages=self._messages(system_instructions, input),
+            messages=self._messages(
+                system_instructions,
+                input,
+                previous_response_id=previous_response_id,
+            ),
             tools=self._tools(tools, handoffs),
             temperature=getattr(model_settings, "temperature", 0),
             top_p=getattr(model_settings, "top_p", None),
             tool_choice=getattr(model_settings, "tool_choice", None),
         )
         response = await self._gateway.complete(request, self._profile)
+        response_id = f"provider-response-{secrets.token_hex(16)}"
+        if response.continuation is not None:
+            for call in response.tool_calls:
+                self._continuations[call.id] = (
+                    response_id,
+                    call.name,
+                    json.dumps(
+                        call.arguments,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                    response.continuation.model_copy(deep=True),
+                )
+            while len(self._continuations) > 256:
+                self._continuations.pop(next(iter(self._continuations)))
         usage = Usage(
             requests=1,
             input_tokens=response.usage.prompt_tokens,
@@ -319,7 +394,7 @@ class ControlPlaneSdkModel(Model):
         return SdkModelResponse(
             output=self._sdk_output(response),  # type: ignore[arg-type]
             usage=usage,
-            response_id=None,
+            response_id=response_id,
         )
 
     async def stream_response(
@@ -360,7 +435,7 @@ class ControlPlaneSdkModel(Model):
             total_tokens=sdk_usage.total_tokens,
         )
         completed = Response(
-            id="provider-response",
+            id=response.response_id or f"provider-response-{secrets.token_hex(16)}",
             created_at=time.time(),
             model=self._model,
             object="response",
@@ -386,6 +461,40 @@ class PythonTermConversationRuntimeExecutor:
             raise TypeError("runtime must be an exact PythonTermRuntime")
         self._runtime = runtime
 
+    def _durable_execution(self, term_id: str) -> PythonTermExecution | None:
+        term = self._runtime.repository.get_term(term_id)
+        if term is None:
+            return None
+        events = tuple(
+            RuntimeEventV2(
+                event_id=event.event_id,
+                run_id=event.run_id,
+                term_id=event.term_id,
+                step_id=event.step_id,
+                cursor=event.cursor,
+                type=event.type,
+                payload=event.payload,
+                required=True,
+            )
+            for event in self._runtime.repository.list_events(term_id)
+        )
+        final_output = next(
+            (
+                event.payload.get("content")
+                for event in reversed(events)
+                if event.type == "assistant.message"
+                and isinstance(event.payload.get("content"), str)
+            ),
+            None,
+        )
+        return PythonTermExecution(
+            status=term.status,
+            events=events,
+            checkpoint_hint=None,
+            final_output=final_output,
+            replayed=True,
+        )
+
     async def execute_snapshot(self, snapshot: dict[str, object]) -> object:
         if not isinstance(snapshot, dict):
             raise TypeError("Python Term execution snapshot must be an object")
@@ -410,30 +519,58 @@ class PythonTermConversationRuntimeExecutor:
             environment, (list, tuple)
         ):
             raise ValueError("Python Term execution snapshot is invalid")
-        return await self._runtime.execute(
-            QueryCommandV2.model_validate(snapshot["command"]),
-            envelope=RunEnvelopeV2.model_validate(snapshot["envelope"]),
-            agents=tuple(
-                AgentDescriptor.model_validate(item) for item in snapshot["agents"]  # type: ignore[union-attr]
-            ),
-            handoffs=tuple(
-                HandoffDescriptor.model_validate(item)
-                for item in snapshot["handoffs"]  # type: ignore[union-attr]
-            ),
-            model_messages=tuple(messages),  # type: ignore[arg-type]
-            conversation_context=ConversationContextRef.model_validate(
-                snapshot["conversation_context"]
-            ),
-            project_context=ProjectContextRef.model_validate(
-                snapshot["project_context"]
-            ),
-            work_state=TermWorkStateRef.model_validate(snapshot["work_state"]),
-            permission_policy=PermissionPolicy.model_validate(
-                snapshot["permission_policy"]
-            ),
-            environment_allowlist=tuple(environment),  # type: ignore[arg-type]
-            effect_scope=EffectScope.model_validate(snapshot["effect_scope"]),
-        )
+        command = QueryCommandV2.model_validate(snapshot["command"])
+        envelope = RunEnvelopeV2.model_validate(snapshot["envelope"])
+        try:
+            await self._runtime.execute(
+                command,
+                envelope=envelope,
+                agents=tuple(
+                    AgentDescriptor.model_validate(item) for item in snapshot["agents"]  # type: ignore[union-attr]
+                ),
+                handoffs=tuple(
+                    HandoffDescriptor.model_validate(item)
+                    for item in snapshot["handoffs"]  # type: ignore[union-attr]
+                ),
+                model_messages=tuple(messages),  # type: ignore[arg-type]
+                conversation_context=ConversationContextRef.model_validate(
+                    snapshot["conversation_context"]
+                ),
+                project_context=ProjectContextRef.model_validate(
+                    snapshot["project_context"]
+                ),
+                work_state=TermWorkStateRef.model_validate(snapshot["work_state"]),
+                permission_policy=PermissionPolicy.model_validate(
+                    snapshot["permission_policy"]
+                ),
+                environment_allowlist=tuple(environment),  # type: ignore[arg-type]
+                effect_scope=EffectScope.model_validate(snapshot["effect_scope"]),
+            )
+        except (PythonTermRuntimeError, PythonTermResumeRejected) as error:
+            durable = self._durable_execution(envelope.term_id)
+            if durable is not None and durable.status in {
+                "completed",
+                "failed",
+                "cancelled",
+            }:
+                return durable
+            if error.code == "retryable_conflict":
+                raise
+            return PythonTermExecution(
+                status="failed",
+                events=() if durable is None else durable.events,
+                checkpoint_hint=None,
+                final_output=None if durable is None else durable.final_output,
+                replayed=durable is not None,
+            )
+        durable = self._durable_execution(envelope.term_id)
+        if durable is None or durable.status not in {
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            raise ValueError("Python Term execution did not durably terminate")
+        return durable
 
 
 async def _workspace_read_executor(
@@ -445,35 +582,53 @@ async def _workspace_read_executor(
     path_value = arguments.get("path")
     if not isinstance(path_value, str):
         raise ValueError("workspace path is required")
-    data = await asyncio.to_thread(Path(path_value).read_bytes)
-    if len(data) > 64 * 1024:
-        raise ValueError("workspace read exceeded the fixed output bound")
+    def bounded_read() -> bytes:
+        path = Path(path_value)
+        with path.open("rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("workspace read requires a regular file")
+            if metadata.st_size > 64 * 1024:
+                raise ValueError("workspace read exceeded the fixed output bound")
+            data = handle.read(64 * 1024 + 1)
+        if len(data) > 64 * 1024:
+            raise ValueError("workspace read exceeded the fixed output bound")
+        return data
+
+    data = await asyncio.to_thread(bounded_read)
     text = data.decode("utf-8")
     return PublicToolResult(status="completed", summary=text[:4096])
 
 
-def python_term_gate_source_revision() -> str:
-    source_root = Path(__file__).resolve().parents[2]
-    paths = (
-        Path(__file__).resolve(),
-        source_root / "main.py",
-        source_root / "api" / "app.py",
-        source_root / "api" / "conversations.py",
-        source_root / "conversations" / "repository.py",
-        source_root / "runtime" / "engine_host" / "v2" / "registry.py",
-        source_root / "runtime" / "engine_host" / "v2" / "python_term_control_plane.py",
-        source_root / "runtime" / "python_term" / "runtime.py",
-        source_root / "runtime" / "python_term" / "sdk_adapter.py",
-        source_root / "runtime" / "python_term" / "tool_router.py",
-        source_root / "runtime" / "python_term" / "pty_worker.py",
-    )
+def _python_term_gate_manifest_files() -> dict[str, bytes]:
+    mvp_root = Path(__file__).resolve().parents[4]
+    paths = {
+        *mvp_root.glob("src/workbench/**/*.py"),
+        *mvp_root.glob("tests/**/*.py"),
+        mvp_root / "pyproject.toml",
+        mvp_root / "uv.lock",
+        mvp_root / "scripts" / "run_python_term_runtime_gate.py",
+    }
+    return {
+        path.relative_to(mvp_root).as_posix(): path.read_bytes()
+        for path in paths
+        if path.is_file()
+    }
+
+
+def _digest_python_term_gate_manifest(files: Mapping[str, bytes]) -> str:
     digest = hashlib.sha256()
-    for path in sorted(paths):
-        digest.update(str(path.relative_to(source_root)).encode("utf-8"))
+    for path, content in sorted(files.items()):
+        digest.update(path.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(content)
         digest.update(b"\0")
     return "mvp-tree:" + digest.hexdigest()[:40]
+
+
+def python_term_gate_source_revision() -> str:
+    """Digest the full production source, dependency lock and test matrix."""
+    return _digest_python_term_gate_manifest(_python_term_gate_manifest_files())
 
 
 def compose_python_term_production(
@@ -510,7 +665,7 @@ def compose_python_term_production(
         streaming=True,
         event_cursor=True,
     )
-    verdict = load_packaged_python_term_gate_verdict(preflight_capabilities)
+    verdict = load_signed_python_term_gate_verdict(preflight_capabilities)
 
     workspace_manifest = ToolManifestEntryV2(
         tool_id="workspace.read",
@@ -584,7 +739,7 @@ def compose_python_term_production(
     if runtime.capabilities != preflight_capabilities:
         raise RuntimeError("Python Term capabilities changed after gate preflight")
     runtime.register(registry)
-    proof = issue_python_term_gate_proof(verdict, runtime.capabilities)
+    proof = _issue_verified_python_term_gate_proof(verdict, runtime.capabilities)
     return PythonTermProductionComposition(
         runtime=runtime,
         executor=PythonTermConversationRuntimeExecutor(runtime),
@@ -670,31 +825,73 @@ def build_python_term_gate_verdict(
     )
 
 
-def load_packaged_python_term_gate_verdict(
+def python_term_gate_signing_document(
+    verdict: PythonTermGateVerdict,
+) -> dict[str, object]:
+    if type(verdict) is not PythonTermGateVerdict:
+        raise TypeError("verdict must be an exact PythonTermGateVerdict")
+    return {
+        "source_revision": verdict.source_revision,
+        "sdk_revision": verdict.sdk_revision,
+        "runtime_id": verdict.runtime_id,
+        "build_id": verdict.build_id,
+        "protocol_version": verdict.protocol_version,
+        "capability_digest": verdict.capability_digest,
+        "scenarios": [
+            {
+                "scenario_id": item.scenario_id,
+                "status": item.status,
+                "command_summary": item.command_summary,
+            }
+            for item in verdict.scenarios
+        ],
+        "result_digest": verdict.result_digest,
+        "decision": verdict.decision,
+    }
+
+
+def _canonical_signed_payload(payload: Mapping[str, object]) -> bytes:
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def load_signed_python_term_gate_verdict(
     capabilities: RuntimeCapabilitiesV2,
 ) -> PythonTermGateVerdict:
-    """Load the build-owned deterministic receipt and bind it to live code.
-
-    The receipt contains no proof or credential.  A missing, malformed, stale,
-    or capability-mismatched receipt fails before executor registration.
-    """
+    """Verify an externally signed build proof; local production fails closed."""
     try:
-        raw = json.loads(_GATE_RECEIPT_PATH.read_text(encoding="utf-8"))
+        envelope = json.loads(_SIGNED_GATE_PROOF_PATH.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Python Term gate receipt is unavailable") from exc
-    if not isinstance(raw, dict) or set(raw) != {
+        raise RuntimeError("Python Term signed build proof is unavailable") from exc
+    if not isinstance(envelope, dict) or set(envelope) != {"payload", "signature"}:
+        raise RuntimeError("Python Term signed build proof is invalid")
+    raw = envelope.get("payload")
+    encoded_signature = envelope.get("signature")
+    if not isinstance(raw, dict) or not isinstance(encoded_signature, str):
+        raise RuntimeError("Python Term signed build proof is invalid")
+    if set(raw) != {
         "source_revision",
         "sdk_revision",
         "runtime_id",
         "build_id",
         "protocol_version",
+        "capability_digest",
         "scenarios",
         "result_digest",
+        "decision",
     }:
-        raise RuntimeError("Python Term gate receipt is invalid")
+        raise RuntimeError("Python Term signed build proof is invalid")
+    try:
+        signature = base64.b64decode(encoded_signature, validate=True)
+        Ed25519PublicKey.from_public_bytes(_TRUSTED_BUILD_PUBLIC_KEY).verify(
+            signature, _canonical_signed_payload(raw)
+        )
+    except (binascii.Error, ValueError, InvalidSignature) as exc:
+        raise RuntimeError("Python Term signed build proof signature is invalid") from exc
     scenario_values = raw.get("scenarios")
     if not isinstance(scenario_values, list):
-        raise RuntimeError("Python Term gate receipt is invalid")
+        raise RuntimeError("Python Term signed build proof is invalid")
     try:
         scenarios = tuple(
             PythonTermGateScenario(
@@ -711,29 +908,14 @@ def load_packaged_python_term_gate_verdict(
             scenarios=scenarios,
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("Python Term gate receipt is invalid") from exc
-    expected = {
-        "source_revision": rebuilt.source_revision,
-        "sdk_revision": rebuilt.sdk_revision,
-        "runtime_id": rebuilt.runtime_id,
-        "build_id": rebuilt.build_id,
-        "protocol_version": rebuilt.protocol_version,
-        "scenarios": [
-            {
-                "scenario_id": item.scenario_id,
-                "status": item.status,
-                "command_summary": item.command_summary,
-            }
-            for item in rebuilt.scenarios
-        ],
-        "result_digest": rebuilt.result_digest,
-    }
+        raise RuntimeError("Python Term signed build proof is invalid") from exc
+    expected = python_term_gate_signing_document(rebuilt)
     if raw != expected:
-        raise RuntimeError("Python Term gate receipt does not match this build")
+        raise RuntimeError("Python Term signed build proof does not match this build")
     return rebuilt
 
 
-def issue_python_term_gate_proof(
+def _issue_verified_python_term_gate_proof(
     verdict: PythonTermGateVerdict,
     capabilities: RuntimeCapabilitiesV2,
 ) -> object:
@@ -814,7 +996,7 @@ __all__ = [
     "PythonTermGateVerdict",
     "build_python_term_gate_verdict",
     "compose_python_term_production",
-    "issue_python_term_gate_proof",
-    "load_packaged_python_term_gate_verdict",
+    "load_signed_python_term_gate_verdict",
+    "python_term_gate_signing_document",
     "python_term_gate_source_revision",
 ]

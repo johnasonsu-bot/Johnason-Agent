@@ -660,8 +660,16 @@ class ConversationAPI:
                     "cancelled",
                 }:
                     raise TurnSnapshotCorruption("invalid Python Term execution result")
+                projected_cursor = turn.state.get("python_term_projected_cursor", 0)
+                if not isinstance(projected_cursor, int) or projected_cursor < 0:
+                    raise TurnSnapshotCorruption("invalid Python Term projected cursor")
                 projected: list[dict[str, Any]] = []
                 for runtime_event in runtime_events:
+                    cursor = getattr(runtime_event, "cursor", None)
+                    if not isinstance(cursor, int) or cursor <= 0:
+                        raise TurnSnapshotCorruption("invalid Python Term event cursor")
+                    if cursor <= projected_cursor:
+                        continue
                     for domain_event in map_runtime_event(runtime_event):
                         appended = self._append(
                             session_id,
@@ -673,6 +681,15 @@ class ConversationAPI:
                         )
                         if appended:
                             projected.append(appended)
+                    projected_cursor = cursor
+                    projected_state = dict(turn.state)
+                    projected_state["python_term_projected_cursor"] = projected_cursor
+                    self.conversations.save_turn_state(
+                        session_id,
+                        command_id,
+                        owner_id=turn.owner_id,
+                        state=projected_state,
+                    )
                 if isinstance(final_output, str) and final_output:
                     self.conversations.append_message(
                         ConversationMessage(
@@ -688,7 +705,11 @@ class ConversationAPI:
                     command_id,
                     owner_id=turn.owner_id,
                     status=terminal_status,
-                    state={"phase": terminal_status, "events": []},
+                    state={
+                        "phase": terminal_status,
+                        "events": [],
+                        "python_term_projected_cursor": projected_cursor,
+                    },
                     result=projected,
                 )
                 return

@@ -145,10 +145,12 @@ cd mvp
 .venv/bin/python scripts/run_python_term_runtime_gate.py
 ```
 
-门禁只有在 9 个确定性场景全部通过时才输出
-`Decision: GO_PYTHON_TERM_RUNTIME`；本地 LM Studio smoke 单独报告，不可用时不会
-冒充或阻塞确定性结果。生产 admission 的私有 proof 不通过 HTTP、IPC 或 renderer
-传递。当前实现证据与最终固定 revision 结果见
+门禁在 9 个确定性场景全部通过后只输出待 CI/发布系统签名的 build payload；
+本地没有生产签发私钥，因此此时仍为
+`Decision: BLOCKED_EXTERNAL_SIGNATURE_REQUIRED`。生产仅验证 Ed25519 签名，
+签名覆盖完整运行时源码、依赖锁、测试/场景矩阵和 capability/result digest。
+本地 LM Studio smoke 单独报告，不可用时不会冒充确定性结果。生产 admission 的
+私有 proof 不通过 HTTP、IPC 或 renderer 传递。当前证据见
 [`Python Term Runtime 门禁报告`](docs/superpowers/reports/2026-08-27-python-term-runtime-gate.md)。
 
 复现核心门：

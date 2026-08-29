@@ -19,7 +19,7 @@ from workbench.runtime.python_term.gate import (
     REQUIRED_GATE_SCENARIOS,
     PythonTermGateScenario,
     build_python_term_gate_verdict,
-    load_packaged_python_term_gate_verdict,
+    python_term_gate_signing_document,
     python_term_gate_source_revision,
 )
 from workbench.runtime.python_term.runtime import RUNTIME_BUILD_ID
@@ -64,7 +64,7 @@ SCENARIO_COMMANDS: dict[str, tuple[str, ...]] = {
         "tests/acceptance/test_python_term_runtime_gate.py::test_gate_proof_binds_source_runtime_capabilities_and_complete_results",
         "tests/acceptance/test_python_term_runtime_gate.py::test_gate_cannot_issue_go_for_missing_or_failed_deterministic_scenario",
         "tests/acceptance/test_python_term_runtime_gate.py::test_gate_rejects_live_evidence_inside_the_deterministic_proof_matrix",
-        "tests/acceptance/test_python_term_runtime_gate.py::test_production_composition_fails_closed_without_packaged_gate_receipt",
+        "tests/acceptance/test_python_term_runtime_gate.py::test_production_composition_fails_closed_without_signed_build_proof",
     ),
 }
 
@@ -160,18 +160,14 @@ def main() -> int:
         )
     except ValueError:
         decision = "BLOCKED"
+        signing_payload = None
         result_digest = hashlib.sha256(
             json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     else:
-        try:
-            packaged = load_packaged_python_term_gate_verdict(capabilities)
-        except RuntimeError:
-            decision = "BLOCKED"
-            result_digest = verdict.result_digest
-        else:
-            decision = verdict.decision if packaged == verdict else "BLOCKED"
-            result_digest = verdict.result_digest
+        decision = "BLOCKED_EXTERNAL_SIGNATURE_REQUIRED"
+        result_digest = verdict.result_digest
+        signing_payload = python_term_gate_signing_document(verdict)
     document = {
         "source_revision": source_revision,
         "sdk_revision": PINNED_AGENTS_SDK_REVISION,
@@ -181,12 +177,13 @@ def main() -> int:
         "scenarios": evidence,
         "live_smoke": asyncio.run(_live_lmstudio_smoke()),
         "result_digest": result_digest,
+        "external_signature_payload": signing_payload,
         "Decision": decision,
         "Goose runtime status": "NOT_YET_EVALUATED",
         "DSH runtime status": "NOT_YET_EVALUATED",
     }
     print(json.dumps(document, ensure_ascii=False, indent=2))
-    return 0 if decision == "GO_PYTHON_TERM_RUNTIME" else 1
+    return 1
 
 
 if __name__ == "__main__":
