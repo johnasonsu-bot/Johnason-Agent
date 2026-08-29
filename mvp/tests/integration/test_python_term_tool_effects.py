@@ -5,12 +5,14 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from asyncio import CancelledError
 from pathlib import Path
 
 import pytest
 
 from workbench.runtime.python_term import repository as repository_module
+from workbench.runtime.python_term import tool_router as tool_router_module
 from workbench.runtime.python_term.contracts import (
     PublicToolResult,
     ToolEffectRecord,
@@ -18,6 +20,7 @@ from workbench.runtime.python_term.contracts import (
     canonical_json,
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
+from workbench.runtime.python_term.runtime import PythonTermRuntime
 from workbench.runtime.python_term.tool_router import (
     HmacRequestDigestService,
     ToolRouteError,
@@ -140,6 +143,76 @@ def _restart_router(
     assert step_claim is not None
     router.admit(context, step_claim=step_claim)
     return router
+
+
+def _checkpoint_tool_call(
+    router: ToolRouter,
+    context,
+    manifest,
+    *,
+    tool_call_id: str,
+) -> None:
+    claim = router.exposed_tools(context)[0].step_claim
+    PythonTermRuntime(router.repository)._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": manifest.tool_id,
+            "tool_call_id": tool_call_id,
+            "read_only": manifest.read_only,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=claim,
+    )
+
+
+def _expire_active_effect_lease(
+    repository: PythonTermRepository,
+    context,
+) -> ToolEffectRecord:
+    active = max(
+        repository.list_tool_effects(context.term_id, context.step_id),
+        key=lambda effect: effect.effect_attempt,
+    )
+    expired = active.model_copy(update={"lease_expires_at_ms": 1})
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+            (canonical_json(expired), expired.effect_id),
+        )
+    return expired
+
+
+async def _start_after_checkpointed_release(
+    router: ToolRouter,
+    context,
+    manifest,
+    arguments: dict[str, object],
+    *,
+    tool_call_id: str,
+    **invoke_options,
+) -> asyncio.Task[PublicToolResult]:
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            arguments,
+            tool_call_id=tool_call_id,
+            **invoke_options,
+        )
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id=tool_call_id,
+        timeout_ms=1_000,
+    )
+    _checkpoint_tool_call(
+        router, context, manifest, tool_call_id=tool_call_id
+    )
+    assert router.release_dispatch_gate(permit)
+    return invocation
 
 
 @pytest.mark.asyncio
@@ -354,10 +427,21 @@ async def test_idempotent_read_can_reexecute_after_crash(tmp_path: Path) -> None
         tmp_path, manifest=manifest, executor=executor
     )
 
+    invocation = asyncio.create_task(
+        router.invoke(context, "read-file", {}, tool_call_id="call-read")
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-read",
+        timeout_ms=1_000,
+    )
+    _checkpoint_tool_call(
+        router, context, manifest, tool_call_id="call-read"
+    )
+    assert router.release_dispatch_gate(permit)
     with pytest.raises(SimulatedProcessCrash):
-        await _invoke_after_durable_release(
-            router, context, "read-file", {}, tool_call_id="call-read"
-        )
+        await invocation
+    _expire_active_effect_lease(router.repository, context)
     restarted = _restart_router(
         database,
         context,
@@ -407,7 +491,7 @@ async def test_write_timeout_is_unknown_and_never_automatically_retried(
 ) -> None:
     import asyncio
 
-    manifest = _tool("write-file", read_only=False, timeout_ms=1)
+    manifest = _tool("write-file", read_only=False, timeout_ms=100)
 
     class SlowWrite:
         def __init__(self) -> None:
@@ -537,7 +621,7 @@ async def test_takeover_exception_is_safely_normalized(
         raise RuntimeError(forbidden)
 
     monkeypatch.setattr(
-        router.repository, "takeover_expired_tool_effect", fail_takeover
+        router.repository, "replace_tool_effect_with_successor", fail_takeover
     )
     with pytest.raises(ToolRouteError) as raised:
         await router.invoke(
@@ -559,7 +643,7 @@ async def test_takeover_exception_is_safely_normalized(
 async def test_recovery_owner_rechecks_workspace_expiry_before_execute(
     tmp_path: Path,
 ) -> None:
-    manifest = _tool("read-file", read_only=True, timeout_ms=100)
+    manifest = _tool("read-file", read_only=True, timeout_ms=1_000)
 
     class CrashFirstRead:
         def __init__(self) -> None:
@@ -584,14 +668,12 @@ async def test_recovery_owner_rechecks_workspace_expiry_before_execute(
         clock_ms=lambda: now,
         runtime_context_kwargs={"workspace_expires_at_ms": 2_000},
     )
-    first = asyncio.create_task(
-        _invoke_after_durable_release(
-            router,
-            context,
-            manifest.tool_id,
-            {},
-            tool_call_id="call-expiry-wait",
-        )
+    first = await _start_after_checkpointed_release(
+        router,
+        context,
+        manifest,
+        {},
+        tool_call_id="call-expiry-wait",
     )
     await executor.started.wait()
     second = asyncio.create_task(
@@ -609,6 +691,7 @@ async def test_recovery_owner_rechecks_workspace_expiry_before_execute(
 
     with pytest.raises(SimulatedProcessCrash):
         await first
+    _expire_active_effect_lease(router.repository, context)
     with pytest.raises(ToolRouteError) as raised:
         await second
 
@@ -620,7 +703,7 @@ async def test_recovery_owner_rechecks_workspace_expiry_before_execute(
 async def test_recovery_owner_reacquires_approval_after_lease_wait(
     tmp_path: Path,
 ) -> None:
-    manifest = _tool("read-file", read_only=True, timeout_ms=100)
+    manifest = _tool("read-file", read_only=True, timeout_ms=1_000)
 
     class CrashFirstRead:
         def __init__(self) -> None:
@@ -650,15 +733,13 @@ async def test_recovery_owner_reacquires_approval_after_lease_wait(
         approvals += 1
         return True
 
-    first = asyncio.create_task(
-        _invoke_after_durable_release(
-            router,
-            context,
-            manifest.tool_id,
-            {},
-            tool_call_id="call-approval-wait",
-            approval=approve,
-        )
+    first = await _start_after_checkpointed_release(
+        router,
+        context,
+        manifest,
+        {},
+        tool_call_id="call-approval-wait",
+        approval=approve,
     )
     await executor.started.wait()
     second = asyncio.create_task(
@@ -676,6 +757,7 @@ async def test_recovery_owner_reacquires_approval_after_lease_wait(
 
     with pytest.raises(SimulatedProcessCrash):
         await first
+    _expire_active_effect_lease(router.repository, context)
     result = await second
 
     assert result.summary == "approved replay"
@@ -954,6 +1036,105 @@ async def test_external_cancellation_persists_unknown_write_and_reraises(
     effect = PythonTermRepository(database).get_tool_effect(row["effect_id"])
     assert effect.status == "reconciliation_required"
     assert executor.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_effect", [False, True])
+async def test_effect_lease_expiry_before_durable_release_permanently_rejects_permit(
+    tmp_path: Path, write_effect: bool
+) -> None:
+    """A stale Effect fence must never cross the durable dispatch boundary."""
+    manifest = _tool(
+        "write-value" if write_effect else "read-value",
+        read_only=not write_effect,
+        idempotency="non_idempotent" if write_effect else "idempotent",
+        timeout_ms=1,
+    )
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="must not execute")
+    )
+    context, router, database = _durable_router(
+        tmp_path, manifest=manifest, executor=executor
+    )
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-stale-before-release",
+        )
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-stale-before-release",
+        timeout_ms=1_000,
+    )
+    time.sleep(0.05)
+
+    for _ in range(2):
+        with pytest.raises(ToolRouteError) as rejected:
+            router.release_dispatch_gate(permit)
+        assert rejected.value.code == "effect_fence_lost"
+
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+    effect = PythonTermRepository(database).list_tool_effects(
+        context.term_id, context.step_id
+    )[0]
+    assert effect.status == "reserved"
+    assert effect.dispatch_state == "pending"
+    assert executor.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_effect", [False, True])
+async def test_effect_lease_expiry_after_release_blocks_pre_dispatch_executor(
+    tmp_path: Path, write_effect: bool
+) -> None:
+    """A released permit cannot authorize execution after its Effect lease expires."""
+    manifest = _tool(
+        "write-value" if write_effect else "read-value",
+        read_only=not write_effect,
+        idempotency="non_idempotent" if write_effect else "idempotent",
+        timeout_ms=25,
+    )
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="must not execute")
+    )
+    context, router, database = _durable_router(
+        tmp_path, manifest=manifest, executor=executor
+    )
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-stale-after-release",
+        )
+    )
+    permit = await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-stale-after-release",
+        timeout_ms=1_000,
+    )
+    assert router.release_dispatch_gate(permit)
+    time.sleep(0.075)
+
+    with pytest.raises(ToolRouteError) as rejected:
+        await invocation
+
+    assert rejected.value.code == (
+        "reconciliation_required" if write_effect else "effect_fence_lost"
+    )
+    effect = PythonTermRepository(database).list_tool_effects(
+        context.term_id, context.step_id
+    )[0]
+    assert effect.status == (
+        "reconciliation_required" if write_effect else "reserved"
+    )
+    assert effect.dispatch_state == ("ambiguous" if write_effect else "released")
+    assert executor.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1291,8 +1472,9 @@ def test_legacy_migration_serializes_with_concurrent_legacy_commit(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_mode", ["timeout", "cancel"])
 async def test_suppressed_cancellation_stays_supervised_until_quiescent(
-    tmp_path: Path, exit_mode: str
+    tmp_path: Path, exit_mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(tool_router_module, "_LEASE_GRACE_MS", 1_000)
     manifest = _tool(
         "write-file",
         read_only=False,
@@ -1330,7 +1512,12 @@ async def test_suppressed_cancellation_stays_supervised_until_quiescent(
             tool_call_id=f"call-supervised-{exit_mode}",
         )
     )
-    await executor.started.wait()
+    try:
+        await asyncio.wait_for(executor.started.wait(), timeout=1)
+    except asyncio.TimeoutError:
+        if invocation.done():
+            await invocation
+        raise
     if exit_mode == "cancel":
         invocation.cancel()
     if exit_mode == "cancel":

@@ -100,6 +100,24 @@ class BlockingWriteExecutor:
         return PublicToolResult(status="completed", summary="Write completed")
 
 
+def _expire_effect_and_step_claim(
+    repository: PythonTermRepository,
+    effect: ToolEffectRecord,
+) -> ToolEffectRecord:
+    expired = effect.model_copy(update={"lease_expires_at_ms": 1})
+    with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+            (canonical_json(expired), expired.effect_id),
+        )
+        connection.execute(
+            "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
+            "WHERE term_id = ? AND step_id = ?",
+            (expired.term_id, expired.step_id),
+        )
+    return expired
+
+
 def _command(*, two_steps: bool = False) -> QueryCommandV2:
     payload = (
         {
@@ -454,6 +472,286 @@ async def test_crash_after_durable_gate_release_marks_write_dispatch_ambiguous(
     assert reconciled.status == "reconciliation_required"
     assert reconciled.dispatch_state == "ambiguous"
     assert executor.calls == 0
+
+
+@pytest.mark.parametrize("successor_phase", ["pending", "released", "committed"])
+def test_read_successor_preserves_predecessor_checkpoint_across_crash_windows(
+    tmp_path, successor_phase
+) -> None:
+    """Every successor phase must retain the exact predecessor recovery proof."""
+    repository = PythonTermRepository(
+        tmp_path / f"read-successor-{successor_phase}.sqlite"
+    )
+    runtime = PythonTermRuntime(repository)
+    inputs = _runtime_inputs(tmp_path, runtime)
+    context = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    ).contexts[0]
+    predecessor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="read-predecessor-step-owner",
+        lease_seconds=60,
+    )
+    assert predecessor_claim is not None
+    runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    proposal = ToolEffectRecord(
+        effect_id="effect-read-predecessor",
+        term_id=context.term_id,
+        step_id=context.step_id,
+        tool_call_id="call-read-successor",
+        request_digest="8" * 64,
+        step_claim_digest=predecessor_claim.identity_digest,
+        status="reserved",
+    )
+    predecessor, created = repository.reserve_tool_effect(
+        proposal,
+        execution_owner_id="read-predecessor-effect-owner",
+        lease_duration_ms=60_000,
+        step_claim=predecessor_claim,
+    )
+    assert created
+    runtime._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": "read_value",
+            "tool_call_id": predecessor.tool_call_id,
+            "read_only": True,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    predecessor = repository.release_tool_dispatch_gate(
+        predecessor,
+        step_claim=predecessor_claim,
+        dispatch_required=True,
+    )
+    assert predecessor is not None
+    expired_predecessor = _expire_effect_and_step_claim(repository, predecessor)
+    successor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="read-successor-step-owner",
+        lease_seconds=60,
+    )
+    assert successor_claim is not None
+    successor_proposal = expired_predecessor.model_copy(
+        update={
+            "effect_id": "effect-read-successor",
+            "step_claim_digest": successor_claim.identity_digest,
+            "execution_owner_id": None,
+            "lease_expires_at_ms": None,
+            "fence_id": None,
+            "fence_generation": 0,
+            "dispatch_state": "pending",
+            "effect_attempt": 1,
+            "predecessor_effect_id": expired_predecessor.effect_id,
+            "predecessor_record_digest": canonical_digest(expired_predecessor),
+        }
+    )
+    successor, won = repository.replace_read_effect_with_successor(
+        expired_predecessor,
+        successor_proposal,
+        execution_owner_id="read-successor-effect-owner",
+        lease_duration_ms=60_000,
+        step_claim=successor_claim,
+    )
+    assert won
+    if successor_phase in {"released", "committed"}:
+        successor = repository.release_tool_dispatch_gate(
+            successor,
+            step_claim=successor_claim,
+            dispatch_required=True,
+        )
+        assert successor is not None
+    if successor_phase == "committed":
+        result = PublicToolResult(status="completed", summary="Read completed")
+        terminal = successor.model_copy(
+            update={
+                "status": "committed",
+                "execution_owner_id": None,
+                "lease_expires_at_ms": None,
+                "result_digest": canonical_digest(result),
+                "public_result": result,
+            }
+        )
+        successor, finished = repository.finish_tool_effect(
+            terminal,
+            expected_owner_id="read-successor-effect-owner",
+            expected_fence_token=successor.fence_token,
+            expected_fence_generation=successor.fence_generation,
+            step_claim=successor_claim,
+        )
+        assert finished
+
+    for _ in range(2):
+        decision = runtime.recover(
+            _command(), agents=(_descriptor(),), **inputs
+        )
+        assert decision.action == "retry_step"
+    effects = repository.list_tool_effects(context.term_id, context.step_id)
+    assert tuple(effect.effect_id for effect in effects) == (
+        expired_predecessor.effect_id,
+        successor.effect_id,
+    )
+    assert repository.get_tool_effect(expired_predecessor.effect_id) == (
+        expired_predecessor
+    )
+    assert sum(effect.effect_attempt == 1 for effect in effects) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_write_checkpoint_restarts_once_before_executor_admission(
+    tmp_path,
+) -> None:
+    """A durable pending write proves that the executor was never admitted."""
+    manifest = _tool(
+        "write_value", read_only=False, idempotency="non_idempotent", timeout_ms=1_000
+    )
+    executor = RecordingBroker(
+        PublicToolResult(status="completed", summary="Write completed")
+    )
+    repository = PythonTermRepository(tmp_path / "pending-write-restart.sqlite")
+    broker, registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-write", ToolAccess()),),
+    )
+    request_digests = HmacRequestDigestService(os.urandom(32))
+    router = ToolRouter(
+        repository,
+        registrations,
+        executor_broker=broker,
+        request_digests=request_digests,
+        clock_ms=lambda: 1_000,
+    )
+    runtime = PythonTermRuntime(repository, tool_router=router)
+    inputs = _runtime_inputs(tmp_path, runtime, tools=(manifest,))
+    inputs["effect_scope"] = EffectScope(scope_id="scope-1", write_effects=True)
+    context = runtime.compile_start(
+        _command(), agents=(_descriptor(),), **inputs
+    ).contexts[0]
+    predecessor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="pending-write-step-owner",
+        lease_seconds=60,
+    )
+    assert predecessor_claim is not None
+    router.admit(context, step_claim=predecessor_claim)
+    runtime._commit_event(
+        context,
+        event_type="runtime.status",
+        payload={"status": "running"},
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    invocation = asyncio.create_task(
+        router.invoke(
+            context,
+            manifest.tool_id,
+            {},
+            tool_call_id="call-pending-write",
+            step_claim=predecessor_claim,
+        )
+    )
+    await router.await_dispatch_gate(
+        context_identity_digest=context.identity_digest,
+        tool_call_id="call-pending-write",
+        timeout_ms=1_000,
+    )
+    runtime._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": manifest.tool_id,
+            "tool_call_id": "call-pending-write",
+            "read_only": False,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=predecessor_claim,
+    )
+    assert executor.calls == 0
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+    predecessor = repository.list_tool_effects(
+        context.term_id, context.step_id
+    )[0]
+    assert predecessor.dispatch_state == "pending"
+    _expire_effect_and_step_claim(repository, predecessor)
+
+    for _ in range(2):
+        decision = runtime.recover(
+            _command(), agents=(_descriptor(),), **inputs
+        )
+        assert decision.action == "retry_step"
+    restarted_broker, restarted_registrations = _executor_registry(
+        tmp_path,
+        executor.execute,
+        ((manifest, "executor-write", ToolAccess()),),
+    )
+    restarted_router = ToolRouter(
+        repository,
+        restarted_registrations,
+        executor_broker=restarted_broker,
+        request_digests=request_digests,
+        clock_ms=lambda: 1_000,
+    )
+    successor_claim = repository.claim_step(
+        context.term_id,
+        context.step_id,
+        owner_id="pending-write-successor-owner",
+        lease_seconds=60,
+    )
+    assert successor_claim is not None
+    restarted_router.admit(context, step_claim=successor_claim)
+
+    async def invoke_after_release():
+        call = asyncio.create_task(
+            restarted_router.invoke(
+                context,
+                manifest.tool_id,
+                {},
+                tool_call_id="call-pending-write",
+                step_claim=successor_claim,
+            )
+        )
+        permit = await restarted_router.await_dispatch_gate(
+            context_identity_digest=context.identity_digest,
+            tool_call_id="call-pending-write",
+            timeout_ms=1_000,
+        )
+        assert restarted_router.release_dispatch_gate(permit)
+        return await call
+
+    recovered = await invoke_after_release()
+    replayed = await invoke_after_release()
+
+    assert recovered.summary == "Write completed"
+    assert replayed == recovered
+    assert executor.calls == 1
+    effects = repository.list_tool_effects(context.term_id, context.step_id)
+    assert len(effects) == 2
+    assert sum(effect.effect_attempt == 1 for effect in effects) == 1
+    assert max(effects, key=lambda effect: effect.effect_attempt).status == "committed"
+    for _ in range(2):
+        decision = runtime.recover(
+            _command(), agents=(_descriptor(),), **inputs
+        )
+        assert decision.action == "retry_step"
+    assert executor.calls == 1
 
 
 @pytest.mark.parametrize("tamper", ["request", "owner_fence", "result"])
@@ -912,7 +1210,9 @@ async def test_resume_skips_durable_tool_call_prefix_without_public_duplicates(
 
     assert result.status == "completed"
     assert executor.calls == 1
-    successor = repository.list_tool_effects("term-1", "step-1")[0]
+    effects = repository.list_tool_effects("term-1", "step-1")
+    assert len(effects) == 2
+    successor = max(effects, key=lambda effect: effect.effect_attempt)
     assert successor.status == "committed"
     assert successor.dispatch_state == "released"
     assert successor.effect_attempt == 1

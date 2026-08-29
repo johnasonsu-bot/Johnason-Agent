@@ -1035,7 +1035,7 @@ class ToolRouter:
         reservation = gate.effect
         if not self._dispatch_gate_is_current(gate):
             self._dispatch_gates.pop((context.identity_digest, tool_call_id), None)
-            if replay is None:
+            if replay is None and write_effect:
                 await self._finish_failed_execution(
                     reservation,
                     write_effect=write_effect,
@@ -1043,7 +1043,7 @@ class ToolRouter:
                     step_claim=bound_step_claim,
                 )
             raise ToolRouteError(
-                "step_claim_lost",
+                "effect_fence_lost",
                 "Tool dispatch gate lost its Step or Effect fence",
                 effect_id=reservation.effect_id,
             ) from None
@@ -1691,114 +1691,119 @@ class ToolRouter:
                     ) from None
                 effect = refreshed
                 continue
+            lease_is_current = self.repository.tool_effect_lease_is_current(effect)
             if (
                 not claim_changed
                 and effect.dispatch_state == "pending"
                 and effect.execution_owner_id == owner_id
-                and self.repository.tool_effect_lease_is_current(effect)
+                and lease_is_current
             ):
                 # A retry under the exact Step and deterministic Effect owner can
                 # safely rebuild the in-process gate around the durable pending
                 # reservation without changing either fence.
                 self._register_active_effect_task(effect.effect_id)
                 return effect, None, False
-            if claim_changed or effect.dispatch_state != "pending":
-                if effect.write_effect:
-                    terminal = self._terminal_effect(
-                        effect,
-                        status="reconciliation_required",
-                        code="write_dispatch_ambiguous",
-                    )
-                    await self._persist_terminal_or_raise(
-                        terminal, effect, step_claim=None
-                    )
-                    raise ToolRouteError(
-                        "reconciliation_required",
-                        "Tool Effect requires reconciliation",
-                        effect_id=effect.effect_id,
-                    ) from None
-                if manifest.idempotency != "idempotent":
-                    terminal = self._terminal_effect(
-                        effect, status="rejected", code="replay_not_allowed"
-                    )
-                    await self._persist_terminal_or_raise(
-                        terminal, effect, step_claim=None
-                    )
-                    raise ToolRouteError(
-                        "replay_not_allowed",
-                        "Manifest does not permit replay of this read Tool",
-                        effect_id=effect.effect_id,
-                    ) from None
-                if step_claim is None:
-                    raise ToolRouteError(
-                        "step_claim_lost", "Tool Step execution claim was rejected",
-                        effect_id=effect.effect_id,
-                    ) from None
-                next_attempt = effect.effect_attempt + 1
-                successor_id = "effect-" + self.request_digests.digest(
-                    {
-                        "domain": "tool-effect-successor-v1",
-                        "predecessor_effect_id": effect.effect_id,
-                        "effect_attempt": next_attempt,
-                        "term_id": effect.term_id,
-                        "step_id": effect.step_id,
-                        "tool_call_id": effect.tool_call_id,
-                        "request_digest": effect.request_digest,
-                    }
+            if effect.write_effect and effect.dispatch_state != "pending":
+                terminal = self._terminal_effect(
+                    effect,
+                    status="reconciliation_required",
+                    code="write_dispatch_ambiguous",
                 )
-                successor = effect.model_copy(
-                    update={
-                        "effect_id": successor_id,
-                        "step_claim_digest": step_claim.identity_digest,
-                        "execution_owner_id": None,
-                        "lease_expires_at_ms": None,
-                        "fence_id": None,
-                        "fence_generation": 0,
-                        "dispatch_state": "pending",
-                        "effect_attempt": next_attempt,
-                        "predecessor_effect_id": effect.effect_id,
-                        "predecessor_record_digest": canonical_digest(effect),
-                        "status": "reserved",
-                        "result_code": None,
-                        "result_digest": None,
-                        "public_result": None,
-                    }
+                await self._persist_terminal_or_raise(
+                    terminal, effect, step_claim=None
                 )
-                try:
-                    effect, won = self.repository.replace_read_effect_with_successor(
-                        effect,
-                        successor,
-                        execution_owner_id=owner_id,
-                        lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
-                        step_claim=step_claim,
-                    )
-                except Exception:
+                raise ToolRouteError(
+                    "reconciliation_required",
+                    "Tool Effect requires reconciliation",
+                    effect_id=effect.effect_id,
+                ) from None
+            if (
+                not effect.write_effect
+                and effect.dispatch_state != "pending"
+                and manifest.idempotency != "idempotent"
+            ):
+                terminal = self._terminal_effect(
+                    effect, status="rejected", code="replay_not_allowed"
+                )
+                await self._persist_terminal_or_raise(
+                    terminal, effect, step_claim=None
+                )
+                raise ToolRouteError(
+                    "replay_not_allowed",
+                    "Manifest does not permit replay of this read Tool",
+                    effect_id=effect.effect_id,
+                ) from None
+            if step_claim is None:
+                raise ToolRouteError(
+                    "step_claim_lost", "Tool Step execution claim was rejected",
+                    effect_id=effect.effect_id,
+                ) from None
+            if lease_is_current:
+                if self._remaining_ms(deadline_at_ms) <= 0:
                     raise ToolRouteError(
-                        "effect_takeover_failed",
-                        "Tool Effect recovery ownership failed",
+                        "deadline_exceeded", "Tool Step deadline elapsed",
                         effect_id=effect.effect_id,
                     ) from None
-                if won:
-                    self._register_active_effect_task(effect.effect_id)
-                    return effect, None, True
+                await asyncio.sleep(
+                    min(
+                        _WAIT_POLL_SECONDS,
+                        self._remaining_ms(deadline_at_ms) / 1000,
+                    )
+                )
+                refreshed = self._safe_get_effect(effect.effect_id)
+                if refreshed is None:
+                    raise ToolRouteError(
+                        "effect_corrupt", "Tool Effect disappeared while leased",
+                        effect_id=effect.effect_id,
+                    ) from None
+                effect = refreshed
                 continue
+            refreshed = self._safe_get_effect(effect.effect_id)
+            if refreshed is None:
+                raise ToolRouteError(
+                    "effect_corrupt", "Tool Effect disappeared before recovery",
+                    effect_id=effect.effect_id,
+                ) from None
+            if canonical_json(refreshed) != canonical_json(effect):
+                effect = refreshed
+                continue
+            next_attempt = effect.effect_attempt + 1
+            successor_id = "effect-" + self.request_digests.digest(
+                {
+                    "domain": "tool-effect-successor-v1",
+                    "predecessor_effect_id": effect.effect_id,
+                    "effect_attempt": next_attempt,
+                    "term_id": effect.term_id,
+                    "step_id": effect.step_id,
+                    "tool_call_id": effect.tool_call_id,
+                    "request_digest": effect.request_digest,
+                }
+            )
+            successor = effect.model_copy(
+                update={
+                    "effect_id": successor_id,
+                    "step_claim_digest": step_claim.identity_digest,
+                    "execution_owner_id": None,
+                    "lease_expires_at_ms": None,
+                    "fence_id": None,
+                    "fence_generation": 0,
+                    "dispatch_state": "pending",
+                    "effect_attempt": next_attempt,
+                    "predecessor_effect_id": effect.effect_id,
+                    "predecessor_record_digest": canonical_digest(effect),
+                    "status": "reserved",
+                    "result_code": None,
+                    "result_digest": None,
+                    "public_result": None,
+                }
+            )
             takeover_failed = False
             replacement: ToolEffectRecord | None = None
             won = False
             try:
-                takeover_proposal = effect.model_copy(
-                    update={
-                        "execution_owner_id": None,
-                        "lease_expires_at_ms": None,
-                        "fence_id": None,
-                        "fence_generation": 0,
-                    }
-                )
-                replacement, won = self.repository.takeover_expired_tool_effect(
-                    takeover_proposal,
-                    expected_owner_id=effect.execution_owner_id,
-                    expected_fence_token=effect.fence_token,
-                    expected_fence_generation=effect.fence_generation,
+                replacement, won = self.repository.replace_tool_effect_with_successor(
+                    effect,
+                    successor,
                     execution_owner_id=owner_id,
                     lease_duration_ms=manifest.timeout_ms + _LEASE_GRACE_MS,
                     step_claim=step_claim,
@@ -1811,18 +1816,10 @@ class ToolRouter:
                     "Tool Effect recovery ownership failed",
                     effect_id=effect.effect_id,
                 ) from None
-            if won:
-                self._register_active_effect_task(replacement.effect_id)
-                return replacement, None, True
             effect = replacement
-            if self._remaining_ms(deadline_at_ms) <= 0:
-                raise ToolRouteError(
-                    "deadline_exceeded", "Tool Step deadline elapsed",
-                    effect_id=effect.effect_id,
-                )
-            await asyncio.sleep(
-                min(_WAIT_POLL_SECONDS, self._remaining_ms(deadline_at_ms) / 1000)
-            )
+            if won:
+                self._register_active_effect_task(effect.effect_id)
+                return effect, None, True
 
     def _register_active_effect_task(self, effect_id: str) -> None:
         task = asyncio.current_task()

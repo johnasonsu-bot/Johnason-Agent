@@ -516,30 +516,9 @@ class PythonTermRuntime:
                 "runtime_error", "Python Term recovery state is missing"
             )
         effects = self.repository.list_tool_effects(term.term_id)
-        unknown_writes = tuple(
-            effect
-            for effect in effects
-            if effect.write_effect
-            and effect.status in {"reserved", "reconciliation_required"}
-        )
-        if unknown_writes:
-            for effect in unknown_writes:
-                if effect.status == "reserved":
-                    self._mark_unknown_write(effect)
-            first = unknown_writes[0]
-            return PythonTermRecovery(
-                action="reconciliation_required",
-                step_id=first.step_id,
-                cursor=term.cursor,
-                reusable_effect_ids=tuple(
-                    effect.effect_id
-                    for effect in effects
-                    if effect.write_effect and effect.status == "committed"
-                ),
-                checkpoint_hint=self._checkpoint_hint(term.term_id),
-            )
-
+        active_effects = self._active_effect_attempts(effects)
         checkpoint = self.repository.latest_checkpoint(term.term_id)
+        recoverable_pending_write_ids: frozenset[str] = frozenset()
         if term.cursor > 0 and checkpoint is None:
             raise PythonTermResumeRejected(
                 "runtime_error", "Python Term checkpoint evidence is missing"
@@ -611,6 +590,7 @@ class PythonTermRuntime:
                         expected.effect_evidence,
                         step_is_running=checkpoint_step.status == "running",
                         durable_tool_calls=durable_tool_calls,
+                        current_records=checkpoint_effects,
                     )
                 )
             )
@@ -618,10 +598,51 @@ class PythonTermRuntime:
                 raise PythonTermResumeRejected(
                     "invalid_request", "Python Term checkpoint identity changed before resume"
                 )
+            recoverable_pending_write_ids = frozenset(
+                effect.effect_id
+                for effect in active_effects
+                if effect.step_id == checkpoint.step_id
+                and effect.write_effect
+                and effect.status == "reserved"
+                and effect.dispatch_state == "pending"
+                and effect.tool_call_id in durable_tool_calls
+            )
+
+        unknown_writes = tuple(
+            effect
+            for effect in active_effects
+            if effect.write_effect
+            and (
+                effect.status == "reconciliation_required"
+                or (
+                    effect.status == "reserved"
+                    and (
+                        effect.dispatch_state != "pending"
+                        or effect.effect_id not in recoverable_pending_write_ids
+                    )
+                )
+            )
+        )
+        if unknown_writes:
+            for effect in unknown_writes:
+                if effect.status == "reserved":
+                    self._mark_unknown_write(effect)
+            first = unknown_writes[0]
+            return PythonTermRecovery(
+                action="reconciliation_required",
+                step_id=first.step_id,
+                cursor=term.cursor,
+                reusable_effect_ids=tuple(
+                    effect.effect_id
+                    for effect in active_effects
+                    if effect.write_effect and effect.status == "committed"
+                ),
+                checkpoint_hint=self._checkpoint_hint(term.term_id),
+            )
 
         reusable = tuple(
             effect.effect_id
-            for effect in effects
+            for effect in active_effects
             if effect.write_effect and effect.status == "committed"
         )
         if term.status == "completed":
@@ -647,6 +668,32 @@ class PythonTermRuntime:
             cursor=term.cursor,
             reusable_effect_ids=reusable,
             checkpoint_hint=self._checkpoint_hint(term.term_id),
+        )
+
+    @staticmethod
+    def _active_effect_attempts(
+        effects: Sequence[ToolEffectRecord],
+    ) -> tuple[ToolEffectRecord, ...]:
+        active: dict[tuple[str, str, str], ToolEffectRecord] = {}
+        for effect in effects:
+            key = (effect.term_id, effect.step_id, effect.tool_call_id)
+            current = active.get(key)
+            if current is None or effect.effect_attempt > current.effect_attempt:
+                active[key] = effect
+                continue
+            if effect.effect_attempt == current.effect_attempt:
+                raise PythonTermResumeRejected(
+                    "runtime_error", "Python Term Effect attempt identity is duplicated"
+                )
+        return tuple(
+            sorted(
+                active.values(),
+                key=lambda effect: (
+                    effect.step_id,
+                    effect.tool_call_id,
+                    effect.effect_id,
+                ),
+            )
         )
 
     @staticmethod
@@ -715,14 +762,35 @@ class PythonTermRuntime:
         *,
         step_is_running: bool,
         durable_tool_calls: frozenset[str],
+        current_records: Sequence[ToolEffectRecord],
     ) -> bool:
         previous_by_id = {item.effect_id: item for item in previous}
         current_by_id = {item.effect_id: item for item in current}
+        records_by_id = {item.effect_id: item for item in current_records}
+        if len(records_by_id) != len(current_records):
+            return False
         if not previous_by_id.keys() <= current_by_id.keys():
             return False
         for effect_id, before in previous_by_id.items():
             after = current_by_id[effect_id]
             if before == after:
+                continue
+            if (
+                step_is_running
+                and before.status == "reserved"
+                and before.dispatch_state == "pending"
+                and after
+                == before.model_copy(
+                    update={
+                        "dispatch_state": "released",
+                        "result_evidence_digest": after.result_evidence_digest,
+                    }
+                )
+                and records_by_id.get(effect_id) is not None
+                and records_by_id[effect_id].result_evidence_digest
+                == after.result_evidence_digest
+                and after.tool_call_id in durable_tool_calls
+            ):
                 continue
             if not step_is_running or (
                 before.tool_call_id != after.tool_call_id
@@ -745,9 +813,89 @@ class PythonTermRuntime:
                 return False
         for effect_id in current_by_id.keys() - previous_by_id.keys():
             added = current_by_id[effect_id]
+            predecessor_before = (
+                None
+                if added.predecessor_effect_id is None
+                else previous_by_id.get(added.predecessor_effect_id)
+            )
+            predecessor_after = (
+                None
+                if added.predecessor_effect_id is None
+                else current_by_id.get(added.predecessor_effect_id)
+            )
+            predecessor_record = (
+                None
+                if added.predecessor_effect_id is None
+                else records_by_id.get(added.predecessor_effect_id)
+            )
+            successor_record = records_by_id.get(effect_id)
+            successor_state_is_valid = (
+                (
+                    added.status == "reserved"
+                    and added.dispatch_state in {"pending", "released"}
+                    and added.execution_owner_id is not None
+                    and added.fence_id is not None
+                    and added.result_code is None
+                    and added.result_digest is None
+                )
+                or (
+                    added.status
+                    in {"committed", "rejected", "reconciliation_required"}
+                    and added.execution_owner_id is None
+                    and added.result_digest is not None
+                    and (added.status == "committed")
+                    == (added.result_code is None)
+                )
+            )
+            successor_is_valid = (
+                step_is_running
+                and predecessor_before is not None
+                and predecessor_after is not None
+                and predecessor_record is not None
+                and successor_record is not None
+                and predecessor_record.status == "reserved"
+                and predecessor_record.dispatch_state
+                in (
+                    {"pending"}
+                    if predecessor_record.write_effect
+                    else {"pending", "released"}
+                )
+                and successor_record.term_id == predecessor_record.term_id
+                and successor_record.step_id == predecessor_record.step_id
+                and successor_record.tool_call_id
+                == predecessor_record.tool_call_id
+                and successor_record.request_digest
+                == predecessor_record.request_digest
+                and successor_record.request_digest_version
+                == predecessor_record.request_digest_version
+                and successor_record.effect_identity_version
+                == predecessor_record.effect_identity_version
+                and successor_record.write_effect == predecessor_record.write_effect
+                and successor_record.effect_attempt
+                == predecessor_record.effect_attempt + 1
+                and successor_record.predecessor_effect_id
+                == predecessor_record.effect_id
+                and successor_record.predecessor_record_digest
+                == canonical_digest(predecessor_record)
+                and added.predecessor_record_digest
+                == canonical_digest(predecessor_record)
+                and added.effect_attempt == predecessor_after.effect_attempt + 1
+                and added.fence_generation > predecessor_after.fence_generation
+                and added.tool_call_id == predecessor_after.tool_call_id
+                and added.request_digest == predecessor_after.request_digest
+                and added.request_digest_version
+                == predecessor_after.request_digest_version
+                and added.write_effect == predecessor_after.write_effect
+                and added.tool_call_id in durable_tool_calls
+                and successor_state_is_valid
+            )
+            if successor_is_valid:
+                continue
             if (
                 not step_is_running
                 or added.status != "committed"
+                or added.effect_attempt != 0
+                or added.predecessor_effect_id is not None
                 or added.execution_owner_id is not None
                 or added.result_code is not None
                 or added.result_digest is None
@@ -1866,8 +2014,10 @@ class PythonTermRuntime:
                     effect = next(
                         (
                             item
-                            for item in self.repository.list_tool_effects(
-                                context.term_id, context.step_id
+                            for item in self._active_effect_attempts(
+                                self.repository.list_tool_effects(
+                                    context.term_id, context.step_id
+                                )
                             )
                             if item.tool_call_id == call_id
                         ),

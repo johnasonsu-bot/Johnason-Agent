@@ -318,3 +318,71 @@ Task 5 使用确定性 SDK model seam；无 `OPENAI_API_KEY` 时只有 SDK 跳�
 - heartbeat 的首次全量失败被认定为负载下 timing flake：独立五连跑与最终完整 unit 均通过，
   因此未用 sleep、放宽断言或生产改动掩盖它。
 - macOS PTY 的平台约束沿用 Task 4 已有边界，本轮没有扩大 PTY authority。
+
+---
+
+## Fix round 4/5 — Effect lease freshness、不可变 attempt lineage 与 pending write 恢复
+
+### 状态
+
+- 四态：IMPLEMENTED / TASK 5 GREEN / FULL UNIT GREEN / READY FOR REVIEW。
+- reviewer 基线：`11c7c2756716a379ac65b55d03f07f0e898f3d28`。
+- 本轮以独立非改史提交收口，commit hash 见交付回报；未 amend、rebase、reset 或删除历史。
+- 范围保持在 Task 5 runtime/repository、Task 3 Tool Router 及对应 Task 3/4/5 测试；未修改
+  Host v1、Task 6 路由、前端事件或产品终态模型。
+
+### RED → GREEN
+
+1. reserve→release 与 release→predispatch 两个 Effect lease expiry 窗口，按 read/write 参数化
+   首次为 `4 failed`：旧 release/validate 只验证 Step claim 和 Effect fence，过期 permit 仍可能
+   放行。加入各自事务内 SQLite trusted-time lease 校验后为 `4 passed, 30 deselected`；stale
+   permit 重试永久失败，write/read 均未进入 executor。
+2. successor pending、released、committed-before-`tool.result` 三个 crash window 与 pending write
+   restart 首次为 `4 failed`：active slot 替换会丢 predecessor checkpoint evidence，pending write
+   被一律判 unknown。加入 append-only attempt registry、immutable predecessor lineage、原子
+   retire/reserve 及 successor-aware checkpoint transition 后为 `4 passed, 27 deselected`；重复恢复
+   只有一个 successor/executor，predecessor 仍可按原 ID/digest 读取。
+3. Task 5 首轮完整回归为 `57 passed, 1 failed`：SDK `tool_output` 仍取 lineage 列表首项。
+   改为显式选择 logical call 的最高 attempt 后，失败项单测通过，Task 5 最终为 `58 passed`。
+4. Task 3 首轮回归在 68 个通过项后停于 supervisor timeout 用例。进程栈证明后台 invocation
+   已被严格的 release→predispatch lease 校验拒绝，而测试在无限等待 executor start；并非生产
+   deadlock。该测试保持 executor timeout=10ms，仅在测试内给 Effect lease 独立确定余量，并将
+   executor start 改为 1s 有界等待，原 timeout/cancel/supervised/quiescence 断言不变；timeout
+   参数五个独立进程连续 `5/5` 通过，Task 3 最终为 `77 passed`。
+
+### 边界裁决
+
+- `release_tool_dispatch_gate()` 与 `validate_tool_dispatch_gate()` 均在自己的 SQLite 事务中读取
+  trusted time，并要求 exact active Effect 的 owner、fence、generation、lease 全部存在且
+  `lease_expires_at_ms > now`。过期 permit 不可复活；released write 进入 reconciliation，read
+  只能走新的 fenced successor。
+- `python_tool_effect_attempts` 以 `(term_id, step_id, tool_call_id, effect_attempt)` 唯一约束
+  generation identity；`python_tool_effect_lineage` 保存完整 canonical predecessor record/digest。
+  两表用 no-update/no-delete trigger 保持 append-only；retire predecessor、注册 successor identity、
+  更新 active slot 在同一 `BEGIN IMMEDIATE` 事务完成，迁移也在同一事务回填并拒绝 phantom 或
+  duplicate attempt。
+- checkpoint 只接受完整 predecessor digest、相同 Term/Step/call/request/version/classification、
+  attempt+1、严格递增 fence、durable `tool.call` 的 successor；原 evidence 不得删除或任意改写。
+- `pending` write 只在 exact durable `tool.call` 与当前 checkpoint 下可恢复；live lease 继续等待，
+  expired lease 只能通过原子 successor attempt 转移。`released|ambiguous` write 始终 reconciliation，
+  不自动重放。恢复与 SDK output 仅把最高 attempt 视为 active，lineage 仍完整参与 checkpoint 证明。
+
+### 最终验证
+
+在最后一版代码上新鲜执行，全部 exit 0：
+
+1. Task 5 integration：`58 passed in 34.81s`。
+2. Task 3 Tool/Effect focused：`77 passed in 20.93s`。
+3. Task 4 PTY/Host focused：`31 passed in 5.45s`。
+4. 单进程完整 unit：`2125 passed in 110.70s`。
+5. supervisor timeout 回归：五个独立 pytest 进程连续 `5/5` 通过。
+6. `.venv/bin/python -m compileall -q src/workbench/runtime/python_term
+   src/workbench/runtime/engine_host/v2 src/workbench/agui`：exit 0。
+7. `git diff --check`：exit 0。
+
+### Concerns
+
+- 无阻塞 concern。
+- side-table migration 保留原 `python_tool_effects` active-slot schema 以兼容既有数据库；所有新增
+  lineage/attempt 写入均与 active slot 变更处于同一 SQLite transaction，未引入双写窗口。
+- 本轮没有读取、记录或写入 API key、Token、密码、provider 参数或原始异常。

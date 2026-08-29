@@ -63,6 +63,7 @@ class PythonTermRepository:
         try:
             migrate_phase1(connection)
             self._migrate_legacy_tool_effects(connection)
+            self._migrate_tool_effect_lineage(connection)
         finally:
             connection.close()
 
@@ -297,6 +298,205 @@ class PythonTermRepository:
         except Exception:
             connection.rollback()
             raise
+
+    def _migrate_tool_effect_lineage(self, connection: sqlite3.Connection) -> None:
+        """Add immutable generation identity and retired-record evidence.
+
+        ``python_tool_effects`` remains the one active slot for a logical call so
+        older databases keep their original schema.  These side tables make
+        every attempt unique and preserve the complete predecessor record when
+        that active slot advances to a successor.
+        """
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            statements = (
+                """CREATE TABLE IF NOT EXISTS python_tool_effect_attempts (
+                    effect_id TEXT PRIMARY KEY,
+                    term_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    effect_attempt INTEGER NOT NULL,
+                    predecessor_effect_id TEXT,
+                    predecessor_record_digest TEXT,
+                    stable_identity_digest TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE (term_id, step_id, tool_call_id, effect_attempt),
+                    FOREIGN KEY (term_id, step_id)
+                        REFERENCES python_steps(term_id, step_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS python_tool_effect_lineage (
+                    effect_id TEXT PRIMARY KEY,
+                    term_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    tool_call_id TEXT NOT NULL,
+                    effect_attempt INTEGER NOT NULL,
+                    record_digest TEXT NOT NULL,
+                    effect_json TEXT NOT NULL,
+                    retired_at REAL NOT NULL,
+                    UNIQUE (term_id, step_id, tool_call_id, effect_attempt),
+                    FOREIGN KEY (term_id, step_id)
+                        REFERENCES python_steps(term_id, step_id)
+                )""",
+                """CREATE TRIGGER IF NOT EXISTS
+                python_tool_effect_attempts_no_update
+                BEFORE UPDATE ON python_tool_effect_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'Tool Effect attempts are append-only');
+                END""",
+                """CREATE TRIGGER IF NOT EXISTS
+                python_tool_effect_attempts_no_delete
+                BEFORE DELETE ON python_tool_effect_attempts
+                BEGIN
+                    SELECT RAISE(ABORT, 'Tool Effect attempts are append-only');
+                END""",
+                """CREATE TRIGGER IF NOT EXISTS
+                python_tool_effect_lineage_no_update
+                BEFORE UPDATE ON python_tool_effect_lineage
+                BEGIN
+                    SELECT RAISE(ABORT, 'Tool Effect lineage is append-only');
+                END""",
+                """CREATE TRIGGER IF NOT EXISTS
+                python_tool_effect_lineage_no_delete
+                BEFORE DELETE ON python_tool_effect_lineage
+                BEGIN
+                    SELECT RAISE(ABORT, 'Tool Effect lineage is append-only');
+                END""",
+            )
+            for statement in statements:
+                connection.execute(statement)
+            active = tuple(
+                self._decode_effect(row)
+                for row in connection.execute(
+                    """SELECT * FROM python_tool_effects
+                    ORDER BY term_id, step_id, tool_call_id, effect_id"""
+                ).fetchall()
+            )
+            retired = tuple(
+                self._decode_effect_lineage(row)
+                for row in connection.execute(
+                    """SELECT * FROM python_tool_effect_lineage
+                    ORDER BY term_id, step_id, tool_call_id, effect_id"""
+                ).fetchall()
+            )
+            records = active + retired
+            if len({record.effect_id for record in records}) != len(records):
+                raise RepositoryCorruption("Tool Effect lineage duplicates an active ID")
+            for record in records:
+                self._register_tool_effect_attempt(connection, record)
+            attempt_rows = connection.execute(
+                "SELECT * FROM python_tool_effect_attempts"
+            ).fetchall()
+            if len(attempt_rows) != len(records):
+                raise RepositoryCorruption("Tool Effect attempt registry has phantom rows")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _effect_attempt_identity(effect: ToolEffectRecord) -> tuple[object, ...]:
+        return (
+            effect.effect_id,
+            effect.term_id,
+            effect.step_id,
+            effect.tool_call_id,
+            effect.effect_attempt,
+            effect.predecessor_effect_id,
+            effect.predecessor_record_digest,
+            effect.stable_identity_digest,
+        )
+
+    def _register_tool_effect_attempt(
+        self,
+        connection: sqlite3.Connection,
+        effect: ToolEffectRecord,
+    ) -> None:
+        row = connection.execute(
+            """SELECT * FROM python_tool_effect_attempts
+            WHERE effect_id = ? OR
+            (term_id = ? AND step_id = ? AND tool_call_id = ?
+             AND effect_attempt = ?)""",
+            (
+                effect.effect_id,
+                effect.term_id,
+                effect.step_id,
+                effect.tool_call_id,
+                effect.effect_attempt,
+            ),
+        ).fetchone()
+        if row is None:
+            try:
+                connection.execute(
+                    """INSERT INTO python_tool_effect_attempts(
+                    effect_id, term_id, step_id, tool_call_id, effect_attempt,
+                    predecessor_effect_id, predecessor_record_digest,
+                    stable_identity_digest, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (*self._effect_attempt_identity(effect), time.time()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RepositoryConflict(
+                    "Tool Effect attempt identity conflict"
+                ) from exc
+            return
+        persisted = (
+            row["effect_id"],
+            row["term_id"],
+            row["step_id"],
+            row["tool_call_id"],
+            row["effect_attempt"],
+            row["predecessor_effect_id"],
+            row["predecessor_record_digest"],
+            row["stable_identity_digest"],
+        )
+        if persisted != self._effect_attempt_identity(effect):
+            raise RepositoryCorruption("Tool Effect attempt identity disagrees")
+
+    def _preserve_retired_tool_effect(
+        self,
+        connection: sqlite3.Connection,
+        effect: ToolEffectRecord,
+    ) -> None:
+        row = connection.execute(
+            """SELECT * FROM python_tool_effect_lineage
+            WHERE effect_id = ? OR
+            (term_id = ? AND step_id = ? AND tool_call_id = ?
+             AND effect_attempt = ?)""",
+            (
+                effect.effect_id,
+                effect.term_id,
+                effect.step_id,
+                effect.tool_call_id,
+                effect.effect_attempt,
+            ),
+        ).fetchone()
+        if row is not None:
+            if canonical_json(self._decode_effect_lineage(row)) != canonical_json(
+                effect
+            ):
+                raise RepositoryConflict("Tool Effect predecessor lineage conflict")
+            return
+        try:
+            connection.execute(
+                """INSERT INTO python_tool_effect_lineage(
+                effect_id, term_id, step_id, tool_call_id, effect_attempt,
+                record_digest, effect_json, retired_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    effect.effect_id,
+                    effect.term_id,
+                    effect.step_id,
+                    effect.tool_call_id,
+                    effect.effect_attempt,
+                    canonical_digest(effect),
+                    canonical_json(effect),
+                    time.time(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise RepositoryConflict(
+                "Tool Effect predecessor lineage conflict"
+            ) from exc
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -809,6 +1009,7 @@ class PythonTermRepository:
             if canonical_json(current) != canonical_json(validated_effect):
                 return None
             if dispatch_required:
+                now_ms = self._database_now_ms(connection)
                 valid = (
                     current.status == "reserved"
                     and current.dispatch_state == "pending"
@@ -816,6 +1017,8 @@ class PythonTermRepository:
                     and current.execution_owner_id is not None
                     and current.fence_token is not None
                     and current.fence_generation > 0
+                    and current.lease_expires_at_ms is not None
+                    and current.lease_expires_at_ms > now_ms
                 )
                 if not valid:
                     return None
@@ -863,6 +1066,7 @@ class PythonTermRepository:
             if canonical_json(current) != canonical_json(validated_effect):
                 return False
             if dispatch_required:
+                now_ms = self._database_now_ms(connection)
                 return (
                     current.status == "reserved"
                     and current.dispatch_state == "released"
@@ -870,6 +1074,8 @@ class PythonTermRepository:
                     and current.execution_owner_id is not None
                     and current.fence_token is not None
                     and current.fence_generation > 0
+                    and current.lease_expires_at_ms is not None
+                    and current.lease_expires_at_ms > now_ms
                 )
             return current.status == "committed" and current.public_result is not None
 
@@ -1294,6 +1500,7 @@ class PythonTermRepository:
                 self._require_active_aggregate(
                     connection, validated.term_id, validated.step_id
                 )
+                self._register_tool_effect_attempt(connection, validated)
                 try:
                     connection.execute(
                         """INSERT INTO python_tool_effects(
@@ -1455,6 +1662,7 @@ class PythonTermRepository:
                 }
             )
             owned = self._validate_model(owned, ToolEffectRecord)
+            self._register_tool_effect_attempt(connection, owned)
             encoded = canonical_json(owned)
             try:
                 connection.execute(
@@ -1574,7 +1782,7 @@ class PythonTermRepository:
             )
             return replacement, True
 
-    def replace_read_effect_with_successor(
+    def replace_tool_effect_with_successor(
         self,
         predecessor: ToolEffectRecord,
         successor: ToolEffectRecord,
@@ -1583,7 +1791,7 @@ class PythonTermRepository:
         lease_duration_ms: int,
         step_claim: StepExecutionClaim,
     ) -> tuple[ToolEffectRecord, bool]:
-        """Atomically retire one stale read reservation into a lineage successor."""
+        """Atomically retire one expired gate into one fenced successor attempt."""
         validated_predecessor = self._validate_model(
             predecessor, ToolEffectRecord
         )
@@ -1591,9 +1799,11 @@ class PythonTermRepository:
         validated_claim = self._validate_model(step_claim, StepExecutionClaim)
         if (
             validated_predecessor.status != "reserved"
-            or validated_predecessor.write_effect
             or validated_successor.status != "reserved"
             or validated_successor.write_effect
+            != validated_predecessor.write_effect
+            or validated_predecessor.dispatch_state
+            not in ({"pending"} if validated_predecessor.write_effect else {"pending", "released"})
             or validated_successor.dispatch_state != "pending"
             or validated_successor.execution_owner_id is not None
             or validated_successor.fence_token is not None
@@ -1615,6 +1825,8 @@ class PythonTermRepository:
             != validated_predecessor.request_digest_version
             or validated_successor.effect_identity_version
             != validated_predecessor.effect_identity_version
+            or validated_successor.result_digest_version
+            != validated_predecessor.result_digest_version
             or validated_successor.step_claim_digest
             != validated_claim.identity_digest
             or validated_claim.term_id != validated_successor.term_id
@@ -1622,7 +1834,7 @@ class PythonTermRepository:
             or type(lease_duration_ms) is not int
             or not 1 <= lease_duration_ms <= 86_400_000
         ):
-            raise RepositoryConflict("read Effect successor identity conflict")
+            raise RepositoryConflict("Tool Effect successor identity conflict")
         with self._transaction() as connection:
             self._require_step_claim(connection, validated_claim)
             row = connection.execute(
@@ -1636,7 +1848,7 @@ class PythonTermRepository:
                 ),
             ).fetchone()
             if row is None:
-                raise RepositoryConflict("read Effect predecessor is missing")
+                raise RepositoryConflict("Tool Effect predecessor is missing")
             current = self._decode_effect(row)
             self._load_owning_aggregate(
                 connection, current.term_id, current.step_id
@@ -1652,23 +1864,67 @@ class PythonTermRepository:
                     and current.step_claim_digest
                     == validated_successor.step_claim_digest
                     and current.request_digest == validated_successor.request_digest
+                    and current.request_digest_version
+                    == validated_successor.request_digest_version
+                    and current.effect_identity_version
+                    == validated_successor.effect_identity_version
+                    and current.write_effect == validated_successor.write_effect
                 )
                 if successor_matches:
+                    lineage = connection.execute(
+                        """SELECT * FROM python_tool_effect_lineage
+                        WHERE effect_id = ?""",
+                        (validated_predecessor.effect_id,),
+                    ).fetchone()
+                    if lineage is None or canonical_json(
+                        self._decode_effect_lineage(lineage)
+                    ) != canonical_json(validated_predecessor):
+                        raise RepositoryCorruption(
+                            "Tool Effect predecessor lineage is missing"
+                        )
                     return current, False
-                raise RepositoryConflict("read Effect successor uniqueness conflict")
+                raise RepositoryConflict("Tool Effect successor uniqueness conflict")
             if canonical_json(current) != canonical_json(validated_predecessor):
-                raise RepositoryConflict("read Effect predecessor fence changed")
+                raise RepositoryConflict("Tool Effect predecessor fence changed")
+            now_ms = self._database_now_ms(connection)
+            if (
+                current.execution_owner_id is None
+                or current.fence_token is None
+                or current.fence_generation < 1
+                or current.lease_expires_at_ms is None
+            ):
+                raise RepositoryCorruption("Tool Effect predecessor fence is missing")
+            if current.lease_expires_at_ms > now_ms:
+                return current, False
+            durable_call = any(
+                transition.event.type == "tool.call"
+                and transition.event.payload.get("tool_call_id")
+                == current.tool_call_id
+                for transition in (
+                    self._decode_transition(event_row)
+                    for event_row in connection.execute(
+                        """SELECT * FROM python_step_events
+                        WHERE term_id = ? AND step_id = ? AND event_type = 'tool.call'
+                        ORDER BY cursor""",
+                        (current.term_id, current.step_id),
+                    ).fetchall()
+                )
+            )
+            if not durable_call:
+                raise RepositoryConflict(
+                    "Tool Effect successor requires a durable tool.call"
+                )
             owned = validated_successor.model_copy(
                 update={
                     "execution_owner_id": execution_owner_id,
-                    "lease_expires_at_ms": (
-                        self._database_now_ms(connection) + lease_duration_ms
-                    ),
+                    "lease_expires_at_ms": now_ms + lease_duration_ms,
                     "fence_id": "fence-" + secrets.token_hex(16),
                     "fence_generation": current.fence_generation + 1,
                 }
             )
             owned = self._validate_model(owned, ToolEffectRecord)
+            self._preserve_retired_tool_effect(connection, current)
+            self._register_tool_effect_attempt(connection, owned)
             cursor = connection.execute(
                 """UPDATE python_tool_effects SET effect_id = ?,
                 request_digest = ?, status = ?, result_digest = NULL,
@@ -1688,8 +1944,28 @@ class PythonTermRepository:
                 ),
             )
             if cursor.rowcount != 1:
-                raise RepositoryConflict("read Effect successor lost its row fence")
+                raise RepositoryConflict("Tool Effect successor lost its row fence")
             return owned, True
+
+    def replace_read_effect_with_successor(
+        self,
+        predecessor: ToolEffectRecord,
+        successor: ToolEffectRecord,
+        *,
+        execution_owner_id: str,
+        lease_duration_ms: int,
+        step_claim: StepExecutionClaim,
+    ) -> tuple[ToolEffectRecord, bool]:
+        """Compatibility seam for the original read-only successor API."""
+        if predecessor.write_effect or successor.write_effect:
+            raise RepositoryConflict("read Effect successor identity conflict")
+        return self.replace_tool_effect_with_successor(
+            predecessor,
+            successor,
+            execution_owner_id=execution_owner_id,
+            lease_duration_ms=lease_duration_ms,
+            step_claim=step_claim,
+        )
 
     def finish_tool_effect(
         self,
@@ -1850,8 +2126,15 @@ class PythonTermRepository:
                 (effect_id,),
             ).fetchone()
             if row is None:
-                return None
-            effect = self._decode_effect(row)
+                lineage_row = connection.execute(
+                    "SELECT * FROM python_tool_effect_lineage WHERE effect_id = ?",
+                    (effect_id,),
+                ).fetchone()
+                if lineage_row is None:
+                    return None
+                effect = self._decode_effect_lineage(lineage_row)
+            else:
+                effect = self._decode_effect(row)
             self._load_owning_aggregate(
                 connection, effect.term_id, effect.step_id
             )
@@ -1863,14 +2146,25 @@ class PythonTermRepository:
         """Return validated Effect evidence in stable identity order."""
         with self._read_snapshot() as connection:
             if step_id is None:
-                rows = connection.execute(
+                active_rows = connection.execute(
                     """SELECT * FROM python_tool_effects
                     WHERE term_id = ? ORDER BY step_id, tool_call_id, effect_id""",
                     (term_id,),
                 ).fetchall()
+                lineage_rows = connection.execute(
+                    """SELECT * FROM python_tool_effect_lineage
+                    WHERE term_id = ? ORDER BY step_id, tool_call_id, effect_id""",
+                    (term_id,),
+                ).fetchall()
             else:
-                rows = connection.execute(
+                active_rows = connection.execute(
                     """SELECT * FROM python_tool_effects
+                    WHERE term_id = ? AND step_id = ?
+                    ORDER BY tool_call_id, effect_id""",
+                    (term_id, step_id),
+                ).fetchall()
+                lineage_rows = connection.execute(
+                    """SELECT * FROM python_tool_effect_lineage
                     WHERE term_id = ? AND step_id = ?
                     ORDER BY tool_call_id, effect_id""",
                     (term_id, step_id),
@@ -1879,11 +2173,25 @@ class PythonTermRepository:
                 connection,
                 term_id,
                 step_id,
-                required=bool(rows),
+                required=bool(active_rows or lineage_rows),
             )
             if owning is None:
                 return ()
-            return tuple(self._decode_effect(row) for row in rows)
+            effects = tuple(self._decode_effect(row) for row in active_rows) + tuple(
+                self._decode_effect_lineage(row) for row in lineage_rows
+            )
+            if len({effect.effect_id for effect in effects}) != len(effects):
+                raise RepositoryCorruption("Tool Effect lineage duplicates an active ID")
+            return tuple(
+                sorted(
+                    effects,
+                    key=lambda effect: (
+                        effect.step_id,
+                        effect.tool_call_id,
+                        effect.effect_id,
+                    ),
+                )
+            )
 
     def _require_term(
         self, connection: sqlite3.Connection, term_id: str
@@ -2384,5 +2692,22 @@ class PythonTermRepository:
         ):
             raise RepositoryCorruption(
                 "Tool Effect columns, digest, or projection disagree"
+            )
+        return record
+
+    def _decode_effect_lineage(self, row: sqlite3.Row) -> ToolEffectRecord:
+        record = self._parse_model(
+            row["effect_json"], ToolEffectRecord, "Tool Effect lineage"
+        )
+        if (
+            row["effect_id"] != record.effect_id
+            or row["term_id"] != record.term_id
+            or row["step_id"] != record.step_id
+            or row["tool_call_id"] != record.tool_call_id
+            or row["effect_attempt"] != record.effect_attempt
+            or row["record_digest"] != canonical_digest(record)
+        ):
+            raise RepositoryCorruption(
+                "Tool Effect lineage columns or record digest disagree"
             )
         return record

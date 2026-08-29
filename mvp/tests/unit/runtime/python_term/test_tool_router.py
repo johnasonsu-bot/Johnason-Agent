@@ -21,9 +21,11 @@ from workbench.runtime.python_term.contracts import (
     PermissionPolicy,
     PublicToolResult,
     canonical_digest,
+    canonical_json,
 )
 from workbench.runtime.python_term import tool_router as tool_router_module
 from workbench.runtime.python_term.repository import PythonTermRepository
+from workbench.runtime.python_term.runtime import PythonTermRuntime
 from workbench.runtime.python_term.tool_router import (
     ExecutorBroker,
     ExecutorRegistration,
@@ -439,10 +441,28 @@ async def test_read_successor_attempt_is_atomically_unique_for_one_logical_call(
         timeout_ms=1_000,
     )
     predecessor = repository.list_tool_effects(context.term_id, context.step_id)[0]
+    PythonTermRuntime(repository)._commit_event(
+        context,
+        event_type="tool.call",
+        payload={
+            "tool_id": old_wrapper.tool_id,
+            "tool_call_id": "call-successor",
+            "read_only": True,
+            "name": "Tool invocation",
+            "summary": "Tool execution requested",
+        },
+        step_status="running",
+        execution_claim=old_wrapper.step_claim,
+    )
     old_invocation.cancel()
     with pytest.raises(asyncio.CancelledError):
         await old_invocation
+    predecessor = predecessor.model_copy(update={"lease_expires_at_ms": 1})
     with sqlite3.connect(repository.path) as connection:
+        connection.execute(
+            "UPDATE python_tool_effects SET effect_json = ? WHERE effect_id = ?",
+            (canonical_json(predecessor), predecessor.effect_id),
+        )
         connection.execute(
             "UPDATE python_step_claims SET lease_expires_at_ms = 0 "
             "WHERE term_id = ? AND step_id = ?",
@@ -480,7 +500,10 @@ async def test_read_successor_attempt_is_atomically_unique_for_one_logical_call(
     assert sum(isinstance(item, PublicToolResult) for item in outcomes) == 1
     assert sum(isinstance(item, ToolRouteError) for item in outcomes) == 1
     assert executor.calls == 1
-    successor = repository.list_tool_effects(context.term_id, context.step_id)[0]
+    effects = repository.list_tool_effects(context.term_id, context.step_id)
+    successor = max(effects, key=lambda effect: effect.effect_attempt)
+    assert len(effects) == 2
+    assert repository.get_tool_effect(predecessor.effect_id) == predecessor
     assert successor.effect_attempt == 1
     assert successor.predecessor_effect_id == predecessor.effect_id
     assert successor.predecessor_record_digest == canonical_digest(predecessor)
