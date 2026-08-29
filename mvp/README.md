@@ -235,7 +235,10 @@ cd mvp
 
 外部 signer 独立于生产服务，只从标准输入读取 base64 Ed25519 私钥，输出带
 `key_id` 的 signed proof；私钥不得经 argv、环境变量、仓库、HTTP、IPC 或 renderer
-传入。CI/发布系统需为生产固定公钥配置对应 secret，并在相同 payload 上执行：
+传入。发布顺序固定为“生成 manifest → 运行 gate → 外部签名 → 构建 wheel/package”；
+`signed_gate_proof.json` 明确不参与 manifest revision，因此 Hatch build hook 在 proof
+已存在时再次刷新 manifest 也不能改变 revision。CI/发布系统需为生产固定公钥配置
+对应 secret，并在相同 payload 上执行：
 
 ```bash
 .venv/bin/python scripts/sign_python_term_runtime_gate.py \
@@ -246,6 +249,9 @@ cd mvp
 
 第一条命令的私钥必须由 CI secret manager 直接写入标准输入；上例故意不展示或
 持久化私钥。没有外部 proof、key 不匹配或 manifest 改变时，验证均 fail closed。
+运行时还会枚举已安装的 `workbench` package root，要求 manifest 与静态文件集合精确
+相等；除 manifest、signed proof 和 Python cache 等明确的运行派生文件外，任何未登记
+Python 文件或资源文件都会失败关闭。wheel 的 `.dist-info` 元数据不属于 package root。
 
 仅用于本地手工测试时，可以在独立 `HERMES_RUNTIME_DIR` 内放置
 `python-term-dev-public-key.txt` 与 `python-term-dev-signed-proof.json`，并显式设置
@@ -265,8 +271,11 @@ Content-Type: application/json
 {"outcome":"applied|not_applied","summary":"公开、无敏感信息的确认摘要"}
 ```
 
-命令严格绑定 session、command、Term 与 Effect；重复相同确认幂等，冲突 outcome、
-错误 Effect 或跨会话/跨命令绑定返回冲突。多个 pending Effect 全部确认后才重新入队。
+`Idempotency-Key` 通过 REST、业务层与 SQLite command ledger 完整传递，绑定 session、
+command、Effect、outcome 与 summary digest，并持久化首个公开响应。同 key 同 payload
+在并发和重启后返回稳定原响应；同 key 不同 payload 返回 409 且错误文本不回显 summary。
+不同 key 对已确认 Effect 的同一语义结果幂等，冲突 outcome、错误 Effect 或跨会话/跨
+命令绑定返回冲突。多个 pending Effect 全部确认后才重新入队。
 Effect 先持久化、Conversation 后推进；两者之间崩溃时重复同一确认会复用 durable
 Effect 并补齐 Conversation 转换。
 
@@ -385,7 +394,8 @@ CI 签发后可用 `--verify-only` 验证当前完整 manifest；只有匹配 pr
 构建 manifest 随 wheel/package 安装，运行时验证安装文件 hash；`pyproject.toml`、
 `uv.lock`、测试矩阵与 gate scripts 只作为签名 manifest 内的构建证据 digest，安装后
 无需保留这些仓库文件。Hatch wheel build hook 会在组装 wheel 前强制刷新 manifest；
-发布流水线仍应显式执行生成命令，以便在签名和打包前审阅固定 payload。
+发布流水线仍应显式执行“manifest → gate → external sign → build/package”，并由 wheel
+E2E 验证打包后仍是同一 revision 的 `GO_PYTHON_TERM_RUNTIME`。
 
 ### 10.6 Electron/Playwright
 

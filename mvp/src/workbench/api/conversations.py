@@ -284,6 +284,7 @@ class ConversationAPI:
         session_id: str,
         command_id: str,
         effect_id: str,
+        idempotency_key: str,
         request: PythonTermReconciliationRequest,
     ) -> dict[str, Any]:
         """Confirm one unknown write outcome through control-plane authority.
@@ -313,6 +314,16 @@ class ConversationAPI:
         term_id = envelope.get("term_id") if isinstance(envelope, dict) else None
         if not isinstance(term_id, str) or not term_id:
             raise TurnSnapshotCorruption("Python Term reconciliation binding is invalid")
+        cached = self.conversations.begin_python_term_reconciliation_command(
+            idempotency_key=idempotency_key,
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=request.outcome,
+            summary=request.summary,
+        )
+        if cached is not None:
+            return cached
         self.python_term_executor.reconcile_effect_for_turn(
             term_id=term_id,
             effect_id=effect_id,
@@ -327,13 +338,22 @@ class ConversationAPI:
         pending_value = refreshed.state.get("reconciliation_effect_ids", [])
         if not isinstance(pending_value, list):
             raise TurnSnapshotCorruption("Python Term reconciliation state is invalid")
-        return {
+        response = {
             "session_id": session_id,
             "command_id": command_id,
             "effect_id": effect_id,
             "status": refreshed.status,
             "pending_effect_ids": pending_value,
         }
+        return self.conversations.complete_python_term_reconciliation_command(
+            idempotency_key=idempotency_key,
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=request.outcome,
+            summary=request.summary,
+            response=response,
+        )
 
     async def enqueue_message(
         self,
@@ -2410,6 +2430,7 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
                 session_id=session_id,
                 command_id=command_id,
                 effect_id=effect_id,
+                idempotency_key=idempotency_key,
                 request=payload,
             )
         except KeyError as exc:

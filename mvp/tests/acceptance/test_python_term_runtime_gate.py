@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import zipfile
 
 import pytest
 from agents.testing import ScriptedModel, assistant_message
@@ -234,6 +236,167 @@ def test_build_manifest_verifies_a_copied_install_without_repository_inputs(
         gate_module.verify_python_term_build_manifest(
             package_root=installed_package
         )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "content"),
+    (
+        ("runtime/python_term/rogue.py", b"ROGUE = True\n"),
+        ("runtime/python_term/rogue-resource.dat", b"unlisted-resource\n"),
+    ),
+)
+def test_build_manifest_rejects_every_unlisted_installed_package_file(
+    tmp_path: Path, relative_path: str, content: bytes
+) -> None:
+    source_package = Path(gate_module.__file__).resolve().parents[2]
+    installed_package = tmp_path / "site-packages" / "workbench"
+    shutil.copytree(source_package, installed_package)
+    target = installed_package / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+
+    with pytest.raises(RuntimeError, match="installed file set"):
+        gate_module.verify_python_term_build_manifest(
+            package_root=installed_package
+        )
+
+
+def test_manifest_revision_excludes_external_proof_and_survives_wheel_build(
+    tmp_path: Path,
+) -> None:
+    source_mvp = Path(__file__).resolve().parents[2]
+    project = tmp_path / "mvp"
+    shutil.copytree(
+        source_mvp,
+        project,
+        ignore=shutil.ignore_patterns(".venv", "dist", "__pycache__", "*.pyc"),
+    )
+    private_key = Ed25519PrivateKey.generate()
+    private_bytes = private_key.private_bytes(
+        Encoding.Raw, PrivateFormat.Raw, NoEncryption()
+    )
+    public_bytes = private_key.public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    gate_source = project / "src/workbench/runtime/python_term/gate.py"
+    original_key = base64.b64encode(gate_module._TRUSTED_BUILD_PUBLIC_KEY).decode()
+    gate_source.write_text(
+        gate_source.read_text(encoding="utf-8").replace(
+            original_key, base64.b64encode(public_bytes).decode()
+        ),
+        encoding="utf-8",
+    )
+    manifest_script = project / "scripts/build_python_term_gate_manifest.py"
+    generated = subprocess.run(
+        [sys.executable, str(manifest_script)],
+        cwd=project,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert generated.returncode == 0, generated.stderr
+    manifest_path = project / "src/workbench/runtime/python_term/gate_manifest.json"
+    first_manifest = manifest_path.read_bytes()
+
+    payload_path = tmp_path / "candidate.json"
+    payload_program = """
+import json
+from workbench.runtime.python_term.gate import (
+    PythonTermGateScenario, REQUIRED_GATE_SCENARIOS,
+    build_python_term_gate_verdict, python_term_gate_signing_document,
+    python_term_gate_source_revision,
+)
+from workbench.runtime.engine_host.v2.contracts import RuntimeCapabilitiesV2
+from workbench.runtime.python_term.runtime import RUNTIME_BUILD_ID
+capabilities = RuntimeCapabilitiesV2(
+    runtime_id='python-term', build_id=RUNTIME_BUILD_ID, query=True, model=True,
+    tools=True, workspace=True, checkpoints=True, streaming=True, event_cursor=True,
+)
+scenarios = tuple(PythonTermGateScenario(
+    scenario_id=item, status='PASS', command_summary='e2e:' + item,
+) for item in REQUIRED_GATE_SCENARIOS)
+verdict = build_python_term_gate_verdict(
+    source_revision=python_term_gate_source_revision(),
+    capabilities=capabilities, scenarios=scenarios,
+)
+print(json.dumps(python_term_gate_signing_document(verdict), sort_keys=True))
+"""
+    built_payload = subprocess.run(
+        [sys.executable, "-c", payload_program],
+        cwd=project,
+        env={"PYTHONPATH": str(project / "src")},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert built_payload.returncode == 0, built_payload.stderr
+    payload_path.write_text(built_payload.stdout, encoding="utf-8")
+    proof_path = project / "src/workbench/runtime/python_term/signed_gate_proof.json"
+    signed = subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/sign_python_term_runtime_gate.py"),
+            str(payload_path),
+            str(proof_path),
+        ],
+        input=base64.b64encode(private_bytes).decode() + "\n",
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert signed.returncode == 0, signed.stderr
+    assert base64.b64encode(private_bytes).decode() not in signed.stdout + signed.stderr
+
+    rebuilt = subprocess.run(
+        [sys.executable, str(manifest_script)],
+        cwd=project,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert rebuilt.returncode == 0, rebuilt.stderr
+    assert manifest_path.read_bytes() == first_manifest
+
+    wheel_build = subprocess.run(
+        ["uv", "build", "--wheel", "--offline", "--out-dir", str(tmp_path / "dist")],
+        cwd=project,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert wheel_build.returncode == 0, wheel_build.stdout + wheel_build.stderr
+    assert manifest_path.read_bytes() == first_manifest
+    wheel = next((tmp_path / "dist").glob("*.whl"))
+    installed = tmp_path / "installed"
+    with zipfile.ZipFile(wheel) as archive:
+        archive.extractall(installed)
+    packaged_manifest = (
+        installed / "workbench/runtime/python_term/gate_manifest.json"
+    ).read_bytes()
+    assert packaged_manifest == first_manifest
+    assert (
+        installed / "workbench/runtime/python_term/signed_gate_proof.json"
+    ).is_file()
+    verified = subprocess.run(
+        [
+            sys.executable,
+            str(project / "scripts/run_python_term_runtime_gate.py"),
+            "--verify-only",
+        ],
+        cwd=tmp_path,
+        env={"PYTHONPATH": str(installed)},
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert verified.returncode == 0, verified.stdout + verified.stderr
+    assert json.loads(verified.stdout)["Decision"] == "GO_PYTHON_TERM_RUNTIME"
 
 
 def test_external_signer_and_development_verify_mode_are_isolated_from_production(
@@ -1057,18 +1220,42 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
     app = FastAPI()
     app.include_router(conversation_router(api))
     with TestClient(app) as client:
-        first = client.post(
-            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+        reconcile_url = (
+            "/api/sessions/session-1/turns/command-1/"
+            "effects/effect-unknown-1/reconcile"
+        )
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            concurrent = tuple(
+                pool.submit(
+                    client.post,
+                    reconcile_url,
+                    headers={"Idempotency-Key": "reconcile-1"},
+                    json={
+                        "outcome": "applied",
+                        "summary": "write confirmed applied",
+                    },
+                )
+                for _ in range(4)
+            )
+            concurrent_responses = tuple(item.result() for item in concurrent)
+        first = concurrent_responses[0]
+        duplicate = client.post(
+            reconcile_url,
             headers={"Idempotency-Key": "reconcile-1"},
             json={"outcome": "applied", "summary": "write confirmed applied"},
         )
-        duplicate = client.post(
-            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+        same_key_changed_payload = client.post(
+            reconcile_url,
             headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "private changed summary"},
+        )
+        semantic_duplicate = client.post(
+            reconcile_url,
+            headers={"Idempotency-Key": "reconcile-equivalent"},
             json={"outcome": "applied", "summary": "write confirmed applied"},
         )
         conflict = client.post(
-            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+            reconcile_url,
             headers={"Idempotency-Key": "reconcile-conflict"},
             json={"outcome": "not_applied", "summary": "different outcome"},
         )
@@ -1089,10 +1276,17 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
         )
 
     assert first.status_code == 200, first.text
+    assert all(item.status_code == 200 for item in concurrent_responses)
+    assert all(item.json() == first.json() for item in concurrent_responses)
     assert first.json()["status"] == "interrupted"
     assert first.json()["pending_effect_ids"] == ["effect-unknown-2"]
     assert duplicate.status_code == 200 and duplicate.json() == first.json()
+    assert semantic_duplicate.status_code == 200
+    assert semantic_duplicate.json() == first.json()
+    assert same_key_changed_payload.status_code == 409
+    assert "private changed summary" not in same_key_changed_payload.text
     assert conflict.status_code == 409
+    assert "different outcome" not in conflict.text
     assert wrong_effect.status_code == 409
     assert cross_command.status_code in {404, 409}
     assert cross_session.status_code in {404, 409}
@@ -1131,12 +1325,32 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
             headers={"Idempotency-Key": "reconcile-2"},
             json={"outcome": "not_applied", "summary": "write confirmed absent"},
         )
+        restart_conflict = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-unknown-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "private restart mismatch"},
+        )
 
     assert final.status_code == 200, final.text
     assert final.json()["status"] == "queued"
     assert final.json()["pending_effect_ids"] == []
     assert final_duplicate.status_code == 200
     assert final_duplicate.json() == final.json()
+    assert restart_conflict.status_code == 409
+    assert "private restart mismatch" not in restart_conflict.text
+    with restarted_conversations.store.connect() as connection:
+        command_row = connection.execute(
+            """SELECT session_id, command_id, effect_id, outcome,
+            summary_digest, response_json
+            FROM python_term_reconciliation_commands
+            WHERE idempotency_key = 'reconcile-1'"""
+        ).fetchone()
+    assert command_row is not None
+    assert tuple(command_row)[:4] == (
+        "session-1", "command-1", "effect-unknown-1", "applied"
+    )
+    assert len(command_row["summary_digest"]) == 64
+    assert json.loads(command_row["response_json"]) == first.json()
     assert restarted_conversations.claim_next_turn(owner_id="worker-2") is not None
     await restarted_api.process_queued_turn("session-1", "command-1")
 

@@ -1108,6 +1108,150 @@ class ConversationRepository:
         assert refreshed is not None
         return self._turn_status(refreshed)
 
+    @staticmethod
+    def _python_term_reconciliation_identity(
+        *,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        outcome: str,
+        summary: str,
+    ) -> tuple[str, str]:
+        summary_digest = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+        request_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "command_id": command_id,
+                    "effect_id": effect_id,
+                    "outcome": outcome,
+                    "summary_digest": summary_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return summary_digest, request_digest
+
+    def begin_python_term_reconciliation_command(
+        self,
+        *,
+        idempotency_key: str,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        outcome: str,
+        summary: str,
+    ) -> dict[str, Any] | None:
+        """Reserve one durable REST command identity before mutating an Effect."""
+        summary_digest, request_digest = self._python_term_reconciliation_identity(
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=outcome,
+            summary=summary,
+        )
+        now = time.time()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM python_term_reconciliation_commands
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """INSERT INTO python_term_reconciliation_commands(
+                    idempotency_key, session_id, command_id, effect_id, outcome,
+                    summary_digest, request_digest, response_json, created_at,
+                    updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)""",
+                    (
+                        idempotency_key,
+                        session_id,
+                        command_id,
+                        effect_id,
+                        outcome,
+                        summary_digest,
+                        request_digest,
+                        now,
+                        now,
+                    ),
+                )
+                connection.commit()
+                return None
+            if (
+                row["session_id"] != session_id
+                or row["command_id"] != command_id
+                or row["effect_id"] != effect_id
+                or row["outcome"] != outcome
+                or row["summary_digest"] != summary_digest
+                or row["request_digest"] != request_digest
+            ):
+                raise ValueError("reconciliation command identity cannot change")
+            response_json = row["response_json"]
+            connection.commit()
+        if response_json is None:
+            return None
+        response = json.loads(response_json)
+        if not isinstance(response, dict):
+            raise TurnSnapshotCorruption("reconciliation command response is invalid")
+        return response
+
+    def complete_python_term_reconciliation_command(
+        self,
+        *,
+        idempotency_key: str,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        outcome: str,
+        summary: str,
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist and replay the first public response for one command key."""
+        summary_digest, request_digest = self._python_term_reconciliation_identity(
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=outcome,
+            summary=summary,
+        )
+        encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT * FROM python_term_reconciliation_commands
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None or (
+                row["session_id"] != session_id
+                or row["command_id"] != command_id
+                or row["effect_id"] != effect_id
+                or row["outcome"] != outcome
+                or row["summary_digest"] != summary_digest
+                or row["request_digest"] != request_digest
+            ):
+                raise ValueError("reconciliation command identity cannot change")
+            if row["response_json"] is None:
+                changed = connection.execute(
+                    """UPDATE python_term_reconciliation_commands
+                    SET response_json = ?, updated_at = ?
+                    WHERE idempotency_key = ? AND response_json IS NULL""",
+                    (encoded, time.time(), idempotency_key),
+                )
+                if changed.rowcount != 1:
+                    raise RuntimeError("reconciliation command response fence was lost")
+                response_json = encoded
+            else:
+                response_json = row["response_json"]
+            connection.commit()
+        restored = json.loads(response_json)
+        if not isinstance(restored, dict):
+            raise TurnSnapshotCorruption("reconciliation command response is invalid")
+        return restored
+
     def fail_corrupt_turn(
         self,
         session_id: str,

@@ -797,6 +797,27 @@ def verify_python_term_build_manifest(*, package_root: Path | None = None) -> st
             raise RuntimeError("Python Term manifest file digest changed")
     if [entry.get("path") for entry in files if isinstance(entry, dict)] != sorted(seen):
         raise RuntimeError("Python Term build manifest is not canonical")
+    ignored = {
+        "runtime/python_term/gate_manifest.json",
+        "runtime/python_term/signed_gate_proof.json",
+    }
+    installed: set[str] = set()
+    for target in root.rglob("*"):
+        relative = target.relative_to(root)
+        relative_value = relative.as_posix()
+        if target.is_symlink():
+            raise RuntimeError("Python Term installed file set is invalid")
+        if not target.is_file():
+            continue
+        if (
+            relative_value in ignored
+            or "__pycache__" in relative.parts
+            and target.suffix == ".pyc"
+        ):
+            continue
+        installed.add(relative_value)
+    if installed != seen:
+        raise RuntimeError("Python Term installed file set does not match manifest")
     for entry in build_inputs:
         if (
             not isinstance(entry, dict)

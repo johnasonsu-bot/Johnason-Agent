@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 22
+PHASE1_SCHEMA_VERSION = 23
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -460,6 +460,21 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         ON python_step_checkpoints(term_id, cursor);
         CREATE INDEX IF NOT EXISTS idx_python_tool_effects_status
         ON python_tool_effects(status, updated_at);
+        CREATE TABLE IF NOT EXISTS python_term_reconciliation_commands (
+            idempotency_key TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            effect_id TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'not_applied')),
+            summary_digest TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            response_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY (session_id, command_id)
+                REFERENCES conversation_turns(session_id, command_id),
+            FOREIGN KEY (effect_id) REFERENCES python_tool_effects(effect_id)
+        );
         CREATE TRIGGER IF NOT EXISTS graph_plan_approvals_no_update
         BEFORE UPDATE ON graph_plan_approvals
         BEGIN

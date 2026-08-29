@@ -7,8 +7,8 @@
     },
     {
       "path": "scripts/build_python_term_gate_manifest.py",
-      "sha256": "a0bcdf06702af2e0a3088d7f36032e84b47d664bb2a937271c155059e56d4a92",
-      "size": 2939
+      "sha256": "adc85dc5343111a383c4ea419ed6667790c890b3dbb28b3f0952cb4cecafd2ef",
+      "size": 2944
     },
     {
       "path": "scripts/hatch_build.py",
@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "791dc9a1665ba33623a9dc32264c8ec21247fbf1343585e682e5bd1931c45c66",
-      "size": 1463362
+      "sha256": "b07f14019031b304ded84f5ace4f5d4196eecd8846352962b5944e0ccd035f62",
+      "size": 1471595
     },
     {
       "path": "uv.lock",
@@ -144,8 +144,8 @@
     },
     {
       "path": "api/conversations.py",
-      "sha256": "d05a1aa13dd244445ad055d991ce3f65690da0db792dae6a69446c41abbe92af",
-      "size": 99187
+      "sha256": "51828c0206f83dd692d5d0a8244e5539fdfdfc373e66f0784aeb0d9612ac76eb",
+      "size": 99979
     },
     {
       "path": "api/engine_host.py",
@@ -194,8 +194,8 @@
     },
     {
       "path": "conversations/repository.py",
-      "sha256": "7bb40592334ea6516e2ac2f056a68f064fc051459e8de0b01b639189d2e45377",
-      "size": 46873
+      "sha256": "aaa5c0ff9d90146ea18a2d65bc87dc9a833a7d4bb38a1191d85e70b53f165d7e",
+      "size": 52502
     },
     {
       "path": "conversations/worker.py",
@@ -549,8 +549,13 @@
     },
     {
       "path": "runtime/python_term/gate.py",
-      "sha256": "40ac927b4d7f46a94a759ddbb7307c4711b5bc31b160d2ae65f0b33ea153005d",
-      "size": 45952
+      "sha256": "405417336e016ebd6bddeda6ed7ff2e57b0a68822c1d719328bd75a150e7a069",
+      "size": 46715
+    },
+    {
+      "path": "runtime/python_term/gate_receipt.json",
+      "sha256": "34f61a964cbd5d4dca07f4b81826727a1115cad3f000f917c14f1431a2cddf57",
+      "size": 108
     },
     {
       "path": "runtime/python_term/pty_worker.py",
@@ -664,8 +669,8 @@
     },
     {
       "path": "workflow/schema.py",
-      "sha256": "74359926f8de6678a260de18f008e1c463fd609ca8799828dd12881724fda1cc",
-      "size": 31611
+      "sha256": "03039ab3c8b11564b5f5c1e4f9733ffedfa97ac754b29d482a6c3b197e0acabb",
+      "size": 32325
     },
     {
       "path": "workflow/store.py",

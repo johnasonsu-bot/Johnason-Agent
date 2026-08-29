@@ -32,7 +32,7 @@ def main() -> int:
         if path.is_file()
         and "__pycache__" not in path.parts
         and path != manifest_path
-        and path.name != "gate_receipt.json"
+        and path.name != "signed_gate_proof.json"
     )
     files = [
         {
