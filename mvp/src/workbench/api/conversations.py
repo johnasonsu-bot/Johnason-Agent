@@ -1338,9 +1338,33 @@ class ConversationAPI:
     ) -> AsyncIterator[str]:
         import json
 
-        for event in self.events.read_stream(
-            f"run:{session_id}", after_sequence=max(0, after_cursor[0] - 1)
-        ):
+        paused = False
+        terminal_causes: set[str] = set()
+        for event in self.events.read_stream(f"run:{session_id}"):
+            stale = False
+            if event.event_type == "conversation.status":
+                status = event.payload.get("status")
+                if status == "paused":
+                    paused = True
+                elif status == "running":
+                    explicit_resume = "command_id" not in event.payload
+                    stale = paused and not explicit_resume
+                    if explicit_resume:
+                        paused = False
+            elif event.event_type in {
+                "conversation.turn.queued",
+                "conversation.turn.retryable",
+            }:
+                stale = paused or event.causation_id in terminal_causes
+            if event.event_type in {
+                "conversation.turn.finished",
+                "conversation.turn.failed",
+            }:
+                if event.causation_id is not None:
+                    terminal_causes.add(event.causation_id)
+                paused = paused or event.payload.get("response_status") == "paused"
+            if stale:
+                continue
             for projection_index, projected in enumerate(map_domain_event(event)):
                 cursor = (event.sequence or 0, projection_index)
                 if cursor <= after_cursor:
@@ -1622,15 +1646,16 @@ class ConversationAPI:
         )
         if terminal is None:
             return None
+        terminal_index = events.index(terminal)
         last_retry = max(
             (
                 index
-                for index, event in enumerate(events)
+                for index, event in enumerate(events[:terminal_index])
                 if event.event_type == "conversation.turn.retryable"
             ),
             default=-1,
         )
-        final_attempt = events[last_retry + 1 :]
+        final_attempt = events[last_retry + 1 : terminal_index + 1]
         return {
             "session_id": session_id,
             "command_id": command_id,

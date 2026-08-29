@@ -1,6 +1,7 @@
 """Tests for the asynchronous conversation enqueue boundary."""
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -117,6 +118,19 @@ def _wait_for_status(database: Path, status: str) -> None:
     raise AssertionError(f"turn did not reach {status!r}")
 
 
+async def _projected_sse_events(api: ConversationAPI) -> list[dict[str, object]]:
+    chunks = [
+        chunk
+        async for chunk in api._stream_events("session-1", after_cursor=(0, -1))
+    ]
+    return [
+        json.loads(line.removeprefix("data: "))
+        for chunk in chunks
+        for line in chunk.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
 @pytest.mark.asyncio
 async def test_v1_retry_rebuilds_a_missing_queued_event_after_persisted_crash_window(
     tmp_path: Path,
@@ -230,6 +244,9 @@ async def test_v1_retry_repairs_missing_queued_before_returning_terminal(
     )
 
     assert recovered["status"] == "completed"
+    assert [event["name"] for event in recovered["events"]] == ["turn_finished"]
+    replay = await _projected_sse_events(api)
+    assert [event["name"] for event in replay] == ["turn_finished"]
     queued = [
         event
         for event in events.read_stream("run:session-1")
@@ -243,6 +260,72 @@ async def test_v1_retry_repairs_missing_queued_before_returning_terminal(
         "model": "configured-model",
         "provider_id": "provider-1",
     }
+
+
+@pytest.mark.asyncio
+async def test_v1_retry_repairs_missing_queued_without_regressing_paused_projection(
+    tmp_path: Path,
+) -> None:
+    """A late audit repair cannot follow the effective paused terminal projection."""
+    database = tmp_path / "v1-paused-before-retry.sqlite"
+    repository = ConversationRepository(database)
+    events = EventStore(database)
+    api = ConversationAPI(repository, events, RetryOnceRunner())
+    api.create_session("session-1")
+    identity = {
+        "content": "recover paused history",
+        "model": "configured-model",
+        "provider_id": "provider-1",
+    }
+    reservation_id = api._reserve("session-1", "turn-1", "message", identity)
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id=api._lifecycle_run_id("session-1"),
+        provider_id="provider-1",
+        model="configured-model",
+        prompt=identity["content"],
+        initial_state=api._initial_turn_state("session-1"),
+    )
+    await api.set_status(
+        session_id="session-1", command_id="pause-1", status="paused"
+    )
+    claimed = repository.claim_next_turn(owner_id="worker")
+    assert claimed is not None
+    repository.finish_turn(
+        "session-1",
+        "turn-1",
+        owner_id="worker",
+        status="completed",
+        state=claimed.state,
+        result=[],
+    )
+    api._append(
+        "session-1",
+        "conversation.turn.finished",
+        {"command_id": "turn-1", "response_status": "paused"},
+        "turn-1",
+        ordinal=1,
+        causation_id=reservation_id,
+    )
+
+    recovered = await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content=identity["content"],
+        model=identity["model"],
+        provider_id=identity["provider_id"],
+    )
+
+    assert recovered["status"] == "paused"
+    assert [event["name"] for event in recovered["events"]] == ["turn_finished"]
+    replay = await _projected_sse_events(api)
+    assert [event["name"] for event in replay] == [
+        "conversation.status",
+        "turn_finished",
+    ]
+    durable = events.read_stream("run:session-1")
+    assert [event.event_type for event in durable][-1] == "conversation.turn.queued"
 
 
 @pytest.mark.asyncio

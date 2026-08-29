@@ -94,22 +94,53 @@ function mapEvent(event: ConversationEvent, index: number): TimelineEntry | null
   return null;
 }
 
-function statusForEvent(event: ConversationEvent): { label: string; terminal: boolean } | null {
-  if (event.name === "orchestration.graph.queued") return { label: "多 Agent 已排队 · queued", terminal: false };
-  if (event.name === "orchestration.node.progress") return { label: "多 Agent 执行中 · running", terminal: false };
-  if (event.name === "orchestration.interrupted") return { label: "等待人工审批 · needs human", terminal: true };
-  if (event.name === "turn_queued") return { label: "排队中 · queued", terminal: false };
+export type ConversationStatusPhase = "ready" | "queued" | "running" | "retryable" | "paused" | "completed" | "failed" | "reconciliation_required";
+export type ConversationStatusProjection = { phase: ConversationStatusPhase; label: string; terminal: boolean; commandId?: string };
+
+const readyStatus: ConversationStatusProjection = { phase: "ready", label: "准备就绪 · ready", terminal: false };
+const completedStatus: ConversationStatusProjection = { phase: "completed", label: "已完成 · completed", terminal: true };
+
+function statusForEvent(event: ConversationEvent): ConversationStatusProjection | null {
+  const commandId = typeof event.value?.command_id === "string" ? event.value.command_id : undefined;
+  if (event.name === "orchestration.graph.queued") return { phase: "queued", label: "多 Agent 已排队 · queued", terminal: false, commandId };
+  if (event.name === "orchestration.node.progress") return { phase: "running", label: "多 Agent 执行中 · running", terminal: false };
+  if (event.name === "orchestration.interrupted") return { phase: "paused", label: "等待人工审批 · needs human", terminal: true };
+  if (event.name === "turn_queued") return { phase: "queued", label: "排队中 · queued", terminal: false, commandId };
   if (event.name === "conversation.status") {
     const status = String(event.value?.status ?? "running");
     return status === "paused"
-      ? { label: "已暂停 · paused", terminal: true }
-      : { label: "执行中 · running", terminal: false };
+      ? { phase: "paused", label: "已暂停 · paused", terminal: true }
+      : { phase: "running", label: "执行中 · running", terminal: false };
   }
-  if (event.name === "turn_retryable") return { label: "等待重试 · retryable", terminal: false };
-  if (event.name === "turn_finished" || event.type === "RUN_FINISHED") return { label: "已完成 · completed", terminal: true };
-  if (event.name === "turn_failed" || event.type === "RUN_ERROR") return { label: "执行失败 · failed", terminal: true };
-  if (event.delta) return { label: "执行中 · running", terminal: false };
+  if (event.name === "turn_retryable") return { phase: "retryable", label: "等待重试 · retryable", terminal: false, commandId };
+  if (event.name === "turn_finished" || event.type === "RUN_FINISHED") return { ...completedStatus, commandId };
+  if (event.name === "turn_failed" || event.type === "RUN_ERROR") {
+    return event.value?.response_status === "reconciliation_required"
+      ? { phase: "reconciliation_required", label: "需要对账 · reconciliation required", terminal: true, commandId }
+      : { phase: "failed", label: "执行失败 · failed", terminal: true, commandId };
+  }
+  if (event.delta) return { phase: "running", label: "执行中 · running", terminal: false };
   return null;
+}
+
+export function reduceConversationStatus(
+  current: ConversationStatusProjection | undefined,
+  event: ConversationEvent,
+): ConversationStatusProjection {
+  const prior = current ?? readyStatus;
+  const next = statusForEvent(event);
+  if (!next) return prior;
+  const sticky = prior.terminal;
+  const regressive = next.phase === "queued" || next.phase === "running" || next.phase === "retryable";
+  const explicitResume = event.name === "conversation.status"
+    && event.value?.status === "running"
+    && event.value?.command_id === undefined;
+  const newCommand = prior.phase !== "paused"
+    && next.phase === "queued"
+    && prior.commandId !== undefined
+    && next.commandId !== undefined
+    && prior.commandId !== next.commandId;
+  return sticky && regressive && !explicitResume && !newCommand ? prior : next;
 }
 
 export function describeConversationError(error: unknown): string {
@@ -127,7 +158,8 @@ export function ConversationWorkspace() {
   const [groups, setGroups] = useState({ ...seededGroups, ...persistedGroups });
   const [entries, setEntries] = useState<TimelineEntry[]>(initialTimeline);
   const [source, setSource] = useState("Task 3 REST/SSE");
-  const [status, setStatus] = useState("已完成 · completed");
+  const [statusProjection, setStatusProjection] = useState<ConversationStatusProjection>(completedStatus);
+  const status = statusProjection.label;
   const [pending, setPending] = useState(false);
   const [paused, setPaused] = useState(false);
   const [artifactId, setArtifactId] = useState("markdown");
@@ -158,7 +190,7 @@ export function ConversationWorkspace() {
     setEntries(storedTimeline.length ? storedTimeline : (sessionId === "ui-session-0" ? initialTimeline : []));
     setSequential(emptySequentialState());
     setResearch(emptyResearchGraphState());
-    setStatus("准备就绪 · ready");
+    setStatusProjection(readyStatus);
     setSource("Task 3 REST/SSE");
     const consume = async () => {
       if (!active || watcherGenerationRef.current !== generation) return;
@@ -193,17 +225,17 @@ export function ConversationWorkspace() {
             cursorsRef.current[sessionId] = event.cursor;
             saveConversationCursor(sessionId, event.cursor);
           }
-          const nextStatus = statusForEvent(event);
-          if (nextStatus) {
-            setStatus(nextStatus.label);
-            if (nextStatus.terminal) setPending(false);
-          }
+          setStatusProjection((current) => {
+            const next = reduceConversationStatus(current, event);
+            if (next.terminal) setPending(false);
+            return next;
+          });
         }
         setSource("Task 3 REST/SSE · cursor");
       } catch (error: unknown) {
         if (active) {
           setSource("Task 3 API · 等待本地服务");
-          if (error instanceof Error && error.message.includes("session not found")) setStatus("会话尚未同步 · waiting");
+          if (error instanceof Error && error.message.includes("session not found")) setStatusProjection({ phase: "ready", label: "会话尚未同步 · waiting", terminal: false });
         }
       }
       if (active && watcherGenerationRef.current === generation) window.setTimeout(() => void consume(), 350);
@@ -232,7 +264,7 @@ export function ConversationWorkspace() {
     setTitles((current) => ({ ...current, [createdSessionId]: newTitle }));
     setEntries([]);
     setSessionId(createdSessionId);
-    setStatus("准备执行 · ready");
+    setStatusProjection({ phase: "ready", label: "准备执行 · ready", terminal: false });
     return { sessionId: createdSessionId, title: newTitle };
   };
   const selectSession = (nextSessionId: string) => { setSessionId(nextSessionId); setPaused(false); };
@@ -249,12 +281,12 @@ export function ConversationWorkspace() {
       agentBindings = orderedMentionBindings(prompt, modelProfiles);
     } catch (error) {
       const reason = describeConversationError(error);
-      setStatus(`执行失败 · ${reason}`);
+      setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
       setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · Agent 配置", content: reason, agent: "Agent Profile API", status: "failed" }]);
       return;
     }
     setPending(true);
-    setStatus("排队中 · queued");
+    setStatusProjection({ phase: "queued", label: "排队中 · queued", terminal: false });
     const commandId = createConversationCommandId("message", sessionId);
     void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId, agentBindings).then((result) => {
       setSource("Task 3 REST/SSE · queued");
@@ -263,39 +295,39 @@ export function ConversationWorkspace() {
         saveConversationCursor(sessionId, result.cursor);
       }
       if (result.status === "paused") {
-        setStatus("已暂停 · paused");
+        setStatusProjection({ phase: "paused", label: "已暂停 · paused", terminal: true });
         setPending(false);
       }
     }).catch((error: unknown) => {
       const reason = describeConversationError(error);
       setSource("Task 3 API error");
-      setStatus(`执行失败 · ${reason}`);
+      setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
       setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · API diagnosis", content: `conversation.messages → ${reason}`, agent: "Task3 Conversation API", status: "failed" }]);
       setPending(false);
     });
   };
   const intervene = (prompt: string) => {
     addUserEntry(prompt, "decision");
-    setStatus("介入已排队 · queued");
-    void conversationApi.intervene(sessionId, prompt, createConversationCommandId("intervention", sessionId)).then(() => setSource("Task 3 intervention API")).catch((error: unknown) => { setSource("Task 3 API error"); setStatus(`介入失败 · ${describeConversationError(error)}`); });
+    setStatusProjection({ phase: "queued", label: "介入已排队 · queued", terminal: false });
+    void conversationApi.intervene(sessionId, prompt, createConversationCommandId("intervention", sessionId)).then(() => setSource("Task 3 intervention API")).catch((error: unknown) => { setSource("Task 3 API error"); setStatusProjection({ phase: "failed", label: `介入失败 · ${describeConversationError(error)}`, terminal: true }); });
   };
   const togglePause = () => {
     const commandId = createConversationCommandId(paused ? "resume" : "pause", sessionId);
     setPaused((current) => !current);
-    void (paused ? conversationApi.resume(sessionId, commandId) : conversationApi.pause(sessionId, commandId)).then(() => setStatus(paused ? "已恢复 · running" : "已暂停 · paused")).catch(() => setStatus("状态同步失败 · fixture"));
+    void (paused ? conversationApi.resume(sessionId, commandId) : conversationApi.pause(sessionId, commandId)).then(() => setStatusProjection(paused ? { phase: "running", label: "已恢复 · running", terminal: false } : { phase: "paused", label: "已暂停 · paused", terminal: true })).catch(() => setStatusProjection({ phase: "failed", label: "状态同步失败 · fixture", terminal: true }));
   };
   const approveOrchestration = () => {
     if (!sequential.commandId) return;
-    setStatus("人工审批已提交 · queued");
+    setStatusProjection({ phase: "queued", label: "人工审批已提交 · queued", terminal: false });
     void conversationApi.resumeOrchestration(sessionId, sequential.commandId, createConversationCommandId("orchestration-resume", sessionId)).then(() => {
       setSequential((current) => ({ ...current, interrupted: undefined }));
-    }).catch((error: unknown) => setStatus(`审批失败 · ${describeConversationError(error)}`));
+    }).catch((error: unknown) => setStatusProjection({ phase: "failed", label: `审批失败 · ${describeConversationError(error)}`, terminal: true }));
   };
   const htmlArtifact = Object.values(sequential.artifacts).filter((item) => item.mediaType === "text/html").at(-1);
   const resumeResearch = (preference?: string) => {
     if (!research.graphRunId || !research.interruptId) return;
-    setStatus("人工审核已批准 · queued");
-    void graphPlanApi.resumeInterrupt(research.graphRunId, research.interruptId, createConversationCommandId("research-interrupt", sessionId), preference).catch((error: unknown) => setStatus(`审核恢复失败 · ${describeConversationError(error)}`));
+    setStatusProjection({ phase: "queued", label: "人工审核已批准 · queued", terminal: false });
+    void graphPlanApi.resumeInterrupt(research.graphRunId, research.interruptId, createConversationCommandId("research-interrupt", sessionId), preference).catch((error: unknown) => setStatusProjection({ phase: "failed", label: `审核恢复失败 · ${describeConversationError(error)}`, terminal: true }));
   };
 
   return <section className="conversation-workspace" aria-label="会话工作区">
@@ -306,7 +338,7 @@ export function ConversationWorkspace() {
       <div className={`conversation-status ${status.includes("执行中") ? "running" : ""}`} data-testid="conversation-status" aria-live="polite">{status}</div>
       <div className="conversation-execution-panels">
         <SequentialGraph state={sequential} profiles={modelProfiles} onApprove={approveOrchestration} />
-        <PlanApproval sessionId={sessionId} onApproved={() => setStatus("研究计划已批准并排队 · queued")} />
+        <PlanApproval sessionId={sessionId} onApproved={() => setStatusProjection({ phase: "queued", label: "研究计划已批准并排队 · queued", terminal: false })} />
         <GraphRun state={research} onResume={resumeResearch} sessionId={sessionId} />
       </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />

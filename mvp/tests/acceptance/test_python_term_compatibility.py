@@ -107,24 +107,36 @@ def _task7_app(
 
 
 class _ObservableAdmissionGate:
-    """Expose each request reaching the session-lock boundary to the test."""
+    """Observable context manager backed by the real session ``asyncio.Lock``."""
 
     def __init__(self) -> None:
-        self._attempts: asyncio.Queue[int] = asyncio.Queue()
+        self._lock = asyncio.Lock()
+        self._attempts: asyncio.Queue[tuple[int, bool, int]] = asyncio.Queue()
+        self._acquired: asyncio.Queue[int] = asyncio.Queue()
         self._releases: list[asyncio.Event] = []
 
     async def __aenter__(self) -> None:
         attempt = len(self._releases)
         release = asyncio.Event()
         self._releases.append(release)
-        await self._attempts.put(attempt)
+        acquire = asyncio.create_task(self._lock.acquire())
+        await asyncio.sleep(0)
+        waiters = getattr(self._lock, "_waiters", None)
+        await self._attempts.put(
+            (attempt, acquire.done(), len(waiters) if waiters is not None else 0)
+        )
+        await acquire
+        await self._acquired.put(attempt)
         await release.wait()
 
     async def __aexit__(self, *_args: object) -> None:
-        return None
+        self._lock.release()
 
-    async def next_attempt(self) -> int:
+    async def next_attempt(self) -> tuple[int, bool, int]:
         return await asyncio.wait_for(self._attempts.get(), timeout=2)
+
+    async def next_acquired(self) -> int:
+        return await asyncio.wait_for(self._acquired.get(), timeout=2)
 
     def release(self, attempt: int) -> None:
         self._releases[attempt].set()
@@ -314,6 +326,14 @@ async def test_same_session_v1_and_python_term_admission_serializes_at_lock_boun
     command_id = "cross-runtime-command"
     gate = _ObservableAdmissionGate()
     api._locks[session_id] = gate  # type: ignore[assignment]
+    admission_entries: asyncio.Queue[str] = asyncio.Queue()
+    original_enqueue_locked = api._enqueue_message_locked
+
+    def observed_enqueue_locked(**request: Any) -> dict[str, Any]:
+        admission_entries.put_nowait(request.get("runtime") or "v1")
+        return original_enqueue_locked(**request)
+
+    api._enqueue_message_locked = observed_enqueue_locked  # type: ignore[method-assign]
     requests: dict[str, dict[str, Any]] = {
         "v1": {
             "session_id": session_id,
@@ -333,11 +353,19 @@ async def test_same_session_v1_and_python_term_admission_serializes_at_lock_boun
     }
     loser = "python-term" if winner == "v1" else "v1"
     winner_task = asyncio.create_task(api.enqueue_message(**requests[winner]))
-    assert await gate.next_attempt() == 0
+    assert await gate.next_attempt() == (0, True, 0)
+    assert await gate.next_acquired() == 0
     loser_task = asyncio.create_task(api.enqueue_message(**requests[loser]))
-    assert await gate.next_attempt() == 1
+    loser_attempt = await gate.next_attempt()
+    assert loser_attempt[0] == 1
+    assert loser_attempt[1] is False
+    assert loser_attempt[2] == 1
+    assert admission_entries.empty()
     gate.release(0)
+    assert await asyncio.wait_for(admission_entries.get(), timeout=2) == winner
     winner_result = await asyncio.wait_for(winner_task, timeout=2)
+    assert await gate.next_acquired() == 1
+    assert admission_entries.empty()
     gate.release(1)
     loser_error = PythonTermAdmissionConflict if loser == "python-term" else ValueError
     with pytest.raises(loser_error, match="command (identity cannot change|conflict)"):

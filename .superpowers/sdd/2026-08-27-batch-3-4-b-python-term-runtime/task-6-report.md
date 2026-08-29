@@ -273,3 +273,44 @@ Provider grant。Task 5 测试进程报告 `OPENAI_API_KEY is not set, skipping 
   production eligibility 或 `GO_PYTHON_TERM_RUNTIME`。
 - same-session serialization 仍是单一 Electron backend 内的 asyncio lock 边界，不宣称跨进程或
   分布式互斥；该边界与 Task 6 既有 ruling 一致。
+
+## Round 5 修复（2026-08-29）
+
+### RED → GREEN
+
+1. RED：terminal-before-retry 与 paused-before-retry 的 append-only queue repair 会把
+   `turn_queued` 放到有效 terminal 投影之后；terminal response 和 SSE replay 均会把公开状态
+   从 completed/paused 回退为 queued。GREEN：durable `conversation.turn.queued` 仍按原顺序
+   保留以补齐审计历史，但 terminal response 只返回最后有效 attempt 截至 terminal 的投影；SSE
+   从完整历史重建 paused/terminal projection，过滤同 causation 的迟到 queued/retryable 以及
+   paused 期间的 stale turn-running。显式、无 turn command identity 的 resume 仍可恢复 running，
+   不重写、不删除、不重排 durable event。
+2. RED：Canvas 逐事件直接覆盖字符串状态，completed、failed、reconciliation-required 与 paused
+   都能被迟到 `turn_queued` 回退。GREEN：新增纯 `reduceConversationStatus` 投影 reducer，四类
+   sticky 状态拒绝 stale queued/running/retryable；显式 session resume 是受支持的唯一 paused→running
+   过渡。组件实际消费该 reducer，而非只在测试中建立旁路模型。
+3. 原 Round 4 并发 gate 没有执行真实 lock acquire/release。替换为 `asyncio.Lock` 的可观测包装：
+   winner 已真实持锁，loser 的 acquire task 已进入底层 waiter 队列（`done=False`、waiter=1）后才
+   放行 winner；测试同时观察 `_enqueue_message_locked` 入口，证明 winner 持锁时无请求进入、winner
+   退出前 loser 不能进入。v1 与 Python Term 双向 winner 均断言唯一 reservation/message/Turn、
+   typed loser error 和零 orphan internal pin。
+
+### Round 5 验证证据
+
+1. RED focused：backend `2 failed, 2 passed`，两项失败均为 terminal response 在 terminal 后继续
+   返回 late `turn_queued`；Canvas 新投影用例 `5 failed`（reducer 尚不存在）。
+2. Queue + Task 6 focused：`74 passed in 5.79s`（exit 0）。
+3. Host/API/Conversation focused：`144 passed in 13.77s`（exit 0）。
+4. Task 5 runtime/recovery：`64 passed in 42.43s`（exit 0）。
+5. 完整 unit：`2130 passed in 115.32s`（exit 0）。
+6. Canvas：Vite/TypeScript build 完成，Playwright `44 passed (1.5m)`（exit 0）。
+7. `compileall`（main、conversations、Host v2、Python Term）与 `git diff --check`：exit 0。
+
+### Round 5 Concern
+
+- Task 7 proof 与 executor composition 仍未实现；生产 explicit Python Term 继续 fail closed，本轮
+  不发行 `GO_PYTHON_TERM_RUNTIME`。
+- session lock 仍是单 Electron backend 事件循环内的互斥，不是跨进程或分布式锁。SSE 为保证从
+  任意 cursor 恢复时仍能识别其之前的 terminal/paused 状态，会读取该 session 的完整事件流后再
+  进行公开投影；如果未来单会话历史达到超大规模，需要增加持久化 projection checkpoint，而不能
+  退回只看 cursor 后事件的非单调实现。
