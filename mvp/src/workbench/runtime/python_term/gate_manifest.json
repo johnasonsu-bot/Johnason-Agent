@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "4d44025b8196f0e71470bb6d47ec84d75614817eaac5de008ef73e561896887b",
-      "size": 1555958
+      "sha256": "657e56589be18a8c5d966379275571f88174cfa59a1cc39e964a89a28e5fcea7",
+      "size": 1563486
     },
     {
       "path": "uv.lock",
@@ -469,18 +469,18 @@
     },
     {
       "path": "runtime/deepseek_harness/__init__.py",
-      "sha256": "417a0fc50bc126359f6f70f06ea4581081879476e0a1e3da4c15dcc1e4939ca4",
-      "size": 257
+      "sha256": "6fbfd0d96199562c4d9aefaadba53e9c9210442174687bf35deb428b02426db8",
+      "size": 327
     },
     {
       "path": "runtime/deepseek_harness/source_gate.py",
-      "sha256": "82e3744c0d3c7cf69e333680f3bcf02e246d11054902011db80887fa0cda6031",
-      "size": 12512
+      "sha256": "df40167a59d0ad31d17ba853cabad3536392e59867bcf707ce87c1ceaddcf42d",
+      "size": 15713
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "a5acbe65ee37390196dd93321311db8192488ae80906a6a6dd10ba30e05ac5c8",
-      "size": 2747
+      "sha256": "272dbf90057a1938f75f7fcc760d758511be318646e4be66277c772b7872ddc7",
+      "size": 3213
     },
     {
       "path": "runtime/engine_host/__init__.py",
@@ -564,13 +564,13 @@
     },
     {
       "path": "runtime/goose/source_gate.py",
-      "sha256": "d3cf089c4c9b6cb33501009f934e5aad2c414e7d5d292b29f32a8e4293a996ae",
-      "size": 7607
+      "sha256": "5d17987ed67b6e1bc0fc814f1be083ad235ce5188d3c0d02de6e3d6b29f8ddec",
+      "size": 9529
     },
     {
       "path": "runtime/goose/source_manifest.json",
-      "sha256": "e81746fcc14fab11da83db85aa6ff8a6514d4e7987e3003e3a981758ae99da4e",
-      "size": 1297
+      "sha256": "2cf02f33505f78df094b674b55ca563bd15fa7a3b8621984f6ad233028cdf8b7",
+      "size": 2463
     },
     {
       "path": "runtime/python_term/__init__.py",
