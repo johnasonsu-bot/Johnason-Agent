@@ -10,6 +10,7 @@ from workbench.runtime.deepseek_harness.source_gate import (
     DeepSeekSourceVerifier,
     SourceReadinessError,
     canonical_manifest_bytes,
+    select_release_build_command,
 )
 
 
@@ -136,10 +137,28 @@ def test_manifest_records_frozen_build_boundary_and_sidecar_inputs(
     assert manifest["dependency_preparation"]["command"] == (
         "corepack pnpm@11.7.0 install --frozen-lockfile"
     )
-    assert manifest["release_build"]["command"] == (
-        "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts "
-        "--targets=node24-linux-x64,node24-linux-arm64,node24-macos-arm64"
-    )
+    assert manifest["release_build"]["commands"] == [
+        {
+            "command": "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-linux-x64",
+            "host_arch": "x64",
+            "host_os": "linux",
+            "target": "node24-linux-x64",
+        },
+        {
+            "command": "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-linux-arm64",
+            "host_arch": "arm64",
+            "host_os": "linux",
+            "target": "node24-linux-arm64",
+        },
+        {
+            "command": "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-macos-arm64",
+            "host_arch": "arm64",
+            "host_os": "darwin",
+            "target": "node24-macos-arm64",
+        },
+    ]
+    assert manifest["release_build"]["execution_policy"] == "matching_host_only"
+    assert manifest["release_build"]["actual_build_attested"] is False
     assert manifest["release_build"]["plugin_download"] is False
     assert manifest["release_build"]["user_plugin_scan"] is False
     assert manifest["release_build"]["requires_prepared_frozen_lock"] is True
@@ -152,6 +171,41 @@ def test_manifest_records_frozen_build_boundary_and_sidecar_inputs(
         "node24-linux-arm64",
         "node24-macos-arm64",
     ]
+
+
+@pytest.mark.parametrize(
+    ("host_os", "host_arch", "expected_target"),
+    [
+        ("linux", "x64", "node24-linux-x64"),
+        ("linux", "arm64", "node24-linux-arm64"),
+        ("darwin", "arm64", "node24-macos-arm64"),
+    ],
+)
+def test_release_build_planning_selects_only_the_matching_runner_target(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+    host_os: str,
+    host_arch: str,
+    expected_target: str,
+) -> None:
+    root, verifier, _ = source_repository
+
+    selected = select_release_build_command(
+        verifier.build_manifest(root), host_os=host_os, host_arch=host_arch
+    )
+
+    assert selected["target"] == expected_target
+    assert selected["command"].endswith(f"--targets={expected_target}")
+
+
+def test_release_build_planning_rejects_an_unsupported_runner(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, _ = source_repository
+
+    with pytest.raises(SourceReadinessError, match="no canonical release build"):
+        select_release_build_command(
+            verifier.build_manifest(root), host_os="darwin", host_arch="x64"
+        )
 
 
 def test_wrong_gitlink_revision_fails_closed(
@@ -171,6 +225,50 @@ def test_wrong_gitlink_revision_fails_closed(
     )
 
     with pytest.raises(SourceReadinessError, match="revision"):
+        verifier.verify(root, manifest_path)
+
+
+def test_parent_head_pinned_but_index_diverged_fails_closed(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    _git(
+        root,
+        "update-index",
+        "--cacheinfo",
+        "160000,1111111111111111111111111111111111111111,third_party/deepseek-harness",
+    )
+
+    with pytest.raises(SourceReadinessError, match="index gitlink revision"):
+        verifier.verify(root, manifest_path)
+
+
+def test_parent_head_diverged_but_index_and_checkout_pinned_fail_closed(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    source = root / "third_party" / "deepseek-harness"
+    pinned = verifier.expected_revision
+    _write(source / "new.txt", "new revision\n")
+    _git(source, "add", "new.txt")
+    _git(source, "commit", "-q", "-m", "new")
+    divergent = _git(source, "rev-parse", "HEAD")
+    _git(
+        root,
+        "update-index",
+        "--cacheinfo",
+        f"160000,{divergent},third_party/deepseek-harness",
+    )
+    _git(root, "commit", "-q", "-m", "diverged parent head")
+    _git(source, "checkout", "-q", pinned)
+    _git(
+        root,
+        "update-index",
+        "--cacheinfo",
+        f"160000,{pinned},third_party/deepseek-harness",
+    )
+
+    with pytest.raises(SourceReadinessError, match="HEAD gitlink revision"):
         verifier.verify(root, manifest_path)
 
 
@@ -223,7 +321,9 @@ def test_manifest_content_drift_fails(
 ) -> None:
     root, verifier, manifest_path = source_repository
     document = json.loads(manifest_path.read_text(encoding="utf-8"))
-    document["release_build"]["command"] = "pnpm install && scan-user-plugins"
+    document["release_build"]["commands"][0]["command"] = (
+        "pnpm install && scan-user-plugins"
+    )
     manifest_path.write_bytes(canonical_manifest_bytes(document))
 
     with pytest.raises(SourceReadinessError, match="manifest drift"):

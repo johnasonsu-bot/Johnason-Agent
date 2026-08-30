@@ -23,14 +23,10 @@ DSH_SOURCE_MANIFEST_SCHEMA = "workbench.runtime.dsh.source_manifest.v1"
 _DEPENDENCY_PREPARATION_COMMAND = (
     "corepack pnpm@11.7.0 install --frozen-lockfile"
 )
-_SUPPORTED_TARGETS = (
-    "node24-linux-x64",
-    "node24-linux-arm64",
-    "node24-macos-arm64",
-)
-_RELEASE_BUILD_COMMAND = (
-    "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts "
-    "--targets=" + ",".join(_SUPPORTED_TARGETS)
+_RELEASE_TARGETS = (
+    ("node24-linux-x64", "linux", "x64"),
+    ("node24-linux-arm64", "linux", "arm64"),
+    ("node24-macos-arm64", "darwin", "arm64"),
 )
 _SIDECAR_PACKAGE = "dsh-jsonrpc-agent-pkg"
 _SIDECAR_PACKAGE_MANIFEST = "python/sdk-runtime/package.json"
@@ -102,6 +98,17 @@ def _run_git(directory: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+def _gitlink_revision(line: str, *, label: str) -> str:
+    """Extract a commit id from one canonical gitlink listing."""
+
+    fields = line.split(maxsplit=3)
+    if len(fields) < 3 or fields[0] != "160000":
+        raise SourceReadinessError(f"DeepSeek Harness {label} is not a gitlink")
+    if fields[1] == "commit":
+        return fields[2]
+    return fields[1]
+
+
 def _canonical_digest(value: Any) -> str:
     return _sha256_bytes(
         json.dumps(
@@ -111,6 +118,51 @@ def _canonical_digest(value: Any) -> str:
             ensure_ascii=False,
         ).encode("utf-8")
     )
+
+
+def select_release_build_command(
+    manifest: Mapping[str, Any], *, host_os: str, host_arch: str
+) -> dict[str, str]:
+    """Select exactly one canonical target for a matching build runner.
+
+    Selection is planning only: the source-ready gate never marks the selected
+    command as executed and never attests its artifacts.
+    """
+
+    release = manifest.get("release_build")
+    if not isinstance(release, dict):
+        raise SourceReadinessError("DeepSeek Harness release build plan is missing")
+    if release.get("execution_policy") != "matching_host_only":
+        raise SourceReadinessError("DeepSeek Harness release build policy is invalid")
+    if release.get("actual_build_attested") is not False:
+        raise SourceReadinessError(
+            "DeepSeek Harness source gate cannot attest a release build"
+        )
+    commands = release.get("commands")
+    if not isinstance(commands, list):
+        raise SourceReadinessError("DeepSeek Harness release build commands are missing")
+    matches = [
+        command
+        for command in commands
+        if isinstance(command, dict)
+        and command.get("host_os") == host_os
+        and command.get("host_arch") == host_arch
+    ]
+    if len(matches) != 1:
+        raise SourceReadinessError(
+            f"no canonical release build for runner {host_os}/{host_arch}"
+        )
+    selected = matches[0]
+    required = ("target", "host_os", "host_arch", "command")
+    if not all(isinstance(selected.get(key), str) for key in required):
+        raise SourceReadinessError("DeepSeek Harness release build command is invalid")
+    target = selected["target"]
+    command = selected["command"]
+    if not command.endswith(f"--targets={target}"):
+        raise SourceReadinessError(
+            "DeepSeek Harness release build target and command disagree"
+        )
+    return {key: selected[key] for key in required}
 
 
 def _load_json(path: Path, label: str) -> dict[str, Any]:
@@ -141,6 +193,21 @@ class DeepSeekSourceVerifier:
 
     def _verify_source_checkout(self, repository_root: Path) -> Path:
         source = self._source(repository_root)
+        head = _run_git(
+            repository_root,
+            "ls-tree",
+            "HEAD",
+            "--",
+            self.submodule_path,
+        ).splitlines()
+        if len(head) != 1:
+            raise SourceReadinessError("DeepSeek Harness HEAD gitlink is missing")
+        head_revision = _gitlink_revision(head[0], label="HEAD path")
+        if head_revision != self.expected_revision:
+            raise SourceReadinessError(
+                "DeepSeek Harness HEAD gitlink revision does not match the pinned revision"
+            )
+
         staged = _run_git(
             repository_root,
             "ls-files",
@@ -149,15 +216,12 @@ class DeepSeekSourceVerifier:
             self.submodule_path,
         ).splitlines()
         if len(staged) != 1:
-            raise SourceReadinessError("DeepSeek Harness gitlink is missing")
-        fields = staged[0].split(maxsplit=3)
-        if len(fields) < 3 or fields[0] != "160000":
-            raise SourceReadinessError("DeepSeek Harness path is not a gitlink")
-        gitlink_revision = fields[1]
+            raise SourceReadinessError("DeepSeek Harness index gitlink is missing")
+        gitlink_revision = _gitlink_revision(staged[0], label="index path")
         checkout_revision = _run_git(source, "rev-parse", "HEAD")
         if gitlink_revision != self.expected_revision:
             raise SourceReadinessError(
-                "DeepSeek Harness gitlink revision does not match the pinned revision"
+                "DeepSeek Harness index gitlink revision does not match the pinned revision"
             )
         if checkout_revision != self.expected_revision:
             raise SourceReadinessError(
@@ -278,7 +342,21 @@ class DeepSeekSourceVerifier:
                 "frozen_lockfile": True,
             },
             "release_build": {
-                "command": _RELEASE_BUILD_COMMAND,
+                "commands": [
+                    {
+                        "target": target,
+                        "host_os": host_os,
+                        "host_arch": host_arch,
+                        "command": (
+                            "corepack pnpm@11.7.0 exec tsx "
+                            "scripts/build-exe-for-python-sdk.ts "
+                            f"--targets={target}"
+                        ),
+                    }
+                    for target, host_os, host_arch in _RELEASE_TARGETS
+                ],
+                "execution_policy": "matching_host_only",
+                "actual_build_attested": False,
                 "requires_prepared_frozen_lock": True,
                 "network_policy": "pinned_build_tool_only",
                 "plugin_download": False,
@@ -289,7 +367,7 @@ class DeepSeekSourceVerifier:
                 "package_manifest": _SIDECAR_PACKAGE_MANIFEST,
                 "entrypoint": _SIDECAR_ENTRYPOINT,
                 "entrypoint_source": _SIDECAR_ENTRYPOINT_SOURCE,
-                "targets": list(_SUPPORTED_TARGETS),
+                "targets": [target for target, _, _ in _RELEASE_TARGETS],
             },
         }
 
