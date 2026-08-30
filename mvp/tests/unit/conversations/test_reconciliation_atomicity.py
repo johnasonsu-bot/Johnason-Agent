@@ -1,5 +1,6 @@
 """Atomicity tests for Python Term reconciliation command responses."""
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -7,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from workbench.api.conversations import (
+    ConversationAPI,
+    PythonTermReconciliationRequest,
+)
 from workbench.conversations.repository import ConversationRepository
+from workbench.workflow.event_store import EventStore
 
 
 def _prepare_reconciliation(
@@ -93,6 +99,72 @@ def _commit(
         effect_id=effect_id,
         outcome="applied",
         summary="private confirmation",
+    )
+
+
+def _mark_legacy_confirmation(
+    repository: ConversationRepository,
+    *,
+    terminal: bool = False,
+    public_status: str = "completed",
+) -> None:
+    public_result = json.dumps(
+        {
+            "artifact_ref": None,
+            "status": public_status,
+            "summary": "private confirmation",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    state = (
+        {"phase": "completed", "runner_mode": "python_term"}
+        if terminal
+        else {
+            "phase": "before_model",
+            "runner_mode": "python_term",
+            "reconciliation_effect_ids": [],
+            "reconciled_effect_ids": ["effect-1"],
+        }
+    )
+    with repository.store.connect() as connection:
+        connection.execute(
+            """UPDATE python_tool_effects
+            SET status = 'committed', result_digest = ?, effect_json = ?,
+                public_result_json = ?
+            WHERE effect_id = 'effect-1'""",
+            (
+                hashlib.sha256(public_result.encode("utf-8")).hexdigest(),
+                json.dumps(
+                    {
+                        "effect_id": "effect-1",
+                        "public_result": json.loads(public_result),
+                        "status": "committed",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                public_result,
+            ),
+        )
+        connection.execute(
+            """UPDATE conversation_turns
+            SET status = ?, state_json = ?, result_json = ?
+            WHERE session_id = 'session-1' AND command_id = 'command-1'""",
+            (
+                "completed" if terminal else "queued",
+                json.dumps(state, sort_keys=True),
+                "[]" if terminal else None,
+            ),
+        )
+
+
+def _api(repository: ConversationRepository) -> ConversationAPI:
+    return ConversationAPI(
+        conversations=repository,
+        events=EventStore(repository.store.path),
+        runner=object(),
+        python_term_executor=None,
     )
 
 
@@ -208,3 +280,120 @@ def test_reconciliation_identity_conflict_does_not_echo_private_summary(
 
     assert str(raised.value) == "reconciliation command identity cannot change"
     assert "private changed summary" not in str(raised.value)
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_legacy_null_response_is_repaired_after_restart_without_reexecuting_effect(
+    tmp_path: Path,
+    terminal: bool,
+) -> None:
+    database = tmp_path / f"legacy-{'terminal' if terminal else 'queued'}.sqlite"
+    repository = _prepare_reconciliation(database)
+    _mark_legacy_confirmation(repository, terminal=terminal)
+    with repository.store.connect() as connection:
+        before_effect = connection.execute(
+            "SELECT * FROM python_tool_effects WHERE effect_id = 'effect-1'"
+        ).fetchone()
+        before_turn = connection.execute(
+            """SELECT status, state_json, result_json FROM conversation_turns
+            WHERE session_id = 'session-1' AND command_id = 'command-1'"""
+        ).fetchone()
+    assert before_effect is not None and before_turn is not None
+
+    restarted = ConversationRepository(database)
+    response = _api(restarted).reconcile_python_term_effect(
+        session_id="session-1",
+        command_id="command-1",
+        effect_id="effect-1",
+        idempotency_key="reconcile-1",
+        request=PythonTermReconciliationRequest(
+            outcome="applied", summary="private confirmation"
+        ),
+    )
+
+    assert response == {
+        "session_id": "session-1",
+        "command_id": "command-1",
+        "effect_id": "effect-1",
+        "status": "queued",
+        "pending_effect_ids": [],
+    }
+    with restarted.store.connect() as connection:
+        after_effect = connection.execute(
+            "SELECT * FROM python_tool_effects WHERE effect_id = 'effect-1'"
+        ).fetchone()
+        after_turn = connection.execute(
+            """SELECT status, state_json, result_json FROM conversation_turns
+            WHERE session_id = 'session-1' AND command_id = 'command-1'"""
+        ).fetchone()
+        command = connection.execute(
+            """SELECT response_json FROM python_term_reconciliation_commands
+            WHERE idempotency_key = 'reconcile-1'"""
+        ).fetchone()
+    assert dict(after_effect) == dict(before_effect)
+    assert dict(after_turn) == dict(before_turn)
+    assert command is not None and json.loads(command["response_json"]) == response
+
+
+def test_legacy_repair_fails_closed_when_effect_outcome_is_not_verifiable(
+    tmp_path: Path,
+) -> None:
+    repository = _prepare_reconciliation(tmp_path / "legacy-conflict.sqlite")
+    _mark_legacy_confirmation(repository, public_status="failed")
+
+    with pytest.raises(ValueError, match="legacy reconciliation recovery conflict"):
+        _api(ConversationRepository(repository.store.path)).reconcile_python_term_effect(
+            session_id="session-1",
+            command_id="command-1",
+            effect_id="effect-1",
+            idempotency_key="reconcile-1",
+            request=PythonTermReconciliationRequest(
+                outcome="applied", summary="private confirmation"
+            ),
+        )
+
+
+def test_different_key_cannot_replay_already_confirmed_legacy_effect(
+    tmp_path: Path,
+) -> None:
+    repository = _prepare_reconciliation(tmp_path / "legacy-new-key.sqlite")
+    _mark_legacy_confirmation(repository)
+
+    with pytest.raises(ValueError, match="already bound to another identity"):
+        _api(ConversationRepository(repository.store.path)).reconcile_python_term_effect(
+            session_id="session-1",
+            command_id="command-1",
+            effect_id="effect-1",
+            idempotency_key="different-key",
+            request=PythonTermReconciliationRequest(
+                outcome="applied", summary="private confirmation"
+            ),
+        )
+    with repository.store.connect() as connection:
+        created = connection.execute(
+            """SELECT 1 FROM python_term_reconciliation_commands
+            WHERE idempotency_key = 'different-key'"""
+        ).fetchone()
+    assert created is None
+
+
+def test_command_reservation_serializes_one_identity_per_effect(tmp_path: Path) -> None:
+    repository = _prepare_reconciliation(tmp_path / "identity-fence.sqlite")
+
+    with pytest.raises(ValueError, match="already bound to another identity"):
+        repository.begin_python_term_reconciliation_command(
+            idempotency_key="racing-different-key",
+            session_id="session-1",
+            command_id="command-1",
+            effect_id="effect-1",
+            outcome="applied",
+            summary="private confirmation",
+        )
+
+    with repository.store.connect() as connection:
+        count = connection.execute(
+            """SELECT COUNT(*) AS count FROM python_term_reconciliation_commands
+            WHERE session_id = 'session-1' AND command_id = 'command-1'
+              AND effect_id = 'effect-1'"""
+        ).fetchone()
+    assert count is not None and count["count"] == 1

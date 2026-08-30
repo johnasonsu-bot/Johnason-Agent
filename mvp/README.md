@@ -222,6 +222,8 @@ Python Term 默认关闭。启用时，只有外部签名 build proof 与注册�
 - 最后一个待确认 Effect 的 Turn 重入队与 REST 幂等响应在同一 SQLite
   `BEGIN IMMEDIATE` 事务提交；事务前后崩溃均不会暴露 `queued` 加空响应账本的
   中间状态，同一 Idempotency-Key 在重启、Worker 完成和终态压缩后仍稳定重放；
+- Effect 首次确认后只接受原 Idempotency-Key 重放；更换 Key 即使 payload 相同也
+  返回 409，避免在缺少原账本身份时伪造第二次确认；
 - `workspace.read` regular-file 校验与 64 KiB + 1 有界读取。
 
 运行 9 场景确定性门禁：

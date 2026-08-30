@@ -1281,8 +1281,8 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
     assert first.json()["status"] == "interrupted"
     assert first.json()["pending_effect_ids"] == ["effect-unknown-2"]
     assert duplicate.status_code == 200 and duplicate.json() == first.json()
-    assert semantic_duplicate.status_code == 200
-    assert semantic_duplicate.json() == first.json()
+    assert semantic_duplicate.status_code == 409
+    assert "write confirmed applied" not in semantic_duplicate.text
     assert same_key_changed_payload.status_code == 409
     assert "private changed summary" not in same_key_changed_payload.text
     assert conflict.status_code == 409

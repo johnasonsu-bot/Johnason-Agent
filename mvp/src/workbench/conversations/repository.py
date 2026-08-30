@@ -27,6 +27,10 @@ class TurnSnapshotCorruption(ValueError):
     """A durable Turn snapshot cannot be interpreted or safely retried."""
 
 
+class ReconciliationRecoveryConflict(TurnSnapshotCorruption):
+    """A legacy reconciliation command cannot be recovered unambiguously."""
+
+
 @dataclass(frozen=True)
 class TurnClaim:
     disposition: str
@@ -1160,6 +1164,17 @@ class ConversationRepository:
                 (idempotency_key,),
             ).fetchone()
             if row is None:
+                existing_identity = connection.execute(
+                    """SELECT idempotency_key
+                    FROM python_term_reconciliation_commands
+                    WHERE session_id = ? AND command_id = ? AND effect_id = ?
+                    LIMIT 1""",
+                    (session_id, command_id, effect_id),
+                ).fetchone()
+                if existing_identity is not None:
+                    raise ValueError(
+                        "reconciliation command already bound to another identity"
+                    )
                 connection.execute(
                     """INSERT INTO python_term_reconciliation_commands(
                     idempotency_key, session_id, command_id, effect_id, outcome,
@@ -1244,6 +1259,177 @@ class ConversationRepository:
         if not isinstance(response, dict):
             raise TurnSnapshotCorruption("reconciliation command response is invalid")
         return True, response
+
+    def has_python_term_reconciliation_command(
+        self, *, session_id: str, command_id: str, effect_id: str
+    ) -> bool:
+        """Return whether an Effect is already bound to a command identity."""
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM python_term_reconciliation_commands
+                WHERE session_id = ? AND command_id = ? AND effect_id = ?
+                LIMIT 1""",
+                (session_id, command_id, effect_id),
+            ).fetchone()
+        return row is not None
+
+    def recover_legacy_python_term_reconciliation_command(
+        self,
+        *,
+        idempotency_key: str,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        outcome: str,
+        summary: str,
+    ) -> dict[str, Any] | None:
+        """Repair the pre-atomic queued/null-response crash state.
+
+        Recovery writes only the missing public response.  It is permitted for
+        one fully bound legacy command whose Effect has the exact confirmed
+        outcome and whose Turn proves that the command released the last
+        pending reconciliation.  An interrupted Turn is still on the normal
+        confirmation path and returns ``None`` without mutation.
+        """
+        summary_digest, request_digest = self._python_term_reconciliation_identity(
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=outcome,
+            summary=summary,
+        )
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            command = connection.execute(
+                """SELECT * FROM python_term_reconciliation_commands
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if command is None or (
+                command["session_id"] != session_id
+                or command["command_id"] != command_id
+                or command["effect_id"] != effect_id
+                or command["outcome"] != outcome
+                or command["summary_digest"] != summary_digest
+                or command["request_digest"] != request_digest
+            ):
+                raise ValueError("reconciliation command identity cannot change")
+            if command["response_json"] is not None:
+                restored = json.loads(command["response_json"])
+                if not isinstance(restored, dict):
+                    raise TurnSnapshotCorruption(
+                        "reconciliation command response is invalid"
+                    )
+                connection.commit()
+                return restored
+
+            turn = connection.execute(
+                """SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            if turn is None:
+                raise KeyError((session_id, command_id))
+            if turn["status"] == "interrupted":
+                connection.commit()
+                return None
+            state = json.loads(turn["state_json"])
+            queued_last_pending = (
+                turn["status"] == "queued"
+                and state.get("runner_mode") == "python_term"
+                and state.get("phase") == "before_model"
+                and state.get("reconciliation_effect_ids") == []
+                and isinstance(state.get("reconciled_effect_ids"), list)
+                and effect_id in state["reconciled_effect_ids"]
+                and "reason" not in state
+            )
+            compacted_after_worker = (
+                turn["status"] in {"completed", "failed"}
+                and state.get("runner_mode") == "python_term"
+                and "reconciliation_effect_ids" not in state
+                and "reconciled_effect_ids" not in state
+            )
+            if not (queued_last_pending or compacted_after_worker):
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                )
+            unresolved = connection.execute(
+                """SELECT COUNT(*) AS count
+                FROM python_term_reconciliation_commands
+                WHERE session_id = ? AND command_id = ? AND response_json IS NULL""",
+                (session_id, command_id),
+            ).fetchone()
+            if unresolved is None or unresolved["count"] != 1:
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                )
+            effect = connection.execute(
+                """SELECT status, result_digest, effect_json, public_result_json
+                FROM python_tool_effects WHERE effect_id = ?""",
+                (effect_id,),
+            ).fetchone()
+            if (
+                effect is None
+                or effect["status"] != "committed"
+                or not isinstance(effect["public_result_json"], str)
+            ):
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                )
+            try:
+                public_result = json.loads(effect["public_result_json"])
+                effect_record = json.loads(effect["effect_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                ) from exc
+            canonical_public_result = json.dumps(
+                public_result,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            expected_status = "completed" if outcome == "applied" else "failed"
+            public_summary = (
+                public_result.get("summary")
+                if isinstance(public_result, dict)
+                else None
+            )
+            if (
+                canonical_public_result != effect["public_result_json"]
+                or effect["result_digest"]
+                != hashlib.sha256(canonical_public_result.encode("utf-8")).hexdigest()
+                or not isinstance(public_result, dict)
+                or public_result.get("status") != expected_status
+                or not isinstance(public_summary, str)
+                or hashlib.sha256(public_summary.encode("utf-8")).hexdigest()
+                != summary_digest
+                or not isinstance(effect_record, dict)
+                or effect_record.get("effect_id") != effect_id
+                or effect_record.get("status") != "committed"
+                or effect_record.get("public_result") != public_result
+            ):
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                )
+            response = {
+                "session_id": session_id,
+                "command_id": command_id,
+                "effect_id": effect_id,
+                "status": "queued",
+                "pending_effect_ids": [],
+            }
+            encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
+            changed = connection.execute(
+                """UPDATE python_term_reconciliation_commands
+                SET response_json = ?, updated_at = ?
+                WHERE idempotency_key = ? AND response_json IS NULL""",
+                (encoded, time.time(), idempotency_key),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("reconciliation command response fence was lost")
+            connection.commit()
+        return response
 
     def complete_python_term_reconciliation_command(
         self,

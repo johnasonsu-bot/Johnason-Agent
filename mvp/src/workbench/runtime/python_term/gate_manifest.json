@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "c7150f7d8a616268be9583dc634de3c823b6a78789b43dcd63ae85d02008bd99",
-      "size": 1482161
+      "sha256": "e5b17afc102c46d561a77bf470692c4934f054dbb556035aff54efe2e7c89bd3",
+      "size": 1489218
     },
     {
       "path": "uv.lock",
@@ -144,8 +144,8 @@
     },
     {
       "path": "api/conversations.py",
-      "sha256": "815f1f4cef83f9ba9fa8fa4b1ee3503b26ad577406c58dc2d99224cdb6578881",
-      "size": 99699
+      "sha256": "8c24eeb40c8bdce7bbe7dbc5d16077527dae03e5bee65cabe84e265f83b13047",
+      "size": 100517
     },
     {
       "path": "api/engine_host.py",
@@ -194,8 +194,8 @@
     },
     {
       "path": "conversations/repository.py",
-      "sha256": "6d8a2ec182ea3109728b89f004d732b0c43b56ca6efc367505913380f04f29dd",
-      "size": 59908
+      "sha256": "8c9565e33232808522d9101d7e1fb0a4e2e72b130383bdd59967fdbd05dbbcb9",
+      "size": 68299
     },
     {
       "path": "conversations/worker.py",
