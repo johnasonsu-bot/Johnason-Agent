@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "2040d090f31629fae8ac50fa8e3a5ad9f7070dd789af45d5cb5b616baade9127",
-      "size": 1593420
+      "sha256": "d1af6ba7029e83f29de6db2f1c235b7056e2a5223c36e707ab343b7821be0d7a",
+      "size": 1630449
     },
     {
       "path": "uv.lock",
@@ -144,13 +144,13 @@
     },
     {
       "path": "api/conversations.py",
-      "sha256": "29de7c78bc10f4a751b497f7c5c01a43cb28bc25b18deb95fa3a17c70260e314",
-      "size": 101553
+      "sha256": "29b5103d2ff920efc4d20716ffdad443d3355761587270203a0afa190db4190f",
+      "size": 109809
     },
     {
       "path": "api/engine_host.py",
-      "sha256": "cdfb77f6ef2f30f2180ada3fe6e2677106a49ed1f63d765499b7d86112d82928",
-      "size": 4747
+      "sha256": "d3c535b224b8a33ef5567f7c8bd49c72cd5afbc41cb90446e0ce3b9ebc35af6a",
+      "size": 6442
     },
     {
       "path": "api/graph_plans.py",
@@ -239,8 +239,8 @@
     },
     {
       "path": "main.py",
-      "sha256": "6d2b0314252097b0325f4d252a21cdae95c751367c43f60604e1edc537ab8661",
-      "size": 36703
+      "sha256": "8d6997cdd5d43ec5c6d11476d93aeaf62861b3a7ac6e051d9405432b5671c893",
+      "size": 40865
     },
     {
       "path": "models/__init__.py",
@@ -554,8 +554,8 @@
     },
     {
       "path": "runtime/engine_host/v2/runtime_admission.py",
-      "sha256": "5c15269c043ba972e1ca192fc6a2dc6a74337977b99a991d0d27c5fd2de97f7d",
-      "size": 24991
+      "sha256": "6d5e49afe6d8f5f2a772b3595421b531cfa381bc36ddf38dc700706190c01cb8",
+      "size": 33564
     },
     {
       "path": "runtime/engine_host/v2/security.py",
@@ -588,9 +588,14 @@
       "size": 46231
     },
     {
+      "path": "runtime/python_term/dev_environment.py",
+      "sha256": "0bf5108dbb2faca0cf55ed34c36f0eacf3721b1b59871cb30711703c92df9a49",
+      "size": 16154
+    },
+    {
       "path": "runtime/python_term/gate.py",
-      "sha256": "405417336e016ebd6bddeda6ed7ff2e57b0a68822c1d719328bd75a150e7a069",
-      "size": 46715
+      "sha256": "7a189a47eba2ce97f03a980a3b5635d2ad2276c0b8768ba1ad8887a0abcdcecb",
+      "size": 47197
     },
     {
       "path": "runtime/python_term/gate_receipt.json",

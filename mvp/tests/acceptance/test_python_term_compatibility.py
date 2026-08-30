@@ -775,12 +775,16 @@ def test_python_term_diagnostic_is_read_only_and_omits_process_and_secret_author
             "enabled": True,
             "protocol": "2.0",
             "runtimes": [
-                {
-                    "runtime_id": "python-term",
-                    "build_id": app.state.python_term_runtime.build_id,
-                    "state": "ready",
-                    "capabilities": ["checkpoints", "event_cursor"],
-                }
+                    {
+                        "runtime_id": "python-term",
+                        "build_id": app.state.python_term_runtime.build_id,
+                        "state": "ready",
+                        "capabilities": ["checkpoints", "event_cursor"],
+                        "selector": "python-term",
+                        "selectable_for_new_commands": False,
+                        "admission_state": "unavailable",
+                        "admission_reason": "proof_missing",
+                    }
             ],
         }
     }
@@ -819,5 +823,9 @@ def test_python_term_diagnostic_exposes_only_a_fixed_recent_error_category(
         "state",
         "capabilities",
         "last_error_category",
+        "selector",
+        "selectable_for_new_commands",
+        "admission_state",
+        "admission_reason",
     }
     assert "Python Term command was rejected" not in response.text

@@ -987,7 +987,10 @@ async def test_provider_failure_seals_the_conversation_from_durable_runtime_term
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Provider:
+        calls = 0
+
         async def complete(self, request, profile):
+            self.calls += 1
             raise RuntimeError("provider failed")
 
     database = tmp_path / "provider-failure.sqlite"
@@ -1001,10 +1004,11 @@ async def test_provider_failure_seals_the_conversation_from_durable_runtime_term
     ProviderRepository(database).save(profile)
     registry = RuntimeRegistryV2(RuntimeV2Repository(database))
     _install_test_signed_build_proof(monkeypatch, tmp_path)
+    provider = Provider()
     composition = compose_python_term_production(
         registry=registry,
         repository=PythonTermRepository(database),
-        gateway=ModelGateway({"test": Provider()}),
+        gateway=ModelGateway({"test": provider}),
         profiles=(profile,),
         runtime_dir=tmp_path.resolve(),
     )
@@ -1035,6 +1039,25 @@ async def test_provider_failure_seals_the_conversation_from_durable_runtime_term
     turn = conversations.load_turn_status("session-1", "command-1")
     assert turn is not None and turn.status == "failed"
     assert conversations.claim_next_turn(owner_id="worker-2") is None
+    first_retry = await api.enqueue_message(
+        session_id="session-1",
+        command_id="command-1",
+        content="hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="python-term",
+    )
+    repeated_retry = await api.enqueue_message(
+        session_id="session-1",
+        command_id="command-1",
+        content="hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="python-term",
+    )
+    assert first_retry == repeated_retry
+    assert first_retry["status"] == "failed"
+    assert provider.calls == 1
 
 
 @pytest.mark.asyncio

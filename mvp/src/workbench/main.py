@@ -26,6 +26,7 @@ from workbench.api.conversations import (
     PythonTermConversationAdmission,
     PythonTermConversationRoute,
     PythonTermRuntimeUnavailable,
+    python_term_command_id,
 )
 from workbench.api.engine_host import engine_host_v2_router
 from workbench.conversations.repository import ConversationRepository
@@ -58,6 +59,7 @@ from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeAdmissionRepository,
     RuntimeCatalog,
     RuntimeCatalogEntry,
+    RuntimeAdmissionProbe,
 )
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
@@ -65,7 +67,11 @@ from workbench.runtime.engine_host.v2.assignment import (
     RuntimeTrustKey,
     SignedRuntimeGateProof,
 )
-from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
+from workbench.runtime.engine_host.v2.contracts import (
+    QueryCommandV2,
+    RunEnvelopeV2,
+    ToolManifestEntryV2,
+)
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
     PythonTermDevelopmentTrust,
@@ -93,10 +99,12 @@ class RuntimeQueryRouter:
         *,
         _gate_proof: object | None = None,
         _admission_coordinator: RuntimeAdmissionCoordinator | None = None,
+        _admission_probe: RuntimeAdmissionProbe | None = None,
     ) -> None:
         self._registry = registry
         self.__gate_proof = _gate_proof
         self._admission_coordinator = _admission_coordinator
+        self._admission_probe = _admission_probe
 
     def route_new_query(
         self, command: QueryCommandV2, envelope: RunEnvelopeV2
@@ -107,6 +115,21 @@ class RuntimeQueryRouter:
             ) from None
         return self._registry.route_python_term_query(
             command, envelope, gate_proof=self.__gate_proof
+        )
+
+    def public_admission(
+        self, session_id: str, public_command_id: str
+    ) -> dict[str, object] | None:
+        if self._admission_coordinator is None:
+            return None
+        probe = self._admission_probe or RuntimeAdmissionProbe(
+            coordinator=self._admission_coordinator,
+            provider_available=False,
+            executor_available=False,
+            runtime_enabled=False,
+        )
+        return probe.command(
+            session_id, python_term_command_id(session_id, public_command_id)
         )
 
     def route_conversation_query(
@@ -241,6 +264,14 @@ class RuntimeQueryRouter:
         project_digest = self._digest(
             project.model_dump(mode="json") if project is not None else None
         )
+        development_smoke = tuple(envelope.workspace_grant.readable_paths) == (
+            "/workspace/README.md",
+        )
+        permission_policy = (
+            {"tool_policy": "allow", "filesystem_policy": "allow"}
+            if development_smoke
+            else {"tool_policy": "deny", "filesystem_policy": "deny"}
+        )
         return {
             "command": command.model_dump(mode="json"),
             "envelope": envelope.model_dump(mode="json"),
@@ -269,15 +300,14 @@ class RuntimeQueryRouter:
                     {"term_id": envelope.term_id, "agent_id": envelope.agent_id}
                 ),
             },
-            "permission_policy": {
-                "tool_policy": "deny",
-                "filesystem_policy": "deny",
-            },
+            "permission_policy": permission_policy,
             "environment_allowlist": (),
             "effect_scope": {
                 "scope_id": f"conversation-scope-{envelope.term_id[-32:]}",
                 "write_effects": False,
-                "allowed_tool_ids": (),
+                "allowed_tool_ids": (
+                    ("workspace.read",) if development_smoke else ()
+                ),
             },
         }
 
@@ -350,6 +380,53 @@ class RuntimeQueryRouter:
             "messages": message_snapshot,
         }
         identity = self._digest(binding)
+        development_smoke = self._development_smoke(admission)
+        workspace_manifest = ToolManifestEntryV2(
+            tool_id="workspace.read",
+            version="1",
+            read_only=True,
+            timeout_ms=5_000,
+            idempotency="idempotent",
+            schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "const": "/workspace/README.md",
+                        "maxLength": 1024,
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        )
+        tool_manifest = (workspace_manifest,) if development_smoke else ()
+        permission_policy = (
+            {"tool_policy": "allow", "filesystem_policy": "allow"}
+            if development_smoke
+            else {"tool_policy": "deny", "filesystem_policy": "deny"}
+        )
+        workspace_grant = (
+            {
+                "grant_id": "python-term-dev-smoke",
+                "workspace_snapshot_ref": "python-term-dev-smoke",
+                "readable_paths": ("/workspace/README.md",),
+                "writable_paths": (),
+                "command_policy": "deny",
+                "network_policy": "deny",
+                "expires_at_ms": 4_102_444_800_000,
+            }
+            if development_smoke
+            else {
+                "grant_id": f"conversation-grant-{identity[:32]}",
+                "workspace_snapshot_ref": f"empty-workspace-{identity[:32]}",
+                "readable_paths": (),
+                "writable_paths": (),
+                "command_policy": "deny",
+                "network_policy": "deny",
+                "expires_at_ms": 4_102_444_800_000,
+            }
+        )
         session_ref = f"conversation-session:{admission.session_id}"
         run_ref = f"conversation-run-{identity[:32]}"
         if len(admission.agent_profiles) == 1:
@@ -423,28 +500,21 @@ class RuntimeQueryRouter:
                     "compaction_policy": "none",
                     "summary_ref": None,
                 },
-                "tool_manifest": (),
-                "tool_manifest_digest": self._digest(()),
+                "tool_manifest": tool_manifest,
+                "tool_manifest_digest": self._digest(
+                    tuple(item.model_dump(mode="json") for item in tool_manifest)
+                ),
                 "skill_pins": (),
                 "skill_manifest_digest": self._digest(()),
                 "plugin_pins": (),
                 "plugin_manifest_digest": self._digest(()),
-                "permission_policy_digest": self._digest(
-                    {"tool_policy": "deny", "filesystem_policy": "deny"}
-                ),
-                "workspace_grant": {
-                    "grant_id": f"conversation-grant-{identity[:32]}",
-                    "workspace_snapshot_ref": f"empty-workspace-{identity[:32]}",
-                    "readable_paths": (),
-                    "writable_paths": (),
-                    "command_policy": "deny",
-                    "network_policy": "deny",
-                    "expires_at_ms": 4_102_444_800_000,
-                },
+                "permission_policy_digest": self._digest(permission_policy),
+                "workspace_grant": workspace_grant,
                 "checkpoint_cursor": 0,
                 "deadline_ms": 60_000,
                 "traceparent": f"conversation-trace-{identity[:32]}",
                 "extensions": {
+                    "admission_identity_digest": identity,
                     "agent_profile_refs": agent_refs,
                     "agent_profiles_digest": self._digest(agent_snapshots),
                     "project_context_ref": project_ref,
@@ -457,6 +527,30 @@ class RuntimeQueryRouter:
                 type="query.start", command_id=admission.runtime_command_id
             ),
             envelope,
+        )
+
+    def _development_smoke(
+        self, admission: PythonTermConversationAdmission
+    ) -> bool:
+        """Preserve a ready command's frozen DEV trust across later probe changes."""
+        if self._admission_probe is None:
+            return False
+        if self._admission_coordinator is not None:
+            intent = self._admission_coordinator.intents.get(
+                admission.session_id, admission.runtime_command_id
+            )
+            if intent is not None and intent.state == "ready":
+                diagnostic = self._admission_probe.command(
+                    admission.session_id, admission.runtime_command_id
+                )
+                return bool(
+                    diagnostic is not None
+                    and diagnostic.get("trust_status") == "DEV_UNTRUSTED"
+                )
+        diagnostic = self._admission_probe.selector("python-term")
+        return (
+            diagnostic.selectable_for_new_commands
+            and diagnostic.trust_status == "DEV_UNTRUSTED"
         )
 
 
@@ -676,10 +770,21 @@ def build_app(
         if runtime_registry_v2 is not None
         else None
     )
+    runtime_admission_probe = (
+        RuntimeAdmissionProbe(
+            coordinator=runtime_admission_coordinator,
+            provider_available=any(profile.enabled for profile in providers.list()),
+            executor_available=python_term_executor is not None,
+            runtime_enabled=resolved.python_term_runtime_enabled,
+        )
+        if runtime_admission_coordinator is not None
+        else None
+    )
     runtime_query_router = RuntimeQueryRouter(
         runtime_registry_v2,
         _gate_proof=python_term_gate_proof,
         _admission_coordinator=runtime_admission_coordinator,
+        _admission_probe=runtime_admission_probe,
     )
     app = create_app(
         AppSettings(
@@ -709,6 +814,7 @@ def build_app(
                     if python_term_trust_status is None
                     else {"python-term": python_term_trust_status}
                 ),
+                admission_probe=runtime_admission_probe,
             )
         )
     app.state.agent_runtime = agent_runtime

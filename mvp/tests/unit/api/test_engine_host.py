@@ -16,6 +16,18 @@ from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from tests.fixtures.host_v2 import runtime_capabilities
 
 
+class _AdmissionProbe:
+    def selector(self, selector: str):
+        assert selector == "fake-v2"
+        return SimpleNamespace(
+            selector=selector,
+            selectable_for_new_commands=True,
+            admission_state="ready",
+            trust_status="DEV_UNTRUSTED",
+            admission_reason=None,
+        )
+
+
 class NoopRunner:
     async def execute_step(self, run_id: str, step_id: str) -> AgentStepResult:
         return AgentStepResult()
@@ -192,12 +204,16 @@ def test_v2_engine_host_diagnostic_exposes_only_safe_runtime_summary(
             "enabled": True,
             "protocol": "2.0",
             "runtimes": [
-                {
-                    "runtime_id": "fake-v2",
-                    "build_id": "fake:test",
-                    "state": "ready",
-                    "capabilities": ["query", "tools"],
-                }
+                    {
+                        "runtime_id": "fake-v2",
+                        "build_id": "fake:test",
+                        "state": "ready",
+                        "capabilities": ["query", "tools"],
+                        "selector": "fake-v2",
+                        "selectable_for_new_commands": False,
+                        "admission_state": "unavailable",
+                        "admission_reason": "catalog_unavailable",
+                    }
             ],
         }
     }
@@ -248,6 +264,37 @@ def test_v2_engine_host_diagnostic_preserves_disabled_state_after_reopen(
 
     assert response.status_code == 200
     assert response.json()["v2"]["runtimes"][0]["state"] == "disabled"
+
+
+def test_v2_engine_host_diagnostic_uses_request_time_admission_probe(
+    tmp_path: Path,
+) -> None:
+    registry = RuntimeRegistryV2(RuntimeV2Repository(tmp_path / "api.sqlite"))
+    registry.register(
+        runtime_capabilities("fake-v2", build_id="fake:test", query=True)
+    )
+    app = FastAPI()
+    app.include_router(
+        engine_host_v2_router(
+            registry, enabled=True, admission_probe=_AdmissionProbe()
+        )
+    )
+
+    response = TestClient(app).get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    item = response.json()["v2"]["runtimes"][0]
+    assert item == {
+        "runtime_id": "fake-v2",
+        "build_id": "fake:test",
+        "state": "ready",
+        "capabilities": ["query"],
+        "selector": "fake-v2",
+        "selectable_for_new_commands": True,
+        "admission_state": "ready",
+        "trust_status": "DEV_UNTRUSTED",
+    }
+    assert "digest" not in response.text
 
 
 def test_v2_engine_host_diagnostic_hides_corrupt_registration_details(

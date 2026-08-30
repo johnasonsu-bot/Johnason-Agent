@@ -63,8 +63,8 @@ export function EngineHostStatus() {
       <div className="engine-host-capabilities" aria-label="Host v2 只读诊断">
         <span>{`Host v2 · ${v2Status?.v2.enabled ? "enabled" : "disabled"}`}</span>
         {v2Status?.v2.runtimes.map((runtime) => (
-          <span key={`${runtime.runtime_id}:${runtime.build_id}`}>
-            {`${runtime.runtime_id} · ${runtime.state}`}
+          <span key={`${runtime.runtime_id}:${runtime.build_id}`} data-testid={`runtime-diagnostic-${runtime.selector}`}>
+            {`${runtime.selector} · ${runtime.admission_state} · ${runtime.trust_status ?? "UNTRUSTED"}${runtime.admission_reason ? ` · ${runtime.admission_reason}` : ""}`}
           </span>
         ))}
       </div>

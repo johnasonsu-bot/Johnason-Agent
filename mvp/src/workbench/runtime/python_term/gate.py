@@ -877,6 +877,15 @@ def _compose_python_term(
         preflight_capabilities, development_trust=development_trust
     )
 
+    workspace_path_schema = (
+        {
+            "type": "string",
+            "const": "/workspace/README.md",
+            "maxLength": 1024,
+        }
+        if development_trust is not None
+        else {"type": "string", "minLength": 1, "maxLength": 1024}
+    )
     workspace_manifest = ToolManifestEntryV2(
         tool_id="workspace.read",
         version="1",
@@ -885,9 +894,7 @@ def _compose_python_term(
         idempotency="idempotent",
         schema={
             "type": "object",
-            "properties": {
-                "path": {"type": "string", "minLength": 1, "maxLength": 1024}
-            },
+            "properties": {"path": workspace_path_schema},
             "required": ["path"],
             "additionalProperties": False,
         },
@@ -913,6 +920,13 @@ def _compose_python_term(
             "additionalProperties": False,
         },
     )
+    workspace_executor = _workspace_read_executor
+    if development_trust is not None:
+        from workbench.runtime.python_term.dev_environment import (
+            development_workspace_reader,
+        )
+
+        workspace_executor = development_workspace_reader(runtime_dir)
     workspace_descriptor = _declare_executor(
         registry,
         "python-term",
@@ -921,7 +935,7 @@ def _compose_python_term(
         ExecutorAccessV2(
             files=(ExecutorFileAccessV2(argument="path", mode="read"),)
         ),
-        _workspace_read_executor,
+        workspace_executor,
     )
     pty_worker = PtyWorker(canonical_cwd=runtime_dir.resolve())
     pty_descriptor = _declare_executor(

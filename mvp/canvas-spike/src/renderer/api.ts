@@ -112,14 +112,44 @@ export type EngineHostV2Diagnostic = {
       build_id: string;
       state: "ready" | "disabled" | "unavailable";
       capabilities: string[];
+      selector: string;
+      selectable_for_new_commands: boolean;
+      admission_state: RuntimeAdmissionState;
+      trust_status: RuntimeTrustStatus;
+      admission_reason: RuntimeAdmissionReason | null;
       last_error_category?: "capability_unavailable" | "command_rejected" | "gate_metadata_unavailable" | "registry_integrity";
     }>;
   };
 };
 
+export type RuntimeAdmissionState = "ready" | "blocked" | "unavailable";
+export type RuntimeTrustStatus = "PRODUCTION_TRUSTED" | "DEV_UNTRUSTED" | null;
+export type RuntimeAdmissionReason =
+  | "proof_quarantined"
+  | "proof_revoked"
+  | "proof_expired"
+  | "proof_missing"
+  | "executor_unavailable"
+  | "provider_unavailable"
+  | "catalog_unavailable"
+  | "runtime_disabled"
+  | "runtime_unavailable";
+
+export type RuntimeAdmissionDiagnostic = {
+  session_id: string;
+  command_id: string;
+  selector: string | null;
+  runtime_id: string | null;
+  build_id: string | null;
+  state: "absent" | "pending" | "ready" | "blocked";
+  trust_status: RuntimeTrustStatus;
+  reason_category?: RuntimeAdmissionReason | null;
+};
+
 export const engineHostApi = {
   status: () => request<EngineHostStatus>("/engine-host/status"),
   v2Status: () => request<EngineHostV2Diagnostic>("/v1/engine-host"),
+  runtimeAdmission: (sessionId: string, publicCommandId: string) => request<RuntimeAdmissionDiagnostic>(`/sessions/${encodeURIComponent(sessionId)}/runtime-admissions/${encodeURIComponent(publicCommandId)}`),
 };
 
 export type ConversationEvent = { type?: string; name?: string; delta?: string; result?: string; toolCallName?: string; value?: Record<string, unknown>; runId?: string; sequence?: number; eventId?: string; cursor?: string };

@@ -201,6 +201,233 @@ class RuntimeAdmissionResult:
     legacy: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeSelectorAdmissionDiagnostic:
+    """Public selector state derived afresh without creating admission facts."""
+
+    selector: str
+    selectable_for_new_commands: bool
+    admission_state: Literal["ready", "blocked", "unavailable"]
+    trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"] | None
+    admission_reason: (
+        Literal[
+            "proof_quarantined",
+            "proof_revoked",
+            "proof_expired",
+            "proof_missing",
+            "executor_unavailable",
+            "provider_unavailable",
+            "catalog_unavailable",
+            "runtime_disabled",
+            "runtime_unavailable",
+        ]
+        | None
+    )
+
+
+class RuntimeAdmissionProbe:
+    """Read-only request-time view over Registry, catalog and trust evidence."""
+
+    def __init__(
+        self,
+        *,
+        coordinator: "RuntimeAdmissionCoordinator",
+        provider_available: bool,
+        executor_available: bool,
+        runtime_enabled: bool,
+    ) -> None:
+        self.coordinator = coordinator
+        self.provider_available = bool(provider_available)
+        self.executor_available = bool(executor_available)
+        self.runtime_enabled = bool(runtime_enabled)
+
+    def selector(self, selector: str) -> RuntimeSelectorAdmissionDiagnostic:
+        entry = next(
+            (item for item in self.coordinator.catalog.entries if item.selector == selector),
+            None,
+        )
+        if entry is None:
+            try:
+                registered = any(
+                    item.runtime_id == selector
+                    for item in self.coordinator.registry.snapshot()
+                )
+            except RuntimeRegistryIntegrityError:
+                registered = False
+            return self._unavailable(
+                selector,
+                "proof_missing"
+                if selector == "python-term" and registered
+                else "catalog_unavailable",
+            )
+
+        trust_status, proof_reason = self._proof_state(entry)
+        if proof_reason is not None:
+            blocked = proof_reason in {"proof_quarantined", "proof_revoked"}
+            return RuntimeSelectorAdmissionDiagnostic(
+                selector=selector,
+                selectable_for_new_commands=False,
+                admission_state="blocked" if blocked else "unavailable",
+                trust_status=trust_status,
+                admission_reason=proof_reason,
+            )
+        if not self.executor_available:
+            return self._unavailable(
+                selector, "executor_unavailable", trust_status=trust_status
+            )
+        if not self.provider_available:
+            return self._unavailable(
+                selector, "provider_unavailable", trust_status=trust_status
+            )
+        if not self.runtime_enabled or not entry.enabled:
+            return self._unavailable(
+                selector, "runtime_disabled", trust_status=trust_status
+            )
+        try:
+            snapshot = next(
+                (
+                    item
+                    for item in self.coordinator.registry.snapshot()
+                    if item.runtime_id == entry.runtime_id
+                    and item.build_id == entry.build_id
+                ),
+                None,
+            )
+        except RuntimeRegistryIntegrityError:
+            snapshot = None
+        if snapshot is None:
+            return self._unavailable(
+                selector, "runtime_unavailable", trust_status=trust_status
+            )
+        if snapshot.state == "disabled":
+            return self._unavailable(
+                selector, "runtime_disabled", trust_status=trust_status
+            )
+        if snapshot.state != "ready":
+            return self._unavailable(
+                selector, "runtime_unavailable", trust_status=trust_status
+            )
+        return RuntimeSelectorAdmissionDiagnostic(
+            selector=selector,
+            selectable_for_new_commands=True,
+            admission_state="ready",
+            trust_status=trust_status,
+            admission_reason=None,
+        )
+
+    def command(self, session_id: str, command_id: str) -> dict[str, object] | None:
+        """Read one durable intent without exposing its internal identity or digests."""
+        intent = self.coordinator.intents.get(session_id, command_id)
+        if intent is None:
+            return None
+        entry = RuntimeCatalogEntry(
+            selector=intent.selector,
+            runtime_id=intent.runtime_id,
+            build_id=intent.build_id,
+            capability_digest=intent.capability_digest,
+            gate_proof_digest=intent.gate_proof_digest,
+            required_capabilities=intent.required_capabilities,
+        )
+        trust_status, proof_reason = self._proof_state(entry)
+        state = intent.state
+        reason: str | None = None
+        if proof_reason in {"proof_quarantined", "proof_revoked"}:
+            state = "blocked"
+            reason = proof_reason
+        elif proof_reason is not None:
+            reason = proof_reason
+        elif state == "blocked":
+            reason = "proof_missing"
+        return {
+            "selector": intent.selector,
+            "runtime_id": intent.runtime_id,
+            "build_id": intent.build_id,
+            "state": state,
+            "trust_status": trust_status,
+            "reason_category": reason,
+        }
+
+    def _proof_state(
+        self, entry: RuntimeCatalogEntry
+    ) -> tuple[
+        Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"] | None,
+        Literal[
+            "proof_quarantined",
+            "proof_revoked",
+            "proof_expired",
+            "proof_missing",
+        ]
+        | None,
+    ]:
+        assignments = self.coordinator.assignments
+        try:
+            now = float(self.coordinator._trusted_time())
+            with assignments.store.connect() as connection:
+                row = connection.execute(
+                    "SELECT * FROM runtime_gate_proofs_private WHERE proof_digest=?",
+                    (entry.gate_proof_digest,),
+                ).fetchone()
+                if row is None:
+                    return None, "proof_missing"
+                proof = assignments._proof_from_row(row)
+                trust_status = proof.trust_tier
+                quarantined = connection.execute(
+                    "SELECT 1 FROM runtime_security_blocks WHERE "
+                    "block_type='build' AND runtime_id=? AND subject=?",
+                    (entry.runtime_id, entry.build_id),
+                ).fetchone()
+                if quarantined is not None:
+                    return trust_status, "proof_quarantined"
+                revoked = connection.execute(
+                    "SELECT 1 FROM runtime_security_blocks WHERE "
+                    "block_type='key' AND runtime_id=? AND subject=?",
+                    (entry.runtime_id, proof.signer_key_id),
+                ).fetchone()
+                if revoked is not None:
+                    return trust_status, "proof_revoked"
+                if now < proof.issued_at or now > proof.expires_at:
+                    return trust_status, "proof_expired"
+                assignments._require_current_proof_trust(row, proof)
+                if (
+                    proof.runtime_id,
+                    proof.build_id,
+                    proof.capability_digest,
+                ) != (
+                    entry.runtime_id,
+                    entry.build_id,
+                    entry.capability_digest,
+                ):
+                    return None, "proof_missing"
+                return trust_status, None
+        except (CorruptAssignmentState, SecurityReviewBlocked, TypeError, ValueError):
+            return None, "proof_missing"
+
+    @staticmethod
+    def _unavailable(
+        selector: str,
+        reason: Literal[
+            "proof_quarantined",
+            "proof_revoked",
+            "proof_expired",
+            "proof_missing",
+            "executor_unavailable",
+            "provider_unavailable",
+            "catalog_unavailable",
+            "runtime_disabled",
+            "runtime_unavailable",
+        ],
+        *,
+        trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"] | None = None,
+    ) -> RuntimeSelectorAdmissionDiagnostic:
+        return RuntimeSelectorAdmissionDiagnostic(
+            selector=selector,
+            selectable_for_new_commands=False,
+            admission_state="unavailable",
+            trust_status=trust_status,
+            admission_reason=reason,
+        )
+
+
 class RuntimeAdmissionRepository:
     def __init__(self, database: Path) -> None:
         self.store = WorkflowStore(database)

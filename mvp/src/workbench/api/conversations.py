@@ -133,6 +133,21 @@ class MessageRequest(BaseModel):
     project_context: ProjectContextBindingRequest | None = None
 
 
+class RuntimeAdmissionDiagnostic(BaseModel):
+    """Secret-free status for one public Conversation command."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    session_id: str
+    command_id: str
+    selector: str | None = None
+    runtime_id: str | None = None
+    build_id: str | None = None
+    state: Literal["absent", "pending", "ready", "blocked"]
+    trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"] | None = None
+    reason_category: str | None = None
+
+
 class ConversationInterventionRequest(BaseModel):
     kind: Literal[
         "supplement",
@@ -250,6 +265,45 @@ def python_term_command_id(session_id: str, command_id: str) -> str:
     return "python-term-command:" + hashlib.sha256(value.encode()).hexdigest()
 
 
+def python_term_admission_identity(
+    admission: PythonTermConversationAdmission,
+) -> dict[str, object]:
+    """Return the secret-free authority snapshot pinned by one Runtime command."""
+    provider_snapshot = admission.provider.model_dump(
+        mode="json", exclude={"secret_id"}
+    )
+    provider_snapshot["capabilities"] = sorted(
+        provider_snapshot.get("capabilities", [])
+    )
+    return {
+        "runtime_command_id": admission.runtime_command_id,
+        "provider": provider_snapshot,
+        "model": admission.model,
+        "agents": [
+            profile.model_dump(mode="json") for profile in admission.agent_profiles
+        ],
+        "project": (
+            admission.project_context.model_dump(mode="json")
+            if admission.project_context is not None
+            else None
+        ),
+        "messages": [
+            {
+                "message_id": message.message_id,
+                "command_id": message.command_id,
+                "sequence": message.sequence,
+                "role": message.role,
+                "content": message.content,
+            }
+            for message in admission.messages
+            if not (
+                message.role == "assistant"
+                and message.command_id == f"{admission.command_id}:assistant"
+            )
+        ],
+    }
+
+
 class RuntimeConversationRouter(Protocol):
     """Runtime-neutral selector seam; HTTP provides only an opaque selector."""
 
@@ -287,6 +341,33 @@ class ConversationAPI:
         if self.engine is not None:
             self._ensure_lifecycle_run(session_id)
         return self.conversations.create_session(session_id)
+
+    def runtime_admission(
+        self, *, session_id: str, public_command_id: str
+    ) -> RuntimeAdmissionDiagnostic:
+        """Return only public command identity and current durable admission state."""
+        self._require_session(session_id)
+        reader = self.runtime_router or self.python_term_router
+        read = getattr(reader, "public_admission", None)
+        value = read(session_id, public_command_id) if callable(read) else None
+        if value is None:
+            return RuntimeAdmissionDiagnostic(
+                session_id=session_id,
+                command_id=public_command_id,
+                state="absent",
+            )
+        if not isinstance(value, dict):
+            raise TurnSnapshotCorruption("runtime admission diagnostic is invalid")
+        return RuntimeAdmissionDiagnostic(
+            session_id=session_id,
+            command_id=public_command_id,
+            selector=value.get("selector"),
+            runtime_id=value.get("runtime_id"),
+            build_id=value.get("build_id"),
+            state=value.get("state"),
+            trust_status=value.get("trust_status"),
+            reason_category=value.get("reason_category"),
+        )
 
     def reconcile_python_term_effect(
         self,
@@ -400,6 +481,19 @@ class ConversationAPI:
                 content=content,
                 model=model,
                 provider_id=provider_id,
+            )
+            if retry is not None:
+                return retry
+        elif runtime is not None:
+            retry = self._runtime_message_retry_response(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                model=model,
+                provider_id=provider_id,
+                runtime=runtime,
+                agent_bindings=agent_bindings,
+                project_context=project_context,
             )
             if retry is not None:
                 return retry
@@ -1940,8 +2034,7 @@ class ConversationAPI:
     ) -> dict[str, Any] | None:
         """Read an already-accepted legacy retry without waiting for its worker turn.
 
-        Python Term requests deliberately never use this fast path: their frozen
-        repository snapshots must be rebuilt under the session admission lock.
+        Explicit Runtime requests use their own frozen-snapshot retry path.
         """
         key = self._reservation_id(session_id, command_id)
         with self.events.store.connect() as connection:
@@ -1968,6 +2061,118 @@ class ConversationAPI:
         turn = self.conversations.load_turn_status(session_id, command_id)
         if turn is None:
             return None
+        queued = next(
+            (
+                item
+                for item in self.events.read_stream(f"run:{session_id}")
+                if item.event_type == "conversation.turn.queued"
+                and item.causation_id == event.event_id
+            ),
+            None,
+        )
+        if queued is None:
+            return None
+        terminal = self._terminal_response(session_id, command_id, event.event_id)
+        if terminal is not None:
+            return terminal
+        return {
+            "session_id": session_id,
+            "command_id": command_id,
+            "status": turn.status,
+            "cursor": f"{queued.sequence}:0",
+        }
+
+    def _runtime_message_retry_response(
+        self,
+        *,
+        session_id: str,
+        command_id: str,
+        content: str,
+        model: str,
+        provider_id: str | None,
+        runtime: str,
+        agent_bindings: tuple[AgentBindingRequest, ...],
+        project_context: ProjectContextBindingRequest | None,
+    ) -> dict[str, Any] | None:
+        """Return an accepted Runtime retry from its already-frozen Turn.
+
+        A ready admission is an immutable execution fact.  Retry must not ask
+        the current selector probe to rebuild its Envelope after proof trust or
+        availability changes.
+        """
+        key = self._reservation_id(session_id, command_id)
+        with self.events.store.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT domain_events.event_json FROM command_results
+                JOIN domain_events ON domain_events.event_id = command_results.event_id
+                WHERE command_results.command_id = ?
+                """,
+                (key,),
+            ).fetchone()
+        if existing is None:
+            return None
+        event = DomainEvent.model_validate_json(existing["event_json"])
+        identity = {
+            "content": content,
+            "model": model,
+            "provider_id": provider_id,
+            "runtime": runtime,
+            "agent_bindings": [
+                binding.model_dump(mode="json") for binding in agent_bindings
+            ],
+            "project_context": (
+                project_context.model_dump(mode="json")
+                if project_context is not None
+                else None
+            ),
+        }
+        expected = {
+            "session_id": session_id,
+            "kind": "message",
+            "identity_digest": self._digest(identity),
+        }
+        conflict = (
+            PythonTermAdmissionConflict
+            if runtime == "python-term"
+            else RuntimeAdmissionConflict
+        )
+        if event.event_type != "conversation.command.accepted" or event.payload != expected:
+            raise conflict()
+        turn = self.conversations.load_turn_status(session_id, command_id)
+        if turn is None:
+            return None
+        execution = turn.state.get("python_term_execution")
+        if (
+            turn.state.get("runner_mode") != "python_term"
+            or turn.state.get("runtime_id") != runtime
+            or turn.state.get("runtime_command_id")
+            != python_term_command_id(session_id, command_id)
+            or not isinstance(execution, dict)
+        ):
+            raise conflict()
+        try:
+            current_admission = self._python_term_admission(
+                session_id=session_id,
+                command_id=command_id,
+                content=content,
+                model=model,
+                provider_id=provider_id,
+                agent_bindings=agent_bindings,
+                project_context=project_context,
+            )
+        except PythonTermRuntimeUnavailable:
+            raise conflict() from None
+        current_digest = self._digest(python_term_admission_identity(current_admission))
+        envelope = execution.get("envelope")
+        extensions = envelope.get("extensions") if isinstance(envelope, dict) else None
+        frozen_digest = (
+            extensions.get("admission_identity_digest")
+            if isinstance(extensions, dict)
+            else None
+        )
+        if frozen_digest != current_digest:
+            raise conflict()
         queued = next(
             (
                 item
@@ -2411,6 +2616,22 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
             raise HTTPException(503, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @router.get(
+        "/sessions/{session_id}/runtime-admissions/{public_command_id}",
+        response_model=RuntimeAdmissionDiagnostic,
+    )
+    def runtime_admission(
+        session_id: str, public_command_id: str
+    ) -> RuntimeAdmissionDiagnostic:
+        try:
+            return api.runtime_admission(
+                session_id=session_id, public_command_id=public_command_id
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "session not found") from exc
+        except (TurnSnapshotCorruption, ValueError) as exc:
+            raise HTTPException(409, "runtime admission unavailable") from exc
 
     @router.get("/sessions/{session_id}/events")
     def session_events(

@@ -28,6 +28,7 @@ record("engine-host-env:" + JSON.stringify({
   allowlist: process.env.WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON,
   v2Enabled: process.env.WORKBENCH_ENGINE_HOST_V2_ENABLED,
   pythonTermEnabled: process.env.WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED,
+  pythonTermDevelopmentTrust: process.env.WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST,
 }));
 let bootstrap = "";
 process.stdin.setEncoding("utf8");
@@ -111,6 +112,7 @@ test("engine host JSON settings cross the sanitized backend environment unchange
       WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON: allowlist,
       WORKBENCH_ENGINE_HOST_V2_ENABLED: "true",
       WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED: "false",
+      WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST: "true",
     },
   });
 
@@ -124,6 +126,7 @@ test("engine host JSON settings cross the sanitized backend environment unchange
         allowlist,
         v2Enabled: "true",
         pythonTermEnabled: "false",
+        pythonTermDevelopmentTrust: "true",
       })}`,
     );
   } finally {

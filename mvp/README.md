@@ -258,10 +258,37 @@ cd mvp
 相等；除 manifest、signed proof 和 Python cache 等明确的运行派生文件外，任何未登记
 Python 文件或资源文件都会失败关闭。wheel 的 `.dist-info` 元数据不属于 package root。
 
-仅用于本地手工测试时，可以在独立 `HERMES_RUNTIME_DIR` 内放置
-`python-term-dev-public-key.txt` 与 `python-term-dev-signed-proof.json`，并显式设置
-`WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST=true`。此路径在公开 Runtime 诊断中固定标为
-`DEV_UNTRUSTED`，且不能覆盖生产 proof 路径或生产固定信任根。
+仅用于本地手工测试时，先用准备脚本原子创建一个全新的
+`HERMES_RUNTIME_DIR`。目标目录必须尚不存在；脚本会生成开发公钥、Python Term Gate
+proof、Runtime Admission proof、完整发布 marker 和固定只读测试 Workspace。开发私钥
+只存在于脚本进程内存，不会写入文件或输出：
+
+```bash
+cd mvp
+.venv/bin/python scripts/prepare_python_term_dev_environment.py \
+  /absolute/path/to/new-python-term-runtime
+```
+
+同一目录在 7 天有效期内重复运行只会返回 `already_prepared`，不会更换 trust root。
+目录不完整、被修改或 proof 已过期时脚本 fail closed；请选择新的空目录，不要覆盖旧目录，
+以便旧 assignment 仍可使用原信任根恢复。
+
+配置一个无需凭据的 LM Studio Provider 后，从 Electron-owned 客户端启动：
+
+```bash
+cd mvp/canvas-spike
+HERMES_RUNTIME_DIR=/absolute/path/to/new-python-term-runtime \
+WORKBENCH_ENGINE_HOST_V2_ENABLED=true \
+WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED=true \
+WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST=true \
+npm start
+```
+
+会话输入区的 Runtime 选择器只有在控制面实时验证两类 proof、Provider、executor 和
+catalog 均就绪后，才允许选择 `Python Term · DEV_UNTRUSTED`。本地 Smoke 只授权读取
+虚拟路径 `/workspace/README.md`；PTY、写文件、网络和任意命令继续拒绝。
+此路径在公开 Runtime 诊断中固定标为 `DEV_UNTRUSTED`，且不能覆盖生产 proof 路径或
+生产固定信任根。
 生产 composition 不接受任何 trust 参数；development 使用独立类型与独立 composition
 入口，无法通过标签升级为 production。
 

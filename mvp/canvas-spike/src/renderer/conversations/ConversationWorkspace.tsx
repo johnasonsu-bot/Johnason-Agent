@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { artifacts } from "../artifacts";
-import { agentApi, conversationApi, type ConversationEvent } from "../api";
+import { agentApi, conversationApi, engineHostApi, type ConversationEvent, type EngineHostV2Diagnostic } from "../api";
 import { registry } from "../renderers";
-import { Composer } from "./Composer";
+import { Composer, type RuntimeOption } from "./Composer";
 import { SessionSidebar } from "./SessionSidebar";
 import { Timeline, type TimelineEntry } from "./Timeline";
 import { createConversationCommandId } from "./commandIds";
@@ -87,9 +87,10 @@ function mapEvent(event: ConversationEvent, index: number): TimelineEntry | null
   if (event.delta) return { id, kind: "delta", title: "流式输出 · Streaming", content: event.delta, agent: "Agent / API", status: "TEXT_MESSAGE_CONTENT" };
   if (event.name === "turn_finished" || type === "RUN_FINISHED") return { id, kind: "agent", title: "执行完成 · Turn finished", content: String(value.status ?? "completed"), agent: "Agent / API", status: "completed" };
   if (event.name === "turn_failed" || type === "RUN_ERROR") return { id, kind: "agent", title: "执行失败 · Turn failed", content: String(value.reason ?? "agent_error"), agent: "Agent / API", status: "failed" };
-  if (event.name?.includes("tool") || type.startsWith("TOOL_CALL")) return { id, kind: "tool", title: "工具执行 · Tool evidence", content: String(value.public_result ?? value.result ?? event.name ?? event.toolCallName ?? "tool"), agent: "Tool / API", status: event.name?.includes("completed") || type === "TOOL_CALL_END" ? "completed" : "running" };
+  if (event.name?.includes("tool") || type.startsWith("TOOL_CALL")) return { id, kind: "tool", title: "工具执行 · Tool evidence", content: String(value.public_result ?? value.result ?? event.result ?? event.name ?? event.toolCallName ?? "tool"), agent: "Tool / API", status: event.name?.includes("completed") || type === "TOOL_CALL_END" ? "completed" : "running" };
   if (event.name?.includes("decision")) return { id, kind: "decision", title: "决策摘要 · Decision", content: String(value.summary ?? "decision"), agent: "Supervisor / API" };
   if (event.name === "conversation.status") return { id, kind: "step", title: "会话状态 · Conversation status", content: String(value.status ?? "running"), agent: "Task3 Conversation API" };
+  if (event.name === "runtime.status.changed") return { id, kind: "step", title: "Runtime 状态 · Runtime status", content: String(value.status ?? "running"), agent: "Python Term Runtime" };
   if (event.name === "turn_queued") return { id, kind: "step", title: "已排队 · Turn queued", content: `command ${String(value.command_id ?? "")}`, agent: "Conversation Worker", status: "queued" };
   return null;
 }
@@ -111,6 +112,14 @@ function statusForEvent(event: ConversationEvent): ConversationStatusProjection 
     return status === "paused"
       ? { phase: "paused", label: "已暂停 · paused", terminal: true }
       : { phase: "running", label: "执行中 · running", terminal: false };
+  }
+  if (event.name === "runtime.status.changed") {
+    const status = String(event.value?.status ?? "running");
+    if (status === "completed") return { ...completedStatus, commandId };
+    if (status === "failed" || status === "cancelled") return { phase: "failed", label: "执行失败 · failed", terminal: true, commandId };
+    if (status === "paused") return { phase: "paused", label: "已暂停 · paused", terminal: true, commandId };
+    if (status === "queued") return { phase: "queued", label: "排队中 · queued", terminal: false, commandId };
+    return { phase: "running", label: "执行中 · running", terminal: false, commandId };
   }
   if (event.name === "turn_retryable") return { phase: "retryable", label: "等待重试 · retryable", terminal: false, commandId };
   if (event.name === "turn_finished" || event.type === "RUN_FINISHED") return { ...completedStatus, commandId };
@@ -169,6 +178,8 @@ export function ConversationWorkspace() {
   const [research, setResearch] = useState(emptyResearchGraphState);
   const [selectedModel, setSelectedModel] = useState("local-agent");
   const [selectedProviderId, setSelectedProviderId] = useState("lmstudio");
+  const [selectedRuntime, setSelectedRuntime] = useState<"" | "python-term">("");
+  const [runtimeDiagnostic, setRuntimeDiagnostic] = useState<EngineHostV2Diagnostic | null>(null);
   const cursorsRef = useRef<Record<string, string>>(loadConversationCursors());
   const seenEventsRef = useRef<Record<string, Set<string>>>({});
   const watcherGenerationRef = useRef(0);
@@ -176,6 +187,15 @@ export function ConversationWorkspace() {
   const title = titles[sessionId] ?? "新建会话 · New task";
   const activeProfile = useMemo(() => agentModelProfileFor(modelProfiles, group[0] ?? "产品经理"), [group, modelProfiles]);
   const modelOptions = useMemo(() => modelProfiles.filter((profile) => profile.enabled).map((profile) => ({ id: profile.id, providerId: profile.providerId, model: profile.model, label: `${profile.name} · ${providerLabels[profile.providerId]} · ${profile.model}` })), [modelProfiles]);
+  const runtimeOptions = useMemo<RuntimeOption[]>(() => runtimeDiagnostic?.v2.runtimes
+    .filter((runtime) => runtime.selector === "python-term")
+    .map((runtime) => ({
+      selector: "python-term",
+      label: "Python Term",
+      selectable: runtime.selectable_for_new_commands,
+      trustStatus: runtime.trust_status,
+      reason: runtime.admission_reason,
+    })) ?? [], [runtimeDiagnostic]);
   const selectedProviderLabel = providerLabels[selectedProviderId as keyof typeof providerLabels] ?? selectedProviderId;
   const artifact = useMemo(() => artifacts.find((candidate) => candidate.id === artifactId) ?? artifacts[0], [artifactId]);
   const Renderer = registry.resolve(artifact.kind);
@@ -196,7 +216,11 @@ export function ConversationWorkspace() {
       if (!active || watcherGenerationRef.current !== generation) return;
       try {
         await conversationApi.createSession(sessionId);
-        const events = await conversationApi.events(sessionId, hydratedGraph ? cursorsRef.current[sessionId] : undefined);
+        const resumeCursor = cursorsRef.current[sessionId];
+        const events = await conversationApi.events(sessionId, resumeCursor);
+        const graphEvents = !hydratedGraph && resumeCursor
+          ? await conversationApi.events(sessionId)
+          : events;
         if (!active || watcherGenerationRef.current !== generation) return;
         const fresh = events.filter((event) => {
           const id = event.cursor ?? event.eventId ?? `${event.sequence ?? ""}:${event.name ?? event.type ?? ""}`;
@@ -206,8 +230,9 @@ export function ConversationWorkspace() {
         });
         const mapped = fresh.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry));
         if (!hydratedGraph) {
-          setSequential(events.reduce(reduceSequentialEvent, emptySequentialState()));
-          setResearch(events.reduce(reduceResearchEvent, emptyResearchGraphState()));
+          setSequential(graphEvents.reduce(reduceSequentialEvent, emptySequentialState()));
+          setResearch(graphEvents.reduce(reduceResearchEvent, emptyResearchGraphState()));
+          setStatusProjection(graphEvents.reduce(reduceConversationStatus, readyStatus));
           hydratedGraph = true;
         } else if (fresh.length) {
           setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
@@ -246,6 +271,21 @@ export function ConversationWorkspace() {
 
   useEffect(() => {
     let active = true;
+    const refreshRuntimeStatus = async () => {
+      try {
+        const diagnostic = await engineHostApi.v2Status();
+        if (active) setRuntimeDiagnostic(diagnostic);
+      } catch {
+        if (active) setRuntimeDiagnostic(null);
+      }
+    };
+    void refreshRuntimeStatus();
+    const timer = window.setInterval(() => void refreshRuntimeStatus(), 5_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
     void agentApi.list().then((records) => {
       if (active) setModelProfiles(mergeAgentRecords(records));
     }).catch(() => { /* Agent settings displays the actionable backend error. */ });
@@ -274,6 +314,15 @@ export function ConversationWorkspace() {
     return next;
   });
   const send = (prompt: string, contexts: string[] = []) => {
+    const chosenRuntime = selectedRuntime
+      ? runtimeOptions.find((option) => option.selector === selectedRuntime)
+      : undefined;
+    if (selectedRuntime && chosenRuntime?.selectable !== true) {
+      const reason = chosenRuntime?.reason ?? "runtime_unavailable";
+      setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
+      setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · Runtime admission", content: reason, agent: "Runtime Admission API", status: "failed" }]);
+      return;
+    }
     const apiPrompt = contexts.length ? `${prompt}\n\n[本轮上下文]\n${contexts.map((context) => `- ${context}`).join("\n")}` : prompt;
     addUserEntry(prompt);
     let agentBindings: Array<{ agent_id: string; expected_version: number }> = [];
@@ -288,7 +337,7 @@ export function ConversationWorkspace() {
     setPending(true);
     setStatusProjection({ phase: "queued", label: "排队中 · queued", terminal: false });
     const commandId = createConversationCommandId("message", sessionId);
-    void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId, agentBindings).then((result) => {
+    void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId, agentBindings, selectedRuntime || undefined).then((result) => {
       setSource("Task 3 REST/SSE · queued");
       if (result.cursor) {
         cursorsRef.current[sessionId] = result.cursor;
@@ -298,8 +347,25 @@ export function ConversationWorkspace() {
         setStatusProjection({ phase: "paused", label: "已暂停 · paused", terminal: true });
         setPending(false);
       }
-    }).catch((error: unknown) => {
-      const reason = describeConversationError(error);
+      if (selectedRuntime) {
+        void engineHostApi.runtimeAdmission(sessionId, result.command_id).then((admission) => {
+          if (admission.state === "blocked") {
+            setStatusProjection({ phase: "failed", label: `执行失败 · ${admission.reason_category ?? "runtime_unavailable"}`, terminal: true });
+            setPending(false);
+          }
+        }).catch(() => { /* SSE remains authoritative when the read-only diagnostic is temporarily unavailable. */ });
+      }
+    }).catch(async (error: unknown) => {
+      let reason = describeConversationError(error);
+      if (selectedRuntime) {
+        try {
+          const diagnostic = await engineHostApi.v2Status();
+          setRuntimeDiagnostic(diagnostic);
+          reason = diagnostic.v2.runtimes.find((runtime) => runtime.selector === selectedRuntime)?.admission_reason ?? reason;
+        } catch {
+          // Preserve the original stable HTTP category when diagnostics are unavailable.
+        }
+      }
       setSource("Task 3 API error");
       setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
       setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · API diagnosis", content: `conversation.messages → ${reason}`, agent: "Task3 Conversation API", status: "failed" }]);
@@ -342,7 +408,7 @@ export function ConversationWorkspace() {
         <GraphRun state={research} onResume={resumeResearch} sessionId={sessionId} />
       </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
-      <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} />
+      <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} runtime={selectedRuntime} runtimeOptions={runtimeOptions} onRuntimeChange={setSelectedRuntime} />
     </main>
     {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header>{htmlArtifact ? <HtmlArtifactPreview artifactId={htmlArtifact.artifactId} /> : <><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section></>}<section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>当前结果 · 历史 Attempt · 审核证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
   </section>;

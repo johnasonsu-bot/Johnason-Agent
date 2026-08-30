@@ -17,7 +17,11 @@ from fastapi.testclient import TestClient
 import workbench.main as main
 from tests.fixtures.host_v2 import run_envelope, runtime_capabilities
 from workbench.api.app import AppSettings, create_app
-from workbench.api.conversations import python_term_command_id
+from workbench.api.conversations import (
+    PythonTermConversationAdmission,
+    python_term_command_id,
+)
+from workbench.conversations.models import ConversationMessage
 from workbench.conversations.repository import ConversationRepository
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.providers.repository import ProviderRepository
@@ -44,6 +48,7 @@ from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeAdmissionUnavailable,
     RuntimeCatalog,
     RuntimeCatalogEntry,
+    RuntimeAdmissionProbe,
 )
 from workbench.protocol.events import DomainEvent
 from workbench.workflow.event_store import EventStore
@@ -147,6 +152,277 @@ def _admit(coordinator: RuntimeAdmissionCoordinator, *, command_id: str = "comma
     )
 
 
+def test_request_time_probe_reports_ready_then_revoked_without_creating_admission(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite"
+    coordinator, intents, registry, assignments, key = _admission_system(database)
+    probe = RuntimeAdmissionProbe(
+        coordinator=coordinator,
+        provider_available=True,
+        executor_available=True,
+        runtime_enabled=True,
+    )
+
+    ready = probe.selector("python-term")
+
+    assert ready.selector == "python-term"
+    assert ready.selectable_for_new_commands is True
+    assert ready.admission_state == "ready"
+    assert ready.trust_status == "DEV_UNTRUSTED"
+    assert ready.admission_reason is None
+    with intents.store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM runtime_admission_intents"
+        ).fetchone()[0] == 0
+
+    assignments.revoke_key("python-term", key.key_id, trusted_time=31.0)
+    revoked = probe.selector("python-term")
+
+    assert revoked.selectable_for_new_commands is False
+    assert revoked.admission_state == "blocked"
+    assert revoked.trust_status == "DEV_UNTRUSTED"
+    assert revoked.admission_reason == "proof_revoked"
+
+
+def test_request_time_probe_uses_stable_unavailable_priority(tmp_path: Path) -> None:
+    coordinator, _, _, _, _ = _admission_system(
+        tmp_path / "missing.sqlite", with_proof=False
+    )
+    probe = RuntimeAdmissionProbe(
+        coordinator=coordinator,
+        provider_available=False,
+        executor_available=False,
+        runtime_enabled=False,
+    )
+
+    diagnostic = probe.selector("python-term")
+
+    assert diagnostic.selectable_for_new_commands is False
+    assert diagnostic.admission_state == "unavailable"
+    assert diagnostic.trust_status is None
+    assert diagnostic.admission_reason == "proof_missing"
+
+
+def test_request_time_probe_quarantine_precedes_revoke_and_expiry(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, assignments, key = _admission_system(tmp_path / "state.sqlite")
+    coordinator._trusted_time = lambda: 101.0
+    assignments.revoke_key("python-term", key.key_id, trusted_time=31.0)
+    assignments.quarantine_build("python-term", "python-term:test", trusted_time=32.0)
+    probe = RuntimeAdmissionProbe(
+        coordinator=coordinator,
+        provider_available=False,
+        executor_available=False,
+        runtime_enabled=False,
+    )
+
+    diagnostic = probe.selector("python-term")
+
+    assert diagnostic.admission_state == "blocked"
+    assert diagnostic.admission_reason == "proof_quarantined"
+    assert diagnostic.trust_status == "DEV_UNTRUSTED"
+
+
+def test_request_time_probe_expiry_precedes_executor_provider_and_runtime(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, _, _, _ = _admission_system(tmp_path / "state.sqlite")
+    coordinator._trusted_time = lambda: 101.0
+    probe = RuntimeAdmissionProbe(
+        coordinator=coordinator,
+        provider_available=False,
+        executor_available=False,
+        runtime_enabled=False,
+    )
+
+    diagnostic = probe.selector("python-term")
+
+    assert diagnostic.admission_state == "unavailable"
+    assert diagnostic.admission_reason == "proof_expired"
+    assert diagnostic.trust_status == "DEV_UNTRUSTED"
+
+
+def test_explicit_dev_admission_freezes_only_readonly_smoke_workspace(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite"
+    coordinator, _, registry, _, _ = _admission_system(database)
+    app = _conversation_app(database, coordinator, registry)
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/sessions", json={"session_id": "session-1"}
+        ).status_code == 200
+        accepted = client.post(
+            "/api/sessions/session-1/messages",
+            headers={"Idempotency-Key": "public-command"},
+            json={
+                "content": "read /workspace/README.md",
+                "runtime": "python-term",
+            },
+        )
+
+    assert accepted.status_code == 202
+    turn = ConversationRepository(database).load_turn_status(
+        "session-1", "public-command"
+    )
+    assert turn is not None
+    snapshot = turn.state["python_term_execution"]
+    envelope = snapshot["envelope"]
+    assert [item["tool_id"] for item in envelope["tool_manifest"]] == [
+        "workspace.read"
+    ]
+    assert envelope["workspace_grant"] == {
+        "grant_id": "python-term-dev-smoke",
+        "workspace_snapshot_ref": "python-term-dev-smoke",
+        "readable_paths": ["/workspace/README.md"],
+        "writable_paths": [],
+        "command_policy": "deny",
+        "network_policy": "deny",
+        "expires_at_ms": 4_102_444_800_000,
+    }
+    assert snapshot["permission_policy"] == {
+        "tool_policy": "allow",
+        "filesystem_policy": "allow",
+    }
+    assert snapshot["effect_scope"] == {
+        "scope_id": envelope["term_id"].replace(
+            "conversation-term-", "conversation-scope-"
+        ),
+        "write_effects": False,
+        "allowed_tool_ids": ["workspace.read"],
+    }
+    assert "pty.run" not in json.dumps(snapshot, sort_keys=True)
+    with TestClient(app) as client:
+        diagnostic = client.get(
+            "/api/sessions/session-1/runtime-admissions/public-command"
+        )
+    assert diagnostic.status_code == 200
+    assert diagnostic.json() == {
+        "session_id": "session-1",
+        "command_id": "public-command",
+        "selector": "python-term",
+        "runtime_id": "python-term",
+        "build_id": "python-term:test",
+        "state": "ready",
+        "trust_status": "DEV_UNTRUSTED",
+        "reason_category": None,
+    }
+
+
+@pytest.mark.parametrize("change", ("expired", "revoked", "restart"))
+def test_ready_runtime_retry_reuses_frozen_dev_envelope_when_current_probe_changes(
+    tmp_path: Path, change: str
+) -> None:
+    database = tmp_path / f"{change}.sqlite"
+    coordinator, _, registry, assignments, key = _admission_system(database)
+    app = _conversation_app(database, coordinator, registry)
+    request = {
+        "content": "read /workspace/README.md",
+        "runtime": "python-term",
+    }
+    headers = {"Idempotency-Key": "public-command"}
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/sessions", json={"session_id": "session-1"}
+        ).status_code == 200
+        first = client.post(
+            "/api/sessions/session-1/messages", headers=headers, json=request
+        )
+    assert first.status_code == 202
+    before = ConversationRepository(database).load_turn_status(
+        "session-1", "public-command"
+    )
+    assert before is not None
+    frozen = json.loads(json.dumps(before.state["python_term_execution"]))
+
+    retry_app = app
+    if change == "expired":
+        coordinator._trusted_time = lambda: 101.0
+    elif change == "revoked":
+        assignments.revoke_key("python-term", key.key_id, trusted_time=31.0)
+    else:
+        restarted = RuntimeAdmissionCoordinator(
+            catalog=coordinator.catalog,
+            registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+            assignments=AssignmentRepository.development(database, trust_keys=(key,)),
+            intents=RuntimeAdmissionRepository(database),
+            trusted_time=lambda: 30.0,
+        )
+        retry_app = _conversation_app(database, restarted, restarted.registry)
+
+    with TestClient(retry_app) as client:
+        retried = client.post(
+            "/api/sessions/session-1/messages", headers=headers, json=request
+        )
+
+    assert retried.status_code in {200, 202}, retried.text
+    after = ConversationRepository(database).load_turn_status(
+        "session-1", "public-command"
+    )
+    assert after is not None
+    assert after.state["python_term_execution"] == frozen
+    assert after.state["python_term_execution"]["permission_policy"] == {
+        "tool_policy": "allow",
+        "filesystem_policy": "allow",
+    }
+
+
+def test_ready_intent_without_turn_reuses_frozen_dev_envelope_after_revocation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite"
+    coordinator, _, registry, assignments, key = _admission_system(database)
+    probe = RuntimeAdmissionProbe(
+        coordinator=coordinator,
+        provider_available=True,
+        executor_available=True,
+        runtime_enabled=True,
+    )
+    router = main.RuntimeQueryRouter(
+        registry,
+        _admission_coordinator=coordinator,
+        _admission_probe=probe,
+    )
+    admission = PythonTermConversationAdmission(
+        session_id="session-1",
+        command_id="public-command",
+        runtime_command_id=python_term_command_id("session-1", "public-command"),
+        provider=ProviderProfileRecord(
+            id="provider-1",
+            name="Provider",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234",
+            model_aliases={"default": "configured-model"},
+        ),
+        model="configured-model",
+        agent_profiles=(),
+        project_context=None,
+        messages=(
+            ConversationMessage(
+                message_id="message-1",
+                session_id="session-1",
+                command_id="public-command:user",
+                sequence=1,
+                role="user",
+                content="read the smoke workspace",
+            ),
+        ),
+    )
+
+    first = router.route_conversation_query(admission=admission)
+    assignments.revoke_key("python-term", key.key_id, trusted_time=31.0)
+    replay = router.route_conversation_query(admission=admission)
+
+    assert replay.execution_snapshot == first.execution_snapshot
+    assert replay.execution_snapshot["permission_policy"] == {
+        "tool_policy": "allow",
+        "filesystem_policy": "allow",
+    }
+
+
 def _conversation_app(
     database: Path,
     coordinator: RuntimeAdmissionCoordinator,
@@ -167,7 +443,14 @@ def _conversation_app(
             runner=_Runner(),
             owner_id="api",
             runtime_router=main.RuntimeQueryRouter(
-                registry, _admission_coordinator=coordinator
+                registry,
+                _admission_coordinator=coordinator,
+                _admission_probe=RuntimeAdmissionProbe(
+                    coordinator=coordinator,
+                    provider_available=True,
+                    executor_available=True,
+                    runtime_enabled=True,
+                ),
             ),
         )
     )

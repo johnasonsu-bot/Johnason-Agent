@@ -40,13 +40,15 @@ function isApiRequest(value: unknown): value is ApiRequest {
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
     const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
     const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events|interventions|pause|resume))?)?$/.exec(request.path);
+    const runtimeAdmissionPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/runtime-admissions\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
     const orchestrationResumePath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orchestrations\/[A-Za-z0-9_-]{1,128}\/resume$/.exec(request.path);
     const agentPath = /^\/agents(?:\/[A-Za-z0-9_-]{1,64})?$/.exec(request.path);
     const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}$/i.exec(request.path);
     const graphPlanPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/plans(?:\/[A-Za-z0-9._:-]{1,128}\/versions\/\d+(?:\/(approve|replan))?)?$/.exec(request.path);
     const graphInterruptPath = /^\/graph-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
     const developmentInterruptPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/development-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
-    if (!providerPath && !conversationPath && !orchestrationResumePath && !agentPath && !artifactPath && !graphPlanPath && !graphInterruptPath && !developmentInterruptPath) return false;
+    if (!providerPath && !conversationPath && !runtimeAdmissionPath && !orchestrationResumePath && !agentPath && !artifactPath && !graphPlanPath && !graphInterruptPath && !developmentInterruptPath) return false;
+    if (runtimeAdmissionPath) return request.method === "GET";
     if (developmentInterruptPath) return request.method === "POST";
     if (graphInterruptPath) return request.method === "POST";
     if (graphPlanPath) {
@@ -113,6 +115,7 @@ function childEnvironment(): NodeJS.ProcessEnv {
     "WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON",
     "WORKBENCH_ENGINE_HOST_V2_ENABLED",
     "WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED",
+    "WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST",
   ]) {
     if (process.env[name] !== undefined) safe[name] = process.env[name];
   }
