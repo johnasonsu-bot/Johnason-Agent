@@ -280,6 +280,18 @@ class RecoveryOutcome:
     lease: RuntimeInstanceLease | None
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryRecord:
+    source_lease_id: str
+    source_assignment_digest: str
+    source_attempt: int
+    source_lease_generation_seq: int
+    decision: Literal[
+        "release_retry", "read_only_retry", "reuse_committed_write", "reconcile", "released"
+    ]
+    lease: RuntimeInstanceLease | None
+
+
 class _RuntimeEvidenceAuthority:
     """Internal execution-side writer; lease owners never receive this capability."""
 
@@ -793,7 +805,7 @@ class AssignmentRepository:
                     raise LeaseConflict("effect digest changed at the same state")
                 return current
             legal = {
-                "none": {"read_only"},
+                "none": {"read_only", "committed_write", "unknown_write"},
                 "read_only": {"committed_write", "unknown_write"},
                 "committed_write": set(),
                 "unknown_write": set(),
@@ -837,24 +849,25 @@ class AssignmentRepository:
             if persisted is not None:
                 return persisted
             lease = self._load_lease(connection, lease_id)
+            source = lease
             if lease.expires_at >= now:
                 raise LeaseConflict("lease is not expired")
             evidence = self._load_evidence(connection, lease_id)
             if lease.state == "released":
                 outcome = RecoveryOutcome("released", None)
-                self._write_recovery(connection, lease_id, outcome, now)
+                self._write_recovery(connection, source, outcome, now)
                 return outcome
             if lease.state in {"terminal", "reconciliation_required"}:
                 self._recovery_state(connection, lease, "released", now)
                 outcome = RecoveryOutcome("released", None)
-                self._write_recovery(connection, lease_id, outcome, now)
+                self._write_recovery(connection, source, outcome, now)
                 return outcome
             if lease.state == "accepting":
                 self._recovery_state(
                     connection, lease, "reconciliation_required", now
                 )
                 outcome = RecoveryOutcome("reconcile", None)
-                self._write_recovery(connection, lease_id, outcome, now)
+                self._write_recovery(connection, source, outcome, now)
                 return outcome
             decision = "reconcile"
             retry = False
@@ -870,14 +883,14 @@ class AssignmentRepository:
                 elif evidence.acceptance_digest is not None and evidence.effect_state == "committed_write":
                     self._recovery_state(connection, lease, "terminal", now)
                     outcome = RecoveryOutcome("reuse_committed_write", None)
-                    self._write_recovery(connection, lease_id, outcome, now)
+                    self._write_recovery(connection, source, outcome, now)
                     return outcome
             if not retry:
                 self._recovery_state(
                     connection, lease, "reconciliation_required", now
                 )
                 outcome = RecoveryOutcome("reconcile", None)
-                self._write_recovery(connection, lease_id, outcome, now)
+                self._write_recovery(connection, source, outcome, now)
                 return outcome
             self._require_assignment_execution_trust(connection, lease.assignment_digest)
             for field, value in (("instance_id", instance_id), ("instance_nonce", instance_nonce),
@@ -904,7 +917,7 @@ class AssignmentRepository:
                 owner=owner, fence_token=fence_token, expires_at=expiry, now=now,
             )
             outcome = RecoveryOutcome(decision, new_lease)
-            self._write_recovery(connection, lease_id, outcome, now)
+            self._write_recovery(connection, source, outcome, now)
             return outcome
         return self._transaction(recover)
 
@@ -974,16 +987,33 @@ class AssignmentRepository:
             return None
         try:
             document = json.loads(row["outcome_json"])
-            lease_document = document.get("lease")
-            lease = (
-                None if lease_document is None else RuntimeInstanceLease(**lease_document)
+            record = _RecoveryRecord(
+                source_lease_id=document["source_lease_id"],
+                source_assignment_digest=document["source_assignment_digest"],
+                source_attempt=document["source_attempt"],
+                source_lease_generation_seq=document["source_lease_generation_seq"],
+                decision=document["decision"],
+                lease=(
+                    None
+                    if document.get("lease") is None
+                    else RuntimeInstanceLease(**document["lease"])
+                ),
             )
-            outcome = RecoveryOutcome(document["decision"], lease)
-            encoded = canonical_json(asdict(outcome))
+            encoded = canonical_json(asdict(record))
             if (encoded != row["outcome_json"] or _digest(encoded) != row["outcome_digest"] or
-                    outcome.decision != row["decision"] or
-                    (None if lease is None else lease.lease_id) != row["new_lease_id"]):
+                    record.source_lease_id != row["source_lease_id"] or
+                    record.source_assignment_digest != row["source_assignment_digest"] or
+                    record.source_attempt != row["source_attempt"] or
+                    record.source_lease_generation_seq != row["source_lease_generation_seq"] or
+                    record.decision != row["decision"] or
+                    (None if record.lease is None else record.lease.lease_id) != row["new_lease_id"]):
                 raise ValueError
+            source = self._load_lease(connection, record.source_lease_id)
+            if (source.assignment_digest != record.source_assignment_digest or
+                    source.attempt != record.source_attempt or
+                    source.lease_generation_seq != record.source_lease_generation_seq):
+                raise ValueError
+            lease = record.lease
             if lease is not None:
                 durable = connection.execute(
                     "SELECT assignment_digest, attempt, lease_generation_seq "
@@ -993,20 +1023,44 @@ class AssignmentRepository:
                     lease.assignment_digest, lease.attempt, lease.lease_generation_seq
                 ):
                     raise ValueError
-            return outcome
+                if (lease.assignment_digest != source.assignment_digest or
+                        lease.attempt != source.attempt + 1 or lease.state != "reserved" or
+                        record.decision not in {"release_retry", "read_only_retry"}):
+                    raise ValueError
+            elif record.decision in {"release_retry", "read_only_retry"}:
+                raise ValueError
+            expected_source_state = {
+                "release_retry": "released",
+                "read_only_retry": "released",
+                "reuse_committed_write": "terminal",
+                "reconcile": "reconciliation_required",
+                "released": "released",
+            }[record.decision]
+            if source.state != expected_source_state:
+                raise ValueError
+            return RecoveryOutcome(record.decision, lease)
         except Exception as error:
             raise CorruptAssignmentState("runtime lease recovery is corrupt") from error
 
     @staticmethod
     def _write_recovery(
-        connection: sqlite3.Connection, source_lease_id: str,
+        connection: sqlite3.Connection, source: RuntimeInstanceLease,
         outcome: RecoveryOutcome, now: float,
     ) -> None:
-        encoded = canonical_json(asdict(outcome))
+        record = _RecoveryRecord(
+            source_lease_id=source.lease_id,
+            source_assignment_digest=source.assignment_digest,
+            source_attempt=source.attempt,
+            source_lease_generation_seq=source.lease_generation_seq,
+            decision=outcome.decision,
+            lease=outcome.lease,
+        )
+        encoded = canonical_json(asdict(record))
         try:
             connection.execute(
-                "INSERT INTO runtime_lease_recoveries VALUES(?,?,?,?,?,?)",
-                (source_lease_id, outcome.decision,
+                "INSERT INTO runtime_lease_recoveries VALUES(?,?,?,?,?,?,?,?,?)",
+                (source.lease_id, source.assignment_digest, source.attempt,
+                 source.lease_generation_seq, outcome.decision,
                  None if outcome.lease is None else outcome.lease.lease_id,
                  encoded, _digest(encoded), now),
             )

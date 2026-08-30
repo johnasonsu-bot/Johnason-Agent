@@ -450,7 +450,7 @@ def test_schema_upgrade_from_v23_preserves_old_pin_and_concurrent_init(tmp_path:
         assert connection.execute(
             "SELECT command_id, runtime_id FROM runtime_v2_command_pins"
         ).fetchone() == ("legacy", "old")
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 26
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 27
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_lease_evidence'"
         ).fetchone() == ("runtime_lease_evidence",)
@@ -624,6 +624,122 @@ def test_concurrent_authoritative_evidence_is_idempotent_and_invalid_state_rejec
             lease.lease_id, assignment_digest=assignment.assignment_digest,
             attempt=0, lease_generation_seq=lease.lease_generation_seq,
             effect_state="invalid", effect_digest="b" * 64, trusted_time=43.0,
+        )
+
+
+@pytest.mark.parametrize("terminal_state", ["committed_write", "unknown_write"])
+def test_effect_may_move_directly_from_none_to_terminal(
+    tmp_path: Path, terminal_state: str
+) -> None:
+    repository, assignment = _admitted(tmp_path / f"{terminal_state}.sqlite")
+    lease = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=80.0, trusted_time=40.0,
+    )
+    for state in ("starting", "accepting"):
+        lease = repository.transition_lease(
+            lease.lease_id, expected_state=lease.state, new_state=state, attempt=0,
+            owner="o", lease_generation_seq=lease.lease_generation_seq,
+            fence_token="f", trusted_time=41.0,
+        )
+    authority = repository._execution_authority()
+    authority.record_acceptance(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        acceptance_cursor=1, acceptance_digest="a" * 64, trusted_time=42.0,
+    )
+    lease = repository.transition_lease(
+        lease.lease_id, expected_state="accepting", new_state="accepted", attempt=0,
+        owner="o", lease_generation_seq=lease.lease_generation_seq,
+        fence_token="f", trusted_time=43.0,
+    )
+    effect = authority.record_effect(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        effect_state=terminal_state, effect_digest="b" * 64, trusted_time=44.0,
+    )
+    assert effect.effect_state == terminal_state
+
+
+def test_concurrent_different_terminal_effects_allow_exactly_one(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite"
+    repository, assignment = _admitted(database)
+    lease = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=80.0, trusted_time=40.0,
+    )
+    for state in ("starting", "accepting"):
+        lease = repository.transition_lease(
+            lease.lease_id, expected_state=lease.state, new_state=state, attempt=0,
+            owner="o", lease_generation_seq=lease.lease_generation_seq,
+            fence_token="f", trusted_time=41.0,
+        )
+    repository._execution_authority().record_acceptance(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        acceptance_cursor=1, acceptance_digest="a" * 64, trusted_time=42.0,
+    )
+    lease = repository.transition_lease(
+        lease.lease_id, expected_state="accepting", new_state="accepted", attempt=0,
+        owner="o", lease_generation_seq=lease.lease_generation_seq,
+        fence_token="f", trusted_time=43.0,
+    )
+
+    def finish(state: str) -> str:
+        try:
+            AssignmentRepository.development(
+                database, trust_keys=(_DEV_KEY,)
+            )._execution_authority().record_effect(
+                lease.lease_id, assignment_digest=assignment.assignment_digest,
+                attempt=0, lease_generation_seq=lease.lease_generation_seq,
+                effect_state=state, effect_digest=("b" if state == "committed_write" else "c") * 64,
+                trusted_time=44.0,
+            )
+            return "written"
+        except LeaseConflict:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(finish, ("committed_write", "unknown_write"))) == [
+            "conflict", "written"
+        ]
+
+
+@pytest.mark.parametrize("tamper", ["primary_key", "source_assignment"])
+def test_recovery_record_identity_tamper_fails_closed(tmp_path: Path, tamper: str) -> None:
+    database = tmp_path / "state.sqlite"
+    repository, assignment = _admitted(database)
+    source = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=45.0, trusted_time=40.0,
+    )
+    repository.recover_expired_lease(
+        source.lease_id, owner="next", instance_id="i2", instance_nonce="n2",
+        host_generation="g2", client_lease_id="c2", fence_token="f2",
+        expires_at=80.0, trusted_time=50.0,
+    )
+    lookup = source.lease_id
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        if tamper == "primary_key":
+            lookup = "lease-tampered"
+            connection.execute(
+                "UPDATE runtime_lease_recoveries SET source_lease_id=? WHERE source_lease_id=?",
+                (lookup, source.lease_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE runtime_lease_recoveries SET source_assignment_digest=? WHERE source_lease_id=?",
+                ("f" * 64, source.lease_id),
+            )
+    with pytest.raises(CorruptAssignmentState):
+        repository.recover_expired_lease(
+            lookup, owner="ignored", instance_id="ignored-i", instance_nonce="ignored-n",
+            host_generation="ignored-g", client_lease_id="ignored-c", fence_token="ignored-f",
+            expires_at=90.0, trusted_time=51.0,
         )
 
 

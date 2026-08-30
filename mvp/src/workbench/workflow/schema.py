@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 26
+PHASE1_SCHEMA_VERSION = 27
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -197,6 +197,9 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         );
         CREATE TABLE IF NOT EXISTS runtime_lease_recoveries (
             source_lease_id TEXT PRIMARY KEY,
+            source_assignment_digest TEXT NOT NULL,
+            source_attempt INTEGER NOT NULL,
+            source_lease_generation_seq INTEGER NOT NULL,
             decision TEXT NOT NULL,
             new_lease_id TEXT,
             outcome_json TEXT NOT NULL,
@@ -696,6 +699,15 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection, "runtime_instance_leases", "lease_record_digest", "TEXT"
     )
+    _add_column_if_missing(
+        connection, "runtime_lease_recoveries", "source_assignment_digest", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "runtime_lease_recoveries", "source_attempt", "INTEGER"
+    )
+    _add_column_if_missing(
+        connection, "runtime_lease_recoveries", "source_lease_generation_seq", "INTEGER"
+    )
     for row in connection.execute(
         "SELECT lease_id, record_json FROM runtime_instance_leases WHERE lease_record_digest IS NULL"
     ).fetchall():
@@ -721,6 +733,31 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         connection.execute(
             "UPDATE runtime_instance_leases SET record_json=?, lease_record_digest=? WHERE lease_id=?",
             (migrated_record, digest, row["lease_id"]),
+        )
+    for row in connection.execute(
+        "SELECT r.*, l.assignment_digest, l.attempt, l.lease_generation_seq "
+        "FROM runtime_lease_recoveries r JOIN runtime_instance_leases l "
+        "ON l.lease_id=r.source_lease_id WHERE r.source_assignment_digest IS NULL"
+    ).fetchall():
+        old = json.loads(row["outcome_json"])
+        migrated = {
+            "source_lease_id": row["source_lease_id"],
+            "source_assignment_digest": row["assignment_digest"],
+            "source_attempt": row["attempt"],
+            "source_lease_generation_seq": row["lease_generation_seq"],
+            "decision": old["decision"],
+            "lease": old.get("lease"),
+        }
+        encoded = json.dumps(
+            migrated, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        connection.execute(
+            "UPDATE runtime_lease_recoveries SET source_assignment_digest=?, "
+            "source_attempt=?, source_lease_generation_seq=?, outcome_json=?, "
+            "outcome_digest=? WHERE source_lease_id=?",
+            (row["assignment_digest"], row["attempt"], row["lease_generation_seq"],
+             encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+             row["source_lease_id"]),
         )
     _add_column_if_missing(connection, "python_terms", "identity_json", "TEXT")
     _add_column_if_missing(connection, "python_steps", "identity_json", "TEXT")
