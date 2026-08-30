@@ -25,6 +25,8 @@
 | AR-5 | ADR/taint/capability/intervention | 6–10 | `GO_ADR_DEFENSE_GATE` |
 | Final | 三 Runtime + 五门禁联合回归和用户环境 | 5–8 | `GO_AGENT_RELIABILITY_STACK` |
 
+安全专项不嵌入每个 Task 的修复轮次。P0 完成后执行一次 `P0_SECURITY_AUDIT`，P1 完成后执行一次 `P1_SECURITY_AUDIT`，P2 完成后执行一次 `P2_SECURITY_AUDIT`；审计发现的问题进入独立整改批次，不与普通功能修复轮混在一起。
+
 P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日。该估算不包含等待外部 CI/KMS 签名、真实 Provider 账号或上游兼容修复的时间。
 
 ## 2. 依赖与可并行项
@@ -67,5 +69,7 @@ P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日�
 
 - 每个 Task TDD、单独提交、规格审核和代码质量审核。
 - 每轮最多 5 次修复；超出后记录 blocker，不能无限补丁。
+- Task 级审核聚焦规格、正确性、恢复一致性和代码质量，不重复执行广泛安全巡检；API Key/Token/密码不得写入代码的红线始终有效。
+- 安全威胁建模、信任边界、秘密扫描、依赖供应链和攻击型审计统一放在 P0/P1/P2 里程碑安全审计中执行。
 - Fixture 只验证合同，不满足真实 Runtime Gate。
 - 每个 Smoke Gate 均需提供用户可操作环境；每个 Final Gate 需包含 crash/restart、duplicate command、Effect reconciliation 和 secret scan。

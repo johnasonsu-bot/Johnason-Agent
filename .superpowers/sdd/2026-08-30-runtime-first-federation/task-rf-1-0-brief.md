@@ -46,4 +46,4 @@ Create runtime-neutral durable contracts for trusted runtime proof, immutable co
 - Focused red/green tests;
 - Host v2 contract/identity/repository/registry regression;
 - Python Term routing/compatibility regression;
-- compile, diff, manifest and changed-credential scans.
+- compile, diff and manifest consistency. Broad security and credential audits run once at the P0 milestone, not in each Task round.
