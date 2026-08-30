@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "379310a85d8e0ab71964182280835f8c8ccb71757dd17fdefe4f1b7f69e36ec7",
-      "size": 1536047
+      "sha256": "4d44025b8196f0e71470bb6d47ec84d75614817eaac5de008ef73e561896887b",
+      "size": 1555958
     },
     {
       "path": "uv.lock",
@@ -468,6 +468,21 @@
       "size": 2128
     },
     {
+      "path": "runtime/deepseek_harness/__init__.py",
+      "sha256": "417a0fc50bc126359f6f70f06ea4581081879476e0a1e3da4c15dcc1e4939ca4",
+      "size": 257
+    },
+    {
+      "path": "runtime/deepseek_harness/source_gate.py",
+      "sha256": "82e3744c0d3c7cf69e333680f3bcf02e246d11054902011db80887fa0cda6031",
+      "size": 12512
+    },
+    {
+      "path": "runtime/deepseek_harness/source_manifest.json",
+      "sha256": "a5acbe65ee37390196dd93321311db8192488ae80906a6a6dd10ba30e05ac5c8",
+      "size": 2747
+    },
+    {
       "path": "runtime/engine_host/__init__.py",
       "sha256": "4aa8d04c2c560b954b5c0d28ee97cfbcdc3da6557e226f65a0e935ad6147f5a9",
       "size": 969
@@ -499,8 +514,8 @@
     },
     {
       "path": "runtime/engine_host/v2/assignment.py",
-      "sha256": "bba6e98a4cf3f44756d9708bf25ae1b063252c2aa84f0ca7dde9b453a157b043",
-      "size": 53980
+      "sha256": "449a04bcd797ad5f520943e2ea9ce953aabfd3d8e2bf27271b8588c4cd70347a",
+      "size": 54563
     },
     {
       "path": "runtime/engine_host/v2/client.py",
@@ -541,6 +556,21 @@
       "path": "runtime/engine_host/v2/security.py",
       "sha256": "dee4def133c30b0ef8b2e3b0562bcb9b3a30d1c29b45d701ea30b6257b6a813a",
       "size": 1684
+    },
+    {
+      "path": "runtime/goose/__init__.py",
+      "sha256": "bc79d78b4b2bc46a3a56c9093450783bbf3e2d70b3abbd295605e628fdf00d0d",
+      "size": 40
+    },
+    {
+      "path": "runtime/goose/source_gate.py",
+      "sha256": "d3cf089c4c9b6cb33501009f934e5aad2c414e7d5d292b29f32a8e4293a996ae",
+      "size": 7607
+    },
+    {
+      "path": "runtime/goose/source_manifest.json",
+      "sha256": "e81746fcc14fab11da83db85aa6ff8a6514d4e7987e3003e3a981758ae99da4e",
+      "size": 1297
     },
     {
       "path": "runtime/python_term/__init__.py",

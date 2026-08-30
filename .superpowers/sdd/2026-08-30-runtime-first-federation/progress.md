@@ -4,3 +4,9 @@ Task 8 completed at 0dc05f2. User reprioritized the program on 2026-08-30: P0 Ru
 
 Task RF-1.0: started after design review identified runtime assignment/instance/gate-proof contracts as mandatory prerequisites to routing.
 Review cadence ruling: task rounds cover specification, correctness, recovery consistency and code quality. Broad security review and fault injection are deferred to one dedicated final phase after P0, P1 and P2 are complete; existing correctness findings remain in scope.
+Task RF-1.0: fix round 1/5 closed injectable production trust, proof timing/domain, direct takeover and lease integrity gaps; durable recovery evidence and state-machine gaps remained (commits 3a78d3a..189dd96).
+Task RF-1.0: fix round 2/5 made acceptance/effect evidence durable and recovery outcomes idempotent; write-first Effect lattice and recovery source binding remained (commits 189dd96..55ab4eb).
+Task RF-1.0: fix round 3/5 closed write-first Effect and source-bound recovery records; full retry-lease decoding remained (commits 55ab4eb..f59f040).
+Task RF-1.0: fix round 4/5 used a fresh implementer and formal lease decoding for retry recovery; awaiting independent final review (commits f59f040..d845b82).
+Task RF-2A: pinned Goose and DeepSeek Harness submodules at approved revisions (commit b1d0659).
+Task RF-2A: Goose and DeepSeek source-readiness verifiers completed in one shared-index integration commit (commit 4fa31d0); both implementations independently reported complete source-only gates and no Runtime GO claim.
