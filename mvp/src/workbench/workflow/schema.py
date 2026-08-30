@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 25
+PHASE1_SCHEMA_VERSION = 26
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -194,6 +194,16 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             evidence_record_digest TEXT NOT NULL,
             updated_at REAL NOT NULL,
             FOREIGN KEY(lease_id) REFERENCES runtime_instance_leases(lease_id)
+        );
+        CREATE TABLE IF NOT EXISTS runtime_lease_recoveries (
+            source_lease_id TEXT PRIMARY KEY,
+            decision TEXT NOT NULL,
+            new_lease_id TEXT,
+            outcome_json TEXT NOT NULL,
+            outcome_digest TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(source_lease_id) REFERENCES runtime_instance_leases(lease_id),
+            FOREIGN KEY(new_lease_id) REFERENCES runtime_instance_leases(lease_id)
         );
         CREATE TABLE IF NOT EXISTS lifecycle_command_results (
             command_id TEXT PRIMARY KEY,

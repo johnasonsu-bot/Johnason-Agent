@@ -15,6 +15,7 @@ from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     CorruptAssignmentState,
     LeaseConflict,
+    LeaseEvidence,
     RecoveryOutcome,
     RuntimeAssignmentInput,
     RuntimeGateReceipt,
@@ -377,32 +378,54 @@ def test_durable_evidence_is_idempotent_monotonic_and_bound_to_lease_generation(
         host_generation="g", client_lease_id="c", owner="o", fence_token="f",
         expires_at=80.0, trusted_time=40.0,
     )
-    first = repository.record_lease_evidence(
-        lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
-        owner="o", fence_token="f", acceptance_cursor=2,
-        acceptance_digest="a" * 64, effect_state="committed_write",
-        effect_digest="b" * 64, trusted_time=41.0,
+    for state in ("starting", "accepting"):
+        lease = repository.transition_lease(
+            lease.lease_id, expected_state=lease.state, new_state=state, attempt=0,
+            owner="o", lease_generation_seq=lease.lease_generation_seq,
+            fence_token="f", trusted_time=40.5,
+        )
+    assert not hasattr(repository, "record_lease_evidence")
+    authority = repository._execution_authority()
+    first = authority.record_acceptance(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        acceptance_cursor=2, acceptance_digest="a" * 64, trusted_time=41.0,
     )
-    repeated = repository.record_lease_evidence(
-        lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
-        owner="o", fence_token="f", acceptance_cursor=2,
-        acceptance_digest="a" * 64, effect_state="committed_write",
-        effect_digest="b" * 64, trusted_time=42.0,
+    repeated = authority.record_acceptance(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        acceptance_cursor=2, acceptance_digest="a" * 64, trusted_time=42.0,
     )
     assert repeated == first
     with pytest.raises(LeaseConflict):
-        repository.record_lease_evidence(
-            lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
-            owner="o", fence_token="f", acceptance_cursor=1,
-            acceptance_digest="a" * 64, effect_state="committed_write",
-            effect_digest="b" * 64, trusted_time=43.0,
+        authority.record_acceptance(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            acceptance_cursor=1, acceptance_digest="a" * 64, trusted_time=43.0,
         )
+    lease = repository.transition_lease(
+        lease.lease_id, expected_state="accepting", new_state="accepted", attempt=0,
+        owner="o", lease_generation_seq=lease.lease_generation_seq,
+        fence_token="f", trusted_time=43.5,
+    )
+    read_only = authority.record_effect(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        effect_state="read_only", effect_digest="b" * 64, trusted_time=44.0,
+    )
+    assert read_only.effect_state == "read_only"
+    committed = authority.record_effect(
+        lease.lease_id, assignment_digest=assignment.assignment_digest,
+        attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        effect_state="committed_write", effect_digest="c" * 64, trusted_time=45.0,
+    )
+    assert committed.effect_state == "committed_write"
     with pytest.raises(LeaseConflict):
-        repository.record_lease_evidence(
-            lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
-            owner="o", fence_token="f", acceptance_cursor=2,
-            acceptance_digest="a" * 64, effect_state="committed_write",
-            effect_digest="c" * 64, trusted_time=44.0,
+        authority.record_effect(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            effect_state="committed_write", effect_digest="d" * 64,
+            trusted_time=46.0,
         )
 
 
@@ -427,7 +450,7 @@ def test_schema_upgrade_from_v23_preserves_old_pin_and_concurrent_init(tmp_path:
         assert connection.execute(
             "SELECT command_id, runtime_id FROM runtime_v2_command_pins"
         ).fetchone() == ("legacy", "old")
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 25
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 26
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_lease_evidence'"
         ).fetchone() == ("runtime_lease_evidence",)
@@ -461,12 +484,23 @@ def test_expired_recovery_decision_is_evidence_driven(
             fence_token="f", trusted_time=41.0,
         )
     if state in {"accepted", "running", "paused"}:
-        repository.record_lease_evidence(
-            lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
-            owner="o", fence_token="f", acceptance_cursor=1,
-            acceptance_digest="a" * 64, effect_state=effect_state,
-            effect_digest="b" * 64, trusted_time=42.0,
+        authority = repository._execution_authority()
+        authority.record_acceptance(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            acceptance_cursor=1, acceptance_digest="a" * 64, trusted_time=42.0,
         )
+        authority.record_effect(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            effect_state="read_only", effect_digest="b" * 64, trusted_time=43.0,
+        )
+        if effect_state != "read_only":
+            authority.record_effect(
+                lease.lease_id, assignment_digest=assignment.assignment_digest,
+                attempt=0, lease_generation_seq=lease.lease_generation_seq,
+                effect_state=effect_state, effect_digest="c" * 64, trusted_time=44.0,
+            )
     outcome = repository.recover_expired_lease(
         lease.lease_id, owner="next", instance_id="i-next", instance_nonce="n-next",
         host_generation="g-next", client_lease_id="c-next", fence_token="f-next",
@@ -474,6 +508,123 @@ def test_expired_recovery_decision_is_evidence_driven(
     )
     assert outcome.decision == decision
     assert (outcome.lease is not None) is creates_retry
+
+
+def test_released_recovery_is_absorbing_and_reserved_with_evidence_fails_closed(tmp_path: Path) -> None:
+    repository, assignment = _admitted(tmp_path / "state.sqlite")
+    lease = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=45.0, trusted_time=40.0,
+    )
+    with pytest.raises(LeaseConflict):
+        repository._execution_authority().record_acceptance(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            acceptance_cursor=1, acceptance_digest="a" * 64, trusted_time=41.0,
+        )
+    corrupt = LeaseEvidence(
+        lease.lease_id, assignment.assignment_digest, 0, lease.lease_generation_seq,
+        1, "a" * 64, "none", None, 41.0,
+    )
+    with repository.store.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        repository._write_evidence(connection, corrupt)
+        connection.commit()
+    with pytest.raises(CorruptAssignmentState):
+        repository.recover_expired_lease(
+            lease.lease_id, owner="next", instance_id="i2", instance_nonce="n2",
+            host_generation="g2", client_lease_id="c2", fence_token="f2",
+            expires_at=70.0, trusted_time=50.0,
+        )
+
+    released_repository, released_assignment = _admitted(tmp_path / "released.sqlite")
+    released_lease = released_repository.acquire_lease(
+        released_assignment.assignment_digest, attempt=0, instance_id="ri",
+        instance_nonce="rn", host_generation="rg", client_lease_id="rc",
+        owner="ro", fence_token="rf", expires_at=45.0, trusted_time=40.0,
+    )
+    released = released_repository.transition_lease(
+        released_lease.lease_id, expected_state="reserved", new_state="released", attempt=0,
+        owner="ro", lease_generation_seq=released_lease.lease_generation_seq,
+        fence_token="rf", trusted_time=41.0,
+    )
+    assert released.state == "released"
+    first = released_repository.recover_expired_lease(
+        released_lease.lease_id, owner="unused", instance_id="unused-i", instance_nonce="unused-n",
+        host_generation="unused-g", client_lease_id="unused-c", fence_token="unused-f",
+        expires_at=80.0, trusted_time=51.0,
+    )
+    repeated = released_repository.recover_expired_lease(
+        released_lease.lease_id, owner="different", instance_id="different-i", instance_nonce="different-n",
+        host_generation="different-g", client_lease_id="different-c", fence_token="different-f",
+        expires_at=90.0, trusted_time=52.0,
+    )
+    assert repeated == first == RecoveryOutcome("released", None)
+
+
+def test_concurrent_recovery_creates_one_new_lease_and_preserves_old_row(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite"
+    repository, assignment = _admitted(database)
+    old = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="old-i", instance_nonce="old-n",
+        host_generation="old-g", client_lease_id="old-c", owner="old-o", fence_token="old-f",
+        expires_at=45.0, trusted_time=40.0,
+    )
+
+    def recover(_: int) -> RecoveryOutcome:
+        return AssignmentRepository.development(
+            database, trust_keys=(_DEV_KEY,)
+        ).recover_expired_lease(
+            old.lease_id, owner="new-o", instance_id="new-i", instance_nonce="new-n",
+            host_generation="new-g", client_lease_id="new-c", fence_token="new-f",
+            expires_at=80.0, trusted_time=50.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(recover, (1, 2)))
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0].lease is not None
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT state, attempt FROM runtime_instance_leases ORDER BY attempt"
+        ).fetchall()
+    assert rows == [("released", 0), ("reserved", 1)]
+
+
+def test_concurrent_authoritative_evidence_is_idempotent_and_invalid_state_rejected(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite"
+    repository, assignment = _admitted(database)
+    lease = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=80.0, trusted_time=40.0,
+    )
+    for state in ("starting", "accepting"):
+        lease = repository.transition_lease(
+            lease.lease_id, expected_state=lease.state, new_state=state, attempt=0,
+            owner="o", lease_generation_seq=lease.lease_generation_seq,
+            fence_token="f", trusted_time=41.0,
+        )
+
+    def record(_: int) -> LeaseEvidence:
+        return AssignmentRepository.development(
+            database, trust_keys=(_DEV_KEY,)
+        )._execution_authority().record_acceptance(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            acceptance_cursor=1, acceptance_digest="a" * 64, trusted_time=42.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        evidence = list(pool.map(record, (1, 2)))
+    assert evidence[0] == evidence[1]
+    with pytest.raises(ValueError):
+        repository._execution_authority().record_effect(
+            lease.lease_id, assignment_digest=assignment.assignment_digest,
+            attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            effect_state="invalid", effect_digest="b" * 64, trusted_time=43.0,
+        )
 
 
 def test_old_host_v2_pin_remains_readable_and_unchanged(tmp_path: Path) -> None:
