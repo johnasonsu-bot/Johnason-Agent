@@ -1299,6 +1299,137 @@ class ConversationRepository:
             raise TurnSnapshotCorruption("reconciliation command response is invalid")
         return restored
 
+    def commit_python_term_reconciliation(
+        self,
+        *,
+        idempotency_key: str,
+        session_id: str,
+        command_id: str,
+        effect_id: str,
+        outcome: str,
+        summary: str,
+    ) -> dict[str, Any]:
+        """Atomically advance a reconciled Turn and publish its REST response.
+
+        The Python Term Effect is durably confirmed before this method is
+        called.  This transaction makes the final Conversation projection and
+        the idempotency response visible together, so a worker can never claim
+        a requeued Turn whose reconciliation command is still only reserved.
+        """
+        summary_digest, request_digest = self._python_term_reconciliation_identity(
+            session_id=session_id,
+            command_id=command_id,
+            effect_id=effect_id,
+            outcome=outcome,
+            summary=summary,
+        )
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            command = connection.execute(
+                """SELECT * FROM python_term_reconciliation_commands
+                WHERE idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if command is None or (
+                command["session_id"] != session_id
+                or command["command_id"] != command_id
+                or command["effect_id"] != effect_id
+                or command["outcome"] != outcome
+                or command["summary_digest"] != summary_digest
+                or command["request_digest"] != request_digest
+            ):
+                raise ValueError("reconciliation command identity cannot change")
+            if command["response_json"] is not None:
+                response_json = command["response_json"]
+                connection.commit()
+                restored = json.loads(response_json)
+                if not isinstance(restored, dict):
+                    raise TurnSnapshotCorruption(
+                        "reconciliation command response is invalid"
+                    )
+                return restored
+
+            row = connection.execute(
+                """SELECT * FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError((session_id, command_id))
+            state = json.loads(row["state_json"])
+            pending = state.get("reconciliation_effect_ids")
+            reconciled = state.get("reconciled_effect_ids", [])
+            if (
+                state.get("runner_mode") != "python_term"
+                or not isinstance(pending, list)
+                or not isinstance(reconciled, list)
+                or (effect_id not in pending and effect_id not in reconciled)
+            ):
+                raise TurnSnapshotCorruption(
+                    "turn is not awaiting this Python Term reconciliation"
+                )
+
+            next_status = row["status"]
+            if effect_id in pending:
+                if (
+                    row["status"] != "interrupted"
+                    or state.get("reason") != "reconciliation_required"
+                ):
+                    raise TurnSnapshotCorruption(
+                        "turn reconciliation state cannot advance"
+                    )
+                remaining = [item for item in pending if item != effect_id]
+                state["reconciled_effect_ids"] = sorted(
+                    set(reconciled) | {effect_id}
+                )
+                state["reconciliation_effect_ids"] = remaining
+                next_status = "interrupted"
+                if remaining:
+                    state["phase"] = "paused"
+                else:
+                    next_status = "queued"
+                    state["phase"] = "before_model"
+                    state.pop("reason", None)
+                changed = connection.execute(
+                    """UPDATE conversation_turns
+                    SET status = ?, state_json = ?, updated_at = ?
+                    WHERE session_id = ? AND command_id = ?
+                      AND status = 'interrupted'""",
+                    (
+                        next_status,
+                        json.dumps(state, sort_keys=True),
+                        time.time(),
+                        session_id,
+                        command_id,
+                    ),
+                )
+                if changed.rowcount != 1:
+                    raise RuntimeError("reconciliation update lost its turn fence")
+            elif row["status"] != "interrupted":
+                raise TurnSnapshotCorruption(
+                    "turn reconciliation state cannot advance"
+                )
+
+            pending_value = state["reconciliation_effect_ids"]
+            response = {
+                "session_id": session_id,
+                "command_id": command_id,
+                "effect_id": effect_id,
+                "status": next_status,
+                "pending_effect_ids": pending_value,
+            }
+            encoded = json.dumps(response, sort_keys=True, separators=(",", ":"))
+            changed = connection.execute(
+                """UPDATE python_term_reconciliation_commands
+                SET response_json = ?, updated_at = ?
+                WHERE idempotency_key = ? AND response_json IS NULL""",
+                (encoded, time.time(), idempotency_key),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("reconciliation command response fence was lost")
+            connection.commit()
+        return response
+
     def fail_corrupt_turn(
         self,
         session_id: str,

@@ -219,6 +219,9 @@ Python Term 默认关闭。启用时，只有外部签名 build proof 与注册�
 - DeepSeek reasoning continuation 的 response/tool-call 私有绑定与单次消费；
 - 未知写副作用进入可恢复的 `paused/reconciliation_required`，由控制面确认 Effect
   后重新领用并继续，而不是压成永久失败或盲目重放；
+- 最后一个待确认 Effect 的 Turn 重入队与 REST 幂等响应在同一 SQLite
+  `BEGIN IMMEDIATE` 事务提交；事务前后崩溃均不会暴露 `queued` 加空响应账本的
+  中间状态，同一 Idempotency-Key 在重启、Worker 完成和终态压缩后仍稳定重放；
 - `workspace.read` regular-file 校验与 64 KiB + 1 有界读取。
 
 运行 9 场景确定性门禁：

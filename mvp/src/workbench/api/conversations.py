@@ -340,29 +340,13 @@ class ConversationAPI:
             outcome=request.outcome,
             summary=request.summary,
         )
-        refreshed = self.conversations.record_python_term_reconciliation(
-            session_id,
-            command_id,
-            effect_id=effect_id,
-        )
-        pending_value = refreshed.state.get("reconciliation_effect_ids", [])
-        if not isinstance(pending_value, list):
-            raise TurnSnapshotCorruption("Python Term reconciliation state is invalid")
-        response = {
-            "session_id": session_id,
-            "command_id": command_id,
-            "effect_id": effect_id,
-            "status": refreshed.status,
-            "pending_effect_ids": pending_value,
-        }
-        return self.conversations.complete_python_term_reconciliation_command(
+        return self.conversations.commit_python_term_reconciliation(
             idempotency_key=idempotency_key,
             session_id=session_id,
             command_id=command_id,
             effect_id=effect_id,
             outcome=request.outcome,
             summary=request.summary,
-            response=response,
         )
 
     async def enqueue_message(
