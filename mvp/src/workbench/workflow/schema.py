@@ -3,7 +3,7 @@
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 23
+PHASE1_SCHEMA_VERSION = 24
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -112,6 +112,71 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             host_generation TEXT NOT NULL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_gate_proofs_private (
+            proof_digest TEXT PRIMARY KEY,
+            runtime_id TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            signer_key_id TEXT NOT NULL,
+            trust_tier TEXT NOT NULL,
+            issued_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            receipt_json TEXT NOT NULL,
+            signature_b64 TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_assignments (
+            assignment_digest TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            envelope_identity_digest TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            capability_snapshot_digest TEXT NOT NULL,
+            gate_proof_digest TEXT NOT NULL,
+            admission_epoch INTEGER NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(session_id, command_id),
+            UNIQUE(command_id),
+            FOREIGN KEY(gate_proof_digest) REFERENCES runtime_gate_proofs_private(proof_digest)
+        );
+        CREATE TABLE IF NOT EXISTS runtime_instance_leases (
+            lease_id TEXT PRIMARY KEY,
+            assignment_digest TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            instance_id TEXT NOT NULL,
+            instance_nonce TEXT NOT NULL,
+            host_generation TEXT NOT NULL,
+            lease_generation_seq INTEGER NOT NULL,
+            client_lease_id TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            fence_token_digest TEXT NOT NULL,
+            state TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            record_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(assignment_digest) REFERENCES runtime_assignments(assignment_digest)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS runtime_active_assignment_attempt
+            ON runtime_instance_leases(assignment_digest, attempt) WHERE state != 'released';
+        CREATE UNIQUE INDEX IF NOT EXISTS runtime_active_instance
+            ON runtime_instance_leases(instance_id) WHERE state != 'released';
+        CREATE UNIQUE INDEX IF NOT EXISTS runtime_active_client
+            ON runtime_instance_leases(client_lease_id) WHERE state != 'released';
+        CREATE TABLE IF NOT EXISTS runtime_security_blocks (
+            block_type TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(block_type, runtime_id, subject)
+        );
+        CREATE TABLE IF NOT EXISTS runtime_trusted_time (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            watermark REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS lifecycle_command_results (
             command_id TEXT PRIMARY KEY,

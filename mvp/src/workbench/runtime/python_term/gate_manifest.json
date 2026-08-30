@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "3e38823e2f4fc30eb2f7f9385c01c110a0c0d0c77f2234fd71795f06e8e75beb",
-      "size": 1500878
+      "sha256": "6c4aa168ab3eb10c177eabd353568f8d5202d370f73cf007d3a2f4f22e3bcd6d",
+      "size": 1516769
     },
     {
       "path": "uv.lock",
@@ -498,6 +498,11 @@
       "size": 527
     },
     {
+      "path": "runtime/engine_host/v2/assignment.py",
+      "sha256": "ddb3c0584330ca3cb321aefa0fba2d093d511e79f97f9e9413e61528ff028b1c",
+      "size": 30937
+    },
+    {
       "path": "runtime/engine_host/v2/client.py",
       "sha256": "b431c6ed522717beccb9514c4fa41c75d56118fdc9c1e7cc58ce7cf69c3ca40e",
       "size": 68244
@@ -669,8 +674,8 @@
     },
     {
       "path": "workflow/schema.py",
-      "sha256": "03039ab3c8b11564b5f5c1e4f9733ffedfa97ac754b29d482a6c3b197e0acabb",
-      "size": 32325
+      "sha256": "8290706457b33136848497b32069ee8b0dd73806ae13867fc3a8821feef042a1",
+      "size": 35259
     },
     {
       "path": "workflow/store.py",
