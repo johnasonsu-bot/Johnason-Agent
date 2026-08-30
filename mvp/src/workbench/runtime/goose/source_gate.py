@@ -16,14 +16,6 @@ PINNED_REVISION = "d9d08f0e051531e921f561fcb77aa0ed589e9de9"
 PINNED_SOURCE_PATH = "third_party/goose"
 PINNED_SOURCE_URL = "git@github.com:johnasonsu-bot/goose.git"
 PINNED_TOOLCHAIN = "1.96.1"
-PREPARE_COMMAND = (
-    "cargo", "+1.96.1", "metadata", "--frozen", "--locked",
-    "--format-version", "1", "--no-deps",
-)
-RELEASE_COMMAND = (
-    "cargo", "+1.96.1", "build", "--release", "--frozen", "--locked",
-    "--package", "goose-cli", "--bin", "goose",
-)
 SUPPORTED_TARGETS = (
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -49,8 +41,18 @@ class GooseSourceReceipt:
     status: str
     revision: str
     manifest_digest: str
-    release_command: tuple[str, ...]
+    build_plans: tuple["GooseBuildPlan", ...]
     claims: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GooseBuildPlan:
+    cwd: Path
+    host: str
+    target: str
+    prepare_command: tuple[str, ...]
+    release_command: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...] = ()
 
 
 def canonical_manifest_bytes(document: Mapping[str, Any]) -> bytes:
@@ -59,6 +61,17 @@ def canonical_manifest_bytes(document: Mapping[str, Any]) -> bytes:
 
 def default_manifest_path() -> Path:
     return Path(__file__).with_name("source_manifest.json")
+
+
+def build_plan_for_target(
+    target: str, *, host: str, cargo_home: Path
+) -> GooseBuildPlan:
+    if target not in SUPPORTED_TARGETS or host not in SUPPORTED_TARGETS:
+        raise GooseSourceReadinessError("unsupported Goose build host or target")
+    home = Path(cargo_home).resolve()
+    if not home.is_dir() or any(home.iterdir()):
+        raise GooseSourceReadinessError("Goose preparation requires an empty CARGO_HOME")
+    return _build_plan(target, host=host, environment=(("CARGO_HOME", str(home)),))
 
 
 def verify_goose_source_readiness(
@@ -73,14 +86,22 @@ def verify_goose_source_readiness(
         raise GooseSourceReadinessError("Goose source manifest is unavailable") from error
     if not isinstance(document, dict) or raw != canonical_manifest_bytes(document):
         raise GooseSourceReadinessError("Goose source manifest is not canonical")
-    _verify_manifest_contract(document)
+    try:
+        _verify_manifest_contract(document)
+    except GooseSourceReadinessError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise GooseSourceReadinessError("Goose source manifest has invalid types") from error
 
     source_root = root / PINNED_SOURCE_PATH
     if not source_root.is_dir():
         raise GooseSourceReadinessError("Goose submodule is missing")
-    gitlink = _run_git(root, "ls-tree", "HEAD", "--", PINNED_SOURCE_PATH)
-    if gitlink != f"160000 commit {PINNED_REVISION}\t{PINNED_SOURCE_PATH}":
-        raise GooseSourceReadinessError("Goose gitlink revision does not match the pin")
+    head_gitlink = _run_git(root, "ls-tree", "HEAD", "--", PINNED_SOURCE_PATH)
+    if head_gitlink != f"160000 commit {PINNED_REVISION}\t{PINNED_SOURCE_PATH}":
+        raise GooseSourceReadinessError("Goose HEAD gitlink revision does not match the pin")
+    index_gitlink = _run_git(root, "ls-files", "--stage", "--", PINNED_SOURCE_PATH)
+    if index_gitlink != f"160000 {PINNED_REVISION} 0\t{PINNED_SOURCE_PATH}":
+        raise GooseSourceReadinessError("Goose index gitlink revision does not match the pin")
     configured_url = _run_git(
         root, "config", "-f", str(root / ".gitmodules"),
         "--get", f"submodule.{PINNED_SOURCE_PATH}.url",
@@ -104,13 +125,16 @@ def verify_goose_source_readiness(
         status=GO_GOOSE_SOURCE_READY,
         revision=revision,
         manifest_digest=_sha256(raw),
-        release_command=RELEASE_COMMAND,
+        build_plans=tuple(
+            _build_plan(item["target"], host=item["host"])
+            for item in document["build_plans"]
+        ),
         claims=SOURCE_CLAIMS,
     )
 
 
 def _verify_manifest_contract(document: Mapping[str, Any]) -> None:
-    if document.get("schema_version") != 1:
+    if document.get("schema_version") != 2:
         raise GooseSourceReadinessError("unsupported Goose source manifest schema")
     if document.get("source") != {
         "path": PINNED_SOURCE_PATH,
@@ -136,10 +160,9 @@ def _verify_manifest_contract(document: Mapping[str, Any]) -> None:
         raise GooseSourceReadinessError("Goose sidecar selection drift")
     if tuple(document.get("supported_targets", ())) != SUPPORTED_TARGETS:
         raise GooseSourceReadinessError("Goose supported target inputs drift")
-    if tuple(document.get("prepare_command", ())) != PREPARE_COMMAND:
-        raise GooseSourceReadinessError("Goose build preparation command drift")
-    if tuple(document.get("release_command", ())) != RELEASE_COMMAND:
-        raise GooseSourceReadinessError("Goose frozen release command drift")
+    expected_plans = [_manifest_plan(target) for target in SUPPORTED_TARGETS]
+    if document.get("build_plans") != expected_plans:
+        raise GooseSourceReadinessError("Goose build plan drift")
     if tuple(document.get("claims", ())) != SOURCE_CLAIMS:
         raise GooseSourceReadinessError("Goose source readiness claims exceed their scope")
 
@@ -166,6 +189,37 @@ def _verify_rust_inputs(root: Path) -> None:
     )
     if licenses != ["LICENSE"]:
         raise GooseSourceReadinessError("Goose license input set drift")
+
+
+def _manifest_plan(target: str) -> dict[str, object]:
+    plan = _build_plan(target, host=target)
+    return {
+        "cwd": plan.cwd.as_posix(),
+        "host": plan.host,
+        "prepare_command": list(plan.prepare_command),
+        "release_command": list(plan.release_command),
+        "target": plan.target,
+    }
+
+
+def _build_plan(
+    target: str, *, host: str,
+    environment: tuple[tuple[str, str], ...] = (),
+) -> GooseBuildPlan:
+    return GooseBuildPlan(
+        cwd=Path(PINNED_SOURCE_PATH),
+        host=host,
+        target=target,
+        prepare_command=(
+            "cargo", f"+{PINNED_TOOLCHAIN}", "fetch", "--locked", "--target", target,
+        ),
+        release_command=(
+            "cargo", f"+{PINNED_TOOLCHAIN}", "build", "--offline", "--locked",
+            "--release", "--package", "goose-cli", "--bin", "goose", "--target",
+            target,
+        ),
+        environment=environment,
+    )
 
 
 def _run_git(directory: Path, *arguments: str) -> str:
