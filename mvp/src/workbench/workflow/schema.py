@@ -1,9 +1,11 @@
 """Additive Phase 1 SQLite schema kept compatible with Phase 0 probes."""
 
+import hashlib
+import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 24
+PHASE1_SCHEMA_VERSION = 25
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -157,6 +159,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             state TEXT NOT NULL,
             expires_at REAL NOT NULL,
             record_json TEXT NOT NULL,
+            lease_record_digest TEXT NOT NULL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
             FOREIGN KEY(assignment_digest) REFERENCES runtime_assignments(assignment_digest)
@@ -177,6 +180,20 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS runtime_trusted_time (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             watermark REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS runtime_lease_evidence (
+            lease_id TEXT PRIMARY KEY,
+            assignment_digest TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            lease_generation_seq INTEGER NOT NULL,
+            acceptance_cursor INTEGER,
+            acceptance_digest TEXT,
+            effect_state TEXT NOT NULL,
+            effect_digest TEXT,
+            record_json TEXT NOT NULL,
+            evidence_record_digest TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(lease_id) REFERENCES runtime_instance_leases(lease_id)
         );
         CREATE TABLE IF NOT EXISTS lifecycle_command_results (
             command_id TEXT PRIMARY KEY,
@@ -666,6 +683,35 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection, "runtime_v2_command_pins", "capabilities_json", "TEXT"
     )
+    _add_column_if_missing(
+        connection, "runtime_instance_leases", "lease_record_digest", "TEXT"
+    )
+    for row in connection.execute(
+        "SELECT lease_id, record_json FROM runtime_instance_leases WHERE lease_record_digest IS NULL"
+    ).fetchall():
+        record = row["record_json"]
+        try:
+            document = json.loads(record)
+            if not isinstance(document, dict):
+                raise ValueError
+            canonical = json.dumps(
+                document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            if canonical != record:
+                raise ValueError
+            digest = hashlib.sha256(record.encode("utf-8")).hexdigest()
+            document["lease_record_digest"] = digest
+            migrated_record = json.dumps(
+                document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Preserve corrupt legacy audit rows; repository reads fail closed.
+            digest = hashlib.sha256(record.encode("utf-8")).hexdigest()
+            migrated_record = record
+        connection.execute(
+            "UPDATE runtime_instance_leases SET record_json=?, lease_record_digest=? WHERE lease_id=?",
+            (migrated_record, digest, row["lease_id"]),
+        )
     _add_column_if_missing(connection, "python_terms", "identity_json", "TEXT")
     _add_column_if_missing(connection, "python_steps", "identity_json", "TEXT")
     _add_column_if_missing(connection, "python_steps", "host_generation", "TEXT")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import asdict
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -14,39 +15,41 @@ from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     CorruptAssignmentState,
     LeaseConflict,
-    LeaseEvidence,
+    RecoveryOutcome,
     RuntimeAssignmentInput,
     RuntimeGateReceipt,
     RuntimeTrustKey,
-    RuntimeTrustStore,
     SecurityReviewBlocked,
     canonical_json,
-    sign_gate_receipt,
+    SignedRuntimeGateProof,
 )
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from tests.fixtures.host_v2 import run_envelope, runtime_capabilities
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 
 
-def _trust(*, tier: str = "PRODUCTION_TRUSTED", revoked: bool = False):
+_PROOF_DOMAIN = b"johnason.runtime-gate-proof/v1\0"
+_DEV_PRIVATE = Ed25519PrivateKey.generate()
+_DEV_KEY = RuntimeTrustKey(
+    "local-dev", _DEV_PRIVATE.public_key().public_bytes_raw(), "DEV_UNTRUSTED"
+)
+
+
+def _trust(*, tier: str = "DEV_UNTRUSTED", revoked: bool = False):
     private = Ed25519PrivateKey.generate()
     public = private.public_key().public_bytes_raw()
     key_id = "ci-release" if tier == "PRODUCTION_TRUSTED" else "local-dev"
-    store = RuntimeTrustStore(
-        production_keys=(
-            RuntimeTrustKey(key_id, public, "PRODUCTION_TRUSTED", revoked),
-        )
-        if tier == "PRODUCTION_TRUSTED"
-        else (),
-        development_keys=(RuntimeTrustKey(key_id, public, "DEV_UNTRUSTED", revoked),)
-        if tier == "DEV_UNTRUSTED"
-        else (),
-    )
-    return private, key_id, store
+    return private, RuntimeTrustKey(key_id, public, tier, revoked)
+
+
+def _sign(receipt: RuntimeGateReceipt, private: Ed25519PrivateKey, *, domain: bytes = _PROOF_DOMAIN):
+    encoded = canonical_json(asdict(receipt))
+    return SignedRuntimeGateProof(encoded, private.sign(domain + encoded.encode()))
 
 
 def _receipt(key_id: str, *, tier: str = "PRODUCTION_TRUSTED", expires: float = 200.0):
     return RuntimeGateReceipt(
+        proof_version=1,
         runtime_id="python-term",
         build_id="build-1",
         source_manifest_digest="1" * 64,
@@ -60,11 +63,13 @@ def _receipt(key_id: str, *, tier: str = "PRODUCTION_TRUSTED", expires: float = 
     )
 
 
-def _ready_repository(database: Path, *, tier="PRODUCTION_TRUSTED", expires=200.0):
-    private, key_id, trust = _trust(tier=tier)
-    repository = AssignmentRepository(database, trust_store=trust)
+def _ready_repository(database: Path, *, tier="DEV_UNTRUSTED", expires=200.0):
+    if tier != "DEV_UNTRUSTED":
+        raise ValueError("test helper only creates development repositories")
+    private, key = _DEV_PRIVATE, _DEV_KEY
+    repository = AssignmentRepository.development(database, trust_keys=(key,))
     proof = repository.store_gate_proof(
-        sign_gate_receipt(_receipt(key_id, tier=tier, expires=expires), private),
+        _sign(_receipt(key.key_id, tier=tier, expires=expires), private),
         trusted_time=20.0,
     )
     return repository, proof
@@ -94,7 +99,7 @@ def _admitted(database: Path):
 def test_gate_proof_is_verified_and_public_diagnostics_do_not_expose_signature(tmp_path: Path) -> None:
     repository, proof = _ready_repository(tmp_path / "state.sqlite")
 
-    assert proof.trust_tier == "PRODUCTION_TRUSTED"
+    assert proof.trust_tier == "DEV_UNTRUSTED"
     assert set(repository.public_gate_diagnostic(proof.proof_digest)) == {
         "runtime_id", "build_id", "proof_digest", "trust_tier", "state", "expires_at"
     }
@@ -103,35 +108,57 @@ def test_gate_proof_is_verified_and_public_diagnostics_do_not_expose_signature(t
 
 @pytest.mark.parametrize("failure", ["tamper", "wrong-key", "unknown-key", "revoked-key"])
 def test_gate_proof_failures_are_closed(tmp_path: Path, failure: str) -> None:
-    private, key_id, trust = _trust(revoked=failure == "revoked-key")
-    receipt = _receipt(key_id)
-    proof = sign_gate_receipt(receipt, private)
+    private, key = _trust(revoked=failure == "revoked-key")
+    receipt = _receipt(key.key_id, tier="DEV_UNTRUSTED")
+    proof = _sign(receipt, private)
     if failure == "tamper":
         document = json.loads(proof.receipt_json)
         document["build_id"] = "build-tampered"
         proof = proof.__class__(canonical_json(document), proof.signature)
     elif failure == "wrong-key":
-        proof = sign_gate_receipt(receipt, Ed25519PrivateKey.generate())
+        proof = _sign(receipt, Ed25519PrivateKey.generate())
     elif failure == "unknown-key":
-        proof = sign_gate_receipt(_receipt("not-trusted"), private)
+        proof = _sign(_receipt("not-trusted", tier="DEV_UNTRUSTED"), private)
 
     with pytest.raises(SecurityReviewBlocked):
-        AssignmentRepository(tmp_path / "state.sqlite", trust_store=trust).store_gate_proof(
+        AssignmentRepository.development(tmp_path / "state.sqlite", trust_keys=(key,)).store_gate_proof(
             proof, trusted_time=20.0
         )
 
 
+def test_production_trust_cannot_be_injected_or_locally_self_signed(tmp_path: Path) -> None:
+    private, key = _trust(tier="PRODUCTION_TRUSTED")
+    with pytest.raises(TypeError):
+        AssignmentRepository(tmp_path / "state.sqlite", trust_store=(key,))
+    with pytest.raises(SecurityReviewBlocked):
+        AssignmentRepository.production(tmp_path / "prod.sqlite").store_gate_proof(
+            _sign(_receipt(key.key_id), private), trusted_time=20.0
+        )
+
+
+def test_gate_proof_domain_version_and_issue_window_fail_closed(tmp_path: Path) -> None:
+    private, key = _trust()
+    repository = AssignmentRepository.development(tmp_path / "state.sqlite", trust_keys=(key,))
+    receipt = _receipt(key.key_id, tier="DEV_UNTRUSTED")
+    with pytest.raises(SecurityReviewBlocked):
+        repository.store_gate_proof(_sign(receipt, private, domain=b"other-domain\0"), trusted_time=20.0)
+    future = RuntimeGateReceipt(**{**asdict(receipt), "issued_at": 30.0})
+    with pytest.raises(SecurityReviewBlocked):
+        repository.store_gate_proof(_sign(future, private), trusted_time=20.0)
+    with pytest.raises(ValueError):
+        RuntimeGateReceipt(**{**asdict(receipt), "proof_version": 2})
+
+
 def test_dev_proof_is_permanently_untrusted_and_cannot_enter_production_store(tmp_path: Path) -> None:
-    private, key_id, development = _trust(tier="DEV_UNTRUSTED")
-    proof = sign_gate_receipt(_receipt(key_id, tier="DEV_UNTRUSTED"), private)
-    stored = AssignmentRepository(tmp_path / "dev.sqlite", trust_store=development).store_gate_proof(
+    private, key = _trust(tier="DEV_UNTRUSTED")
+    proof = _sign(_receipt(key.key_id, tier="DEV_UNTRUSTED"), private)
+    stored = AssignmentRepository.development(tmp_path / "dev.sqlite", trust_keys=(key,)).store_gate_proof(
         proof, trusted_time=20.0
     )
-    _, _, production = _trust()
 
     assert stored.trust_tier == "DEV_UNTRUSTED"
     with pytest.raises(SecurityReviewBlocked):
-        AssignmentRepository(tmp_path / "prod.sqlite", trust_store=production).store_gate_proof(
+        AssignmentRepository.production(tmp_path / "prod.sqlite").store_gate_proof(
             proof, trusted_time=20.0
         )
 
@@ -181,7 +208,7 @@ def test_build_quarantine_blocks_new_execution_without_hiding_assignment(tmp_pat
 
 def test_explicit_key_revocation_blocks_new_execution_but_keeps_durable_assignment(tmp_path: Path) -> None:
     repository, assignment = _admitted(tmp_path / "state.sqlite")
-    repository.revoke_key("python-term", "ci-release", trusted_time=31.0)
+    repository.revoke_key("python-term", "local-dev", trusted_time=31.0)
 
     assert repository.get_assignment("session-1", "command-1") == assignment
     with pytest.raises(SecurityReviewBlocked):
@@ -194,19 +221,17 @@ def test_explicit_key_revocation_blocks_new_execution_but_keeps_durable_assignme
 
 def test_build_time_key_revocation_blocks_new_assignment_after_restart(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite"
-    private, key_id, trusted = _trust()
-    repository = AssignmentRepository(database, trust_store=trusted)
+    private, key = _trust()
+    repository = AssignmentRepository.development(database, trust_keys=(key,))
     proof = repository.store_gate_proof(
-        sign_gate_receipt(_receipt(key_id), private), trusted_time=20.0
+        _sign(_receipt(key.key_id, tier="DEV_UNTRUSTED"), private), trusted_time=20.0
     )
-    revoked = RuntimeTrustStore(
-        production_keys=(
-            RuntimeTrustKey(key_id, private.public_key().public_bytes_raw(), "PRODUCTION_TRUSTED", True),
-        )
+    revoked = RuntimeTrustKey(
+        key.key_id, private.public_key().public_bytes_raw(), "DEV_UNTRUSTED", True
     )
 
     with pytest.raises(SecurityReviewBlocked):
-        AssignmentRepository(database, trust_store=revoked).admit_assignment(
+        AssignmentRepository.development(database, trust_keys=(revoked,)).admit_assignment(
             _assignment(proof.proof_digest), trusted_time=30.0
         )
 
@@ -247,10 +272,14 @@ def test_takeover_increments_sequence_and_old_owner_cannot_renew_or_cause_aba(tm
         host_generation="g1", client_lease_id="client", owner="old",
         fence_token="old-fence", expires_at=45.0, trusted_time=40.0,
     )
-    new = repository.takeover_lease(
+    outcome = repository.recover_expired_lease(
         old.lease_id, owner="new", instance_id="i2", instance_nonce="n2",
-        host_generation="g2", fence_token="new-fence", expires_at=70.0, trusted_time=50.0,
+        host_generation="g2", client_lease_id="client-new", fence_token="new-fence",
+        expires_at=70.0, trusted_time=50.0,
     )
+    assert isinstance(outcome, RecoveryOutcome) and outcome.decision == "release_retry"
+    assert outcome.lease is not None
+    new = outcome.lease
     assert new.lease_generation_seq > old.lease_generation_seq
     with pytest.raises(LeaseConflict):
         repository.renew_lease(
@@ -286,7 +315,7 @@ def test_concurrent_acquire_allows_one_active_client_query(tmp_path: Path) -> No
 
     def acquire(owner: str) -> str:
         try:
-            AssignmentRepository(database, trust_store=repository.trust_store).acquire_lease(
+            AssignmentRepository.development(database, trust_keys=(_DEV_KEY,)).acquire_lease(
                 assignment.assignment_digest, attempt=0, instance_id=f"i-{owner}", instance_nonce=f"n-{owner}",
                 host_generation=f"g-{owner}", client_lease_id="client-shared", owner=owner,
                 fence_token=f"f-{owner}", expires_at=80.0, trusted_time=40.0,
@@ -307,7 +336,7 @@ def test_clock_rollback_and_corrupt_mirror_fail_closed_after_restart(tmp_path: P
         host_generation="g", client_lease_id="c", owner="o", fence_token="f",
         expires_at=90.0, trusted_time=60.0,
     )
-    reopened = AssignmentRepository(database, trust_store=repository.trust_store)
+    reopened = AssignmentRepository.development(database, trust_keys=(_DEV_KEY,))
     with pytest.raises(LeaseConflict):
         reopened.acquire_lease(
             assignment.assignment_digest, attempt=1, instance_id="i2", instance_nonce="n2",
@@ -320,19 +349,103 @@ def test_clock_rollback_and_corrupt_mirror_fail_closed_after_restart(tmp_path: P
         reopened.get_assignment("session-1", "command-1")
 
 
+def test_lease_record_digest_and_all_mirrors_fail_closed(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite"
+    repository, assignment = _admitted(database)
+    lease = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=80.0, trusted_time=40.0,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE runtime_instance_leases SET client_lease_id='tampered' WHERE lease_id=?",
+            (lease.lease_id,),
+        )
+    with pytest.raises(CorruptAssignmentState):
+        repository.transition_lease(
+            lease.lease_id, expected_state="reserved", new_state="starting", attempt=0,
+            owner="o", lease_generation_seq=lease.lease_generation_seq,
+            fence_token="f", trusted_time=41.0,
+        )
+
+
+def test_durable_evidence_is_idempotent_monotonic_and_bound_to_lease_generation(tmp_path: Path) -> None:
+    repository, assignment = _admitted(tmp_path / "state.sqlite")
+    lease = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=80.0, trusted_time=40.0,
+    )
+    first = repository.record_lease_evidence(
+        lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        owner="o", fence_token="f", acceptance_cursor=2,
+        acceptance_digest="a" * 64, effect_state="committed_write",
+        effect_digest="b" * 64, trusted_time=41.0,
+    )
+    repeated = repository.record_lease_evidence(
+        lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
+        owner="o", fence_token="f", acceptance_cursor=2,
+        acceptance_digest="a" * 64, effect_state="committed_write",
+        effect_digest="b" * 64, trusted_time=42.0,
+    )
+    assert repeated == first
+    with pytest.raises(LeaseConflict):
+        repository.record_lease_evidence(
+            lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            owner="o", fence_token="f", acceptance_cursor=1,
+            acceptance_digest="a" * 64, effect_state="committed_write",
+            effect_digest="b" * 64, trusted_time=43.0,
+        )
+    with pytest.raises(LeaseConflict):
+        repository.record_lease_evidence(
+            lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            owner="o", fence_token="f", acceptance_cursor=2,
+            acceptance_digest="a" * 64, effect_state="committed_write",
+            effect_digest="c" * 64, trusted_time=44.0,
+        )
+
+
+def test_schema_upgrade_from_v23_preserves_old_pin_and_concurrent_init(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)")
+        connection.execute("INSERT INTO schema_migrations VALUES(23, 1.0)")
+        connection.execute(
+            "CREATE TABLE runtime_v2_command_pins(command_id TEXT PRIMARY KEY, identity_digest TEXT, identity_json TEXT, runtime_id TEXT, runtime_build_id TEXT, capability_digest TEXT, capabilities_json TEXT, latest_attempt INTEGER, host_generation TEXT, created_at REAL, updated_at REAL)"
+        )
+        connection.execute(
+            "INSERT INTO runtime_v2_command_pins VALUES('legacy','digest','{}','old','build','cap','{}',0,'host',1,1)"
+        )
+
+    def open_repository(_: int) -> None:
+        AssignmentRepository.development(database, trust_keys=(_DEV_KEY,))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(open_repository, (1, 2)))
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT command_id, runtime_id FROM runtime_v2_command_pins"
+        ).fetchone() == ("legacy", "old")
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 25
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_lease_evidence'"
+        ).fetchone() == ("runtime_lease_evidence",)
+
+
 @pytest.mark.parametrize(
-    ("state", "evidence", "decision"),
+    ("state", "effect_state", "decision", "creates_retry"),
     [
-        ("reserved", LeaseEvidence(False, None, "none"), "release_retry"),
-        ("starting", LeaseEvidence(False, None, "none"), "release_retry"),
-        ("accepting", LeaseEvidence(False, None, "none"), "reconcile"),
-        ("accepted", LeaseEvidence(True, "a" * 64, "read_only"), "read_only_retry"),
-        ("running", LeaseEvidence(True, "a" * 64, "committed_write"), "reuse_committed_write"),
-        ("paused", LeaseEvidence(True, "a" * 64, "unknown_write"), "reconcile"),
+        ("reserved", "none", "release_retry", True),
+        ("starting", "none", "release_retry", True),
+        ("accepting", "none", "reconcile", False),
+        ("accepted", "read_only", "read_only_retry", True),
+        ("running", "committed_write", "reuse_committed_write", False),
+        ("paused", "unknown_write", "reconcile", False),
     ],
 )
 def test_expired_recovery_decision_is_evidence_driven(
-    tmp_path: Path, state: str, evidence: LeaseEvidence, decision: str
+    tmp_path: Path, state: str, effect_state: str, decision: str, creates_retry: bool
 ) -> None:
     repository, assignment = _admitted(tmp_path / f"{state}.sqlite")
     lease = repository.acquire_lease(
@@ -347,7 +460,20 @@ def test_expired_recovery_decision_is_evidence_driven(
             owner="o", lease_generation_seq=lease.lease_generation_seq,
             fence_token="f", trusted_time=41.0,
         )
-    assert repository.recovery_decision(lease.lease_id, evidence=evidence, trusted_time=50.0) == decision
+    if state in {"accepted", "running", "paused"}:
+        repository.record_lease_evidence(
+            lease.lease_id, attempt=0, lease_generation_seq=lease.lease_generation_seq,
+            owner="o", fence_token="f", acceptance_cursor=1,
+            acceptance_digest="a" * 64, effect_state=effect_state,
+            effect_digest="b" * 64, trusted_time=42.0,
+        )
+    outcome = repository.recover_expired_lease(
+        lease.lease_id, owner="next", instance_id="i-next", instance_nonce="n-next",
+        host_generation="g-next", client_lease_id="c-next", fence_token="f-next",
+        expires_at=70.0, trusted_time=50.0,
+    )
+    assert outcome.decision == decision
+    assert (outcome.lease is not None) is creates_retry
 
 
 def test_old_host_v2_pin_remains_readable_and_unchanged(tmp_path: Path) -> None:
@@ -355,6 +481,6 @@ def test_old_host_v2_pin_remains_readable_and_unchanged(tmp_path: Path) -> None:
     old = RuntimeV2Repository(database)
     RuntimeRegistryV2(old).register(runtime_capabilities("fake-v2", build_id="python:test-build", query=True, model=True))
     pin = old.pin_command(run_envelope())
-    AssignmentRepository(database, trust_store=RuntimeTrustStore()).get_assignment("missing", "missing")
+    AssignmentRepository.development(database, trust_keys=(_DEV_KEY,)).get_assignment("missing", "missing")
 
     assert RuntimeV2Repository(database).get_pin(pin.command_id) == pin
