@@ -25,7 +25,7 @@
 | AR-5 | ADR/taint/capability/intervention | 6–10 | `GO_ADR_DEFENSE_GATE` |
 | Final | 三 Runtime + 五门禁联合回归和用户环境 | 5–8 | `GO_AGENT_RELIABILITY_STACK` |
 
-安全专项不嵌入每个 Task 的修复轮次。P0 完成后执行一次 `P0_SECURITY_AUDIT`，P1 完成后执行一次 `P1_SECURITY_AUDIT`，P2 完成后执行一次 `P2_SECURITY_AUDIT`；审计发现的问题进入独立整改批次，不与普通功能修复轮混在一起。
+安全专项不嵌入 P0/P1/P2 的普通 Task 或修复轮次。P2 完成后统一执行 `FINAL_SECURITY_AUDIT` 与 `FAULT_INJECTION_GATE`；审计发现的问题进入独立整改批次，不与功能开发轮混在一起。
 
 P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日。该估算不包含等待外部 CI/KMS 签名、真实 Provider 账号或上游兼容修复的时间。
 
@@ -69,7 +69,15 @@ P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日�
 
 - 每个 Task TDD、单独提交、规格审核和代码质量审核。
 - 每轮最多 5 次修复；超出后记录 blocker，不能无限补丁。
-- Task 级审核聚焦规格、正确性、恢复一致性和代码质量，不重复执行广泛安全巡检；API Key/Token/密码不得写入代码的红线始终有效。
-- 安全威胁建模、信任边界、秘密扫描、依赖供应链和攻击型审计统一放在 P0/P1/P2 里程碑安全审计中执行。
+- Task 级审核聚焦规格、正确性、恢复一致性和代码质量，不执行广泛安全巡检；API Key/Token/密码不得写入代码的红线始终有效。
+- 安全威胁建模、秘密扫描、依赖供应链攻击面和漏洞注入统一放在 P2 完成后的最终安全专项中执行。
 - Fixture 只验证合同，不满足真实 Runtime Gate。
 - 每个 Smoke Gate 均需提供用户可操作环境；每个 Final Gate 需包含 crash/restart、duplicate command、Effect reconciliation 和 secret scan。
+
+## 5. 最终安全专项
+
+只有 P0、P1、P2 功能均完成后才启动：
+
+1. `FINAL_SECURITY_AUDIT`：信任边界、凭据/Vault、依赖供应链、IPC、Workspace、Tool/Plugin、日志/Trace 和公开错误检查；
+2. `FAULT_INJECTION_GATE`：进程崩溃、网络中断、消息重复/乱序、SQLite 事务中断、lease 过期、Effect 未知、checkpoint 损坏、sidecar 冒充和 Provider Grant 重放；
+3. 安全问题进入独立修复批次并重新运行最终功能与安全门禁。
