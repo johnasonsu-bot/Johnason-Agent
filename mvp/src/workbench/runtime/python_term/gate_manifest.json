@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "0eef9e2ddbe46c4258028955bd2f8b0fea8cf488862b07be035910bbe14b1c2f",
-      "size": 1496339
+      "sha256": "3e38823e2f4fc30eb2f7f9385c01c110a0c0d0c77f2234fd71795f06e8e75beb",
+      "size": 1500878
     },
     {
       "path": "uv.lock",
@@ -194,8 +194,8 @@
     },
     {
       "path": "conversations/repository.py",
-      "sha256": "f26d9540c656098ef56e7f44419f0cc82551f62f359deabfaad613e77e1b2f17",
-      "size": 75196
+      "sha256": "ac29cb7138f6ebd7e8af926dba34918f7b13df5bceb37f1516e293b88ece97d1",
+      "size": 69545
     },
     {
       "path": "conversations/worker.py",
@@ -564,8 +564,8 @@
     },
     {
       "path": "runtime/python_term/repository.py",
-      "sha256": "268bee370ed04c987a1b27466c13bbce3dfcb73c37147d1bb3ec5aa14734ae38",
-      "size": 149021
+      "sha256": "60fdc6d141e5828d4615de78b4855bef26918010e1bd4f750f9bd35671b59187",
+      "size": 150234
     },
     {
       "path": "runtime/python_term/runtime.py",

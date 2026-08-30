@@ -2827,6 +2827,36 @@ class PythonTermRepository:
             )
             return effect
 
+    def get_tool_effect_aggregate_evidence(
+        self, effect_id: str
+    ) -> tuple[TermRecord, StepRecord, ToolEffectRecord] | None:
+        """Decode one active Effect and its complete owning aggregate.
+
+        Every redundant SQLite column, canonical record, immutable identity,
+        model invariant, and aggregate membership is checked by the standard
+        fail-closed decoders before evidence is returned.
+        """
+        with self._read_snapshot() as connection:
+            row = connection.execute(
+                "SELECT * FROM python_tool_effects WHERE effect_id = ?",
+                (effect_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            effect = self._decode_effect(row)
+            term, steps = self._load_owning_aggregate(
+                connection, effect.term_id, effect.step_id
+            )
+            step = next(
+                (item for item in steps if item.step_id == effect.step_id),
+                None,
+            )
+            if step is None:
+                raise RepositoryCorruption(
+                    "Tool Effect owning Step evidence is missing"
+                )
+            return term, step, effect
+
     def list_tool_effects(
         self, term_id: str, step_id: str | None = None
     ) -> tuple[ToolEffectRecord, ...]:

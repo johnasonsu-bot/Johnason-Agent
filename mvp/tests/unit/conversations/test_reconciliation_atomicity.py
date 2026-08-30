@@ -17,7 +17,115 @@ from workbench.api.conversations import (
     python_term_command_id,
 )
 from workbench.conversations.repository import ConversationRepository
+from workbench.runtime.engine_host.v2 import (
+    ContextBudgetV2,
+    RunEnvelopeV2,
+    WorkspaceGrantV2,
+)
+from workbench.runtime.engine_host.v2.contracts import ContextRefV2, RuntimeRefV2
+from workbench.runtime.python_term.contracts import (
+    ConversationContextRef,
+    EffectScope,
+    PermissionPolicy,
+    ProjectContextRef,
+    PublicToolResult,
+    StepContext,
+    StepEventRecord,
+    StepEventTransitionRecord,
+    TermWorkStateRef,
+    ToolEffectRecord,
+    canonical_digest,
+    canonical_json,
+)
+from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.workflow.event_store import EventStore
+
+
+def _formal_context(
+    root: Path,
+    *,
+    session_id: str,
+    command_id: str,
+    term_id: str,
+    step_id: str,
+    agent_id: str = "agent-1",
+    host_generation: str = "host-1",
+) -> tuple[RunEnvelopeV2, StepContext]:
+    messages = ({"role": "user", "content": "hello"},)
+    envelope = RunEnvelopeV2(
+        runtime=RuntimeRefV2(
+            runtime_id="python-term",
+            build_id="build-1",
+            config_digest="3" * 64,
+            host_generation=host_generation,
+        ),
+        session_id=session_id,
+        run_id="run-1",
+        term_id=term_id,
+        step_id=step_id,
+        command_id=command_id,
+        attempt=0,
+        agent_id=agent_id,
+        agent_role="worker",
+        provider_ref="provider-1",
+        model="model-1",
+        model_options_digest="4" * 64,
+        message_snapshot_digest=canonical_digest(messages),
+        context=ContextRefV2(
+            snapshot_ref="context-1", snapshot_digest="5" * 64, version=1
+        ),
+        context_budget=ContextBudgetV2(
+            max_input_tokens=1000,
+            reserved_output_tokens=100,
+            compaction_policy="none",
+        ),
+        tool_manifest=(),
+        tool_manifest_digest=canonical_digest(()),
+        skill_pins=(),
+        skill_manifest_digest=canonical_digest(()),
+        plugin_pins=(),
+        plugin_manifest_digest=canonical_digest(()),
+        permission_policy_digest=canonical_digest(
+            {"tool_policy": "allow", "filesystem_policy": "allow"}
+        ),
+        workspace_grant=WorkspaceGrantV2(
+            grant_id="grant-1",
+            workspace_snapshot_ref="workspace-snapshot-1",
+            readable_paths=(str(root.resolve()),),
+            writable_paths=(str(root.resolve()),),
+            command_policy="deny",
+            network_policy="deny",
+            expires_at_ms=4_102_444_800_000,
+        ),
+        checkpoint_cursor=0,
+        deadline_ms=10_000,
+        traceparent="trace-1",
+    )
+    context = StepContext.from_envelope(
+        envelope,
+        model_messages=messages,
+        conversation_context=ConversationContextRef(
+            session_id=session_id,
+            snapshot_ref="context-1",
+            snapshot_digest="5" * 64,
+            version=1,
+        ),
+        project_context=ProjectContextRef(
+            project_id="project-1", version=1, snapshot_digest="7" * 64
+        ),
+        work_state=TermWorkStateRef(
+            term_id=term_id,
+            agent_id=agent_id,
+            root_ref=f".runtime/terms/{term_id}",
+            metadata_digest="8" * 64,
+        ),
+        permission_policy=PermissionPolicy(
+            tool_policy="allow", filesystem_policy="allow"
+        ),
+        environment_allowlist=("PATH",),
+        effect_scope=EffectScope(scope_id="scope-1", write_effects=True),
+    )
+    return envelope, context
 
 
 def _prepare_reconciliation(
@@ -44,49 +152,40 @@ def _prepare_reconciliation(
         "reconciliation_effect_ids": list(pending_effect_ids),
         "reconciled_effect_ids": [],
     }
-    now = time.time()
     runtime_command_id = python_term_command_id("session-1", "command-1")
-    command_identity = {
-        "session_id": "session-1",
-        "command_id": runtime_command_id,
-        "term_id": "term-1",
-        "step_id": "step-1",
-    }
-    term_identity = {"command": command_identity, "step_ids": ["step-1"]}
-    term_identity_json = json.dumps(
-        term_identity, sort_keys=True, separators=(",", ":")
+    envelope, context = _formal_context(
+        database.parent,
+        session_id="session-1",
+        command_id=runtime_command_id,
+        term_id="term-1",
+        step_id="step-1",
     )
-    term_record_json = json.dumps(
-        {
-            "envelope": command_identity,
-            "step_ids": ["step-1"],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    python_repository = PythonTermRepository(database)
+    python_repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
     )
-    step_identity = {
-        "term_id": "term-1",
-        "step_id": "step-1",
-        "ordinal": 0,
-        "command_id": runtime_command_id,
-        "agent_id": "agent-1",
-        "command": command_identity,
-    }
-    step_identity_json = json.dumps(
-        step_identity, sort_keys=True, separators=(",", ":")
+    failed_projection = PublicToolResult(
+        status="failed", summary="Write outcome requires reconciliation"
     )
-    step_record_json = json.dumps(
-        {
-            "term_id": "term-1",
-            "step_id": "step-1",
-            "ordinal": 0,
-            "command_id": runtime_command_id,
-            "agent_id": "agent-1",
-            "command_identity": command_identity,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    for index, effect_id in enumerate(pending_effect_ids, start=1):
+        python_repository.save_tool_effect(
+            ToolEffectRecord(
+                effect_id=effect_id,
+                term_id=context.term_id,
+                step_id=context.step_id,
+                tool_call_id=f"call-{index}",
+                request_digest=str(index) * 64,
+                write_effect=True,
+                dispatch_state="ambiguous",
+                status="reconciliation_required",
+                result_code="unknown_write_outcome",
+                result_digest=canonical_digest(
+                    {"code": "unknown_write_outcome", "result": failed_projection}
+                ),
+                public_result=failed_projection,
+            )
+        )
+    now = time.time()
     with repository.store.connect() as connection:
         connection.execute(
             """UPDATE conversation_turns
@@ -94,46 +193,6 @@ def _prepare_reconciliation(
             WHERE session_id = 'session-1' AND command_id = 'command-1'""",
             (json.dumps(state, sort_keys=True), now),
         )
-        connection.execute(
-            """INSERT INTO python_terms(
-            term_id, command_id, identity_digest, identity_json, attempt,
-            status, cursor, record_json, created_at, updated_at
-            ) VALUES ('term-1', ?, ?, ?, 1, 'paused', 0, ?, ?, ?)""",
-            (
-                runtime_command_id,
-                hashlib.sha256(term_identity_json.encode()).hexdigest(),
-                term_identity_json,
-                term_record_json,
-                now,
-                now,
-            ),
-        )
-        connection.execute(
-            """INSERT INTO python_steps(
-            term_id, step_id, ordinal, command_id, agent_id, host_generation,
-            identity_digest, identity_json, attempt, status, cursor,
-            record_json, created_at, updated_at
-            ) VALUES ('term-1', 'step-1', 0, ?, 'agent-1', 'host-1',
-            ?, ?, 1, 'paused', 0, ?, ?, ?)""",
-            (
-                runtime_command_id,
-                hashlib.sha256(step_identity_json.encode()).hexdigest(),
-                step_identity_json,
-                step_record_json,
-                now,
-                now,
-            ),
-        )
-        for index, effect_id in enumerate(pending_effect_ids, start=1):
-            connection.execute(
-                """INSERT INTO python_tool_effects(
-                effect_id, term_id, step_id, tool_call_id, request_digest,
-                status, result_digest, effect_json, public_result_json,
-                created_at, updated_at
-                ) VALUES (?, 'term-1', 'step-1', ?, ?,
-                'reconciliation_required', NULL, '{}', NULL, ?, ?)""",
-                (effect_id, f"call-{index}", str(index) * 64, now, now),
-            )
     repository.begin_python_term_reconciliation_command(
         idempotency_key=idempotency_key,
         session_id="session-1",
@@ -167,15 +226,32 @@ def _mark_legacy_confirmation(
     terminal: bool = False,
     public_status: str = "completed",
 ) -> None:
-    public_result = json.dumps(
-        {
-            "artifact_ref": None,
-            "status": public_status,
-            "summary": "private confirmation",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    python_repository = PythonTermRepository(repository.store.path)
+    python_repository.confirm_reconciled_tool_effect(
+        "effect-1",
+        PublicToolResult(
+            status=public_status,
+            summary="private confirmation",
+        ),
     )
+    if terminal:
+        term = python_repository.get_term("term-1")
+        assert term is not None
+        python_repository.append_event(
+            StepEventTransitionRecord(
+                event=StepEventRecord(
+                    event_id="event-terminal-1",
+                    run_id=term.envelope.run_id,
+                    term_id="term-1",
+                    step_id="step-1",
+                    cursor=1,
+                    type="agent.message.completed",
+                    payload={"content": "done"},
+                ),
+                step_status="completed",
+                term_status="completed",
+            )
+        )
     state = (
         {"phase": "completed", "runner_mode": "python_term"}
         if terminal
@@ -188,32 +264,6 @@ def _mark_legacy_confirmation(
         }
     )
     with repository.store.connect() as connection:
-        connection.execute(
-            """UPDATE python_tool_effects
-            SET status = 'committed', result_digest = ?, effect_json = ?,
-                public_result_json = ?
-            WHERE effect_id = 'effect-1'""",
-            (
-                hashlib.sha256(public_result.encode("utf-8")).hexdigest(),
-                json.dumps(
-                    {
-                        "effect_id": "effect-1",
-                        "term_id": "term-1",
-                        "step_id": "step-1",
-                        "tool_call_id": "call-1",
-                        "request_digest": "1" * 64,
-                        "public_result": json.loads(public_result),
-                        "result_digest": hashlib.sha256(
-                            public_result.encode("utf-8")
-                        ).hexdigest(),
-                        "status": "committed",
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                public_result,
-            ),
-        )
         connection.execute(
             """UPDATE conversation_turns
             SET status = ?, state_json = ?, result_json = ?
@@ -423,6 +473,103 @@ def test_legacy_repair_fails_closed_when_effect_outcome_is_not_verifiable(
     assert "private confirmation" not in response.text
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "effect_record_missing_field",
+        "term_attempt_column",
+        "step_host_generation_column",
+        "step_session_identity",
+    ],
+)
+def test_legacy_repair_rejects_corrupt_runtime_aggregate_without_writes(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    database = tmp_path / f"legacy-corrupt-{mutation}.sqlite"
+    repository = _prepare_reconciliation(database)
+    _mark_legacy_confirmation(repository)
+    with repository.store.connect() as connection:
+        if mutation == "effect_record_missing_field":
+            row = connection.execute(
+                "SELECT effect_json FROM python_tool_effects WHERE effect_id = 'effect-1'"
+            ).fetchone()
+            record = json.loads(row["effect_json"])
+            record.pop("record_version")
+            connection.execute(
+                """UPDATE python_tool_effects SET effect_json = ?
+                WHERE effect_id = 'effect-1'""",
+                (json.dumps(record, sort_keys=True, separators=(",", ":")),),
+            )
+        elif mutation == "term_attempt_column":
+            connection.execute(
+                "UPDATE python_terms SET attempt = attempt + 1 WHERE term_id = 'term-1'"
+            )
+        elif mutation == "step_host_generation_column":
+            connection.execute(
+                """UPDATE python_steps SET host_generation = 'host-tampered'
+                WHERE term_id = 'term-1' AND step_id = 'step-1'"""
+            )
+        else:
+            row = connection.execute(
+                """SELECT identity_json, record_json FROM python_steps
+                WHERE term_id = 'term-1' AND step_id = 'step-1'"""
+            ).fetchone()
+            identity = json.loads(row["identity_json"])
+            record = json.loads(row["record_json"])
+            identity["command"]["session_id"] = "session-other"
+            record["command_identity"]["session_id"] = "session-other"
+            identity_json = json.dumps(
+                identity, sort_keys=True, separators=(",", ":")
+            )
+            connection.execute(
+                """UPDATE python_steps
+                SET identity_json = ?, identity_digest = ?, record_json = ?
+                WHERE term_id = 'term-1' AND step_id = 'step-1'""",
+                (
+                    identity_json,
+                    hashlib.sha256(identity_json.encode()).hexdigest(),
+                    json.dumps(record, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+        before_turn = connection.execute(
+            """SELECT * FROM conversation_turns
+            WHERE session_id = 'session-1' AND command_id = 'command-1'"""
+        ).fetchone()
+        before_effect = connection.execute(
+            "SELECT * FROM python_tool_effects WHERE effect_id = 'effect-1'"
+        ).fetchone()
+
+    app = FastAPI()
+    app.include_router(
+        conversation_router(_api(ConversationRepository(repository.store.path)))
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "private confirmation"},
+        )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "legacy reconciliation recovery conflict"}
+    assert "private confirmation" not in response.text
+    with repository.store.connect() as connection:
+        after_turn = connection.execute(
+            """SELECT * FROM conversation_turns
+            WHERE session_id = 'session-1' AND command_id = 'command-1'"""
+        ).fetchone()
+        after_effect = connection.execute(
+            "SELECT * FROM python_tool_effects WHERE effect_id = 'effect-1'"
+        ).fetchone()
+        command = connection.execute(
+            """SELECT response_json FROM python_term_reconciliation_commands
+            WHERE idempotency_key = 'reconcile-1'"""
+        ).fetchone()
+    assert dict(after_turn) == dict(before_turn)
+    assert dict(after_effect) == dict(before_effect)
+    assert command is not None and command["response_json"] is None
+
+
 def test_different_key_cannot_replay_already_confirmed_legacy_effect(
     tmp_path: Path,
 ) -> None:
@@ -469,95 +616,66 @@ def test_command_reservation_serializes_one_identity_per_effect(tmp_path: Path) 
     assert count is not None and count["count"] == 1
 
 
-def _move_effect_to_cross_term(repository: ConversationRepository) -> None:
-    now = time.time()
+def _bind_command_to_cross_term_effect(repository: ConversationRepository) -> str:
     cross_command = "python-term-command:" + "f" * 64
-    command_identity = {
-        "session_id": "session-other",
-        "command_id": cross_command,
-        "term_id": "term-cross",
-        "step_id": "step-cross",
-    }
-    term_identity = {"command": command_identity, "step_ids": ["step-cross"]}
-    term_identity_json = json.dumps(
-        term_identity, sort_keys=True, separators=(",", ":")
+    envelope, context = _formal_context(
+        repository.store.path.parent,
+        session_id="session-other",
+        command_id=cross_command,
+        term_id="term-cross",
+        step_id="step-cross",
+        agent_id="agent-cross",
     )
-    step_identity = {
-        "term_id": "term-cross",
-        "step_id": "step-cross",
-        "ordinal": 0,
-        "command_id": cross_command,
-        "agent_id": "agent-cross",
-        "command": command_identity,
-    }
-    step_identity_json = json.dumps(
-        step_identity, sort_keys=True, separators=(",", ":")
+    python_repository = PythonTermRepository(repository.store.path)
+    python_repository.save_aggregate(
+        context.to_term_record(envelope), (context.to_step_record(),)
+    )
+    original = python_repository.get_tool_effect("effect-1")
+    assert original is not None and original.public_result is not None
+    cross_effect = ToolEffectRecord(
+        effect_id="effect-cross",
+        term_id="term-cross",
+        step_id="step-cross",
+        tool_call_id="call-cross",
+        request_digest=original.request_digest,
+        write_effect=True,
+        dispatch_state="released",
+        status="committed",
+        result_digest=canonical_digest(original.public_result),
+        public_result=original.public_result,
+    )
+    python_repository.save_tool_effect(cross_effect)
+    _, request_digest = repository._python_term_reconciliation_identity(
+        session_id="session-1",
+        command_id="command-1",
+        effect_id=cross_effect.effect_id,
+        outcome="applied",
+        summary="private confirmation",
     )
     with repository.store.connect() as connection:
-        connection.execute(
-            """INSERT INTO python_terms(
-            term_id, command_id, identity_digest, identity_json, attempt,
-            status, cursor, record_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 1, 'completed', 0, ?, ?, ?)""",
-            (
-                "term-cross",
-                cross_command,
-                hashlib.sha256(term_identity_json.encode()).hexdigest(),
-                term_identity_json,
-                json.dumps(
-                    {"envelope": command_identity, "step_ids": ["step-cross"]},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                now,
-                now,
-            ),
-        )
-        connection.execute(
-            """INSERT INTO python_steps(
-            term_id, step_id, ordinal, command_id, agent_id, host_generation,
-            identity_digest, identity_json, attempt, status, cursor,
-            record_json, created_at, updated_at
-            ) VALUES (?, ?, 0, ?, 'agent-cross', 'host-1', ?, ?, 1,
-            'completed', 0, ?, ?, ?)""",
-            (
-                "term-cross",
-                "step-cross",
-                cross_command,
-                hashlib.sha256(step_identity_json.encode()).hexdigest(),
-                step_identity_json,
-                json.dumps(
-                    {
-                        "term_id": "term-cross",
-                        "step_id": "step-cross",
-                        "ordinal": 0,
-                        "command_id": cross_command,
-                        "agent_id": "agent-cross",
-                        "command_identity": command_identity,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                now,
-                now,
-            ),
-        )
-        row = connection.execute(
-            """SELECT effect_json FROM python_tool_effects
-            WHERE effect_id = 'effect-1'"""
+        turn = connection.execute(
+            """SELECT state_json FROM conversation_turns
+            WHERE session_id = 'session-1' AND command_id = 'command-1'"""
         ).fetchone()
-        assert row is not None
-        effect_record = json.loads(row["effect_json"])
-        effect_record["term_id"] = "term-cross"
-        effect_record["step_id"] = "step-cross"
-        effect_record["tool_call_id"] = "call-cross"
+        assert turn is not None
+        state = json.loads(turn["state_json"])
+        if "reconciled_effect_ids" in state:
+            state["reconciled_effect_ids"] = [cross_effect.effect_id]
         connection.execute(
-            """UPDATE python_tool_effects
-            SET term_id = 'term-cross', step_id = 'step-cross',
-                tool_call_id = 'call-cross', effect_json = ?
-            WHERE effect_id = 'effect-1'""",
-            (json.dumps(effect_record, sort_keys=True, separators=(",", ":")),),
+            """UPDATE conversation_turns SET state_json = ?
+            WHERE session_id = 'session-1' AND command_id = 'command-1'""",
+            (json.dumps(state, sort_keys=True),),
         )
+        connection.execute(
+            """UPDATE python_term_reconciliation_commands
+            SET effect_id = ?, request_digest = ?
+            WHERE idempotency_key = 'reconcile-1'""",
+            (
+                cross_effect.effect_id,
+                request_digest,
+            ),
+        )
+    return cross_effect.effect_id
 
 
 @pytest.mark.parametrize("terminal", [False, True])
@@ -569,7 +687,7 @@ def test_legacy_repair_rejects_cross_term_effect_with_same_public_result(
         tmp_path / f"cross-term-{'terminal' if terminal else 'queued'}.sqlite"
     )
     _mark_legacy_confirmation(repository, terminal=terminal)
-    _move_effect_to_cross_term(repository)
+    effect_id = _bind_command_to_cross_term_effect(repository)
 
     app = FastAPI()
     app.include_router(
@@ -577,7 +695,7 @@ def test_legacy_repair_rejects_cross_term_effect_with_same_public_result(
     )
     with TestClient(app) as client:
         response = client.post(
-            "/api/sessions/session-1/turns/command-1/effects/effect-1/reconcile",
+            f"/api/sessions/session-1/turns/command-1/effects/{effect_id}/reconcile",
             headers={"Idempotency-Key": "reconcile-1"},
             json={"outcome": "applied", "summary": "private confirmation"},
         )
