@@ -43,6 +43,21 @@ _TRANSITIONS: Mapping[str, frozenset[str]] = {
 }
 
 
+def _lease_state_reachable(source: str, target: str) -> bool:
+    """Return whether ``target`` is reachable through declared lease transitions."""
+    pending = [source]
+    visited: set[str] = set()
+    while pending:
+        state = pending.pop()
+        if state == target:
+            return True
+        if state in visited:
+            continue
+        visited.add(state)
+        pending.extend(_TRANSITIONS.get(state, ()))
+    return False
+
+
 class SecurityReviewBlocked(RuntimeError):
     """Trust, expiry, revocation or quarantine forbids new execution."""
 
@@ -1015,16 +1030,16 @@ class AssignmentRepository:
                 raise ValueError
             lease = record.lease
             if lease is not None:
-                durable = connection.execute(
-                    "SELECT assignment_digest, attempt, lease_generation_seq "
-                    "FROM runtime_instance_leases WHERE lease_id=?", (lease.lease_id,)
-                ).fetchone()
-                if durable is None or tuple(durable) != (
-                    lease.assignment_digest, lease.attempt, lease.lease_generation_seq
-                ):
-                    raise ValueError
-                if (lease.assignment_digest != source.assignment_digest or
+                durable = self._load_lease(connection, lease.lease_id)
+                embedded = asdict(lease)
+                embedded_digest = embedded.pop("lease_record_digest")
+                if (embedded_digest != _digest(canonical_json(embedded)) or
+                        lease.assignment_digest != source.assignment_digest or
                         lease.attempt != source.attempt + 1 or lease.state != "reserved" or
+                        durable.assignment_digest != source.assignment_digest or
+                        durable.attempt != source.attempt + 1 or
+                        durable.lease_generation_seq != lease.lease_generation_seq or
+                        not _lease_state_reachable(lease.state, durable.state) or
                         record.decision not in {"release_retry", "read_only_retry"}):
                     raise ValueError
             elif record.decision in {"release_retry", "read_only_retry"}:

@@ -743,6 +743,91 @@ def test_recovery_record_identity_tamper_fails_closed(tmp_path: Path, tamper: st
         )
 
 
+@pytest.mark.parametrize("tamper", ["state", "record_json", "lease_record_digest"])
+def test_recovery_replay_validates_the_complete_durable_retry_lease(
+    tmp_path: Path, tamper: str
+) -> None:
+    """A recovery replay must fail when any durable retry-lease representation drifts."""
+    database = tmp_path / f"{tamper}.sqlite"
+    repository, assignment = _admitted(database)
+    source = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=45.0, trusted_time=40.0,
+    )
+    first = repository.recover_expired_lease(
+        source.lease_id, owner="next", instance_id="i2", instance_nonce="n2",
+        host_generation="g2", client_lease_id="c2", fence_token="f2",
+        expires_at=80.0, trusted_time=50.0,
+    )
+    assert first.lease is not None
+
+    values = {
+        "state": "starting",
+        "record_json": "{}",
+        "lease_record_digest": "0" * 64,
+    }
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"UPDATE runtime_instance_leases SET {tamper}=? WHERE lease_id=?",
+            (values[tamper], first.lease.lease_id),
+        )
+
+    with pytest.raises(CorruptAssignmentState):
+        repository.recover_expired_lease(
+            source.lease_id, owner="ignored", instance_id="ignored-i",
+            instance_nonce="ignored-n", host_generation="ignored-g",
+            client_lease_id="ignored-c", fence_token="ignored-f",
+            expires_at=90.0, trusted_time=51.0,
+        )
+
+
+@pytest.mark.parametrize("durable_state", ["starting", "running", "terminal", "released"])
+def test_recovery_replay_accepts_a_retry_lease_legally_advanced_from_reserved(
+    tmp_path: Path, durable_state: str
+) -> None:
+    """The recovery snapshot stays reserved while its durable lease advances."""
+    repository, assignment = _admitted(tmp_path / f"{durable_state}.sqlite")
+    source = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=45.0, trusted_time=40.0,
+    )
+    first = repository.recover_expired_lease(
+        source.lease_id, owner="next", instance_id="i2", instance_nonce="n2",
+        host_generation="g2", client_lease_id="c2", fence_token="f2",
+        expires_at=100.0, trusted_time=50.0,
+    )
+    assert first.lease is not None
+    paths = {
+        "starting": ("starting",),
+        "running": ("starting", "accepting", "accepted", "running"),
+        "terminal": ("starting", "accepting", "accepted", "running", "terminal"),
+        "released": (
+            "starting", "accepting", "accepted", "running", "terminal", "released"
+        ),
+    }
+    durable = first.lease
+    for offset, state in enumerate(paths[durable_state], start=1):
+        durable = repository.transition_lease(
+            durable.lease_id, expected_state=durable.state, new_state=state,
+            attempt=durable.attempt, owner=durable.owner,
+            lease_generation_seq=durable.lease_generation_seq, fence_token="f2",
+            trusted_time=50.0 + offset,
+        )
+
+    replay = repository.recover_expired_lease(
+        source.lease_id, owner="ignored", instance_id="ignored-i",
+        instance_nonce="ignored-n", host_generation="ignored-g",
+        client_lease_id="ignored-c", fence_token="ignored-f",
+        expires_at=120.0, trusted_time=70.0,
+    )
+
+    assert durable.state == durable_state
+    assert replay == first
+    assert replay.lease.state == "reserved"
+
+
 def test_old_host_v2_pin_remains_readable_and_unchanged(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite"
     old = RuntimeV2Repository(database)
