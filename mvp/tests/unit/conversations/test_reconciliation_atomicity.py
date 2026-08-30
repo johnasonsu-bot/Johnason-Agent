@@ -7,10 +7,14 @@ import time
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from workbench.api.conversations import (
     ConversationAPI,
     PythonTermReconciliationRequest,
+    conversation_router,
+    python_term_command_id,
 )
 from workbench.conversations.repository import ConversationRepository
 from workbench.workflow.event_store import EventStore
@@ -41,6 +45,48 @@ def _prepare_reconciliation(
         "reconciled_effect_ids": [],
     }
     now = time.time()
+    runtime_command_id = python_term_command_id("session-1", "command-1")
+    command_identity = {
+        "session_id": "session-1",
+        "command_id": runtime_command_id,
+        "term_id": "term-1",
+        "step_id": "step-1",
+    }
+    term_identity = {"command": command_identity, "step_ids": ["step-1"]}
+    term_identity_json = json.dumps(
+        term_identity, sort_keys=True, separators=(",", ":")
+    )
+    term_record_json = json.dumps(
+        {
+            "envelope": command_identity,
+            "step_ids": ["step-1"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    step_identity = {
+        "term_id": "term-1",
+        "step_id": "step-1",
+        "ordinal": 0,
+        "command_id": runtime_command_id,
+        "agent_id": "agent-1",
+        "command": command_identity,
+    }
+    step_identity_json = json.dumps(
+        step_identity, sort_keys=True, separators=(",", ":")
+    )
+    step_record_json = json.dumps(
+        {
+            "term_id": "term-1",
+            "step_id": "step-1",
+            "ordinal": 0,
+            "command_id": runtime_command_id,
+            "agent_id": "agent-1",
+            "command_identity": command_identity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     with repository.store.connect() as connection:
         connection.execute(
             """UPDATE conversation_turns
@@ -52,18 +98,31 @@ def _prepare_reconciliation(
             """INSERT INTO python_terms(
             term_id, command_id, identity_digest, identity_json, attempt,
             status, cursor, record_json, created_at, updated_at
-            ) VALUES ('term-1', 'term-command-1', 'identity', '{}', 1,
-            'paused', 0, '{}', ?, ?)""",
-            (now, now),
+            ) VALUES ('term-1', ?, ?, ?, 1, 'paused', 0, ?, ?, ?)""",
+            (
+                runtime_command_id,
+                hashlib.sha256(term_identity_json.encode()).hexdigest(),
+                term_identity_json,
+                term_record_json,
+                now,
+                now,
+            ),
         )
         connection.execute(
             """INSERT INTO python_steps(
             term_id, step_id, ordinal, command_id, agent_id, host_generation,
             identity_digest, identity_json, attempt, status, cursor,
             record_json, created_at, updated_at
-            ) VALUES ('term-1', 'step-1', 1, 'step-command-1', 'agent-1',
-            'host-1', 'identity', '{}', 1, 'paused', 0, '{}', ?, ?)""",
-            (now, now),
+            ) VALUES ('term-1', 'step-1', 0, ?, 'agent-1', 'host-1',
+            ?, ?, 1, 'paused', 0, ?, ?, ?)""",
+            (
+                runtime_command_id,
+                hashlib.sha256(step_identity_json.encode()).hexdigest(),
+                step_identity_json,
+                step_record_json,
+                now,
+                now,
+            ),
         )
         for index, effect_id in enumerate(pending_effect_ids, start=1):
             connection.execute(
@@ -123,6 +182,7 @@ def _mark_legacy_confirmation(
         else {
             "phase": "before_model",
             "runner_mode": "python_term",
+            "python_term_execution": {"envelope": {"term_id": "term-1"}},
             "reconciliation_effect_ids": [],
             "reconciled_effect_ids": ["effect-1"],
         }
@@ -138,7 +198,14 @@ def _mark_legacy_confirmation(
                 json.dumps(
                     {
                         "effect_id": "effect-1",
+                        "term_id": "term-1",
+                        "step_id": "step-1",
+                        "tool_call_id": "call-1",
+                        "request_digest": "1" * 64,
                         "public_result": json.loads(public_result),
+                        "result_digest": hashlib.sha256(
+                            public_result.encode("utf-8")
+                        ).hexdigest(),
                         "status": "committed",
                     },
                     sort_keys=True,
@@ -341,16 +408,19 @@ def test_legacy_repair_fails_closed_when_effect_outcome_is_not_verifiable(
     repository = _prepare_reconciliation(tmp_path / "legacy-conflict.sqlite")
     _mark_legacy_confirmation(repository, public_status="failed")
 
-    with pytest.raises(ValueError, match="legacy reconciliation recovery conflict"):
-        _api(ConversationRepository(repository.store.path)).reconcile_python_term_effect(
-            session_id="session-1",
-            command_id="command-1",
-            effect_id="effect-1",
-            idempotency_key="reconcile-1",
-            request=PythonTermReconciliationRequest(
-                outcome="applied", summary="private confirmation"
-            ),
+    app = FastAPI()
+    app.include_router(
+        conversation_router(_api(ConversationRepository(repository.store.path)))
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "private confirmation"},
         )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "legacy reconciliation recovery conflict"}
+    assert "private confirmation" not in response.text
 
 
 def test_different_key_cannot_replay_already_confirmed_legacy_effect(
@@ -397,3 +467,126 @@ def test_command_reservation_serializes_one_identity_per_effect(tmp_path: Path) 
               AND effect_id = 'effect-1'"""
         ).fetchone()
     assert count is not None and count["count"] == 1
+
+
+def _move_effect_to_cross_term(repository: ConversationRepository) -> None:
+    now = time.time()
+    cross_command = "python-term-command:" + "f" * 64
+    command_identity = {
+        "session_id": "session-other",
+        "command_id": cross_command,
+        "term_id": "term-cross",
+        "step_id": "step-cross",
+    }
+    term_identity = {"command": command_identity, "step_ids": ["step-cross"]}
+    term_identity_json = json.dumps(
+        term_identity, sort_keys=True, separators=(",", ":")
+    )
+    step_identity = {
+        "term_id": "term-cross",
+        "step_id": "step-cross",
+        "ordinal": 0,
+        "command_id": cross_command,
+        "agent_id": "agent-cross",
+        "command": command_identity,
+    }
+    step_identity_json = json.dumps(
+        step_identity, sort_keys=True, separators=(",", ":")
+    )
+    with repository.store.connect() as connection:
+        connection.execute(
+            """INSERT INTO python_terms(
+            term_id, command_id, identity_digest, identity_json, attempt,
+            status, cursor, record_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, 'completed', 0, ?, ?, ?)""",
+            (
+                "term-cross",
+                cross_command,
+                hashlib.sha256(term_identity_json.encode()).hexdigest(),
+                term_identity_json,
+                json.dumps(
+                    {"envelope": command_identity, "step_ids": ["step-cross"]},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO python_steps(
+            term_id, step_id, ordinal, command_id, agent_id, host_generation,
+            identity_digest, identity_json, attempt, status, cursor,
+            record_json, created_at, updated_at
+            ) VALUES (?, ?, 0, ?, 'agent-cross', 'host-1', ?, ?, 1,
+            'completed', 0, ?, ?, ?)""",
+            (
+                "term-cross",
+                "step-cross",
+                cross_command,
+                hashlib.sha256(step_identity_json.encode()).hexdigest(),
+                step_identity_json,
+                json.dumps(
+                    {
+                        "term_id": "term-cross",
+                        "step_id": "step-cross",
+                        "ordinal": 0,
+                        "command_id": cross_command,
+                        "agent_id": "agent-cross",
+                        "command_identity": command_identity,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                now,
+                now,
+            ),
+        )
+        row = connection.execute(
+            """SELECT effect_json FROM python_tool_effects
+            WHERE effect_id = 'effect-1'"""
+        ).fetchone()
+        assert row is not None
+        effect_record = json.loads(row["effect_json"])
+        effect_record["term_id"] = "term-cross"
+        effect_record["step_id"] = "step-cross"
+        effect_record["tool_call_id"] = "call-cross"
+        connection.execute(
+            """UPDATE python_tool_effects
+            SET term_id = 'term-cross', step_id = 'step-cross',
+                tool_call_id = 'call-cross', effect_json = ?
+            WHERE effect_id = 'effect-1'""",
+            (json.dumps(effect_record, sort_keys=True, separators=(",", ":")),),
+        )
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_legacy_repair_rejects_cross_term_effect_with_same_public_result(
+    tmp_path: Path,
+    terminal: bool,
+) -> None:
+    repository = _prepare_reconciliation(
+        tmp_path / f"cross-term-{'terminal' if terminal else 'queued'}.sqlite"
+    )
+    _mark_legacy_confirmation(repository, terminal=terminal)
+    _move_effect_to_cross_term(repository)
+
+    app = FastAPI()
+    app.include_router(
+        conversation_router(_api(ConversationRepository(repository.store.path)))
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/sessions/session-1/turns/command-1/effects/effect-1/reconcile",
+            headers={"Idempotency-Key": "reconcile-1"},
+            json={"outcome": "applied", "summary": "private confirmation"},
+        )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "legacy reconciliation recovery conflict"}
+    assert "private confirmation" not in response.text
+    with repository.store.connect() as connection:
+        command = connection.execute(
+            """SELECT response_json FROM python_term_reconciliation_commands
+            WHERE idempotency_key = 'reconcile-1'"""
+        ).fetchone()
+    assert command is not None and command["response_json"] is None

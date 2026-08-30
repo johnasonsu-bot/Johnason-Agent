@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "e5b17afc102c46d561a77bf470692c4934f054dbb556035aff54efe2e7c89bd3",
-      "size": 1489218
+      "sha256": "0eef9e2ddbe46c4258028955bd2f8b0fea8cf488862b07be035910bbe14b1c2f",
+      "size": 1496339
     },
     {
       "path": "uv.lock",
@@ -194,8 +194,8 @@
     },
     {
       "path": "conversations/repository.py",
-      "sha256": "8c9565e33232808522d9101d7e1fb0a4e2e72b130383bdd59967fdbd05dbbcb9",
-      "size": 68299
+      "sha256": "f26d9540c656098ef56e7f44419f0cc82551f62f359deabfaad613e77e1b2f17",
+      "size": 75196
     },
     {
       "path": "conversations/worker.py",

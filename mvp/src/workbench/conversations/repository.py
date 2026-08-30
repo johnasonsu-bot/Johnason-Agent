@@ -1364,7 +1364,9 @@ class ConversationRepository:
                     "legacy reconciliation recovery conflict"
                 )
             effect = connection.execute(
-                """SELECT status, result_digest, effect_json, public_result_json
+                """SELECT effect_id, term_id, step_id, tool_call_id,
+                request_digest, status, result_digest, effect_json,
+                public_result_json
                 FROM python_tool_effects WHERE effect_id = ?""",
                 (effect_id,),
             ).fetchone()
@@ -1395,6 +1397,22 @@ class ConversationRepository:
                 if isinstance(public_result, dict)
                 else None
             )
+            canonical_effect_record = json.dumps(
+                effect_record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            mirrored_effect_fields = {
+                "effect_id": effect["effect_id"],
+                "term_id": effect["term_id"],
+                "step_id": effect["step_id"],
+                "tool_call_id": effect["tool_call_id"],
+                "request_digest": effect["request_digest"],
+                "status": effect["status"],
+                "result_digest": effect["result_digest"],
+                "public_result": public_result,
+            }
             if (
                 canonical_public_result != effect["public_result_json"]
                 or effect["result_digest"]
@@ -1405,13 +1423,144 @@ class ConversationRepository:
                 or hashlib.sha256(public_summary.encode("utf-8")).hexdigest()
                 != summary_digest
                 or not isinstance(effect_record, dict)
-                or effect_record.get("effect_id") != effect_id
-                or effect_record.get("status") != "committed"
-                or effect_record.get("public_result") != public_result
+                or canonical_effect_record != effect["effect_json"]
+                or any(
+                    effect_record.get(key) != value
+                    for key, value in mirrored_effect_fields.items()
+                )
             ):
                 raise ReconciliationRecoveryConflict(
                     "legacy reconciliation recovery conflict"
                 )
+            expected_runtime_command = "python-term-command:" + hashlib.sha256(
+                json.dumps(
+                    {"session_id": session_id, "command_id": command_id},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            term = connection.execute(
+                """SELECT term_id, command_id, identity_digest, identity_json,
+                record_json FROM python_terms WHERE term_id = ?""",
+                (effect["term_id"],),
+            ).fetchone()
+            step = connection.execute(
+                """SELECT term_id, step_id, ordinal, command_id, agent_id,
+                identity_digest, identity_json, record_json
+                FROM python_steps WHERE term_id = ? AND step_id = ?""",
+                (effect["term_id"], effect["step_id"]),
+            ).fetchone()
+            try:
+                term_identity = json.loads(term["identity_json"])
+                term_record = json.loads(term["record_json"])
+                step_identity = json.loads(step["identity_json"])
+                step_record = json.loads(step["record_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                ) from exc
+            canonical_term_identity = json.dumps(
+                term_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            canonical_term_record = json.dumps(
+                term_record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            canonical_step_identity = json.dumps(
+                step_identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            canonical_step_record = json.dumps(
+                step_record,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            term_command = (
+                term_identity.get("command")
+                if isinstance(term_identity, dict)
+                else None
+            )
+            term_envelope = (
+                term_record.get("envelope")
+                if isinstance(term_record, dict)
+                else None
+            )
+            term_step_ids = (
+                term_record.get("step_ids")
+                if isinstance(term_record, dict)
+                else None
+            )
+            step_command = (
+                step_identity.get("command")
+                if isinstance(step_identity, dict)
+                else None
+            )
+            if (
+                term is None
+                or step is None
+                or term["term_id"] != effect["term_id"]
+                or term["command_id"] != expected_runtime_command
+                or canonical_term_identity != term["identity_json"]
+                or canonical_term_record != term["record_json"]
+                or term["identity_digest"]
+                != hashlib.sha256(canonical_term_identity.encode("utf-8")).hexdigest()
+                or not isinstance(term_command, dict)
+                or term_command.get("session_id") != session_id
+                or term_command.get("command_id") != expected_runtime_command
+                or term_command.get("term_id") != effect["term_id"]
+                or not isinstance(term_envelope, dict)
+                or term_envelope.get("session_id") != session_id
+                or term_envelope.get("command_id") != expected_runtime_command
+                or term_envelope.get("term_id") != effect["term_id"]
+                or not isinstance(term_step_ids, list)
+                or effect["step_id"] not in term_step_ids
+                or step["term_id"] != effect["term_id"]
+                or step["step_id"] != effect["step_id"]
+                or canonical_step_identity != step["identity_json"]
+                or canonical_step_record != step["record_json"]
+                or step["identity_digest"]
+                != hashlib.sha256(canonical_step_identity.encode("utf-8")).hexdigest()
+                or not isinstance(step_identity, dict)
+                or step_identity.get("term_id") != step["term_id"]
+                or step_identity.get("step_id") != step["step_id"]
+                or step_identity.get("ordinal") != step["ordinal"]
+                or step_identity.get("command_id") != step["command_id"]
+                or step_identity.get("agent_id") != step["agent_id"]
+                or not isinstance(step_command, dict)
+                or step_command.get("term_id") != step["term_id"]
+                or step_command.get("step_id") != step["step_id"]
+                or step_command.get("command_id") != step["command_id"]
+                or not isinstance(step_record, dict)
+                or step_record.get("term_id") != step["term_id"]
+                or step_record.get("step_id") != step["step_id"]
+                or step_record.get("ordinal") != step["ordinal"]
+                or step_record.get("command_id") != step["command_id"]
+                or step_record.get("agent_id") != step["agent_id"]
+                or step_record.get("command_identity") != step_command
+            ):
+                raise ReconciliationRecoveryConflict(
+                    "legacy reconciliation recovery conflict"
+                )
+            if queued_last_pending:
+                snapshot = state.get("python_term_execution")
+                envelope = (
+                    snapshot.get("envelope") if isinstance(snapshot, dict) else None
+                )
+                if (
+                    not isinstance(envelope, dict)
+                    or envelope.get("term_id") != effect["term_id"]
+                ):
+                    raise ReconciliationRecoveryConflict(
+                        "legacy reconciliation recovery conflict"
+                    )
             response = {
                 "session_id": session_id,
                 "command_id": command_id,
