@@ -51,6 +51,11 @@ from workbench.runtime.engine_host.client import (
 from workbench.runtime.engine_host.contracts import HostProtocolError
 from workbench.runtime.engine_host.selector import host_run_id_for
 from workbench.runtime.engine_host.v2.mapper import map_runtime_event
+from workbench.runtime.engine_host.v2.runtime_admission import (
+    RuntimeAdmissionBlocked,
+    RuntimeAdmissionConflict,
+    RuntimeAdmissionUnavailable,
+)
 from workbench.workflow.engine import (
     PauseRun,
     ResumeRun,
@@ -123,7 +128,7 @@ class MessageRequest(BaseModel):
     content: str
     model: str = "default"
     provider_id: str | None = None
-    runtime: Literal["python-term"] | None = None
+    runtime: str | None = Field(default=None, min_length=1, max_length=128)
     agent_bindings: tuple[AgentBindingRequest, ...] = ()
     project_context: ProjectContextBindingRequest | None = None
 
@@ -245,14 +250,18 @@ def python_term_command_id(session_id: str, command_id: str) -> str:
     return "python-term-command:" + hashlib.sha256(value.encode()).hexdigest()
 
 
-class PythonTermConversationRouter(Protocol):
-    """Narrow control-plane seam; request handlers never inspect app state."""
+class RuntimeConversationRouter(Protocol):
+    """Runtime-neutral selector seam; HTTP provides only an opaque selector."""
 
     def route_conversation_query(
         self,
         *,
+        selector: str,
         admission: PythonTermConversationAdmission,
     ) -> PythonTermConversationRoute: ...
+
+
+PythonTermConversationRouter = RuntimeConversationRouter
 
 
 @dataclass
@@ -269,6 +278,7 @@ class ConversationAPI:
     providers: ProviderRepository | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_jobs: DevelopmentJobRepository | None = None
+    runtime_router: RuntimeConversationRouter | None = None
     python_term_router: PythonTermConversationRouter | None = None
     python_term_executor: PythonTermConversationExecutor | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
@@ -378,7 +388,7 @@ class ConversationAPI:
         content: str,
         model: str,
         provider_id: str | None = None,
-        runtime: Literal["python-term"] | None = None,
+        runtime: str | None = None,
         agent_bindings: tuple[AgentBindingRequest, ...] = (),
         project_context: ProjectContextBindingRequest | None = None,
     ) -> dict[str, Any]:
@@ -413,7 +423,7 @@ class ConversationAPI:
         content: str,
         model: str,
         provider_id: str | None,
-        runtime: Literal["python-term"] | None,
+        runtime: str | None,
         agent_bindings: tuple[AgentBindingRequest, ...],
         project_context: ProjectContextBindingRequest | None,
     ) -> dict[str, Any]:
@@ -450,12 +460,17 @@ class ConversationAPI:
                 else None
             )
         try:
+            self.conversations.claim_message_admission(
+                session_id, command_id, reservation_identity
+            )
             self._ensure_message_reservation_compatible(
                 session_id, command_id, reservation_identity
             )
         except ValueError:
             if runtime == "python-term":
                 raise PythonTermAdmissionConflict() from None
+            if runtime is not None:
+                raise RuntimeAdmissionConflict() from None
             raise
         if runtime is None and not agent_bindings:
             recovered = self._repair_v1_missing_queued_event(
@@ -465,9 +480,12 @@ class ConversationAPI:
             if recovered is not None:
                 return recovered
         selected_runtime: PythonTermConversationRoute | None = None
-        if runtime == "python-term":
-            if self.python_term_router is None:
-                raise PythonTermRuntimeUnavailable()
+        if runtime is not None:
+            router = self.runtime_router or self.python_term_router
+            if router is None:
+                if runtime == "python-term":
+                    raise PythonTermRuntimeUnavailable()
+                raise RuntimeAdmissionUnavailable()
             admission = self._python_term_admission(
                 session_id=session_id,
                 command_id=command_id,
@@ -478,12 +496,13 @@ class ConversationAPI:
                 project_context=project_context,
             )
             resolved_provider = admission.provider.id
-            selected_runtime = self.python_term_router.route_conversation_query(
+            selected_runtime = router.route_conversation_query(
+                selector=runtime,
                 admission=admission,
             )
         else:
             resolved_provider = self._resolve_provider_id(provider_id)
-        execution_model = admission.model if runtime == "python-term" else model
+        execution_model = admission.model if runtime is not None else model
         reservation_id = self._reserve(
             session_id,
             command_id,
@@ -497,7 +516,7 @@ class ConversationAPI:
             raise SessionPausedError(session_id)
         self.conversations.append_message(
             admission.messages[-1]
-            if runtime == "python-term"
+            if runtime is not None
             else ConversationMessage(
                 session_id=session_id,
                 command_id=f"{command_id}:user",
@@ -507,6 +526,8 @@ class ConversationAPI:
         )
         initial_state = self._initial_turn_state(session_id)
         if selected_runtime is not None:
+            if selected_runtime.runtime_id != "python-term":
+                raise RuntimeAdmissionUnavailable()
             runner_mode = "python_term"
             initial_state["runtime_id"] = selected_runtime.runtime_id
             initial_state["runtime_build_id"] = selected_runtime.build_id
@@ -2379,6 +2400,10 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         except PythonTermAdmissionConflict as exc:
             raise HTTPException(409, exc.public_detail) from exc
         except PythonTermRuntimeUnavailable as exc:
+            raise HTTPException(503, exc.public_detail) from exc
+        except RuntimeAdmissionConflict as exc:
+            raise HTTPException(409, exc.public_detail) from exc
+        except (RuntimeAdmissionUnavailable, RuntimeAdmissionBlocked) as exc:
             raise HTTPException(503, exc.public_detail) from exc
         except RetryableTurnError as exc:
             raise HTTPException(503, str(exc), headers={"Retry-After": "1"}) from exc

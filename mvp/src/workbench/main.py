@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from uuid import UUID
 
@@ -48,6 +50,21 @@ from workbench.runtime.engine_host.v2.repository import (
     CorruptCommandPin,
     RuntimeV2Repository,
 )
+from workbench.runtime.engine_host.v2.runtime_admission import (
+    RuntimeAdmissionBlocked,
+    RuntimeAdmissionConflict,
+    RuntimeAdmissionCoordinator,
+    RuntimeAdmissionUnavailable,
+    RuntimeAdmissionRepository,
+    RuntimeCatalog,
+    RuntimeCatalogEntry,
+)
+from workbench.runtime.engine_host.v2.assignment import (
+    AssignmentRepository,
+    RuntimeGateReceipt,
+    RuntimeTrustKey,
+    SignedRuntimeGateProof,
+)
 from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
@@ -62,7 +79,7 @@ from workbench.orchestration.development_execution import DevelopmentExecutionAd
 from workbench.orchestration.development_processor import DurableDevelopmentProcessor
 
 
-class PythonTermQueryRouter:
+class RuntimeQueryRouter:
     """Additive control-plane seam for explicitly selected Host v2 Queries.
 
     Existing conversations and graph runs keep their v1 runner.  A future
@@ -75,9 +92,11 @@ class PythonTermQueryRouter:
         registry: RuntimeRegistryV2 | None,
         *,
         _gate_proof: object | None = None,
+        _admission_coordinator: RuntimeAdmissionCoordinator | None = None,
     ) -> None:
         self._registry = registry
         self.__gate_proof = _gate_proof
+        self._admission_coordinator = _admission_coordinator
 
     def route_new_query(
         self, command: QueryCommandV2, envelope: RunEnvelopeV2
@@ -93,21 +112,41 @@ class PythonTermQueryRouter:
     def route_conversation_query(
         self,
         *,
+        selector: str = "python-term",
         admission: PythonTermConversationAdmission,
     ) -> PythonTermConversationRoute:
-        """Build and route the only supported explicit Conversation Query v2 input."""
+        """Resolve one catalog selector before creating any Conversation turn."""
         if self._registry is None:
-            raise PythonTermRuntimeUnavailable()
+            if selector == "python-term":
+                raise PythonTermRuntimeUnavailable()
+            raise RuntimeAdmissionUnavailable()
         try:
-            selected = self._resume_or_registration(admission.runtime_command_id)
+            selected = self._runtime_identity(selector, admission)
             command, envelope = self._conversation_query(
                 admission=admission,
                 runtime_id=selected.runtime_id,
                 build_id=selected.build_id,
             )
-            selected = self._registry.route_python_term_query(
-                command, envelope, gate_proof=self.__gate_proof
-            )
+            if self._admission_coordinator is None:
+                if selector != "python-term":
+                    raise RuntimeAdmissionUnavailable()
+                selected = self._registry.route_python_term_query(
+                    command, envelope, gate_proof=self.__gate_proof
+                )
+            else:
+                admitted = self._admission_coordinator.admit(
+                    selector=selector,
+                    session_id=admission.session_id,
+                    command_id=admission.runtime_command_id,
+                    envelope=envelope,
+                )
+                selected = admitted.selection
+        except (
+            RuntimeAdmissionBlocked,
+            RuntimeAdmissionConflict,
+            RuntimeAdmissionUnavailable,
+        ):
+            raise
         except (
             CommandAttemptRegression,
             CommandCapabilityUnavailable,
@@ -121,7 +160,7 @@ class PythonTermQueryRouter:
             # request boundary.
             raise PythonTermRuntimeUnavailable() from None
         if selected.runtime_id != "python-term":
-            raise PythonTermRuntimeUnavailable()
+            raise RuntimeAdmissionUnavailable()
         return PythonTermConversationRoute(
             runtime_id=selected.runtime_id,
             build_id=selected.build_id,
@@ -129,6 +168,42 @@ class PythonTermQueryRouter:
             execution_snapshot=self._conversation_execution_snapshot(
                 admission, command, envelope
             ),
+        )
+
+    def _runtime_identity(
+        self,
+        selector: str,
+        admission: PythonTermConversationAdmission,
+    ) -> RuntimeSelectionV2:
+        if self._admission_coordinator is None:
+            if selector != "python-term":
+                raise RuntimeAdmissionUnavailable()
+            return self._resume_or_registration(admission.runtime_command_id)
+        intent = self._admission_coordinator.intents.get(
+            admission.session_id, admission.runtime_command_id
+        )
+        if intent is not None:
+            if intent.selector != selector:
+                raise RuntimeAdmissionConflict()
+            return RuntimeSelectionV2(
+                runtime_id=intent.runtime_id,
+                build_id=intent.build_id,
+                state=intent.state,
+                capabilities=(),
+                command_id=intent.command_id,
+            )
+        pin = self._registry.repository.get_pin(admission.runtime_command_id)
+        if pin is not None:
+            if selector != pin.runtime_id:
+                raise RuntimeAdmissionConflict()
+            return self._registry.resume(admission.runtime_command_id)
+        entry = self._admission_coordinator.catalog.resolve(selector)
+        return RuntimeSelectionV2(
+            runtime_id=entry.runtime_id,
+            build_id=entry.build_id,
+            state="catalog",
+            capabilities=entry.required_capabilities,
+            command_id=None,
         )
 
     def _conversation_execution_snapshot(
@@ -385,6 +460,99 @@ class PythonTermQueryRouter:
         )
 
 
+PythonTermQueryRouter = RuntimeQueryRouter
+
+
+def _development_assignment_proof(
+    database: Path, runtime_dir: Path
+) -> tuple[AssignmentRepository, str] | None:
+    """Load an externally signed RF-1 proof; this process never acts as signer."""
+    try:
+        public_key = base64.b64decode(
+            (runtime_dir / "python-term-dev-public-key.txt")
+            .read_text(encoding="ascii")
+            .strip(),
+            validate=True,
+        )
+        document = json.loads(
+            (runtime_dir / "runtime-admission-dev-signed-proof.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        receipt_json = document["receipt_json"]
+        signature = base64.b64decode(document["signature"], validate=True)
+        receipt = RuntimeGateReceipt(**json.loads(receipt_json))
+        if receipt.trust_tier != "DEV_UNTRUSTED":
+            raise ValueError
+        assignments = AssignmentRepository.development(
+            database,
+            trust_keys=(
+                RuntimeTrustKey(
+                    receipt.signer_key_id, public_key, "DEV_UNTRUSTED"
+                ),
+            ),
+        )
+        verified = assignments.store_gate_proof(
+            SignedRuntimeGateProof(receipt_json, signature),
+            trusted_time=time.time(),
+        )
+        return assignments, verified.proof_digest
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _runtime_admission_coordinator(
+    *,
+    settings: WorkbenchSettings,
+    registry: RuntimeRegistryV2,
+    development_trust: bool,
+) -> RuntimeAdmissionCoordinator:
+    """Construct the formal admission path, empty when no RF-1 proof exists."""
+    assignments = AssignmentRepository.production(settings.database)
+    proof_digest: str | None = None
+    if development_trust:
+        development = _development_assignment_proof(
+            settings.database, settings.runtime_dir
+        )
+        if development is not None:
+            assignments, proof_digest = development
+    catalog_entries: tuple[RuntimeCatalogEntry, ...] = ()
+    if proof_digest is not None:
+        selection = next(
+            (
+                item
+                for item in registry.snapshot()
+                if item.runtime_id == "python-term" and item.state == "ready"
+            ),
+            None,
+        )
+        if selection is not None:
+            with registry.repository.store.connect() as connection:
+                row = connection.execute(
+                    "SELECT capability_digest FROM runtime_v2_registrations "
+                    "WHERE runtime_id=? AND build_id=? AND status='ready'",
+                    (selection.runtime_id, selection.build_id),
+                ).fetchone()
+            if row is not None:
+                catalog_entries = (
+                    RuntimeCatalogEntry(
+                        selector="python-term",
+                        runtime_id=selection.runtime_id,
+                        build_id=selection.build_id,
+                        capability_digest=row["capability_digest"],
+                        gate_proof_digest=proof_digest,
+                        required_capabilities=selection.capabilities,
+                    ),
+                )
+    return RuntimeAdmissionCoordinator(
+        catalog=RuntimeCatalog(catalog_entries),
+        registry=registry,
+        assignments=assignments,
+        intents=RuntimeAdmissionRepository(settings.database),
+        trusted_time=time.time,
+    )
+
+
 def build_app(
     settings: WorkbenchSettings | None = None,
     *,
@@ -499,8 +667,19 @@ def build_app(
             python_term_runtime = composition.runtime
             python_term_executor = composition.executor
             python_term_gate_proof = composition.gate_proof
-    python_term_query_router = PythonTermQueryRouter(
-        runtime_registry_v2, _gate_proof=python_term_gate_proof
+    runtime_admission_coordinator = (
+        _runtime_admission_coordinator(
+            settings=resolved,
+            registry=runtime_registry_v2,
+            development_trust=resolved.python_term_development_trust,
+        )
+        if runtime_registry_v2 is not None
+        else None
+    )
+    runtime_query_router = RuntimeQueryRouter(
+        runtime_registry_v2,
+        _gate_proof=python_term_gate_proof,
+        _admission_coordinator=runtime_admission_coordinator,
     )
     app = create_app(
         AppSettings(
@@ -515,7 +694,7 @@ def build_app(
             runner_lifecycle=runner_lifecycle,
             host_generation=getattr(selected_runner, "host_generation", None),
             development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
-            python_term_router=python_term_query_router,
+            runtime_router=runtime_query_router,
             python_term_executor=python_term_executor,
         )
     )
@@ -535,6 +714,7 @@ def build_app(
     app.state.agent_runtime = agent_runtime
     app.state.execution_runner = selected_runner
     app.state.runtime_registry_v2 = runtime_registry_v2
+    app.state.runtime_admission_coordinator = runtime_admission_coordinator
     app.state.python_term_runtime = python_term_runtime
     return app
 

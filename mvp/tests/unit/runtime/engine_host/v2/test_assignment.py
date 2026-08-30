@@ -27,6 +27,7 @@ from workbench.runtime.engine_host.v2.assignment import (
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from tests.fixtures.host_v2 import run_envelope, runtime_capabilities
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.workflow.schema import PHASE1_SCHEMA_VERSION
 
 
 _PROOF_DOMAIN = b"johnason.runtime-gate-proof/v1\0"
@@ -450,7 +451,10 @@ def test_schema_upgrade_from_v23_preserves_old_pin_and_concurrent_init(tmp_path:
         assert connection.execute(
             "SELECT command_id, runtime_id FROM runtime_v2_command_pins"
         ).fetchone() == ("legacy", "old")
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 27
+        assert (
+            connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            == PHASE1_SCHEMA_VERSION
+        )
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='runtime_lease_evidence'"
         ).fetchone() == ("runtime_lease_evidence",)

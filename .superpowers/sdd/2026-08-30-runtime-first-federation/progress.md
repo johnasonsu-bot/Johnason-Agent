@@ -7,6 +7,8 @@ Review cadence ruling: task rounds cover specification, correctness, recovery co
 Task RF-1.0: fix round 1/5 closed injectable production trust, proof timing/domain, direct takeover and lease integrity gaps; durable recovery evidence and state-machine gaps remained (commits 3a78d3a..189dd96).
 Task RF-1.0: fix round 2/5 made acceptance/effect evidence durable and recovery outcomes idempotent; write-first Effect lattice and recovery source binding remained (commits 189dd96..55ab4eb).
 Task RF-1.0: fix round 3/5 closed write-first Effect and source-bound recovery records; full retry-lease decoding remained (commits 55ab4eb..f59f040).
-Task RF-1.0: fix round 4/5 used a fresh implementer and formal lease decoding for retry recovery; awaiting independent final review (commits f59f040..d845b82).
+Task RF-1.0: fix round 4/5 used a fresh implementer and formal lease decoding for retry recovery; independent final review CLEAN (commits f59f040..d845b82).
 Task RF-2A: pinned Goose and DeepSeek Harness submodules at approved revisions (commit b1d0659).
 Task RF-2A: Goose and DeepSeek source-readiness verifiers completed in one shared-index integration commit (commit 4fa31d0); both implementations independently reported complete source-only gates and no Runtime GO claim.
+Task RF-2A: fix round 1/5 closed reproducible Goose and per-target DeepSeek build-plan findings; independent review CLEAN and shared Python Term manifest refreshed (commits 1eae3e3, a729735, 08eb4f1).
+Task RF-1.1: runtime-neutral selector, durable admission intent and immutable RuntimeAssignment integration implemented. Fix round 1/5 enabled the real build_app path, added cross-process command identity arbitration, made terminal CAS idempotent and detached pending recovery from mutable catalog state. Fix round 2/5 preserved pre-v28 accepted-command recovery without claim pollution. Independent review CLEAN; final manifest and integration verification pending controller commit.

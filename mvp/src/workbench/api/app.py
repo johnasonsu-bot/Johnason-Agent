@@ -20,6 +20,7 @@ from workbench.api.conversations import (
     ConversationAPI,
     PythonTermConversationExecutor,
     PythonTermConversationRouter,
+    RuntimeConversationRouter,
     SequentialOrchestrationProcessor,
     conversation_router,
 )
@@ -74,6 +75,7 @@ class AppSettings:
     host_generation: str | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_processor: object | None = None
+    runtime_router: RuntimeConversationRouter | None = None
     python_term_router: PythonTermConversationRouter | None = None
     python_term_executor: PythonTermConversationExecutor | None = None
 
@@ -122,6 +124,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         providers=ProviderRepository(settings.database),
         sequential_processor=sequential_processor,
         development_jobs=development_jobs,
+        runtime_router=settings.runtime_router,
         python_term_router=settings.python_term_router,
         python_term_executor=settings.python_term_executor,
     )

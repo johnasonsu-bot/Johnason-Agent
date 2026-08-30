@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from workbench.conversations.models import ConversationMessage, ConversationSession
+from workbench.protocol.events import DomainEvent
 from workbench.workflow.store import WorkflowStore
 
 
@@ -84,6 +85,60 @@ class ConversationRepository:
             ).fetchone()
         assert row is not None
         return ConversationSession.model_validate_json(row["record_json"])
+
+    def claim_message_admission(
+        self, session_id: str, command_id: str, identity: dict[str, Any]
+    ) -> None:
+        """Freeze one public command identity before runtime-specific writes."""
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        reservation_identity = json.dumps(
+            {"session_id": session_id, "command_id": command_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        reservation_key = "conversation-command:" + hashlib.sha256(
+            reservation_identity.encode("utf-8")
+        ).hexdigest()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                accepted = connection.execute(
+                    "SELECT domain_events.event_json FROM command_results "
+                    "JOIN domain_events "
+                    "ON domain_events.event_id=command_results.event_id "
+                    "WHERE command_results.command_id=?",
+                    (reservation_key,),
+                ).fetchone()
+                if accepted is not None:
+                    event = DomainEvent.model_validate_json(accepted["event_json"])
+                    expected = {
+                        "session_id": session_id,
+                        "kind": "message",
+                        "identity_digest": digest,
+                    }
+                    if (
+                        event.event_type != "conversation.command.accepted"
+                        or event.payload != expected
+                    ):
+                        raise ValueError("command identity cannot change")
+                row = connection.execute(
+                    "SELECT identity_digest, identity_json "
+                    "FROM conversation_admission_claims "
+                    "WHERE session_id=? AND command_id=?",
+                    (session_id, command_id),
+                ).fetchone()
+                if row is None:
+                    connection.execute(
+                        "INSERT INTO conversation_admission_claims VALUES(?,?,?,?,?)",
+                        (session_id, command_id, digest, encoded, time.time()),
+                    )
+                elif row["identity_digest"] != digest or row["identity_json"] != encoded:
+                    raise ValueError("command identity cannot change")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def load_sequential_result(
         self, graph_run_id: str, node_id: str, attempt: int

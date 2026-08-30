@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 27
+PHASE1_SCHEMA_VERSION = 28
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -207,6 +207,37 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             FOREIGN KEY(source_lease_id) REFERENCES runtime_instance_leases(lease_id),
             FOREIGN KEY(new_lease_id) REFERENCES runtime_instance_leases(lease_id)
+        );
+        CREATE TABLE IF NOT EXISTS runtime_admission_intents (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            selector TEXT NOT NULL,
+            envelope_identity_digest TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            capability_digest TEXT NOT NULL,
+            gate_proof_digest TEXT NOT NULL,
+            admission_epoch INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            assignment_digest TEXT,
+            blocked_category TEXT,
+            record_json TEXT NOT NULL,
+            record_digest TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(session_id, command_id),
+            UNIQUE(command_id)
+        );
+        CREATE TABLE IF NOT EXISTS runtime_admission_legacy_pins (
+            command_id TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS conversation_admission_claims (
+            session_id TEXT NOT NULL,
+            command_id TEXT NOT NULL,
+            identity_digest TEXT NOT NULL,
+            identity_json TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (session_id, command_id)
         );
         CREATE TABLE IF NOT EXISTS lifecycle_command_results (
             command_id TEXT PRIMARY KEY,
@@ -674,6 +705,14 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
         END;
         """
     )
+    previous_schema_version = connection.execute(
+        "SELECT MAX(version) FROM schema_migrations"
+    ).fetchone()[0]
+    if previous_schema_version is not None and previous_schema_version < 28:
+        connection.execute(
+            "INSERT OR IGNORE INTO runtime_admission_legacy_pins(command_id) "
+            "SELECT command_id FROM runtime_v2_command_pins"
+        )
     _add_column_if_missing(
         connection, "lifecycle_interventions", "claimed_by", "TEXT"
     )

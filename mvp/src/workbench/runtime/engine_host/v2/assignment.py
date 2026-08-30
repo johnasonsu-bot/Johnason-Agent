@@ -511,6 +511,43 @@ class AssignmentRepository:
                 "proof_digest": proof.proof_digest, "trust_tier": proof.trust_tier,
                 "state": proof.state, "expires_at": proof.expires_at}
 
+    def require_gate_binding(
+        self,
+        *,
+        proof_digest: str,
+        runtime_id: str,
+        build_id: str,
+        capability_digest: str,
+        trusted_time: float,
+    ) -> VerifiedRuntimeGateProof:
+        """Verify one catalog-owned proof before any command pin is created."""
+        _require_digest(proof_digest, "proof_digest")
+        _require_text(runtime_id, "runtime_id")
+        _require_text(build_id, "build_id")
+        _require_digest(capability_digest, "capability_digest")
+
+        def require(connection: sqlite3.Connection) -> VerifiedRuntimeGateProof:
+            now = self._trusted_time(connection, trusted_time)
+            row = connection.execute(
+                "SELECT * FROM runtime_gate_proofs_private WHERE proof_digest=?",
+                (proof_digest,),
+            ).fetchone()
+            if row is None:
+                raise SecurityReviewBlocked("runtime gate proof unavailable")
+            proof = self._proof_from_row(row)
+            self._require_current_proof_trust(row, proof)
+            if now < proof.issued_at or now > proof.expires_at:
+                raise SecurityReviewBlocked("runtime gate proof expired")
+            if (proof.runtime_id, proof.build_id, proof.capability_digest) != (
+                runtime_id, build_id, capability_digest
+            ):
+                raise SecurityReviewBlocked("runtime gate proof binding changed")
+            if self._blocked(connection, runtime_id, build_id, proof.signer_key_id):
+                raise SecurityReviewBlocked("BLOCKED_SECURITY_REVIEW")
+            return proof
+
+        return self._transaction(require)
+
     def admit_assignment(self, request: RuntimeAssignmentInput, *, trusted_time: float) -> RuntimeAssignment:
         if not isinstance(request, RuntimeAssignmentInput):
             raise TypeError("request must be RuntimeAssignmentInput")

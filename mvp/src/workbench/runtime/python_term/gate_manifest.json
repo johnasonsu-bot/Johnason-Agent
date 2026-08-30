@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "657e56589be18a8c5d966379275571f88174cfa59a1cc39e964a89a28e5fcea7",
-      "size": 1563486
+      "sha256": "2040d090f31629fae8ac50fa8e3a5ad9f7070dd789af45d5cb5b616baade9127",
+      "size": 1593420
     },
     {
       "path": "uv.lock",
@@ -129,8 +129,8 @@
     },
     {
       "path": "api/app.py",
-      "sha256": "0ce823364b8d7173014baaa1bf7e5c222260e430012a4db76a26bd07604c8d19",
-      "size": 13329
+      "sha256": "980dde0284f839a4d69900759789c05b2fc79dc4f6df1c1e6eb638f5abffefb5",
+      "size": 13468
     },
     {
       "path": "api/artifacts.py",
@@ -144,8 +144,8 @@
     },
     {
       "path": "api/conversations.py",
-      "sha256": "8c24eeb40c8bdce7bbe7dbc5d16077527dae03e5bee65cabe84e265f83b13047",
-      "size": 100517
+      "sha256": "29de7c78bc10f4a751b497f7c5c01a43cb28bc25b18deb95fa3a17c70260e314",
+      "size": 101553
     },
     {
       "path": "api/engine_host.py",
@@ -194,8 +194,8 @@
     },
     {
       "path": "conversations/repository.py",
-      "sha256": "ac29cb7138f6ebd7e8af926dba34918f7b13df5bceb37f1516e293b88ece97d1",
-      "size": 69545
+      "sha256": "ded317bcc0947a4dc0f0347efcb16d27279a2dac77068872c7d1cfa4042b0e8d",
+      "size": 72167
     },
     {
       "path": "conversations/worker.py",
@@ -239,8 +239,8 @@
     },
     {
       "path": "main.py",
-      "sha256": "bc1cc57b0039ae54f5ef0014ff83e1d53f18627dea8a2b23fa62c89c70fbb661",
-      "size": 29965
+      "sha256": "6d2b0314252097b0325f4d252a21cdae95c751367c43f60604e1edc537ab8661",
+      "size": 36703
     },
     {
       "path": "models/__init__.py",
@@ -514,8 +514,8 @@
     },
     {
       "path": "runtime/engine_host/v2/assignment.py",
-      "sha256": "449a04bcd797ad5f520943e2ea9ce953aabfd3d8e2bf27271b8588c4cd70347a",
-      "size": 54563
+      "sha256": "7236bba98c7a4f6eed59fa5268619f04f044cafb2cbe93b8b6bc54bb5f4a6fef",
+      "size": 56208
     },
     {
       "path": "runtime/engine_host/v2/client.py",
@@ -551,6 +551,11 @@
       "path": "runtime/engine_host/v2/repository.py",
       "sha256": "2c6a1713e058137e8ae3bf5b0850b27638b466a563d1b4f828f1067f72720e46",
       "size": 13827
+    },
+    {
+      "path": "runtime/engine_host/v2/runtime_admission.py",
+      "sha256": "5c15269c043ba972e1ca192fc6a2dc6a74337977b99a991d0d27c5fd2de97f7d",
+      "size": 24991
     },
     {
       "path": "runtime/engine_host/v2/security.py",
@@ -704,8 +709,8 @@
     },
     {
       "path": "workflow/schema.py",
-      "sha256": "444ed570500654fe2138752c51ab55259a14b091b319d182f8acc2065c7c4bdf",
-      "size": 39519
+      "sha256": "efecc3497aee53fab0a5247febc322c04d98aa9316240658e774b38a22abc349",
+      "size": 41128
     },
     {
       "path": "workflow/store.py",
