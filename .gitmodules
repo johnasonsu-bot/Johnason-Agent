@@ -1,0 +1,6 @@
+[submodule "third_party/goose"]
+	path = third_party/goose
+	url = git@github.com:johnasonsu-bot/goose.git
+[submodule "third_party/deepseek-harness"]
+	path = third_party/deepseek-harness
+	url = https://github.com/deepseek-ai/deepseek-harness.git
