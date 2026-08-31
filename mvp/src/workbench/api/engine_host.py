@@ -69,7 +69,7 @@ class EngineHostV2RuntimeDiagnostic(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     runtime_id: str
-    build_id: str
+    build_id: str | None = None
     state: Literal["ready", "disabled", "unavailable"]
     capabilities: tuple[str, ...]
     selector: str
@@ -90,12 +90,35 @@ class EngineHostV2RuntimeDiagnostic(BaseModel):
         | None
     ) = None
     trust_status: Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"] | None = None
+    supervisor_state: (
+        Literal[
+            "configured",
+            "starting",
+            "ready",
+            "leased",
+            "restarting",
+            "unavailable",
+            "stopping",
+            "stopped",
+        ]
+        | None
+    ) = None
+    host_generation: int | None = None
+    restart_count: int | None = None
+    active: bool | None = None
     last_error_category: (
         Literal[
             "capability_unavailable",
             "command_rejected",
             "gate_metadata_unavailable",
             "registry_integrity",
+            "start_failed",
+            "identity_mismatch",
+            "protocol_failed",
+            "process_exited",
+            "restart_exhausted",
+            "cleanup_unconfirmed",
+            "lease_expired",
         ]
         | None
     ) = None
@@ -121,6 +144,10 @@ class RuntimeAdmissionProbeSource(Protocol):
     def selector(self, selector: str) -> object: ...
 
 
+class SidecarSupervisorSnapshotSource(Protocol):
+    def snapshot(self) -> tuple[object, ...]: ...
+
+
 def engine_host_v2_router(
     registry: RuntimeRegistryV2 | None,
     *,
@@ -129,6 +156,7 @@ def engine_host_v2_router(
         str, Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"]
     ] | None = None,
     admission_probe: RuntimeAdmissionProbeSource | None = None,
+    supervisor: SidecarSupervisorSnapshotSource | None = None,
 ) -> APIRouter:
     """Expose the additive v2 registry diagnostic without changing v1 routes."""
 
@@ -145,8 +173,14 @@ def engine_host_v2_router(
             # disclose its raw registration fields or turn a local read endpoint
             # into an exception surface.
             snapshots = ()
+        try:
+            supervisor_snapshots = () if supervisor is None else supervisor.snapshot()
+        except Exception:
+            supervisor_snapshots = ()
+        supervised = {item.runtime_id: item for item in supervisor_snapshots}
         diagnostics = []
         for item in snapshots:
+            supervised_item = supervised.pop(item.runtime_id, None)
             probed = None
             if admission_probe is not None:
                 try:
@@ -181,9 +215,38 @@ def engine_host_v2_router(
                             else runtime_trust_status.get(item.runtime_id)
                         )
                     ),
-                    last_error_category=registry.last_error_category(item.runtime_id)
-                    if registry is not None
-                    else None,
+                    supervisor_state=getattr(supervised_item, "state", None),
+                    host_generation=getattr(
+                        supervised_item, "host_generation", None
+                    ),
+                    restart_count=getattr(supervised_item, "restart_count", None),
+                    active=getattr(supervised_item, "active", None),
+                    last_error_category=(
+                        getattr(supervised_item, "last_error_category", None)
+                        or (
+                            registry.last_error_category(item.runtime_id)
+                            if registry is not None
+                            else None
+                        )
+                    ),
+                )
+            )
+        for runtime_id, item in sorted(supervised.items()):
+            diagnostics.append(
+                EngineHostV2RuntimeDiagnostic(
+                    runtime_id=runtime_id,
+                    build_id=getattr(item, "build_id", None),
+                    state="unavailable",
+                    capabilities=(),
+                    selector=runtime_id,
+                    selectable_for_new_commands=False,
+                    admission_state="unavailable",
+                    admission_reason="runtime_unavailable",
+                    supervisor_state=getattr(item, "state", None),
+                    host_generation=getattr(item, "host_generation", None),
+                    restart_count=getattr(item, "restart_count", None),
+                    active=getattr(item, "active", None),
+                    last_error_category=getattr(item, "last_error_category", None),
                 )
             )
         return EngineHostDiagnosticV2Envelope(

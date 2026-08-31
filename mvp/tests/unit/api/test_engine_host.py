@@ -222,6 +222,78 @@ def test_v2_engine_host_diagnostic_exposes_only_safe_runtime_summary(
     assert "digest" not in response.text
 
 
+def test_v2_engine_host_diagnostic_merges_safe_supervisor_state(
+    tmp_path: Path,
+) -> None:
+    registry = RuntimeRegistryV2(RuntimeV2Repository(tmp_path / "api.sqlite"))
+    registry.register(
+        runtime_capabilities("fake-v2", build_id="fake:test", query=True)
+    )
+    supervisor = SimpleNamespace(
+        snapshot=lambda: (
+            SimpleNamespace(
+                runtime_id="fake-v2",
+                build_id="fake:test",
+                state="leased",
+                host_generation=2,
+                restart_count=1,
+                active=True,
+                last_error_category=None,
+            ),
+            SimpleNamespace(
+                runtime_id="failed-v2",
+                build_id=None,
+                state="unavailable",
+                host_generation=1,
+                restart_count=0,
+                active=False,
+                last_error_category="start_failed",
+            ),
+        )
+    )
+    app = FastAPI()
+    app.include_router(
+        engine_host_v2_router(registry, enabled=True, supervisor=supervisor)
+    )
+
+    response = TestClient(app).get("/api/v1/engine-host")
+
+    assert response.status_code == 200
+    runtimes = {
+        item["runtime_id"]: item for item in response.json()["v2"]["runtimes"]
+    }
+    assert runtimes["fake-v2"] | {} == {
+        "runtime_id": "fake-v2",
+        "build_id": "fake:test",
+        "state": "ready",
+        "capabilities": ["query"],
+        "selector": "fake-v2",
+        "selectable_for_new_commands": False,
+        "admission_state": "unavailable",
+        "admission_reason": "catalog_unavailable",
+        "supervisor_state": "leased",
+        "host_generation": 2,
+        "restart_count": 1,
+        "active": True,
+    }
+    assert runtimes["failed-v2"] == {
+        "runtime_id": "failed-v2",
+        "state": "unavailable",
+        "capabilities": [],
+        "selector": "failed-v2",
+        "selectable_for_new_commands": False,
+        "admission_state": "unavailable",
+        "admission_reason": "runtime_unavailable",
+        "supervisor_state": "unavailable",
+        "host_generation": 1,
+        "restart_count": 0,
+        "active": False,
+        "last_error_category": "start_failed",
+    }
+    for private_name in ("argv", "pid", "nonce", "fence", "environment", "stderr"):
+        assert private_name not in response.text.lower()
+
+
 def test_v2_engine_host_diagnostic_reports_reopened_runtime_as_unavailable(
     tmp_path: Path,
 ) -> None:

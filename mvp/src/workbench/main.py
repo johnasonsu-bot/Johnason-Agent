@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import uvicorn
 from fastapi import FastAPI
@@ -61,6 +61,7 @@ from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeCatalogEntry,
     RuntimeAdmissionProbe,
 )
+from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     RuntimeGateReceipt,
@@ -711,6 +712,17 @@ def build_app(
         if resolved.engine_host_v2_enabled
         else None
     )
+    sidecar_supervisor = (
+        SidecarSupervisor(
+            runtimes=resolved.engine_host_v2_runtimes,
+            registry=runtime_registry_v2,
+            assignments=AssignmentRepository.production(resolved.database),
+            runtime_dir=resolved.runtime_dir,
+            app_instance_id=service_instance_id or str(uuid4()),
+        )
+        if runtime_registry_v2 is not None and resolved.engine_host_v2_runtimes
+        else None
+    )
     python_term_runtime = None
     python_term_executor = None
     python_term_gate_proof = None
@@ -797,6 +809,7 @@ def build_app(
             capability_token=capability_token,
             service_instance_id=service_instance_id,
             runner_lifecycle=runner_lifecycle,
+            sidecar_lifecycle=sidecar_supervisor,
             host_generation=getattr(selected_runner, "host_generation", None),
             development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
             runtime_router=runtime_query_router,
@@ -815,11 +828,13 @@ def build_app(
                     else {"python-term": python_term_trust_status}
                 ),
                 admission_probe=runtime_admission_probe,
+                supervisor=sidecar_supervisor,
             )
         )
     app.state.agent_runtime = agent_runtime
     app.state.execution_runner = selected_runner
     app.state.runtime_registry_v2 = runtime_registry_v2
+    app.state.sidecar_supervisor = sidecar_supervisor
     app.state.runtime_admission_coordinator = runtime_admission_coordinator
     app.state.python_term_runtime = python_term_runtime
     return app

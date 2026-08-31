@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 28
+PHASE1_SCHEMA_VERSION = 29
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -195,6 +195,33 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             FOREIGN KEY(lease_id) REFERENCES runtime_instance_leases(lease_id)
         );
+        CREATE TABLE IF NOT EXISTS runtime_lease_effect_evidence (
+            lease_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            term_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            event_cursor INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            tool_call_id TEXT,
+            tool_id TEXT,
+            effect_id TEXT,
+            effect_state TEXT NOT NULL,
+            canonical_digest TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY(lease_id, run_id, term_id, step_id, event_cursor),
+            UNIQUE(lease_id, event_id),
+            FOREIGN KEY(lease_id) REFERENCES runtime_instance_leases(lease_id)
+        );
+        CREATE TRIGGER IF NOT EXISTS runtime_lease_effect_evidence_no_update
+        BEFORE UPDATE ON runtime_lease_effect_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'runtime lease effect evidence is append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS runtime_lease_effect_evidence_no_delete
+        BEFORE DELETE ON runtime_lease_effect_evidence
+        BEGIN
+            SELECT RAISE(ABORT, 'runtime lease effect evidence is append-only');
+        END;
         CREATE TABLE IF NOT EXISTS runtime_lease_recoveries (
             source_lease_id TEXT PRIMARY KEY,
             source_assignment_digest TEXT NOT NULL,

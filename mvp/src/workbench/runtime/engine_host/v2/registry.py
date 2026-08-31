@@ -459,6 +459,15 @@ class RuntimeRegistryV2:
         with self._lock, self.repository.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                existing = connection.execute(
+                    "SELECT status FROM runtime_v2_registrations WHERE runtime_id = ?",
+                    (capabilities.runtime_id,),
+                ).fetchone()
+                persisted_status = (
+                    "disabled"
+                    if existing is not None and existing["status"] == "disabled"
+                    else status
+                )
                 connection.execute(
                     """
                     INSERT INTO runtime_v2_registrations(
@@ -479,7 +488,7 @@ class RuntimeRegistryV2:
                         capabilities.protocol_version,
                         digest,
                         snapshot_json,
-                        status,
+                        persisted_status,
                         now,
                     ),
                 )
@@ -488,7 +497,17 @@ class RuntimeRegistryV2:
                 connection.rollback()
                 raise
             self._advertised[capabilities.runtime_id] = capabilities
-        return _selection(capabilities, status)
+        return _selection(capabilities, persisted_status)
+
+    def withdraw(self, runtime_id: str) -> RuntimeSelectionV2 | None:
+        """Remove only this process' live advertisement, preserving durable policy."""
+        if not isinstance(runtime_id, str) or not runtime_id:
+            raise ValueError("runtime_id must be a non-empty string")
+        with self._lock:
+            capabilities = self._advertised.pop(runtime_id, None)
+            if capabilities is None:
+                return None
+            return _selection(capabilities, "unavailable")
 
     def disable(self, runtime_id: str) -> RuntimeSelectionV2:
         """Reject new commands for one runtime without altering existing command pins."""

@@ -72,6 +72,7 @@ class AppSettings:
     capability_token: str | None = field(default=None, repr=False)
     service_instance_id: str | None = None
     runner_lifecycle: RunnerLifecycle | None = None
+    sidecar_lifecycle: RunnerLifecycle | None = None
     host_generation: str | None = None
     sequential_processor: SequentialOrchestrationProcessor | None = None
     development_processor: object | None = None
@@ -148,6 +149,7 @@ def create_app(settings: AppSettings) -> FastAPI:
     async def lifespan(app: FastAPI):
         app.state.conversation_worker = conversation_worker
         lifecycle_started = False
+        sidecar_started = False
         worker_started = False
         research_worker_started = False
         development_worker_started = False
@@ -155,6 +157,9 @@ def create_app(settings: AppSettings) -> FastAPI:
             if settings.runner_lifecycle is not None:
                 await settings.runner_lifecycle.start()
                 lifecycle_started = True
+            if settings.sidecar_lifecycle is not None:
+                await settings.sidecar_lifecycle.start()
+                sidecar_started = True
             await conversation_worker.start()
             worker_started = True
             if research_worker is not None:
@@ -177,30 +182,35 @@ def create_app(settings: AppSettings) -> FastAPI:
                     await conversation_worker.stop()
             finally:
                 try:
-                    if lifecycle_started and settings.runner_lifecycle is not None:
-                        await settings.runner_lifecycle.aclose()
+                    if sidecar_started and settings.sidecar_lifecycle is not None:
+                        await settings.sidecar_lifecycle.aclose()
                 finally:
                     try:
-                        if settings.close_gateway and settings.gateway is not None:
-                            await settings.gateway.aclose()
+                        if lifecycle_started and settings.runner_lifecycle is not None:
+                            await settings.runner_lifecycle.aclose()
                     finally:
                         try:
-                            if owns_sequential_processor:
-                                close_processor = getattr(
-                                    sequential_processor, "aclose", None
-                                )
-                                if callable(close_processor):
-                                    await close_processor()
+                            if settings.close_gateway and settings.gateway is not None:
+                                await settings.gateway.aclose()
                         finally:
                             try:
-                                if research_processor is not None:
-                                    await research_processor.aclose()
+                                if owns_sequential_processor:
+                                    close_processor = getattr(
+                                        sequential_processor, "aclose", None
+                                    )
+                                    if callable(close_processor):
+                                        await close_processor()
                             finally:
-                                if settings.vault is not None:
-                                    settings.vault.lock()
+                                try:
+                                    if research_processor is not None:
+                                        await research_processor.aclose()
+                                finally:
+                                    if settings.vault is not None:
+                                        settings.vault.lock()
 
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
     app.state.development_jobs = development_jobs
+    app.state.sidecar_supervisor = settings.sidecar_lifecycle
 
     @app.middleware("http")
     async def authenticate_local_control_plane(request: Request, call_next):

@@ -77,6 +77,88 @@ async def _collect_mode(
         await asyncio.wait_for(client.aclose(), timeout=1.0)
 
 
+@pytest.mark.asyncio
+async def test_observer_persists_acceptance_before_same_batch_events_are_visible() -> None:
+    """Catches ACK and Event from one stdout batch escaping before durable acceptance."""
+    client = EngineHostV2Client(
+        fake_v2_command("ack_terminal_same_batch"),
+        request_timeout=0.25,
+        shutdown_timeout=0.1,
+    )
+    await client.start()
+    order: list[str] = []
+
+    try:
+        async for event in client.run_query(
+            run_envelope(), observer=lambda observation: order.append(observation.kind)
+        ):
+            order.append("visible:" + event.type)
+    finally:
+        await client.aclose()
+
+    assert order[0] == "acceptance"
+    assert order.index("acceptance") < order.index("visible:runtime.status")
+
+
+@pytest.mark.asyncio
+async def test_observer_records_verified_read_and_write_effect_boundaries() -> None:
+    """Catches effect evidence being written before manifest validation or omitted."""
+    read_client = EngineHostV2Client(fake_v2_command("tool_events"))
+    await read_client.start()
+    read_kinds: list[str] = []
+    try:
+        _ = [
+            event
+            async for event in read_client.run_query(
+                run_envelope(),
+                observer=lambda observation: read_kinds.append(observation.kind),
+            )
+        ]
+    finally:
+        await read_client.aclose()
+
+    write_client = EngineHostV2Client(
+        fake_v2_command("write_result_status_completed")
+    )
+    await write_client.start()
+    write_kinds: list[str] = []
+    try:
+        _ = [
+            event
+            async for event in write_client.run_query(
+                _write_envelope(),
+                observer=lambda observation: write_kinds.append(observation.kind),
+            )
+        ]
+    finally:
+        await write_client.aclose()
+
+    assert read_kinds == ["acceptance", "read_only"]
+    assert write_kinds == ["acceptance", "write_started", "committed_write"]
+
+
+@pytest.mark.asyncio
+async def test_observer_failure_closes_client_without_publishing_events() -> None:
+    """Catches a failed durable write being ignored while streaming continues."""
+    client = EngineHostV2Client(
+        fake_v2_command("ack_terminal_same_batch"),
+        request_timeout=0.25,
+        shutdown_timeout=0.1,
+    )
+    await client.start()
+    visible: list[RuntimeEventV2] = []
+
+    def fail_observer(observation) -> None:
+        raise RuntimeError("fixture persistence failure")
+
+    with pytest.raises(RuntimeProtocolError, match="observer"):
+        async for event in client.run_query(run_envelope(), observer=fail_observer):
+            visible.append(event)
+
+    assert visible == []
+    assert client.state == "unavailable"
+
+
 def _write_envelope() -> RunEnvelopeV2:
     value = run_envelope().model_dump(mode="json")
     value["tool_manifest"][0]["read_only"] = False

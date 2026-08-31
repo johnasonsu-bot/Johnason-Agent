@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 import json
 import os
 import signal
 import subprocess
-from typing import Any
+import sys
+from pathlib import Path
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -47,6 +49,9 @@ STATE_TRANSITIONS = {
     "reconciliation_required": frozenset(),
 }
 AUTHORITATIVE_WRITE_RESULT_STATUSES = frozenset({"completed", "failed"})
+ObservationKind = Literal[
+    "acceptance", "write_started", "read_only", "committed_write", "unknown_write"
+]
 
 
 class RuntimeClientError(RuntimeError):
@@ -105,6 +110,16 @@ class _ProcessCleanupResult:
     confirmed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeClientObservation:
+    """Internal synchronous durability boundary emitted before outward progress."""
+
+    kind: ObservationKind
+    envelope: RunEnvelopeV2
+    capabilities: RuntimeCapabilitiesV2
+    event: RuntimeEventV2 | None = None
+
+
 @dataclass
 class _QueryStream:
     envelope: RunEnvelopeV2
@@ -124,6 +139,7 @@ class _QueryStream:
     )
     unfinished_write_effects: set[str] = field(default_factory=set)
     active_tool_calls: dict[str, _ObservedToolCall] = field(default_factory=dict)
+    observer: Callable[[RuntimeClientObservation], None] | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -163,11 +179,24 @@ class EngineHostV2Client:
         command: tuple[str, ...],
         request_timeout: float = 5.0,
         shutdown_timeout: float = 2.0,
+        *,
+        containment_lock: Path | None = None,
+        containment_generation: str | None = None,
     ) -> None:
         command = validate_runtime_argv(command)
         if request_timeout <= 0 or shutdown_timeout <= 0:
             raise ValueError("runtime timeouts must be positive")
+        if (containment_lock is None) != (containment_generation is None):
+            raise ValueError("containment lock and generation must be configured together")
+        if containment_lock is not None and not isinstance(containment_lock, Path):
+            raise TypeError("containment_lock must be a Path")
+        if containment_generation is not None and (
+            not isinstance(containment_generation, str) or not containment_generation
+        ):
+            raise ValueError("containment_generation must be non-empty")
         self.command = command
+        self._containment_lock = containment_lock
+        self._containment_generation = containment_generation
         self.request_timeout = request_timeout
         self.shutdown_timeout = shutdown_timeout
         self._state = "created"
@@ -202,6 +231,7 @@ class EngineHostV2Client:
         self._cleanup_confirmed: bool | None = None
         self._cleanup_error: RuntimeUnavailableError | None = None
         self._diagnostics = ""
+        self._terminated = asyncio.Event()
 
     @property
     def state(self) -> str:
@@ -286,7 +316,7 @@ class EngineHostV2Client:
                 raise asyncio.CancelledError
             spawn_task = asyncio.create_task(
                 asyncio.create_subprocess_exec(
-                    *self.command,
+                    *self._spawn_command(),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -432,7 +462,10 @@ class EngineHostV2Client:
             self._late_spawn_supervised_task = None
 
     async def run_query(
-        self, envelope: RunEnvelopeV2
+        self,
+        envelope: RunEnvelopeV2,
+        *,
+        observer: Callable[[RuntimeClientObservation], None] | None = None,
     ) -> AsyncIterator[RuntimeEventV2]:
         """Accept one pinned Query and stream cursor-checked normalized events."""
         if not isinstance(envelope, RunEnvelopeV2):
@@ -453,6 +486,7 @@ class EngineHostV2Client:
         stream = _QueryStream(
             envelope=envelope,
             generation=self._query_generation,
+            observer=observer,
         )
         self._control_tasks.clear()
         self._interventions.clear()
@@ -1092,6 +1126,7 @@ class EngineHostV2Client:
             and self._active is not None
             and payload.get("accepted") is True
         ):
+            self._notify_observer(self._active, "acceptance")
             self._active.accepted = True
         if not future.done():
             future.set_result(payload)
@@ -1131,6 +1166,7 @@ class EngineHostV2Client:
                     return
                 effect_failure = self._observe_effect(stream, event)
                 if isinstance(effect_failure, RuntimeReconciliationRequired):
+                    self._notify_observer(stream, "unknown_write", event)
                     self._fail_stream(stream, effect_failure)
                     return
             self._fail_stream(
@@ -1158,6 +1194,9 @@ class EngineHostV2Client:
         if not self._accept_cursor(stream, event):
             return
         effect_failure = self._observe_effect(stream, event)
+        observation_kind = self._effect_observation_kind(event, effect_failure)
+        if observation_kind is not None:
+            self._notify_observer(stream, observation_kind, event)
         if effect_failure is not None:
             self._fail_stream(stream, effect_failure)
             return
@@ -1188,6 +1227,55 @@ class EngineHostV2Client:
             await stream.put(event)
             return
         await stream.put(event)
+
+    def _notify_observer(
+        self,
+        stream: _QueryStream,
+        kind: ObservationKind,
+        event: RuntimeEventV2 | None = None,
+    ) -> None:
+        observer = stream.observer
+        if observer is None:
+            return
+        capabilities = self._capabilities
+        if capabilities is None:
+            raise RuntimeProtocolError(
+                "engine-host v2 observer has no capability snapshot"
+            )
+        try:
+            result = observer(
+                RuntimeClientObservation(
+                    kind=kind,
+                    envelope=stream.envelope,
+                    capabilities=capabilities,
+                    event=event,
+                )
+            )
+            if result is not None:
+                raise TypeError("observer must be synchronous")
+        except Exception as error:
+            raise RuntimeProtocolError(
+                "engine-host v2 observer persistence failed"
+            ) from error
+
+    @staticmethod
+    def _effect_observation_kind(
+        event: RuntimeEventV2,
+        failure: RuntimeClientError | None,
+    ) -> ObservationKind | None:
+        if isinstance(failure, RuntimeReconciliationRequired):
+            return "unknown_write"
+        if failure is not None:
+            return None
+        if event.type == "tool.call" and event.payload.get("read_only") is False:
+            return "write_started"
+        if event.type == "tool.result":
+            return (
+                "read_only"
+                if event.payload.get("read_only") is True
+                else "committed_write"
+            )
+        return None
 
     def _accept_cursor(self, stream: _QueryStream, event: RuntimeEventV2) -> bool:
         key = (event.run_id, event.term_id, event.step_id)
@@ -1367,6 +1455,7 @@ class EngineHostV2Client:
         )
 
     def _reader_failed(self, error: Exception) -> None:
+        self._terminated.set()
         stream = self._active
         if stream is not None and stream.terminal is None:
             failure = self._classify_interruption(stream, str(error), error)
@@ -1571,6 +1660,26 @@ class EngineHostV2Client:
                         "terminal",
                     },
                 )
+            self._terminated.set()
+
+    async def wait_terminated(self) -> None:
+        """Wait for process/transport termination without exposing raw process state."""
+        await self._terminated.wait()
+
+    def _spawn_command(self) -> tuple[str, ...]:
+        if self._containment_lock is None:
+            return self.command
+        guard = Path(__file__).with_name("process_guard.py")
+        return (
+            sys.executable,
+            str(guard),
+            "--lock",
+            str(self._containment_lock),
+            "--generation",
+            self._containment_generation or "",
+            "--",
+            *self.command,
+        )
 
     async def _terminate_process_tree(
         self,
@@ -1745,6 +1854,7 @@ class EngineHostV2Client:
 
 __all__ = [
     "EngineHostV2Client",
+    "RuntimeClientObservation",
     "RuntimeCapabilityError",
     "RuntimeClientError",
     "RuntimeControlError",

@@ -27,6 +27,7 @@ record("engine-host-env:" + JSON.stringify({
   command: process.env.WORKBENCH_ENGINE_HOST_COMMAND_JSON,
   allowlist: process.env.WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON,
   v2Enabled: process.env.WORKBENCH_ENGINE_HOST_V2_ENABLED,
+  v2Runtimes: process.env.WORKBENCH_ENGINE_HOST_V2_RUNTIMES_JSON,
   pythonTermEnabled: process.env.WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED,
   pythonTermDevelopmentTrust: process.env.WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST,
 }));
@@ -101,6 +102,9 @@ test("engine host JSON settings cross the sanitized backend environment unchange
   const events = path.join(runtimeDir, "backend-events.log");
   const command = JSON.stringify(["C:\\Program Files\\Hermes Engine\\engine-host.exe", "--stdio", "--label=local host"]);
   const allowlist = JSON.stringify(["lmstudio", "studio-primary"]);
+  const v2Runtimes = JSON.stringify([
+    { runtime_id: "fake-v2", argv: ["C:\\Program Files\\Fake\\runtime.exe", "--stdio"] },
+  ]);
   const app = await electron.launch({
     args: [path.resolve(".")],
     env: {
@@ -111,6 +115,7 @@ test("engine host JSON settings cross the sanitized backend environment unchange
       WORKBENCH_ENGINE_HOST_COMMAND_JSON: command,
       WORKBENCH_ENGINE_HOST_PROVIDER_ALLOWLIST_JSON: allowlist,
       WORKBENCH_ENGINE_HOST_V2_ENABLED: "true",
+      WORKBENCH_ENGINE_HOST_V2_RUNTIMES_JSON: v2Runtimes,
       WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED: "false",
       WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST: "true",
     },
@@ -125,6 +130,7 @@ test("engine host JSON settings cross the sanitized backend environment unchange
         command,
         allowlist,
         v2Enabled: "true",
+        v2Runtimes,
         pythonTermEnabled: "false",
         pythonTermDevelopmentTrust: "true",
       })}`,

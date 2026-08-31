@@ -185,6 +185,46 @@ def test_v2_runtime_process_settings_accept_only_structured_argv(tmp_path: Path)
         RuntimeProcessConfig(runtime_id="fake-v2", argv="fake-v2 --stdio")  # type: ignore[arg-type]
 
 
+def test_v2_runtime_process_settings_reject_duplicate_runtime_ids(
+    tmp_path: Path,
+) -> None:
+    """Catches two process slots racing to advertise the same runtime identity."""
+    with pytest.raises(ValidationError, match="runtime_id.*unique"):
+        WorkbenchSettings(
+            runtime_dir=tmp_path,
+            engine_host_v2_enabled=True,
+            engine_host_v2_runtimes=(
+                RuntimeProcessConfig(runtime_id="fake-v2", argv=("first",)),
+                RuntimeProcessConfig(runtime_id="fake-v2", argv=("second",)),
+            ),
+        )
+
+
+def test_withdraw_is_transient_and_register_preserves_manual_disable(
+    tmp_path: Path,
+) -> None:
+    """Catches a crash/restart silently clearing a persisted operator disable."""
+    registry = RuntimeRegistryV2(RuntimeV2Repository(tmp_path / "state.sqlite"))
+    capabilities = runtime_capabilities("goose", query=True)
+    registry.register(capabilities)
+
+    withdrawn = registry.withdraw("goose")
+
+    assert withdrawn is not None
+    assert withdrawn.runtime_id == "goose"
+    assert withdrawn.state == "unavailable"
+    assert registry.withdraw("goose") is None
+    assert registry.snapshot()[0].state == "unavailable"
+
+    registry.register(capabilities)
+    registry.disable("goose")
+    registry.withdraw("goose")
+    restored = registry.register(capabilities)
+
+    assert restored.state == "disabled"
+    assert registry.snapshot()[0].state == "disabled"
+
+
 @pytest.mark.parametrize(
     "unsafe_argument",
     [
@@ -238,7 +278,26 @@ def test_build_app_assembles_v2_registry_without_replacing_v1_runner(
     assert app.state.execution_runner is runner
     with TestClient(app) as client:
         assert client.get("/api/v1/engine-host").json() == {
-            "v2": {"enabled": True, "protocol": "2.0", "runtimes": []}
+            "v2": {
+                "enabled": True,
+                "protocol": "2.0",
+                "runtimes": [
+                    {
+                        "runtime_id": "fake-v2",
+                        "state": "unavailable",
+                        "capabilities": [],
+                        "selector": "fake-v2",
+                        "selectable_for_new_commands": False,
+                        "admission_state": "unavailable",
+                        "admission_reason": "runtime_unavailable",
+                        "supervisor_state": "unavailable",
+                        "host_generation": 1,
+                        "restart_count": 0,
+                        "active": False,
+                        "last_error_category": "start_failed",
+                    }
+                ],
+            }
         }
 
 

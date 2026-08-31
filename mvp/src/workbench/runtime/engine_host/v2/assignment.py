@@ -23,6 +23,7 @@ from workbench.workflow.store import WorkflowStore
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PROOF_DOMAIN = b"johnason.runtime-gate-proof/v1\0"
+_EFFECT_EVIDENCE_DOMAIN = "johnason.runtime-lease-effect-evidence/v1\0"
 _FACTORY_TOKEN = object()
 _AUTHORITY_TOKEN = object()
 TrustTier = Literal["PRODUCTION_TRUSTED", "DEV_UNTRUSTED"]
@@ -287,6 +288,43 @@ class LeaseEvidence:
         _require_time(self.updated_at, "updated_at")
 
 
+EffectEvidenceState = Literal[
+    "write_started", "read_only", "committed_write", "unknown_write"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeLeaseEffectEvidence:
+    lease_id: str
+    run_id: str
+    term_id: str
+    step_id: str
+    event_cursor: int
+    event_id: str
+    tool_call_id: str | None
+    tool_id: str | None
+    effect_id: str | None
+    effect_state: EffectEvidenceState
+    canonical_digest: str
+    created_at: float
+
+    def __post_init__(self) -> None:
+        for field in ("lease_id", "run_id", "term_id", "step_id", "event_id"):
+            _require_text(getattr(self, field), field)
+        if isinstance(self.event_cursor, bool) or self.event_cursor < 1:
+            raise ValueError("event_cursor must be positive")
+        for field in ("tool_call_id", "tool_id", "effect_id"):
+            value = getattr(self, field)
+            if value is not None:
+                _require_text(value, field)
+        if self.effect_state not in {
+            "write_started", "read_only", "committed_write", "unknown_write"
+        }:
+            raise ValueError("invalid effect evidence state")
+        _require_digest(self.canonical_digest, "canonical_digest")
+        _require_time(self.created_at, "created_at")
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryOutcome:
     decision: Literal[
@@ -337,6 +375,41 @@ class _RuntimeEvidenceAuthority:
             lease_id, assignment_digest=assignment_digest, attempt=attempt,
             lease_generation_seq=lease_generation_seq, effect_state=effect_state,
             effect_digest=effect_digest, trusted_time=trusted_time,
+        )
+
+    def record_effect_evidence(
+        self,
+        lease_id: str,
+        *,
+        assignment_digest: str,
+        attempt: int,
+        lease_generation_seq: int,
+        run_id: str,
+        term_id: str,
+        step_id: str,
+        event_cursor: int,
+        event_id: str,
+        tool_call_id: str | None,
+        tool_id: str | None,
+        effect_id: str | None,
+        effect_state: EffectEvidenceState,
+        trusted_time: float,
+    ) -> RuntimeLeaseEffectEvidence:
+        return self._repository._record_effect_evidence(
+            lease_id,
+            assignment_digest=assignment_digest,
+            attempt=attempt,
+            lease_generation_seq=lease_generation_seq,
+            run_id=run_id,
+            term_id=term_id,
+            step_id=step_id,
+            event_cursor=event_cursor,
+            event_id=event_id,
+            tool_call_id=tool_call_id,
+            tool_id=tool_id,
+            effect_id=effect_id,
+            effect_state=effect_state,
+            trusted_time=trusted_time,
         )
 
 
@@ -599,6 +672,17 @@ class AssignmentRepository:
             ).fetchone()
         return None if row is None else self._assignment_from_row(row)
 
+    def get_assignment_by_digest(
+        self, assignment_digest: str
+    ) -> RuntimeAssignment | None:
+        _require_digest(assignment_digest, "assignment_digest")
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_assignments WHERE assignment_digest=?",
+                (assignment_digest,),
+            ).fetchone()
+        return None if row is None else self._assignment_from_row(row)
+
     def _assignment_from_row(self, row: sqlite3.Row) -> RuntimeAssignment:
         try:
             request = RuntimeAssignmentInput(**json.loads(row["record_json"]))
@@ -674,6 +758,89 @@ class AssignmentRepository:
                 expires_at=expiry, now=now,
             )
         return self._transaction(acquire)
+
+    def acquire_initial_lease(
+        self,
+        assignment_digest: str,
+        *,
+        instance_id: str,
+        instance_nonce: str,
+        host_generation: str,
+        client_lease_id: str,
+        owner: str,
+        fence_token: str,
+        expires_at: float,
+        trusted_time: float,
+    ) -> RuntimeInstanceLease:
+        """Atomically create attempt zero only when no lease/recovery history exists."""
+        _require_digest(assignment_digest, "assignment_digest")
+
+        def acquire(connection: sqlite3.Connection) -> RuntimeInstanceLease:
+            now = self._trusted_time(connection, trusted_time)
+            expiry = _require_time(expires_at, "expires_at")
+            if expiry <= now:
+                raise LeaseConflict("lease must expire in the future")
+            self._require_assignment_execution_trust(connection, assignment_digest)
+            history = connection.execute(
+                "SELECT 1 FROM runtime_instance_leases WHERE assignment_digest=? LIMIT 1",
+                (assignment_digest,),
+            ).fetchone()
+            if history is not None:
+                raise LeaseConflict("initial lease history already exists")
+            seq = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(lease_generation_seq),0)+1 "
+                    "FROM runtime_instance_leases"
+                ).fetchone()[0]
+            )
+            return self._create_lease_in_transaction(
+                connection,
+                assignment_digest=assignment_digest,
+                attempt=0,
+                instance_id=instance_id,
+                instance_nonce=instance_nonce,
+                host_generation=host_generation,
+                lease_generation_seq=seq,
+                client_lease_id=client_lease_id,
+                owner=owner,
+                fence_token=fence_token,
+                expires_at=expiry,
+                now=now,
+            )
+
+        return self._transaction(acquire)
+
+    def active_leases(
+        self, *, runtime_ids: tuple[str, ...] = ()
+    ) -> tuple[RuntimeInstanceLease, ...]:
+        """Read active durable leases for configured runtimes without takeover."""
+        if not isinstance(runtime_ids, tuple) or any(
+            not isinstance(item, str) or not item for item in runtime_ids
+        ):
+            raise TypeError("runtime_ids must be a tuple of non-empty strings")
+        with self.store.connect() as connection:
+            if runtime_ids:
+                placeholders = ",".join("?" for _ in runtime_ids)
+                rows = connection.execute(
+                    "SELECT leases.* FROM runtime_instance_leases AS leases "
+                    "JOIN runtime_assignments AS assignments "
+                    "ON assignments.assignment_digest=leases.assignment_digest "
+                    f"WHERE leases.state!='released' AND assignments.runtime_id IN ({placeholders}) "
+                    "ORDER BY leases.lease_generation_seq",
+                    runtime_ids,
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM runtime_instance_leases WHERE state!='released' "
+                    "ORDER BY lease_generation_seq"
+                ).fetchall()
+        return tuple(self._lease_from_row(row) for row in rows)
+
+    def get_lease(self, lease_id: str) -> RuntimeInstanceLease:
+        """Return one integrity-checked durable lease for handle fencing."""
+        _require_text(lease_id, "lease_id")
+        with self.store.connect() as connection:
+            return self._load_lease(connection, lease_id)
 
     def _require_assignment_execution_trust(
         self, connection: sqlite3.Connection, assignment_digest: str
@@ -874,6 +1041,208 @@ class AssignmentRepository:
         return self._transaction(record)
 
     @staticmethod
+    def _effect_evidence_digest(
+        *,
+        lease_id: str,
+        run_id: str,
+        term_id: str,
+        step_id: str,
+        event_cursor: int,
+        event_id: str,
+        tool_call_id: str | None,
+        tool_id: str | None,
+        effect_id: str | None,
+        effect_state: EffectEvidenceState,
+    ) -> str:
+        return _digest(
+            _EFFECT_EVIDENCE_DOMAIN
+            + canonical_json(
+                {
+                    "lease_id": lease_id,
+                    "run_id": run_id,
+                    "term_id": term_id,
+                    "step_id": step_id,
+                    "event_cursor": event_cursor,
+                    "event_id": event_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_id": tool_id,
+                    "effect_id": effect_id,
+                    "effect_state": effect_state,
+                }
+            )
+        )
+
+    def _record_effect_evidence(
+        self,
+        lease_id: str,
+        *,
+        assignment_digest: str,
+        attempt: int,
+        lease_generation_seq: int,
+        run_id: str,
+        term_id: str,
+        step_id: str,
+        event_cursor: int,
+        event_id: str,
+        tool_call_id: str | None,
+        tool_id: str | None,
+        effect_id: str | None,
+        effect_state: EffectEvidenceState,
+        trusted_time: float,
+    ) -> RuntimeLeaseEffectEvidence:
+        _require_digest(assignment_digest, "assignment_digest")
+        for field, value in (
+            ("lease_id", lease_id),
+            ("run_id", run_id),
+            ("term_id", term_id),
+            ("step_id", step_id),
+            ("event_id", event_id),
+        ):
+            _require_text(value, field)
+        if isinstance(event_cursor, bool) or not isinstance(event_cursor, int) or event_cursor < 1:
+            raise ValueError("event_cursor must be positive")
+        if effect_state not in {
+            "write_started", "read_only", "committed_write", "unknown_write"
+        }:
+            raise ValueError("invalid effect evidence state")
+        for field, value in (
+            ("tool_call_id", tool_call_id),
+            ("tool_id", tool_id),
+            ("effect_id", effect_id),
+        ):
+            if value is not None:
+                _require_text(value, field)
+        if effect_state in {"write_started", "committed_write", "unknown_write"}:
+            if tool_id is None or effect_id is None:
+                raise ValueError("write evidence requires tool and effect identity")
+        digest = self._effect_evidence_digest(
+            lease_id=lease_id,
+            run_id=run_id,
+            term_id=term_id,
+            step_id=step_id,
+            event_cursor=event_cursor,
+            event_id=event_id,
+            tool_call_id=tool_call_id,
+            tool_id=tool_id,
+            effect_id=effect_id,
+            effect_state=effect_state,
+        )
+
+        def record(connection: sqlite3.Connection) -> RuntimeLeaseEffectEvidence:
+            now = self._trusted_time(connection, trusted_time)
+            lease = self._load_lease(connection, lease_id)
+            self._check_evidence_identity(
+                lease, assignment_digest, attempt, lease_generation_seq
+            )
+            if lease.state not in {"accepted", "running", "paused"}:
+                raise LeaseConflict("effect evidence is illegal in this lease state")
+            acceptance = self._load_evidence(connection, lease_id)
+            if acceptance is None or acceptance.acceptance_digest is None:
+                raise LeaseConflict("effect evidence requires durable acceptance")
+            evidence = RuntimeLeaseEffectEvidence(
+                lease_id=lease_id,
+                run_id=run_id,
+                term_id=term_id,
+                step_id=step_id,
+                event_cursor=event_cursor,
+                event_id=event_id,
+                tool_call_id=tool_call_id,
+                tool_id=tool_id,
+                effect_id=effect_id,
+                effect_state=effect_state,
+                canonical_digest=digest,
+                created_at=now,
+            )
+            try:
+                connection.execute(
+                    "INSERT INTO runtime_lease_effect_evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        evidence.lease_id,
+                        evidence.run_id,
+                        evidence.term_id,
+                        evidence.step_id,
+                        evidence.event_cursor,
+                        evidence.event_id,
+                        evidence.tool_call_id,
+                        evidence.tool_id,
+                        evidence.effect_id,
+                        evidence.effect_state,
+                        evidence.canonical_digest,
+                        evidence.created_at,
+                    ),
+                )
+                return evidence
+            except sqlite3.IntegrityError as error:
+                row = connection.execute(
+                    "SELECT * FROM runtime_lease_effect_evidence WHERE lease_id=? "
+                    "AND run_id=? AND term_id=? AND step_id=? AND event_cursor=?",
+                    (lease_id, run_id, term_id, step_id, event_cursor),
+                ).fetchone()
+                if row is None:
+                    raise LeaseConflict("effect event identity drifted") from error
+                current = self._effect_evidence_from_row(row)
+                if current.canonical_digest != digest:
+                    raise LeaseConflict("effect cursor content changed") from error
+                return current
+
+        return self._transaction(record)
+
+    def effect_evidence(
+        self, lease_id: str
+    ) -> tuple[RuntimeLeaseEffectEvidence, ...]:
+        _require_text(lease_id, "lease_id")
+        with self.store.connect() as connection:
+            return self._load_effect_evidence_events(connection, lease_id)
+
+    def _load_effect_evidence_events(
+        self, connection: sqlite3.Connection, lease_id: str
+    ) -> tuple[RuntimeLeaseEffectEvidence, ...]:
+        rows = connection.execute(
+            "SELECT * FROM runtime_lease_effect_evidence WHERE lease_id=? "
+            "ORDER BY run_id,term_id,step_id,event_cursor",
+            (lease_id,),
+        ).fetchall()
+        return tuple(self._effect_evidence_from_row(row) for row in rows)
+
+    def _effect_evidence_from_row(
+        self, row: sqlite3.Row
+    ) -> RuntimeLeaseEffectEvidence:
+        try:
+            evidence = RuntimeLeaseEffectEvidence(
+                lease_id=row["lease_id"],
+                run_id=row["run_id"],
+                term_id=row["term_id"],
+                step_id=row["step_id"],
+                event_cursor=row["event_cursor"],
+                event_id=row["event_id"],
+                tool_call_id=row["tool_call_id"],
+                tool_id=row["tool_id"],
+                effect_id=row["effect_id"],
+                effect_state=row["effect_state"],
+                canonical_digest=row["canonical_digest"],
+                created_at=row["created_at"],
+            )
+            expected = self._effect_evidence_digest(
+                lease_id=evidence.lease_id,
+                run_id=evidence.run_id,
+                term_id=evidence.term_id,
+                step_id=evidence.step_id,
+                event_cursor=evidence.event_cursor,
+                event_id=evidence.event_id,
+                tool_call_id=evidence.tool_call_id,
+                tool_id=evidence.tool_id,
+                effect_id=evidence.effect_id,
+                effect_state=evidence.effect_state,
+            )
+            if expected != evidence.canonical_digest:
+                raise ValueError
+            return evidence
+        except Exception as error:
+            raise CorruptAssignmentState(
+                "runtime lease effect evidence is corrupt"
+            ) from error
+
+    @staticmethod
     def _check_evidence_identity(
         lease: RuntimeInstanceLease, assignment_digest: str, attempt: int, seq: int
     ) -> None:
@@ -890,6 +1259,180 @@ class AssignmentRepository:
                 evidence.lease_generation_seq != lease.lease_generation_seq):
             raise CorruptAssignmentState("lease evidence ownership changed")
 
+    def recover_failed_lease(
+        self,
+        lease_id: str,
+        *,
+        source_owner: str,
+        source_attempt: int,
+        source_lease_generation_seq: int,
+        source_fence_token: str,
+        owner: str,
+        instance_id: str,
+        instance_nonce: str,
+        host_generation: str,
+        client_lease_id: str,
+        fence_token: str,
+        expires_at: float,
+        trusted_time: float,
+    ) -> RecoveryOutcome:
+        """Fence and classify an immediate failure without replaying the Query."""
+
+        def recover(connection: sqlite3.Connection) -> RecoveryOutcome:
+            now = self._trusted_time(connection, trusted_time)
+            lease = self._load_lease(connection, lease_id)
+            if (
+                lease.owner != source_owner
+                or lease.attempt != source_attempt
+                or lease.lease_generation_seq != source_lease_generation_seq
+                or lease.fence_token_digest != _digest(source_fence_token)
+            ):
+                raise LeaseConflict("lease recovery fence failed")
+            persisted = self._load_recovery(connection, lease_id)
+            if persisted is not None:
+                return persisted
+            return self._recover_classified_lease(
+                connection,
+                lease,
+                owner=owner,
+                instance_id=instance_id,
+                instance_nonce=instance_nonce,
+                host_generation=host_generation,
+                client_lease_id=client_lease_id,
+                fence_token=fence_token,
+                expires_at=expires_at,
+                now=now,
+            )
+
+        return self._transaction(recover)
+
+    def _recover_classified_lease(
+        self,
+        connection: sqlite3.Connection,
+        lease: RuntimeInstanceLease,
+        *,
+        owner: str,
+        instance_id: str,
+        instance_nonce: str,
+        host_generation: str,
+        client_lease_id: str,
+        fence_token: str,
+        expires_at: float,
+        now: float,
+    ) -> RecoveryOutcome:
+        source = lease
+        if lease.state == "released":
+            outcome = RecoveryOutcome("released", None)
+            self._write_recovery(connection, source, outcome, now)
+            return outcome
+        if lease.state in {"terminal", "reconciliation_required"}:
+            lease = self._recovery_state(connection, lease, "released", now)
+            outcome = RecoveryOutcome("released", None)
+            self._write_recovery(connection, source, outcome, now)
+            return outcome
+        if lease.state == "accepting":
+            lease = self._recovery_state(
+                connection, lease, "reconciliation_required", now
+            )
+            self._recovery_state(connection, lease, "released", now)
+            outcome = RecoveryOutcome("reconcile", None)
+            self._write_recovery(connection, source, outcome, now)
+            return outcome
+
+        acceptance = self._load_evidence(connection, lease.lease_id)
+        events = self._load_effect_evidence_events(connection, lease.lease_id)
+        decision: Literal[
+            "release_retry", "read_only_retry", "reuse_committed_write", "reconcile"
+        ]
+        retry = False
+        if lease.state in {"reserved", "starting"}:
+            if acceptance is not None or events:
+                raise CorruptAssignmentState(
+                    "pre-acceptance lease has authoritative execution evidence"
+                )
+            decision, retry = "release_retry", True
+        elif lease.state in {"accepted", "running", "paused"}:
+            if acceptance is None or acceptance.acceptance_digest is None:
+                decision = "reconcile"
+            else:
+                unknown = any(item.effect_state == "unknown_write" for item in events)
+                starts = {
+                    (item.step_id, item.tool_call_id, item.effect_id)
+                    for item in events
+                    if item.effect_state == "write_started"
+                }
+                commits = {
+                    (item.step_id, item.tool_call_id, item.effect_id)
+                    for item in events
+                    if item.effect_state == "committed_write"
+                }
+                if unknown or starts - commits or commits - starts:
+                    decision = "reconcile"
+                elif commits:
+                    decision = "reuse_committed_write"
+                elif events or acceptance.effect_state in {"none", "read_only"}:
+                    decision, retry = "read_only_retry", True
+                elif acceptance.effect_state == "committed_write":
+                    decision = "reuse_committed_write"
+                else:
+                    decision = "reconcile"
+        else:
+            decision = "reconcile"
+
+        if not retry:
+            if decision == "reuse_committed_write":
+                lease = self._recovery_state(connection, lease, "terminal", now)
+            else:
+                lease = self._recovery_state(
+                    connection, lease, "reconciliation_required", now
+                )
+            self._recovery_state(connection, lease, "released", now)
+            outcome = RecoveryOutcome(decision, None)
+            self._write_recovery(connection, source, outcome, now)
+            return outcome
+
+        self._require_assignment_execution_trust(connection, lease.assignment_digest)
+        for field, value in (
+            ("instance_id", instance_id),
+            ("instance_nonce", instance_nonce),
+            ("host_generation", host_generation),
+            ("client_lease_id", client_lease_id),
+            ("owner", owner),
+            ("fence_token", fence_token),
+        ):
+            _require_text(value, field)
+        if instance_id == lease.instance_id or client_lease_id == lease.client_lease_id:
+            raise LeaseConflict("recovery retry requires new instance and client lease")
+        expiry = _require_time(expires_at, "expires_at")
+        if expiry <= now:
+            raise LeaseConflict("recovery retry expiry must be in the future")
+        if lease.state in {"accepted", "running", "paused"}:
+            lease = self._recovery_state(connection, lease, "terminal", now)
+        self._recovery_state(connection, lease, "released", now)
+        seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(lease_generation_seq),0)+1 "
+                "FROM runtime_instance_leases"
+            ).fetchone()[0]
+        )
+        new_lease = self._create_lease_in_transaction(
+            connection,
+            assignment_digest=lease.assignment_digest,
+            attempt=lease.attempt + 1,
+            instance_id=instance_id,
+            instance_nonce=instance_nonce,
+            host_generation=host_generation,
+            lease_generation_seq=seq,
+            client_lease_id=client_lease_id,
+            owner=owner,
+            fence_token=fence_token,
+            expires_at=expiry,
+            now=now,
+        )
+        outcome = RecoveryOutcome(decision, new_lease)
+        self._write_recovery(connection, source, outcome, now)
+        return outcome
+
     def recover_expired_lease(
         self, lease_id: str, *, owner: str, instance_id: str, instance_nonce: str,
         host_generation: str, client_lease_id: str, fence_token: str,
@@ -901,76 +1444,20 @@ class AssignmentRepository:
             if persisted is not None:
                 return persisted
             lease = self._load_lease(connection, lease_id)
-            source = lease
             if lease.expires_at >= now:
                 raise LeaseConflict("lease is not expired")
-            evidence = self._load_evidence(connection, lease_id)
-            if lease.state == "released":
-                outcome = RecoveryOutcome("released", None)
-                self._write_recovery(connection, source, outcome, now)
-                return outcome
-            if lease.state in {"terminal", "reconciliation_required"}:
-                self._recovery_state(connection, lease, "released", now)
-                outcome = RecoveryOutcome("released", None)
-                self._write_recovery(connection, source, outcome, now)
-                return outcome
-            if lease.state == "accepting":
-                self._recovery_state(
-                    connection, lease, "reconciliation_required", now
-                )
-                outcome = RecoveryOutcome("reconcile", None)
-                self._write_recovery(connection, source, outcome, now)
-                return outcome
-            decision = "reconcile"
-            retry = False
-            if lease.state in {"reserved", "starting"}:
-                if evidence is not None:
-                    raise CorruptAssignmentState(
-                        "pre-acceptance lease has authoritative execution evidence"
-                    )
-                decision, retry = "release_retry", True
-            elif lease.state in {"accepted", "running", "paused"} and evidence is not None:
-                if evidence.acceptance_digest is not None and evidence.effect_state == "read_only":
-                    decision, retry = "read_only_retry", True
-                elif evidence.acceptance_digest is not None and evidence.effect_state == "committed_write":
-                    self._recovery_state(connection, lease, "terminal", now)
-                    outcome = RecoveryOutcome("reuse_committed_write", None)
-                    self._write_recovery(connection, source, outcome, now)
-                    return outcome
-            if not retry:
-                self._recovery_state(
-                    connection, lease, "reconciliation_required", now
-                )
-                outcome = RecoveryOutcome("reconcile", None)
-                self._write_recovery(connection, source, outcome, now)
-                return outcome
-            self._require_assignment_execution_trust(connection, lease.assignment_digest)
-            for field, value in (("instance_id", instance_id), ("instance_nonce", instance_nonce),
-                                 ("host_generation", host_generation),
-                                 ("client_lease_id", client_lease_id), ("owner", owner),
-                                 ("fence_token", fence_token)):
-                _require_text(value, field)
-            if instance_id == lease.instance_id or client_lease_id == lease.client_lease_id:
-                raise LeaseConflict("recovery retry requires new instance and client lease")
-            expiry = _require_time(expires_at, "expires_at")
-            if expiry <= now:
-                raise LeaseConflict("recovery retry expiry must be in the future")
-            if lease.state in {"accepted", "running", "paused"}:
-                lease = self._recovery_state(connection, lease, "terminal", now)
-            self._recovery_state(connection, lease, "released", now)
-            seq = int(connection.execute(
-                "SELECT COALESCE(MAX(lease_generation_seq),0)+1 FROM runtime_instance_leases"
-            ).fetchone()[0])
-            new_lease = self._create_lease_in_transaction(
-                connection, assignment_digest=lease.assignment_digest,
-                attempt=lease.attempt + 1, instance_id=instance_id,
-                instance_nonce=instance_nonce, host_generation=host_generation,
-                lease_generation_seq=seq, client_lease_id=client_lease_id,
-                owner=owner, fence_token=fence_token, expires_at=expiry, now=now,
+            return self._recover_classified_lease(
+                connection,
+                lease,
+                owner=owner,
+                instance_id=instance_id,
+                instance_nonce=instance_nonce,
+                host_generation=host_generation,
+                client_lease_id=client_lease_id,
+                fence_token=fence_token,
+                expires_at=expires_at,
+                now=now,
             )
-            outcome = RecoveryOutcome(decision, new_lease)
-            self._write_recovery(connection, source, outcome, now)
-            return outcome
         return self._transaction(recover)
 
     def _recovery_state(

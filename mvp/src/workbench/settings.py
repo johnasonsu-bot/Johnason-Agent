@@ -3,7 +3,15 @@
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from workbench.runtime.engine_host.v2.security import validate_runtime_argv
 
@@ -45,6 +53,13 @@ class WorkbenchSettings(BaseModel):
     engine_host_v2_runtimes: tuple[RuntimeProcessConfig, ...] = ()
     python_term_runtime_enabled: StrictBool = False
     python_term_development_trust: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_unique_v2_runtime_ids(self) -> "WorkbenchSettings":
+        runtime_ids = tuple(item.runtime_id for item in self.engine_host_v2_runtimes)
+        if len(set(runtime_ids)) != len(runtime_ids):
+            raise ValueError("engine host v2 runtime_id values must be unique")
+        return self
 
     @property
     def database(self) -> Path:

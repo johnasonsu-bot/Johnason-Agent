@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "d1af6ba7029e83f29de6db2f1c235b7056e2a5223c36e707ab343b7821be0d7a",
-      "size": 1630449
+      "sha256": "b3bb4b7d0e8ebf45e2c94e090c947cf133a313712c4cb27426f99bb40f47db03",
+      "size": 1687912
     },
     {
       "path": "uv.lock",
@@ -129,8 +129,8 @@
     },
     {
       "path": "api/app.py",
-      "sha256": "980dde0284f839a4d69900759789c05b2fc79dc4f6df1c1e6eb638f5abffefb5",
-      "size": 13468
+      "sha256": "e38fcfae9eb9ed90816de87ad9deb472fd4382e2bb3dce3e5638eada8b38c8f8",
+      "size": 14049
     },
     {
       "path": "api/artifacts.py",
@@ -149,8 +149,8 @@
     },
     {
       "path": "api/engine_host.py",
-      "sha256": "d3c535b224b8a33ef5567f7c8bd49c72cd5afbc41cb90446e0ce3b9ebc35af6a",
-      "size": 6442
+      "sha256": "a8886432a4853492bc84823e968daf9f96bb87f84c74a32474efe67ea3683739",
+      "size": 9010
     },
     {
       "path": "api/graph_plans.py",
@@ -239,8 +239,8 @@
     },
     {
       "path": "main.py",
-      "sha256": "8d6997cdd5d43ec5c6d11476d93aeaf62861b3a7ac6e051d9405432b5671c893",
-      "size": 40865
+      "sha256": "5c1ac3597fcb4183d6ac5019e48ae5e307f446371f6e6f5ee0ed17622cba5ce7",
+      "size": 41549
     },
     {
       "path": "models/__init__.py",
@@ -514,13 +514,13 @@
     },
     {
       "path": "runtime/engine_host/v2/assignment.py",
-      "sha256": "7236bba98c7a4f6eed59fa5268619f04f044cafb2cbe93b8b6bc54bb5f4a6fef",
-      "size": 56208
+      "sha256": "0e6225ce8cd87ee1f953b8f6bfe699463331e5559f7d16cf04d8b84302de7330",
+      "size": 74139
     },
     {
       "path": "runtime/engine_host/v2/client.py",
-      "sha256": "b431c6ed522717beccb9514c4fa41c75d56118fdc9c1e7cc58ce7cf69c3ca40e",
-      "size": 68244
+      "sha256": "9d10adab6bb8cb02c15c061552afe4b8e30db9d2581cd22edf02fc14b29bb8bc",
+      "size": 72380
     },
     {
       "path": "runtime/engine_host/v2/contracts.py",
@@ -538,14 +538,19 @@
       "size": 27340
     },
     {
+      "path": "runtime/engine_host/v2/process_guard.py",
+      "sha256": "b012d5502d962e72d252c5e9924221969854e6085508813a31b1b011c53f2e85",
+      "size": 6176
+    },
+    {
       "path": "runtime/engine_host/v2/python_term_control_plane.py",
       "sha256": "5555c217d2c07891a4b84be8ed8f622b31dc482ee35e15063c383561121a1723",
       "size": 19558
     },
     {
       "path": "runtime/engine_host/v2/registry.py",
-      "sha256": "2d029c8f13ff25a8d37fc46356f0f72be8b7b89672cf0e29847d71ef2caf4da3",
-      "size": 34718
+      "sha256": "126452a39237d70027204718a7f11176947983c66e3db3419128b5925cd1e498",
+      "size": 35654
     },
     {
       "path": "runtime/engine_host/v2/repository.py",
@@ -561,6 +566,11 @@
       "path": "runtime/engine_host/v2/security.py",
       "sha256": "dee4def133c30b0ef8b2e3b0562bcb9b3a30d1c29b45d701ea30b6257b6a813a",
       "size": 1684
+    },
+    {
+      "path": "runtime/engine_host/v2/supervisor.py",
+      "sha256": "4509cc28196c01c6efbab24e30c21cc8c2033cd2d35691bad744fa890a98c0e3",
+      "size": 47169
     },
     {
       "path": "runtime/goose/__init__.py",
@@ -634,8 +644,8 @@
     },
     {
       "path": "settings.py",
-      "sha256": "3e92b839920662146fb85041cae2b822ab7c8db4befca6d2f0057290b014a717",
-      "size": 2094
+      "sha256": "5f3ca2d484230b800da3f15578e92c999b1740fb601122d0a7f759a85ab87bad",
+      "size": 2489
     },
     {
       "path": "skills/__init__.py",
@@ -714,8 +724,8 @@
     },
     {
       "path": "workflow/schema.py",
-      "sha256": "efecc3497aee53fab0a5247febc322c04d98aa9316240658e774b38a22abc349",
-      "size": 41128
+      "sha256": "6a1615f236c31aa3d36c505c5516cb12d73da0c10f9be515a5a4c6042482f5f2",
+      "size": 42306
     },
     {
       "path": "workflow/store.py",

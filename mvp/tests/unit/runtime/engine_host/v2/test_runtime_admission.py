@@ -1042,7 +1042,7 @@ def test_schema_upgrade_marks_only_pre_feature_host_pins_as_legacy(tmp_path: Pat
         ),
     )
     with registry.repository.store.connect() as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version=28")
+        connection.execute("DELETE FROM schema_migrations WHERE version>=28")
         connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(27, 1)"
         )
@@ -1054,7 +1054,7 @@ def test_schema_upgrade_marks_only_pre_feature_host_pins_as_legacy(tmp_path: Pat
     with intents.store.connect() as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 28
+        ).fetchone()[0] == 29
 
 
 def test_self_consistent_invalid_intent_state_fails_closed(tmp_path: Path) -> None:

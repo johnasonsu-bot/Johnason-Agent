@@ -267,6 +267,67 @@ def test_lease_state_machine_and_fences_are_exact(tmp_path: Path) -> None:
         )
 
 
+def test_initial_lease_is_attempt_zero_and_cannot_be_recreated_after_history(
+    tmp_path: Path,
+) -> None:
+    """Catches callers bypassing durable recovery by inventing a later attempt."""
+    repository, assignment = _admitted(tmp_path / "state.sqlite")
+    lease = repository.acquire_initial_lease(
+        assignment.assignment_digest,
+        instance_id="instance-1",
+        instance_nonce="nonce-1",
+        host_generation="generation-1",
+        client_lease_id="client-1",
+        owner="owner-1",
+        fence_token="fence-1",
+        expires_at=80.0,
+        trusted_time=40.0,
+    )
+    assert lease.attempt == 0
+    repository.transition_lease(
+        lease.lease_id,
+        expected_state="reserved",
+        new_state="released",
+        attempt=0,
+        owner="owner-1",
+        lease_generation_seq=lease.lease_generation_seq,
+        fence_token="fence-1",
+        trusted_time=41.0,
+    )
+
+    with pytest.raises(LeaseConflict, match="history"):
+        repository.acquire_initial_lease(
+            assignment.assignment_digest,
+            instance_id="instance-2",
+            instance_nonce="nonce-2",
+            host_generation="generation-2",
+            client_lease_id="client-2",
+            owner="owner-2",
+            fence_token="fence-2",
+            expires_at=90.0,
+            trusted_time=42.0,
+        )
+
+
+def test_active_lease_query_is_read_only_and_runtime_scoped(tmp_path: Path) -> None:
+    """Catches an orphan scan taking unrelated or already released leases."""
+    repository, assignment = _admitted(tmp_path / "state.sqlite")
+    lease = repository.acquire_initial_lease(
+        assignment.assignment_digest,
+        instance_id="instance-1",
+        instance_nonce="nonce-1",
+        host_generation="generation-1",
+        client_lease_id="client-1",
+        owner="owner-1",
+        fence_token="fence-1",
+        expires_at=80.0,
+        trusted_time=40.0,
+    )
+
+    assert repository.active_leases(runtime_ids=("python-term",)) == (lease,)
+    assert repository.active_leases(runtime_ids=("other-runtime",)) == ()
+
+
 def test_takeover_increments_sequence_and_old_owner_cannot_renew_or_cause_aba(tmp_path: Path) -> None:
     repository, assignment = _admitted(tmp_path / "state.sqlite")
     old = repository.acquire_lease(
@@ -428,6 +489,201 @@ def test_durable_evidence_is_idempotent_monotonic_and_bound_to_lease_generation(
             effect_state="committed_write", effect_digest="d" * 64,
             trusted_time=46.0,
         )
+
+
+def _accepted_lease_for_effects(database: Path):
+    repository, assignment = _admitted(database)
+    lease = repository.acquire_initial_lease(
+        assignment.assignment_digest,
+        instance_id="instance-1",
+        instance_nonce="nonce-1",
+        host_generation="generation-1",
+        client_lease_id="client-1",
+        owner="owner-1",
+        fence_token="fence-1",
+        expires_at=80.0,
+        trusted_time=40.0,
+    )
+    for state in ("starting", "accepting"):
+        lease = repository.transition_lease(
+            lease.lease_id,
+            expected_state=lease.state,
+            new_state=state,
+            attempt=0,
+            owner="owner-1",
+            lease_generation_seq=lease.lease_generation_seq,
+            fence_token="fence-1",
+            trusted_time=41.0,
+        )
+    authority = repository._execution_authority()
+    authority.record_acceptance(
+        lease.lease_id,
+        assignment_digest=assignment.assignment_digest,
+        attempt=0,
+        lease_generation_seq=lease.lease_generation_seq,
+        acceptance_cursor=0,
+        acceptance_digest="a" * 64,
+        trusted_time=42.0,
+    )
+    lease = repository.transition_lease(
+        lease.lease_id,
+        expected_state="accepting",
+        new_state="accepted",
+        attempt=0,
+        owner="owner-1",
+        lease_generation_seq=lease.lease_generation_seq,
+        fence_token="fence-1",
+        trusted_time=43.0,
+    )
+    return repository, assignment, lease, authority
+
+
+def test_effect_evidence_is_append_only_step_scoped_and_identity_stable(
+    tmp_path: Path,
+) -> None:
+    """Catches overwrite aggregation and cross-Step cursor collisions."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / "state.sqlite"
+    )
+    first = authority.record_effect_evidence(
+        lease.lease_id,
+        assignment_digest=assignment.assignment_digest,
+        attempt=0,
+        lease_generation_seq=lease.lease_generation_seq,
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        event_cursor=1,
+        event_id="event-1",
+        tool_call_id="call-1",
+        tool_id="tool-1",
+        effect_id=None,
+        effect_state="read_only",
+        trusted_time=44.0,
+    )
+    repeated = authority.record_effect_evidence(
+        lease.lease_id,
+        assignment_digest=assignment.assignment_digest,
+        attempt=0,
+        lease_generation_seq=lease.lease_generation_seq,
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        event_cursor=1,
+        event_id="event-1",
+        tool_call_id="call-1",
+        tool_id="tool-1",
+        effect_id=None,
+        effect_state="read_only",
+        trusted_time=45.0,
+    )
+    second_step = authority.record_effect_evidence(
+        lease.lease_id,
+        assignment_digest=assignment.assignment_digest,
+        attempt=0,
+        lease_generation_seq=lease.lease_generation_seq,
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-2",
+        event_cursor=1,
+        event_id="event-2",
+        tool_call_id="call-2",
+        tool_id="tool-1",
+        effect_id=None,
+        effect_state="read_only",
+        trusted_time=46.0,
+    )
+
+    assert repeated == first
+    assert second_step.step_id == "step-2"
+    assert len(repository.effect_evidence(lease.lease_id)) == 2
+    with pytest.raises(LeaseConflict, match="cursor"):
+        authority.record_effect_evidence(
+            lease.lease_id,
+            assignment_digest=assignment.assignment_digest,
+            attempt=0,
+            lease_generation_seq=lease.lease_generation_seq,
+            run_id="run-1",
+            term_id="term-1",
+            step_id="step-1",
+            event_cursor=1,
+            event_id="event-drift",
+            tool_call_id="call-drift",
+            tool_id="tool-1",
+            effect_id=None,
+            effect_state="read_only",
+            trusted_time=47.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("evidence", "decision", "creates_retry"),
+    [
+        ((), "read_only_retry", True),
+        (("read_only",), "read_only_retry", True),
+        (("write_started",), "reconcile", False),
+        (("write_started", "committed_write", "write_started", "committed_write"), "reuse_committed_write", False),
+        (("write_started", "committed_write", "unknown_write"), "reconcile", False),
+    ],
+)
+def test_failed_recovery_uses_aggregate_append_only_effect_evidence(
+    tmp_path: Path,
+    evidence: tuple[str, ...],
+    decision: str,
+    creates_retry: bool,
+) -> None:
+    """Catches replay after an unmatched or unknown write and lost committed writes."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / (decision + ".sqlite")
+    )
+    open_effects: list[tuple[str, str]] = []
+    for cursor, state in enumerate(evidence, start=1):
+        if state == "write_started":
+            call_id = f"call-{cursor}"
+            effect_id = f"effect-{cursor}"
+            open_effects.append((call_id, effect_id))
+        elif state == "committed_write":
+            call_id, effect_id = open_effects.pop(0)
+        else:
+            call_id = f"call-{cursor}"
+            effect_id = "effect-unknown" if state == "unknown_write" else None
+        authority.record_effect_evidence(
+            lease.lease_id,
+            assignment_digest=assignment.assignment_digest,
+            attempt=0,
+            lease_generation_seq=lease.lease_generation_seq,
+            run_id="run-1",
+            term_id="term-1",
+            step_id="step-1",
+            event_cursor=cursor,
+            event_id=f"event-{cursor}",
+            tool_call_id=call_id,
+            tool_id="tool-1",
+            effect_id=effect_id,
+            effect_state=state,
+            trusted_time=44.0 + cursor,
+        )
+
+    outcome = repository.recover_failed_lease(
+        lease.lease_id,
+        source_owner="owner-1",
+        source_attempt=0,
+        source_lease_generation_seq=lease.lease_generation_seq,
+        source_fence_token="fence-1",
+        owner="owner-2",
+        instance_id="instance-2",
+        instance_nonce="nonce-2",
+        host_generation="generation-2",
+        client_lease_id="client-2",
+        fence_token="fence-2",
+        expires_at=100.0,
+        trusted_time=60.0,
+    )
+
+    assert outcome.decision == decision
+    assert (outcome.lease is not None) is creates_retry
+    if outcome.lease is not None:
+        assert outcome.lease.attempt == 1
 
 
 def test_schema_upgrade_from_v23_preserves_old_pin_and_concurrent_init(tmp_path: Path) -> None:

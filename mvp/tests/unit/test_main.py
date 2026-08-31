@@ -16,7 +16,7 @@ from workbench.conversations.repository import ConversationRepository
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.selector import RunnerSelector
-from workbench.settings import WorkbenchSettings
+from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 
 
 class RecordingListener:
@@ -128,14 +128,15 @@ class NoopRunner:
 
 
 class RecordingLifecycle:
-    def __init__(self, operations: list[str]) -> None:
+    def __init__(self, operations: list[str], name: str = "host") -> None:
         self.operations = operations
+        self.name = name
 
     async def start(self) -> None:
-        self.operations.append("host.start")
+        self.operations.append(f"{self.name}.start")
 
     async def aclose(self) -> None:
-        self.operations.append("host.close")
+        self.operations.append(f"{self.name}.close")
 
 
 def test_engine_host_is_disabled_without_an_explicit_command(tmp_path: Path) -> None:
@@ -159,6 +160,51 @@ def test_engine_host_settings_survive_json_round_trip(tmp_path: Path) -> None:
     assert restored.engine_host_enabled is True
     assert restored.engine_host_command == ("engine-host", "--stdio")
     assert restored.engine_host_provider_allowlist == ("lmstudio", "local-secondary")
+
+
+def test_build_app_consumes_v2_runtime_config_only_when_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: list[dict[str, object]] = []
+    lifecycle = RecordingLifecycle([], "sidecar")
+
+    def supervisor_factory(**kwargs):
+        created.append(kwargs)
+        return lifecycle
+
+    captured_settings: list[AppSettings] = []
+
+    def app_factory(settings: AppSettings) -> SimpleNamespace:
+        captured_settings.append(settings)
+        return SimpleNamespace(state=SimpleNamespace())
+
+    monkeypatch.setattr(main, "SidecarSupervisor", supervisor_factory)
+    monkeypatch.setattr(main, "create_app", app_factory)
+    runtime = RuntimeProcessConfig(runtime_id="fake-v2", argv=("fake-v2", "--stdio"))
+
+    disabled = WorkbenchSettings(
+        runtime_dir=tmp_path / "disabled",
+        engine_host_v2_enabled=False,
+        engine_host_v2_runtimes=(runtime,),
+    )
+    main.build_app(disabled, runner=NoopRunner())
+    assert created == []
+    assert captured_settings[-1].sidecar_lifecycle is None
+
+    enabled = WorkbenchSettings(
+        runtime_dir=tmp_path / "enabled",
+        engine_host_v2_enabled=True,
+        engine_host_v2_runtimes=(runtime,),
+    )
+    app = main.build_app(
+        enabled, service_instance_id="app-instance-1", runner=NoopRunner()
+    )
+
+    assert len(created) == 1
+    assert created[0]["runtimes"] == (runtime,)
+    assert created[0]["app_instance_id"] == "app-instance-1"
+    assert captured_settings[-1].sidecar_lifecycle is lifecycle
+    assert app.state.sidecar_supervisor is lifecycle
 
 
 def test_engine_host_settings_are_parsed_from_json_environment(
@@ -384,3 +430,35 @@ def test_app_starts_host_before_worker_and_closes_after_worker(
         assert operations[:2] == ["host.start", "worker.start"]
 
     assert operations[-2:] == ["worker.stop", "host.close"]
+
+
+def test_app_starts_sidecar_before_worker_and_closes_it_after_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations: list[str] = []
+    runner_lifecycle = RecordingLifecycle(operations, "v1")
+    sidecar_lifecycle = RecordingLifecycle(operations, "sidecar")
+
+    async def worker_start(self) -> None:
+        operations.append("worker.start")
+
+    async def worker_stop(self) -> None:
+        operations.append("worker.stop")
+
+    monkeypatch.setattr(ConversationTaskWorker, "start", worker_start)
+    monkeypatch.setattr(ConversationTaskWorker, "stop", worker_stop)
+    app = create_app(
+        AppSettings(
+            database=tmp_path / "app.sqlite",
+            runner=NoopRunner(),
+            owner_id="api",
+            runner_lifecycle=runner_lifecycle,
+            sidecar_lifecycle=sidecar_lifecycle,
+        )
+    )
+
+    assert app.state.sidecar_supervisor is sidecar_lifecycle
+    with TestClient(app):
+        assert operations[:3] == ["v1.start", "sidecar.start", "worker.start"]
+
+    assert operations[-3:] == ["worker.stop", "sidecar.close", "v1.close"]
