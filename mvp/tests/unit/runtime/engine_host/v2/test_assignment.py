@@ -616,6 +616,82 @@ def test_effect_evidence_is_append_only_step_scoped_and_identity_stable(
         )
 
 
+def test_completed_effect_identity_cannot_be_reused_for_a_second_write(
+    tmp_path: Path,
+) -> None:
+    """A duplicate tool/effect identity is durable reconciliation evidence."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / "state.sqlite"
+    )
+    common = {
+        "lease_id": lease.lease_id,
+        "assignment_digest": assignment.assignment_digest,
+        "attempt": 0,
+        "lease_generation_seq": lease.lease_generation_seq,
+        "run_id": "run-1",
+        "term_id": "term-1",
+        "step_id": "step-1",
+        "tool_call_id": "call-1",
+        "tool_id": "tool-1",
+        "effect_id": "effect-1",
+    }
+    authority.record_effect_evidence(
+        **common, event_cursor=1, event_id="event-1",
+        effect_state="write_started", trusted_time=44.0,
+    )
+    authority.record_effect_evidence(
+        **common, event_cursor=2, event_id="event-2",
+        effect_state="committed_write", trusted_time=45.0,
+    )
+    duplicate = authority.record_effect_evidence(
+        **common, event_cursor=3, event_id="event-3",
+        effect_state="write_started", trusted_time=46.0,
+    )
+
+    outcome = repository.recover_failed_lease(
+        lease.lease_id,
+        source_owner="owner-1",
+        source_attempt=0,
+        source_lease_generation_seq=lease.lease_generation_seq,
+        source_fence_token="fence-1",
+        owner="owner-2",
+        instance_id="instance-2",
+        instance_nonce="nonce-2",
+        host_generation="generation-2",
+        client_lease_id="client-2",
+        fence_token="fence-2",
+        expires_at=100.0,
+        trusted_time=60.0,
+        consumer_id="consumer-1",
+    )
+
+    assert duplicate.effect_state == "unknown_write"
+    assert outcome == RecoveryOutcome("reconcile", None)
+
+
+def test_recovery_outcome_is_consumed_exactly_once(tmp_path: Path) -> None:
+    repository, assignment = _admitted(tmp_path / "state.sqlite")
+    source = repository.acquire_lease(
+        assignment.assignment_digest, attempt=0, instance_id="i", instance_nonce="n",
+        host_generation="g", client_lease_id="c", owner="o", fence_token="f",
+        expires_at=45.0, trusted_time=40.0,
+    )
+
+    first = repository.recover_expired_lease(
+        source.lease_id, owner="next", instance_id="i2", instance_nonce="n2",
+        host_generation="g2", client_lease_id="c2", fence_token="f2",
+        expires_at=80.0, trusted_time=50.0, consumer_id="consumer-1",
+    )
+
+    assert first.lease is not None
+    with pytest.raises(LeaseConflict, match="consumed"):
+        repository.recover_expired_lease(
+            source.lease_id, owner="other", instance_id="i3", instance_nonce="n3",
+            host_generation="g3", client_lease_id="c3", fence_token="f3",
+            expires_at=90.0, trusted_time=51.0, consumer_id="consumer-2",
+        )
+
+
 @pytest.mark.parametrize(
     ("evidence", "decision", "creates_retry"),
     [
@@ -815,12 +891,13 @@ def test_released_recovery_is_absorbing_and_reserved_with_evidence_fails_closed(
         host_generation="unused-g", client_lease_id="unused-c", fence_token="unused-f",
         expires_at=80.0, trusted_time=51.0,
     )
-    repeated = released_repository.recover_expired_lease(
-        released_lease.lease_id, owner="different", instance_id="different-i", instance_nonce="different-n",
-        host_generation="different-g", client_lease_id="different-c", fence_token="different-f",
-        expires_at=90.0, trusted_time=52.0,
-    )
-    assert repeated == first == RecoveryOutcome("released", None)
+    assert first == RecoveryOutcome("released", None)
+    with pytest.raises(LeaseConflict, match="consumed"):
+        released_repository.recover_expired_lease(
+            released_lease.lease_id, owner="different", instance_id="different-i", instance_nonce="different-n",
+            host_generation="different-g", client_lease_id="different-c", fence_token="different-f",
+            expires_at=90.0, trusted_time=52.0,
+        )
 
 
 def test_concurrent_recovery_creates_one_new_lease_and_preserves_old_row(tmp_path: Path) -> None:
@@ -832,19 +909,25 @@ def test_concurrent_recovery_creates_one_new_lease_and_preserves_old_row(tmp_pat
         expires_at=45.0, trusted_time=40.0,
     )
 
-    def recover(_: int) -> RecoveryOutcome:
-        return AssignmentRepository.development(
-            database, trust_keys=(_DEV_KEY,)
-        ).recover_expired_lease(
-            old.lease_id, owner="new-o", instance_id="new-i", instance_nonce="new-n",
-            host_generation="new-g", client_lease_id="new-c", fence_token="new-f",
-            expires_at=80.0, trusted_time=50.0,
-        )
+    def recover(index: int) -> RecoveryOutcome | str:
+        try:
+            return AssignmentRepository.development(
+                database, trust_keys=(_DEV_KEY,)
+            ).recover_expired_lease(
+                old.lease_id, owner="new-o", instance_id="new-i", instance_nonce="new-n",
+                host_generation="new-g", client_lease_id="new-c", fence_token="new-f",
+                expires_at=80.0, trusted_time=50.0,
+                consumer_id=f"consumer-{index}",
+            )
+        except LeaseConflict:
+            return "conflict"
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(recover, (1, 2)))
-    assert outcomes[0] == outcomes[1]
-    assert outcomes[0].lease is not None
+    assert sum(item == "conflict" for item in outcomes) == 1
+    winner = next(item for item in outcomes if item != "conflict")
+    assert isinstance(winner, RecoveryOutcome)
+    assert winner.lease is not None
     with sqlite3.connect(database) as connection:
         rows = connection.execute(
             "SELECT state, attempt FROM runtime_instance_leases ORDER BY attempt"
@@ -1043,7 +1126,7 @@ def test_recovery_replay_validates_the_complete_durable_retry_lease(
 
 
 @pytest.mark.parametrize("durable_state", ["starting", "running", "terminal", "released"])
-def test_recovery_replay_accepts_a_retry_lease_legally_advanced_from_reserved(
+def test_consumed_recovery_rejects_replay_after_retry_lease_advances(
     tmp_path: Path, durable_state: str
 ) -> None:
     """The recovery snapshot stays reserved while its durable lease advances."""
@@ -1076,16 +1159,15 @@ def test_recovery_replay_accepts_a_retry_lease_legally_advanced_from_reserved(
             trusted_time=50.0 + offset,
         )
 
-    replay = repository.recover_expired_lease(
-        source.lease_id, owner="ignored", instance_id="ignored-i",
-        instance_nonce="ignored-n", host_generation="ignored-g",
-        client_lease_id="ignored-c", fence_token="ignored-f",
-        expires_at=120.0, trusted_time=70.0,
-    )
+    with pytest.raises(LeaseConflict, match="consumed"):
+        repository.recover_expired_lease(
+            source.lease_id, owner="ignored", instance_id="ignored-i",
+            instance_nonce="ignored-n", host_generation="ignored-g",
+            client_lease_id="ignored-c", fence_token="ignored-f",
+            expires_at=120.0, trusted_time=70.0,
+        )
 
     assert durable.state == durable_state
-    assert replay == first
-    assert replay.lease.state == "reserved"
 
 
 def test_old_host_v2_pin_remains_readable_and_unchanged(tmp_path: Path) -> None:

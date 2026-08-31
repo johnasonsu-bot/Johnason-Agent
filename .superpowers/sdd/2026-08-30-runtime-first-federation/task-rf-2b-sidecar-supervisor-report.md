@@ -115,3 +115,73 @@
 - 后端全量中的 6 个 skip 为现有外部环境条件；Electron build 有现存 Vite config native warning；均不影响测试通过。
 - `development_graph_meta_e2e` 8 项未直接执行；它们是递归外部编排套件。其内部要求的后端标准全量与 Electron/Playwright 全量已在本任务中分别直接通过。
 - 运行环境提示 `OPENAI_API_KEY is not set, skipping trace export`；本任务不需要也未使用真实凭据。
+
+---
+
+## Fix round 1/5（2026-08-31）
+
+### 结论
+
+独立审核提出的 10 项 P0/P1 生命周期缺口均已按 TDD 修复。最终 focused gate、后端标准全量、Goose/DeepSeek source gates 与 Electron/Playwright 全量通过。修复没有增加 RF-2C Provider Grant，也不改变“不得宣称 Goose/DeepSeek 真实 Runtime GO”的边界。
+
+### 修复内容
+
+1. `write_started` durable observer 失败时，handle 立即携带保守 reconcile 标志，并 best-effort 写入 `unknown_write`；即使保守标志无法落盘，恢复事务也通过 `force_reconcile` 禁止 read-only retry。
+2. active handle `aclose()`、Supervisor shutdown、stream `aclose()` 与 consumer cancellation 统一执行 withdraw、精确 cancel、合法 durable 分类/释放、完成 recovery future 和 sidecar 清理；覆盖 `reserved/running/paused`，普通 close 立即 clean recycle，shutdown 不重启。
+3. recovery outcome 增加 durable `consumer_id/consumed_at`；failed/expired recovery 在同一事务中一次性消费，重复或并发第二消费者得到 `LeaseConflict`，不能用新 fence 包装旧 retry lease。
+4. replacement start/handshake 失败纳入 Supervisor 生命周期累计 restart budget；退避严格为 `0.25/0.5/1.0`，成功握手不清零，成功与耗尽均有测试。clean recycle 首次 replacement 失败也进入同一预算循环。
+5. Registry/DB/factory/monitor/watchdog 的非取消异常进入统一 supervisor-fatal：撤销全部 live advertisement、取消受管后台任务、并发关闭全部 sidecar、保守终结 active lease，并以所有槽位 `unavailable + protocol_failed` 对健康/Gate 可见。
+6. crash、expiry、orphan 在 replacement handshake 后、任何可创建 retry 的 recovery 前校验冻结 assignment 的 `build_id` 与 canonical capability digest；漂移时先 close+withdraw，只持久化无 retry 的保守 outcome。
+7. Repository 增加 Query 内 Tool/Effect identity 状态机；同 cursor 同内容仍幂等，但完成后的 `tool_call_id/effect_id` 再次 `write_started` 会以 `unknown_write` 持久化，crash 后只能 reconcile。
+8. outward stream 提前退出或消费者任务取消时不再等待 lease expiry，而是立即进入 cancel + durable recovery。
+9. containment lock 文件名改为带 domain separation 的 SHA-256 digest；任意 runtime ID 都只能落在固定 `engine-host-v2` 目录，不存在 traversal 或路径规范化碰撞。
+10. 所有 monitor/watchdog task 均保留强引用并在 done callback 中消费异常；非取消异常触发统一 fatal，不再产生 `Task exception was never retrieved`。
+
+### 本轮 TDD RED 证据
+
+所有生产修改前先增加测试并观察预期 RED：
+
+| 逻辑组 | RED 命令（摘要） | 实际 RED |
+|---|---|---|
+| observer/recovery/effect identity | `pytest -q test_assignment.py::{completed_identity,recovery_once} test_supervisor.py::test_write_started_observer_failure_recovers_conservatively` | `3 failed`：缺少 `consumer_id`，observer failure 被错误分类为 `read_only_retry` |
+| active close/shutdown/stream | `pytest -q test_supervisor.py::test_active_close_and_shutdown_release_every_lease_state test_supervisor.py::test_stream_close...` | `6 failed, 1 passed`：running/paused 非法直达 released；shutdown recovery future 超时；stream early close 等 expiry |
+| restart/fatal/background | `pytest -q test_supervisor.py::{replacement_handshake...,recycle_registry...,expiry_repository...}` | `4 failed`；日志同时捕获 monitor 与 watchdog 的两条 `Task exception was never retrieved` |
+| replacement assignment drift | crash/expiry/orphan 三个定向测试 | 初始均允许漂移 replacement 创建 retry lease；修复后只保留 source attempt 0 并无 active lease |
+| containment path | `pytest -q test_supervisor.py::test_runtime_ids_cannot_escape_or_collide_in_containment_paths` | `1 failed`：`../escape` 的 parent 逃出固定目录 |
+
+### 本轮 GREEN 与最终验证
+
+1. 最终 focused gate（任务 8 文件，加 assignment/schema 回归）：`286 passed in 20.72s`。
+2. 最终后端标准全量：
+   - 命令：`.venv/bin/python -m pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'`
+   - 结果：`2876 passed, 6 skipped, 8 deselected, 1 warning in 345.68s`。
+3. Goose/DeepSeek source gates：acceptance `4 passed in 0.81s`；CLI 输出 `GO_GOOSE_SOURCE_READY` 与 `GO_DSH_SOURCE_READY`（`source_build_provenance_only`）。
+4. Python Term 安装清单：使用既有 `scripts/build_python_term_gate_manifest.py` 重建，`generated_files=139 build_inputs=7`；安装复制/证明绑定定向 `2 passed`，并包含于最终后端全量。
+5. Electron/Playwright 全量：`npm test` 完成 Vite/TypeScript build，`50 passed (1.8m)`。
+6. `git diff --check`：通过。`ruff` 未安装（`.venv/bin/python: No module named ruff`），因此未把 lint 作为通过项。
+
+### 本轮文件清单
+
+- `mvp/src/workbench/runtime/engine_host/v2/assignment.py`
+- `mvp/src/workbench/runtime/engine_host/v2/supervisor.py`
+- `mvp/src/workbench/workflow/schema.py`（schema 29 → 30）
+- `mvp/src/workbench/runtime/python_term/gate_manifest.json`（既有生成器重建）
+- `mvp/tests/unit/runtime/engine_host/v2/test_assignment.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_supervisor.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_runtime_admission.py`
+- 本报告
+
+### 本轮自审
+
+- 正确性：所有 retry 创建点均位于 replacement assignment 校验之后；显式 close 使用 `create_retry=False`；recovery consumer 由 durable primary row CAS 保证只能成功一次。
+- 并发/生命周期：所有后台 task 异常均被观察；fatal 排除当前 task 后取消其余 task，避免自等待；sidecar 关闭使用并发 gather；shutdown 的 handle recovery future 一定完成。
+- 安全：containment path 不再包含原始 runtime ID；snapshot/error 仍只有固定公开类别，不包含异常正文、argv、PID、nonce、fence、环境或凭据。
+- 数据完整性：effect evidence 仍 append-only；重复完成 identity 转换为 durable `unknown_write`，不覆盖旧事件；schema 30 可迁移旧 recovery row，并给 legacy row 填充 consumed 元数据。
+- 仓库卫生：未删除文件，未写入 API key/token/password；未修改、暂存或提交 `progress.md` 的既有外部改动。
+
+### 本轮问题与边界
+
+- 一次误跑未排除 marker 的 raw `pytest -q` 得到 `2871 passed, 6 skipped, 13 failed`：其中 12 个是本轮源码变化后 Python Term manifest 按设计拒绝 stale digest，重建后相关 30 项通过；另 1 个是递归 `development_graph_meta_e2e`。该 meta 用例独立复跑仍在其临时 clone 的 global regression 阶段失败；仓库的标准后端合同明确 deselect 这 8 个递归 meta 用例，并要求直接分别运行后端与 Electron 全量，本轮两套直接全量均通过。
+- 最终后端全量有 1 条既有 `RuntimeWarning`：`test_tool_router.py` 报另一测试 fixture 的 `never_approves` coroutine 未 awaited；不在 RF-2B 修改路径，未造成测试失败。
+- `npm test` 有既有 Vite native config warning；不影响 build 或 50 项 Playwright 通过。
+- 本轮仍只证明共用 Supervisor/fake Host 合同，不证明真实 Goose/DeepSeek runtime 或 Provider Grant。

@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 29
+PHASE1_SCHEMA_VERSION = 30
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -231,6 +231,8 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             new_lease_id TEXT,
             outcome_json TEXT NOT NULL,
             outcome_digest TEXT NOT NULL,
+            consumer_id TEXT NOT NULL,
+            consumed_at REAL NOT NULL,
             created_at REAL NOT NULL,
             FOREIGN KEY(source_lease_id) REFERENCES runtime_instance_leases(lease_id),
             FOREIGN KEY(new_lease_id) REFERENCES runtime_instance_leases(lease_id)
@@ -773,6 +775,20 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(
         connection, "runtime_lease_recoveries", "source_lease_generation_seq", "INTEGER"
+    )
+    _add_column_if_missing(
+        connection, "runtime_lease_recoveries", "consumer_id", "TEXT"
+    )
+    _add_column_if_missing(
+        connection, "runtime_lease_recoveries", "consumed_at", "REAL"
+    )
+    connection.execute(
+        "UPDATE runtime_lease_recoveries SET consumer_id='legacy-consumed' "
+        "WHERE consumer_id IS NULL"
+    )
+    connection.execute(
+        "UPDATE runtime_lease_recoveries SET consumed_at=created_at "
+        "WHERE consumed_at IS NULL"
     )
     for row in connection.execute(
         "SELECT lease_id, record_json FROM runtime_instance_leases WHERE lease_record_digest IS NULL"

@@ -1054,7 +1054,7 @@ def test_schema_upgrade_marks_only_pre_feature_host_pins_as_legacy(tmp_path: Pat
     with intents.store.connect() as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 29
+        ).fetchone()[0] == 30
 
 
 def test_self_consistent_invalid_intent_state_fails_closed(tmp_path: Path) -> None:

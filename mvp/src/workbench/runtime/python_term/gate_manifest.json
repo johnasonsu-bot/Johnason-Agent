@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "b3bb4b7d0e8ebf45e2c94e090c947cf133a313712c4cb27426f99bb40f47db03",
-      "size": 1687912
+      "sha256": "99aa6a7d6ec2865bc6ef089d659f0b82859d0b1e8f46531f915b3553ac05737f",
+      "size": 1711902
     },
     {
       "path": "uv.lock",
@@ -514,8 +514,8 @@
     },
     {
       "path": "runtime/engine_host/v2/assignment.py",
-      "sha256": "0e6225ce8cd87ee1f953b8f6bfe699463331e5559f7d16cf04d8b84302de7330",
-      "size": 74139
+      "sha256": "1eb200e5958abd3a3b6c8b00a1a1cbd8779049b99458cb86530c4fe895a89dba",
+      "size": 78321
     },
     {
       "path": "runtime/engine_host/v2/client.py",
@@ -569,8 +569,8 @@
     },
     {
       "path": "runtime/engine_host/v2/supervisor.py",
-      "sha256": "4509cc28196c01c6efbab24e30c21cc8c2033cd2d35691bad744fa890a98c0e3",
-      "size": 47169
+      "sha256": "11dcd9ac816aa364946c8391e04265b27c06a01b07283de2f6faa47c6aeeb37e",
+      "size": 57307
     },
     {
       "path": "runtime/goose/__init__.py",
@@ -724,8 +724,8 @@
     },
     {
       "path": "workflow/schema.py",
-      "sha256": "6a1615f236c31aa3d36c505c5516cb12d73da0c10f9be515a5a4c6042482f5f2",
-      "size": 42306
+      "sha256": "ad0473f3c4db6a898ecded5b47f41c22eb5f1cdd4e4e3bf15101e75e2861f2ff",
+      "size": 42871
     },
     {
       "path": "workflow/store.py",
