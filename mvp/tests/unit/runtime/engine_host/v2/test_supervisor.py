@@ -541,11 +541,7 @@ async def test_active_close_and_shutdown_release_every_lease_state(
         await asyncio.wait_for(query, timeout=1.0)
     recovery = await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
 
-    assert recovery.decision == (
-        "reconcile"
-        if operation == "shutdown" and state in {"running", "paused"}
-        else "released"
-    )
+    assert recovery.decision == "released"
     assert recovery.retry_handle is None
     assert assignments.active_leases(runtime_ids=("goose",)) == ()
     assert clients[0].closed is True
@@ -561,7 +557,7 @@ async def test_active_close_and_shutdown_release_every_lease_state(
 
 
 @pytest.mark.asyncio
-async def test_nonterminal_running_retirement_without_cancel_proof_reconciles(
+async def test_nonterminal_running_retirement_without_effect_releases(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "nonterminal-retirement.sqlite"
@@ -607,7 +603,7 @@ async def test_nonterminal_running_retirement_without_cancel_proof_reconciles(
 
     await handle.aclose()
 
-    assert (await handle.wait_recovery()).decision == "reconcile"
+    assert (await handle.wait_recovery()).decision == "released"
     assert assignments.active_leases(runtime_ids=("goose",)) == ()
 
 
@@ -648,7 +644,7 @@ async def test_stream_close_cancels_and_durably_recovers_without_waiting_for_exp
     await stream.aclose()
     recovery = await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
 
-    assert recovery.decision == "reconcile"
+    assert recovery.decision == "released"
     assert clients[0].cancel_count == 1
     assert assignments.active_leases(runtime_ids=("goose",)) == ()
     assert supervisor.snapshot()[0].host_generation == 2
@@ -698,7 +694,7 @@ async def test_cancelled_stream_consumer_completes_durable_recovery(
         await task
     recovery = await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
 
-    assert recovery.decision == "reconcile"
+    assert recovery.decision == "released"
     assert clients[0].cancel_count == 1
     assert assignments.active_leases(runtime_ids=("goose",)) == ()
 
@@ -1058,9 +1054,7 @@ async def test_replacement_exhaustion_durably_releases_the_source_lease(
 
     recovery = await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
 
-    assert recovery.decision == (
-        "reconcile" if recovery_kind == "crash" else "released"
-    )
+    assert recovery.decision == "released"
     assert recovery.retry_handle is None
     assert assignments.get_lease(handle._lease().lease_id).state == "released"
     assert assignments.active_leases(runtime_ids=("goose",)) == ()
@@ -1332,6 +1326,59 @@ async def test_terminal_release_database_failure_preserves_error_and_fences_all(
 
 
 @pytest.mark.asyncio
+async def test_terminal_cleanup_unconfirmed_only_withdraws_failed_runtime(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "terminal-cleanup-local.sqlite"
+    capabilities = runtime_capabilities("alpha", query=True)
+    envelope = run_envelope(
+        runtime_id="alpha", command_id="command-terminal-cleanup",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: dict[str, _Client] = {}
+
+    def factory(config, generation, containment_lock):
+        del generation, containment_lock
+        client = _Client(
+            config.runtime_id, fail_close=config.runtime_id == "alpha"
+        )
+        if config.runtime_id == "alpha":
+            client.capabilities = capabilities
+        clients[config.runtime_id] = client
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=tuple(
+            RuntimeProcessConfig(runtime_id=item, argv=(item,))
+            for item in ("alpha", "zeta")
+        ),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    query = asyncio.create_task(_collect_supervised(handle.run_query(envelope)))
+    await asyncio.wait_for(clients["alpha"].query_started.wait(), timeout=1.0)
+    clients["alpha"].release_query.set()
+
+    with pytest.raises(LeaseConflict, match="cleanup"):
+        await query
+    with pytest.raises(LeaseConflict, match="cleanup"):
+        await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
+
+    snapshots = {item.runtime_id: item for item in supervisor.snapshot()}
+    assert snapshots["alpha"].state == "unavailable"
+    assert snapshots["alpha"].last_error_category == "cleanup_unconfirmed"
+    assert snapshots["zeta"].state == "ready"
+    assert clients["zeta"].closed is False
+
+
+@pytest.mark.asyncio
 async def test_query_recovery_registry_failure_is_fatal_for_every_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1569,6 +1616,91 @@ async def test_retirement_detects_outcome_consumed_by_external_takeover(
     assert assignments.get_lease(handle._lease().lease_id).state == "released"
     with pytest.raises(LeaseConflict, match="already consumed"):
         await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_kind", ["failed", "expired"])
+@pytest.mark.parametrize("externally_consumed", [False, True])
+async def test_recovery_conflict_withdraws_replacement_and_reads_source_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_kind: str,
+    externally_consumed: bool,
+) -> None:
+    database = tmp_path / f"{recovery_kind}-{externally_consumed}.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id=f"command-{recovery_kind}",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: list[_Client] = []
+    now = [10.0]
+    wake = asyncio.Event()
+
+    async def sleep(delay: float) -> None:
+        if delay == 30.0:
+            await wake.wait()
+        else:
+            await asyncio.sleep(0)
+
+    def factory(config, generation, containment_lock):
+        del config, containment_lock
+        client = _Client(
+            "goose", fail_query=recovery_kind == "failed" and generation == 1
+        )
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: now[0],
+        sleep=sleep,
+        max_restarts=1,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    method_name = (
+        "recover_failed_lease"
+        if recovery_kind == "failed"
+        else "recover_expired_lease"
+    )
+    original_recover = getattr(assignments, method_name)
+    consumed = False
+
+    def conflict(*args, **kwargs):
+        nonlocal consumed
+        if externally_consumed and not consumed:
+            consumed = True
+            original_recover(*args, **kwargs)
+        raise LeaseConflict("fixture recovery consumer conflict")
+
+    monkeypatch.setattr(assignments, method_name, conflict)
+    if recovery_kind == "failed":
+        with pytest.raises(RuntimeUnavailableError):
+            _ = [event async for event in handle.run_query(envelope)]
+    else:
+        now[0] = 41.0
+        wake.set()
+
+    with pytest.raises(LeaseConflict, match="consumer conflict"):
+        await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
+
+    snapshot = supervisor.snapshot()[0]
+    source = assignments.get_lease(handle._lease().lease_id)
+    assert clients[1].closed is True
+    assert snapshot.state == "unavailable"
+    assert snapshot.active is (not externally_consumed)
+    if externally_consumed:
+        assert source.state == "released"
+    else:
+        assert source.state != "released"
 
 
 @pytest.mark.asyncio
@@ -2182,12 +2314,90 @@ async def test_immediate_query_crash_recovers_without_replaying_envelope(
         _ = [event async for event in old.run_query(envelope)]
     recovery = await asyncio.wait_for(old.wait_recovery(), timeout=1.0)
 
-    assert recovery.decision == "reconcile"
-    assert recovery.retry_handle is None
+    assert recovery.decision == "read_only_retry"
+    assert recovery.retry_handle is not None
     assert clients[0].closed is True
     assert len(clients) == 2
-    assert assignments.active_leases(runtime_ids=("goose",)) == ()
-    assert supervisor.snapshot()[0].state == "ready"
+    assert assignments.active_leases(runtime_ids=("goose",))[0].attempt == 1
+    assert supervisor.snapshot()[0].state == "leased"
 
     with pytest.raises(LeaseConflict):
         await old.renew()
+
+
+@pytest.mark.asyncio
+async def test_immediate_read_only_crash_creates_same_runtime_retry(
+    tmp_path: Path,
+) -> None:
+    class ReadOnlyCrashClient(_Client):
+        async def run_query(self, envelope, *, observer=None):
+            self.queries.append(envelope)
+            if observer is not None:
+                observer(
+                    RuntimeClientObservation(
+                        kind="acceptance",
+                        envelope=envelope,
+                        capabilities=self.capabilities,
+                    )
+                )
+                observer(
+                    RuntimeClientObservation(
+                        kind="read_only",
+                        envelope=envelope,
+                        capabilities=self.capabilities,
+                        event=runtime_event(
+                            "tool.result",
+                            payload={
+                                "tool_call_id": "call-read",
+                                "tool_id": "tool-read",
+                                "effect_id": "effect-read",
+                            },
+                        ),
+                    )
+                )
+            self.query_started.set()
+            raise RuntimeUnavailableError("fixture read-only query crash")
+            yield  # pragma: no cover
+
+    database = tmp_path / "read-only-crash.sqlite"
+    capabilities = runtime_capabilities("goose", query=True, tools=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-read-only-crash",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: list[_Client] = []
+
+    def factory(config, generation, containment_lock):
+        del config, containment_lock
+        client = (
+            ReadOnlyCrashClient("goose")
+            if generation == 1
+            else _Client("goose")
+        )
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+        sleep=lambda delay: asyncio.sleep(0),
+    )
+    await supervisor.start()
+    old = await supervisor.acquire_initial(assignment)
+
+    with pytest.raises(RuntimeUnavailableError, match="read-only"):
+        _ = [event async for event in old.run_query(envelope)]
+    recovery = await asyncio.wait_for(old.wait_recovery(), timeout=1.0)
+
+    assert recovery.decision == "read_only_retry"
+    assert recovery.retry_handle is not None
+    evidence = assignments.effect_evidence(old._lease().lease_id)
+    assert [item.effect_state for item in evidence] == ["read_only"]
+    assert assignments.active_leases(runtime_ids=("goose",))[0].attempt == 1

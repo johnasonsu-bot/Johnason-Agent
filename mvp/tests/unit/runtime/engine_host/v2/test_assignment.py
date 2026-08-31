@@ -708,8 +708,43 @@ def test_promoted_duplicate_effect_replay_is_idempotent_at_the_same_cursor(
     assert replay == promoted
 
 
-def test_explicit_unknown_write_never_accepts_write_started_cursor_replay(
+def test_promoted_committed_write_cursor_replay_is_idempotent(
     tmp_path: Path,
+) -> None:
+    """Catches committed-write promotion lacking write-start replay symmetry."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / "promoted-committed-replay.sqlite"
+    )
+    common = {
+        "lease_id": lease.lease_id,
+        "assignment_digest": assignment.assignment_digest,
+        "attempt": 0,
+        "lease_generation_seq": lease.lease_generation_seq,
+        "run_id": "run-1",
+        "term_id": "term-1",
+        "step_id": "step-1",
+        "event_cursor": 1,
+        "event_id": "event-1",
+        "tool_call_id": "call-1",
+        "tool_id": "tool-1",
+        "effect_id": "effect-1",
+    }
+    promoted = authority.record_effect_evidence(
+        **common, effect_state="committed_write", trusted_time=44.0,
+    )
+
+    replay = authority.record_effect_evidence(
+        **common, effect_state="committed_write", trusted_time=45.0,
+    )
+
+    assert promoted.effect_state == "unknown_write"
+    assert promoted.reported_effect_state == "committed_write"
+    assert replay == promoted
+
+
+@pytest.mark.parametrize("forged_state", ["write_started", "committed_write"])
+def test_explicit_unknown_write_never_accepts_forged_cursor_replay(
+    tmp_path: Path, forged_state: str,
 ) -> None:
     """Catches explicit unknown evidence masquerading as duplicate promotion."""
     repository, assignment, lease, authority = _accepted_lease_for_effects(
@@ -736,7 +771,7 @@ def test_explicit_unknown_write_never_accepts_write_started_cursor_replay(
     assert explicit.reported_effect_state == "unknown_write"
     with pytest.raises(LeaseConflict, match="cursor"):
         authority.record_effect_evidence(
-            **common, effect_state="write_started", trusted_time=45.0,
+            **common, effect_state=forged_state, trusted_time=45.0,
         )
 
 

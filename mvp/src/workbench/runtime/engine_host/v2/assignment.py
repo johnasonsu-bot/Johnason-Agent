@@ -1181,9 +1181,11 @@ class AssignmentRepository:
                 replay_digest = digest
                 if (
                     current.effect_state == "unknown_write"
-                    and current.reported_effect_state == "write_started"
-                    and reported_effect_state == "write_started"
-                    and effect_state in {"write_started", "unknown_write"}
+                    and current.reported_effect_state
+                    in {"write_started", "committed_write"}
+                    and reported_effect_state == current.reported_effect_state
+                    and effect_state
+                    in {current.reported_effect_state, "unknown_write"}
                 ):
                     replay_digest = self._effect_evidence_digest(
                         lease_id=lease_id,
@@ -1196,7 +1198,7 @@ class AssignmentRepository:
                         tool_id=tool_id,
                         effect_id=effect_id,
                         effect_state="unknown_write",
-                        reported_effect_state="write_started",
+                        reported_effect_state=current.reported_effect_state,
                     )
                 if current.canonical_digest != replay_digest:
                     raise LeaseConflict("effect cursor content changed")

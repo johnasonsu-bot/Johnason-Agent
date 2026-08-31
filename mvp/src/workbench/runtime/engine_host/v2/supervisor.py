@@ -696,11 +696,6 @@ class SidecarSupervisor:
                 handle._fail_recovery(local_error)
             else:
                 handle._mark_closed()
-                if (
-                    handle._lease().state in {"accepted", "running", "paused"}
-                    and not handle._has_terminal_proof()
-                ):
-                    handle._mark_requires_reconcile()
             if confirmed and fatal_error is None and local_error is None:
                 now = self._clock()
                 try:
@@ -734,19 +729,11 @@ class SidecarSupervisor:
                     )
             if confirmed and fatal_error is None and local_error is not None:
                 try:
-                    takeover = self._assignments.get_lease(lease.lease_id)
-                except LeaseConflict:
-                    takeover = None
+                    await self._settle_recovery_conflict(
+                        slot, handle, local_error
+                    )
                 except BaseException as error:
                     fatal_error = error
-                if fatal_error is None:
-                    if takeover is not None and takeover.state == "released":
-                        slot.handle = None
-                        slot.active = False
-                    else:
-                        slot.active = True
-                    self._transition(slot, "unavailable")
-                    handle._fail_recovery(local_error)
         if fatal_error is not None:
             await self._supervisor_fatal(fatal_error)
             if self._shutdown_task is not None:
@@ -774,6 +761,37 @@ class SidecarSupervisor:
                     "supervisor infrastructure failure"
                 ) from error
         return True
+
+    async def _settle_recovery_conflict(
+        self,
+        slot: _RuntimeSlot,
+        handle: "SupervisedRuntimeLease",
+        error: LeaseConflict,
+    ) -> None:
+        """Fence a replacement and resolve ownership from durable source state."""
+        self._registry.withdraw(slot.config.runtime_id)
+        confirmed = await self._close_slot_client(slot)
+        if not confirmed:
+            slot.last_error_category = "cleanup_unconfirmed"
+            if slot.state != "unavailable":
+                self._transition(slot, "unavailable")
+            slot.active = True
+            handle._fail_recovery(
+                LeaseConflict("replacement cleanup was not confirmed")
+            )
+            return
+        try:
+            takeover = self._assignments.get_lease(handle._lease().lease_id)
+        except LeaseConflict:
+            takeover = None
+        if takeover is not None and takeover.state == "released":
+            slot.handle = None
+            slot.active = False
+        else:
+            slot.active = True
+        if slot.state != "unavailable":
+            self._transition(slot, "unavailable")
+        handle._fail_recovery(error)
 
     def _schedule_watchdog(
         self, slot: _RuntimeSlot, handle: "SupervisedRuntimeLease"
@@ -843,11 +861,6 @@ class SidecarSupervisor:
                 )
                 return
             handle._mark_closed()
-            if (
-                handle._lease().state in {"accepted", "running", "paused"}
-                and not handle._has_terminal_proof()
-            ):
-                handle._mark_requires_reconcile()
             try:
                 restarted = await self._restart_with_budget(slot)
             except BaseException as error:
@@ -861,7 +874,12 @@ class SidecarSupervisor:
                         slot, handle, expired=True
                     )
                 except LeaseConflict as error:
-                    handle._fail_recovery(error)
+                    try:
+                        await self._settle_recovery_conflict(
+                            slot, handle, error
+                        )
+                    except BaseException as settle_error:
+                        fatal_error = settle_error
                 except BaseException as error:
                     fatal_error = error
                 else:
@@ -872,7 +890,12 @@ class SidecarSupervisor:
                         slot, handle._assignment(), handle=handle
                     )
                 except LeaseConflict as error:
-                    handle._fail_recovery(error)
+                    try:
+                        await self._settle_recovery_conflict(
+                            slot, handle, error
+                        )
+                    except BaseException as settle_error:
+                        fatal_error = settle_error
                     valid = False
                 except BaseException as error:
                     fatal_error = error
@@ -894,7 +917,12 @@ class SidecarSupervisor:
                             consumer_id="supervisor-" + uuid4().hex,
                         )
                     except LeaseConflict as error:
-                        handle._fail_recovery(error)
+                        try:
+                            await self._settle_recovery_conflict(
+                                slot, handle, error
+                            )
+                        except BaseException as settle_error:
+                            fatal_error = settle_error
                     except BaseException as error:
                         fatal_error = error
                     else:
@@ -1056,11 +1084,6 @@ class SidecarSupervisor:
                 )
                 return
             handle._mark_closed()
-            if (
-                handle._lease().state in {"accepted", "running", "paused"}
-                and not handle._has_terminal_proof()
-            ):
-                handle._mark_requires_reconcile()
             if fatal_error is not None:
                 restarted = False
             else:
@@ -1077,7 +1100,12 @@ class SidecarSupervisor:
                         slot, handle, expired=False
                     )
                 except LeaseConflict as error:
-                    handle._fail_recovery(error)
+                    try:
+                        await self._settle_recovery_conflict(
+                            slot, handle, error
+                        )
+                    except BaseException as settle_error:
+                        fatal_error = settle_error
                 except BaseException as error:
                     fatal_error = error
                 else:
@@ -1088,7 +1116,12 @@ class SidecarSupervisor:
                         slot, handle._assignment(), handle=handle
                     )
                 except LeaseConflict as error:
-                    handle._fail_recovery(error)
+                    try:
+                        await self._settle_recovery_conflict(
+                            slot, handle, error
+                        )
+                    except BaseException as settle_error:
+                        fatal_error = settle_error
                     valid = False
                 except BaseException as error:
                     fatal_error = error
@@ -1115,7 +1148,12 @@ class SidecarSupervisor:
                             force_reconcile=handle._requires_reconcile(),
                         )
                     except LeaseConflict as error:
-                        handle._fail_recovery(error)
+                        try:
+                            await self._settle_recovery_conflict(
+                                slot, handle, error
+                            )
+                        except BaseException as settle_error:
+                            fatal_error = settle_error
                     except BaseException as error:
                         fatal_error = error
                     else:
@@ -1282,6 +1320,7 @@ class SidecarSupervisor:
     ) -> None:
         slot, lease = self._require_current_handle(handle)
         fatal_error: BaseException | None = None
+        local_error: LeaseConflict | None = None
         async with slot.lock:
             slot, lease = self._require_current_handle(handle)
             handle._mark_terminal_proof()
@@ -1308,19 +1347,22 @@ class SidecarSupervisor:
                     self._transition(slot, "unavailable")
                     error = LeaseConflict("sidecar cleanup was not confirmed")
                     handle._fail_recovery(error)
-                    raise error
-                handle._mark_closed()
-                slot.handle = None
-                slot.active = False
-                await self._start_recycled_client(slot)
-                if slot.state != "ready":
-                    await self._restart_with_budget(slot)
-                handle._set_recovery(SupervisedRecoveryResult("released"))
+                    local_error = error
+                else:
+                    handle._mark_closed()
+                    slot.handle = None
+                    slot.active = False
+                    await self._start_recycled_client(slot)
+                    if slot.state != "ready":
+                        await self._restart_with_budget(slot)
+                    handle._set_recovery(SupervisedRecoveryResult("released"))
             except BaseException as error:
                 fatal_error = error
         if fatal_error is not None:
             await self._supervisor_fatal(fatal_error)
             raise fatal_error
+        if local_error is not None:
+            raise local_error
 
     async def _pause_handle(self, handle: "SupervisedRuntimeLease") -> None:
         slot, lease = self._require_current_handle(handle)

@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "ceca2eed59908a90d186580080ecf21d9aa861974671697f759e3c7d0610e0a3",
-      "size": 1749675
+      "sha256": "cd74e2a47720c4fb05355edbf46c462447eb9a2a92be14ddd17d11d44580533f",
+      "size": 1758756
     },
     {
       "path": "uv.lock",
@@ -514,8 +514,8 @@
     },
     {
       "path": "runtime/engine_host/v2/assignment.py",
-      "sha256": "9ed6c5cd1b972013343e018c8ec1913b7d85bc21d1c2e630a081a710f23f874b",
-      "size": 81545
+      "sha256": "02995eebcc317708b6fe0238cb36c4a79d0f38ad0f810ef757526eb368ec23a8",
+      "size": 81648
     },
     {
       "path": "runtime/engine_host/v2/client.py",
@@ -569,8 +569,8 @@
     },
     {
       "path": "runtime/engine_host/v2/supervisor.py",
-      "sha256": "98e0c669da490605d26292a74d8845650ed256efd365ce1e47057d1793bab0d4",
-      "size": 70858
+      "sha256": "d00e8c81145c6c430930b8ba7d5d1cbc264ae90b64ca5402ba550fac42d56556",
+      "size": 72511
     },
     {
       "path": "runtime/goose/__init__.py",

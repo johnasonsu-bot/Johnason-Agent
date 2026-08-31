@@ -318,3 +318,62 @@
 - Goose CLI 首次手工调用漏传必填 `--repo-root`，参数校验按预期失败；按 acceptance 测试中的规范参数立即重跑并得到 `GO_GOOSE_SOURCE_READY`，不属于产品失败。
 - Electron build 仍有既有 Vite native-config warning；50 项 Playwright 全绿。
 - 环境未设置 `OPENAI_API_KEY`，仅跳过 trace export；本任务不需要且未使用真实凭据。
+
+## Fix round 4/5（2026-08-31）
+
+### 结论
+
+复审提出的 4 项 P0/P1 已按 TDD 修复。round 3 的 retiring observer fence 保留，但撤销“accepted/running/paused 无 terminal seal 一律 reconciliation”的过度保守分类：只要旧 containment cleanup 已确认，durable acceptance + 无 Tool-start 或仅 read-only evidence 会恢复批准 brief 的同 Runtime next-attempt retry；只有 observer persistence failure、真实 late/unknown/unmatched write、cancel/cleanup 无法确认等不安全边界才 force reconciliation。terminal client cleanup 未确认只降级故障 Runtime，不再错误回收健康 Runtime。
+
+### 实现内容
+
+1. 删除 close/crash/expiry 路径按非终态 lease state 自动设置 `requires_reconcile` 的逻辑。retiring observer 仍在 cleanup 前保持活跃，late `write_started` 仍持久化为带 provenance 的 `unknown_write`；cancel 失败和 cleanup 未确认仍 fail closed。
+2. immediate crash 的 durable acceptance + 无 Tool evidence 与仅 `read_only` evidence 均由 Repository 原分类生成 `read_only_retry` 和严格 `attempt+1` handle；Supervisor 不自行重放 envelope。真实 late write 继续返回 reconciliation。
+3. terminal client cleanup 未确认改为局部 `LeaseConflict`：故障 slot 进入 `unavailable/cleanup_unconfirmed` 并失败 recovery future，健康 slot/advertisement 保持 ready。terminal DB/Registry/构造不变量异常仍保留原始异常并进入全局 `_supervisor_fatal`；shutdown cleanup 未确认仍返回 `SupervisorShutdownError`。
+4. 新增统一 `_settle_recovery_conflict`，供 retirement、crash 与 expiry 的所有 recover/validation/finalization `LeaseConflict` 使用：先 withdraw 并关闭 replacement，再读取 durable source；source 已 released 时清本地 handle/active，否则保留 active；两者均进入 unavailable 并终结 future。helper 自身的 Registry/DB 异常仍升级全局 fatal，replacement cleanup 未确认则保留 active。
+5. promoted effect replay 对 `reported_effect_state=write_started|committed_write` 使用同一 canonical unknown-write digest；两种原事件的同 cursor 重放均幂等。原生 explicit unknown provenance 不匹配，伪装成任一写状态均继续 content-drift fail closed。
+
+### 本轮 TDD RED 证据
+
+所有生产修改前均先增加或收紧测试并观察预期 RED：
+
+| 逻辑组 | RED 命令（摘要） | 实际 RED |
+|---|---|---|
+| crash/expiry 分类 | `pytest -q test_supervisor.py -k 'immediate_query_crash... or immediate_read_only_crash... or ...'` | `8 failed, 6 passed`：无 Tool/read-only crash 被错误 reconcile；stream/shutdown/预算耗尽的安全 cleanup 被过度保守分类 |
+| terminal cleanup 局部失败 | `pytest -q test_supervisor.py -k terminal_cleanup_unconfirmed_only` | `1 failed`：alpha cleanup 未确认触发全局 fatal，健康 zeta 被错误关闭/unavailable |
+| failed/expired conflict takeover | `pytest -q test_supervisor.py -k recovery_conflict_withdraws_replacement` | `4 failed`：plain/external-consumed 的 crash/expiry conflict 均遗留 replacement client 与 ready slot |
+| committed promotion replay | `pytest -q test_assignment.py -k 'promoted_committed_write or explicit_unknown_write'` | `1 failed, 2 passed`：committed-write promotion 的原 cursor 重放冲突；explicit unknown 的两类伪状态已按预期拒绝 |
+
+### GREEN 与最终验证
+
+1. Repository + Supervisor 组合单元回归：`114 passed in 3.42s`。
+2. 最终 focused gate（任务 8 文件，加 assignment/runtime-admission）：`314 passed in 21.60s`。
+3. Python Term manifest：使用既有生成器重建，输出 `generated_files=139 build_inputs=7`。
+4. 最终后端标准全量：`2904 passed, 6 skipped, 8 deselected in 322.37s`；命令为 `pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'`。
+5. Goose/DeepSeek source gates：acceptance `4 passed in 0.71s`；CLI 分别输出 `GO_GOOSE_SOURCE_READY` 与 `GO_DSH_SOURCE_READY`，DeepSeek scope 为 `source_build_provenance_only`。
+6. Electron/Playwright 全量：`npm test` 完成 Vite/TypeScript build，`50 passed (1.6m)`。
+7. `py_compile` 与 `git diff --check`：通过。
+
+### 本轮文件清单
+
+- `mvp/src/workbench/runtime/engine_host/v2/assignment.py`
+- `mvp/src/workbench/runtime/engine_host/v2/supervisor.py`
+- `mvp/src/workbench/runtime/python_term/gate_manifest.json`（既有生成器重建）
+- `mvp/tests/unit/runtime/engine_host/v2/test_assignment.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_supervisor.py`
+- 本报告
+
+### 本轮自审
+
+- 批准分类：决定只来自 durable acceptance/effect evidence 与明确安全失败，不再从“缺少 terminal proof”本身推导 unknown write；无 Tool/read-only 可 retry，late/unknown/unmatched write reconciliation。
+- 时序：retiring 仍在 cancel/cleanup 前冻结 outward delivery，observer 到 cleanup 确认前仍能记录 late evidence；本轮没有回退 round 3 的 race 修复。
+- 局部/全局边界：client cleanup 未确认是单 Runtime process failure；DB、Registry 与状态不变量仍是 supervisor infrastructure failure。shutdown 合同保持有界且显式失败。
+- conflict takeover：所有 crash/expiry recover 分支，包括 restart exhausted、snapshot validation 与最终 recover，都先关闭 replacement 后按 durable source state 清理本地 ownership；外部已创建的 retry 不被本 Supervisor 接管。
+- provenance：promoted write-start/commit replay 对称；explicit unknown 与 legacy provenance 都不能冒充 deterministic promotion。
+- 安全/边界：未删除文件，未写入 API key/token/password，未实现 RF-2C，未宣称 Goose/DeepSeek Runtime GO，未修改或暂存 `progress.md`。
+
+### 本轮问题与边界
+
+- 后端标准合同继续排除 8 个递归 `development_graph_meta_e2e`；要求的后端与 Electron 全量已分别直接运行。
+- Electron build 仍输出既有 Vite native-config warning；50 项 Playwright 全绿。
+- 环境未设置 `OPENAI_API_KEY`，仅跳过 trace export；本任务不需要且未使用真实凭据。
