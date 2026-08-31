@@ -18,16 +18,16 @@
 | RF-4A | DSH source/build/bootstrap/Prompt/Provider Smoke | 6–9 | `GO_DSH_PLUGIN_SMOKE` |
 | RF-4B | DSH Tool waterfall/Event/checkpoint/plugin Gate | 8–12 | `GO_DSH_PLUGIN_RUNTIME` |
 | RF-5 | 跨 Runtime assignment/Handoff/recovery/Artifact 联合验收 | 6–9 | `GO_RUNTIME_FEDERATION` |
-| AR-1 | Spec/TDD Verifier | 5–8 | `GO_SPEC_TDD_HARNESS` |
-| AR-2 | Context tiering/Skill disclosure/atomic compaction | 8–12 | `GO_CONTEXT_TIERING` |
-| AR-3 | Effect 2PC/bitemporal/causal audit | 6–9 | `GO_EFFECT_BITEMPORAL` |
-| AR-4 | CDE/OpenInference/OpenTelemetry | 6–10 | `GO_CDE_OPENINFERENCE` |
-| AR-5 | ADR/taint/capability/intervention | 6–10 | `GO_ADR_DEFENSE_GATE` |
-| Final | 三 Runtime + 五门禁联合回归和用户环境 | 5–8 | `GO_AGENT_RELIABILITY_STACK` |
+| AR-1 | Spec/TDD Verifier + 公共四级门控合同 | 7–10 | `GO_SPEC_TDD_HARNESS` |
+| AR-2 | Context phase/budget/tiering、Skill disclosure、atomic compaction | 10–15 | `GO_CONTEXT_TIERING` |
+| AR-3 | Effect 2PC/bitemporal/causal audit + Gate/rewind 因果事件 | 7–10 | `GO_EFFECT_BITEMPORAL` |
+| AR-4 | CDE/OpenInference/OpenTelemetry + Gate/Context Budget 遥测 | 7–11 | `GO_CDE_OPENINFERENCE` |
+| AR-5 | ADR/taint/capability/intervention + 风险门控选择策略 | 8–12 | `GO_ADR_DEFENSE_GATE` |
+| Final | 三 Runtime + 五门禁 + 四级门控梯度联合回归和用户环境 | 6–9 | `GO_AGENT_RELIABILITY_STACK` |
 
 安全专项不嵌入 P0/P1/P2 的普通 Task 或修复轮次。P2 完成后统一执行 `FINAL_SECURITY_AUDIT` 与 `FAULT_INJECTION_GATE`；审计发现的问题进入独立整改批次，不与功能开发轮混在一起。
 
-P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日。该估算不包含等待外部 CI/KMS 签名、真实 Provider 账号或上游兼容修复的时间。
+P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Context Phase/Probe 和跨批因果证据，调整为 45–67 个工作日。该估算不包含等待外部 CI/KMS 签名、真实 Provider 账号或上游兼容修复的时间。
 
 ## 2. 依赖与可并行项
 
@@ -35,6 +35,12 @@ P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日�
 - Release 构建必须绑定各自 source/build manifest、仓库声明的 toolchain/engine、目标平台、frozen lock、binary/package、SBOM 和 license digest。fixture 不得进入真实 Gate receipt。
 - Goose 完整门禁先于 DSH 完整门禁，保持既有批准依赖；DSH 的供应链和接口准备可以提前进行，但不得提前宣称 GO。
 - 五项架构更新不阻塞 P0；P0 期间只实现其不可缺少的最小前置，例如 cursor、Effect reconciliation 和安全 grant，不提前建设完整 Spec/taint/OTel 产品。
+- RF-3B/RF-4B 中的 compact/checkpoint 仅做 runtime 原生能力探测、事件透传和恢复 fixture，不开放控制面的 durable Context mutation；厂商中立 compact/rewind 的生产语义和 Context Pin 等价性从 AR-2 才启用。
+- AR-1 必须先产出厂商中立 `GateProfile/GateCycle/GateAttempt/GateReceipt/GateReleaseReceipt` 和 L1–L4 状态机；AR-2～AR-5只消费该公共合同，不各建一套门控。
+- 四级门控按风险累加：普通任务 L1，长时无人值守任务增加 L2，必须发生的检查/Effect/发布增加 L3，架构与里程碑交付增加 L4；任何降级都需要绑定 command identity 的 ADR/审批。
+- L3 连续阻断 8 次只结束自动循环并转 `BLOCKED_INTERVENTION`，绝不生成 PASS。L2/L4 的模型判断只能形成候选证据或 findings。
+- Explore/Plan 与 Execute 使用不同 Context Phase；调查默认在 fresh-context subagent 中完成，主线只接收结构化 Handoff。clear/compact/side-query/rewind 必须实现厂商中立语义并接受恢复测试。
+- 项目约定分为 advisory convention、deterministic policy/hook、on-demand Skill；只有 deterministic 层可以保证动作发生，Skill 加载不等于验收通过。
 - UX 只实现 Runtime 选择、健康、进度、错误和测试证据；其余视觉与 Agent 市场功能后移。
 
 ## 3. 下一批可执行任务
@@ -68,11 +74,13 @@ P0 预计 53–83 个工作日；P1 与联合验收预计 36–57 个工作日�
 ## 4. 审核规则
 
 - 每个 Task TDD、单独提交、规格审核和代码质量审核。
+- P1/P2 的每个 Task brief 必须声明 `required_stages`、机器可执行验收条件、evaluator 身份、证据 Schema、预算和第 8 次阻断后的介入路径；没有这些字段不得进入实现。P0 只记录文档级 provisional gate metadata，不产生尚未实现的 AR-1 `GateReceipt`。
+- 调查类 Task 默认由 fresh-context subagent 完成；执行主线只消费带来源、范围、未解决项和 artifact refs 的结构化 Handoff，原始调查日志不进入主线 Context。
 - 每轮最多 5 次修复；超出后记录 blocker，不能无限补丁。
 - Task 级审核聚焦规格、正确性、恢复一致性和代码质量，不执行广泛安全巡检；API Key/Token/密码不得写入代码的红线始终有效。
 - 安全威胁建模、秘密扫描、依赖供应链攻击面和漏洞注入统一放在 P2 完成后的最终安全专项中执行。
 - Fixture 只验证合同，不满足真实 Runtime Gate。
-- 每个 Smoke Gate 均需提供用户可操作环境；每个 Final Gate 需包含 crash/restart、duplicate command、Effect reconciliation 和 secret scan。
+- 每个 Smoke Gate 均需提供用户可操作环境；P0/P1 的 Final Gate 包含 crash/restart、duplicate command 和 Effect reconciliation。凭据不入库的红线持续有效，但专项 secret scan 只在 P2 后的 `FINAL_SECURITY_AUDIT` 执行。
 
 ## 5. 最终安全专项
 
