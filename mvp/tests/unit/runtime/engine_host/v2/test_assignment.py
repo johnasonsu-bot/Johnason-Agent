@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import asdict
+import hashlib
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
@@ -703,7 +704,132 @@ def test_promoted_duplicate_effect_replay_is_idempotent_at_the_same_cursor(
     )
 
     assert promoted.effect_state == "unknown_write"
+    assert promoted.reported_effect_state == "write_started"
     assert replay == promoted
+
+
+def test_explicit_unknown_write_never_accepts_write_started_cursor_replay(
+    tmp_path: Path,
+) -> None:
+    """Catches explicit unknown evidence masquerading as duplicate promotion."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / "explicit-unknown.sqlite"
+    )
+    common = {
+        "lease_id": lease.lease_id,
+        "assignment_digest": assignment.assignment_digest,
+        "attempt": 0,
+        "lease_generation_seq": lease.lease_generation_seq,
+        "run_id": "run-1",
+        "term_id": "term-1",
+        "step_id": "step-1",
+        "event_cursor": 1,
+        "event_id": "event-1",
+        "tool_call_id": "call-1",
+        "tool_id": "tool-1",
+        "effect_id": "effect-1",
+    }
+    explicit = authority.record_effect_evidence(
+        **common, effect_state="unknown_write", trusted_time=44.0,
+    )
+
+    assert explicit.reported_effect_state == "unknown_write"
+    with pytest.raises(LeaseConflict, match="cursor"):
+        authority.record_effect_evidence(
+            **common, effect_state="write_started", trusted_time=45.0,
+        )
+
+
+def test_schema_v30_effect_evidence_migrates_with_conservative_provenance(
+    tmp_path: Path,
+) -> None:
+    """Catches schema upgrade making legacy explicit unknown rows replayable."""
+    database = tmp_path / "schema-v30.sqlite"
+    repository, assignment, lease, authority = _accepted_lease_for_effects(database)
+    authority.record_effect_evidence(
+        lease.lease_id,
+        assignment_digest=assignment.assignment_digest,
+        attempt=0,
+        lease_generation_seq=lease.lease_generation_seq,
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        event_cursor=1,
+        event_id="event-1",
+        tool_call_id="call-1",
+        tool_id="tool-1",
+        effect_id="effect-1",
+        effect_state="unknown_write",
+        trusted_time=44.0,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(runtime_lease_effect_evidence)"
+            )
+        }
+        if "reported_effect_state" in columns:
+            legacy_document = {
+                "lease_id": lease.lease_id,
+                "run_id": "run-1",
+                "term_id": "term-1",
+                "step_id": "step-1",
+                "event_cursor": 1,
+                "event_id": "event-1",
+                "tool_call_id": "call-1",
+                "tool_id": "tool-1",
+                "effect_id": "effect-1",
+                "effect_state": "unknown_write",
+            }
+            encoded = json.dumps(
+                legacy_document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            legacy_digest = hashlib.sha256(
+                (
+                    "johnason.runtime-lease-effect-evidence/v1\0" + encoded
+                ).encode("utf-8")
+            ).hexdigest()
+            connection.execute(
+                "DROP TRIGGER runtime_lease_effect_evidence_no_update"
+            )
+            connection.execute(
+                "DROP TRIGGER runtime_lease_effect_evidence_no_delete"
+            )
+            connection.execute(
+                "UPDATE runtime_lease_effect_evidence SET canonical_digest=?",
+                (legacy_digest,),
+            )
+            connection.execute(
+                "ALTER TABLE runtime_lease_effect_evidence "
+                "DROP COLUMN reported_effect_state"
+            )
+        connection.execute("DELETE FROM schema_migrations WHERE version > 30")
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations VALUES(30, 1.0)"
+        )
+
+    migrated = AssignmentRepository.development(
+        database, trust_keys=(_DEV_KEY,)
+    )
+    evidence = migrated.effect_evidence(lease.lease_id)[0]
+
+    assert evidence.effect_state == "unknown_write"
+    assert evidence.reported_effect_state == "legacy"
+    with migrated.store.connect() as connection:
+        assert connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == PHASE1_SCHEMA_VERSION
+        assert "reported_effect_state" in {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(runtime_lease_effect_evidence)"
+            )
+        }
 
 
 @pytest.mark.parametrize(

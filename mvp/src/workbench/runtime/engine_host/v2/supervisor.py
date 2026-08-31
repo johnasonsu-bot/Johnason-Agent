@@ -446,7 +446,7 @@ class SidecarSupervisor:
         async with slot.lock:
             handle = slot.handle
             if handle is not None:
-                handle._mark_closed()
+                handle._mark_retiring()
                 if handle._has_run() and slot.client is not None:
                     try:
                         await slot.client.cancel(
@@ -457,6 +457,7 @@ class SidecarSupervisor:
             confirmed = await self._close_slot_client(slot)
             classified = False
             if handle is not None and confirmed:
+                handle._mark_closed()
                 lease = handle._lease()
                 now = self._clock()
                 try:
@@ -593,20 +594,26 @@ class SidecarSupervisor:
             return handle
 
     async def _renew_handle(self, handle: "SupervisedRuntimeLease") -> None:
-        slot, lease = self._require_current_handle(handle)
-        async with slot.lock:
+        try:
             slot, lease = self._require_current_handle(handle)
-            now = self._clock()
-            renewed = self._assignments.renew_lease(
-                lease.lease_id,
-                owner=self._owner,
-                attempt=lease.attempt,
-                lease_generation_seq=lease.lease_generation_seq,
-                fence_token=handle._fence(),
-                expires_at=max(now, lease.expires_at) + self._lease_seconds,
-                trusted_time=now,
-            )
-            handle._replace_lease(renewed)
+            async with slot.lock:
+                slot, lease = self._require_current_handle(handle)
+                now = self._clock()
+                renewed = self._assignments.renew_lease(
+                    lease.lease_id,
+                    owner=self._owner,
+                    attempt=lease.attempt,
+                    lease_generation_seq=lease.lease_generation_seq,
+                    fence_token=handle._fence(),
+                    expires_at=max(now, lease.expires_at) + self._lease_seconds,
+                    trusted_time=now,
+                )
+                handle._replace_lease(renewed)
+        except LeaseConflict:
+            raise
+        except BaseException as error:
+            await self._supervisor_fatal(error)
+            raise
 
     def _require_current_handle(
         self, handle: "SupervisedRuntimeLease"
@@ -614,10 +621,24 @@ class SidecarSupervisor:
         slot = self._slots.get(handle._runtime_id())
         if (
             handle._is_closed()
+            or handle._is_retiring()
             or slot is None
             or slot.handle is not handle
             or slot.state != "leased"
         ):
+            raise LeaseConflict("supervised runtime handle is stale")
+        lease = handle._lease()
+        durable = self._assignments.get_lease(lease.lease_id)
+        if durable != lease:
+            raise LeaseConflict("supervised runtime lease identity drifted")
+        return slot, lease
+
+    def _require_observer_handle(
+        self, handle: "SupervisedRuntimeLease"
+    ) -> tuple[_RuntimeSlot, RuntimeInstanceLease]:
+        """Keep durable evidence open until containment cleanup is confirmed."""
+        slot = self._slots.get(handle._runtime_id())
+        if handle._is_closed() or slot is None or slot.handle is not handle:
             raise LeaseConflict("supervised runtime handle is stale")
         lease = handle._lease()
         durable = self._assignments.get_lease(lease.lease_id)
@@ -657,7 +678,7 @@ class SidecarSupervisor:
             target = "restarting" if restart else "stopping"
             if slot.state != target:
                 self._transition(slot, target)
-            handle._mark_closed()
+            handle._mark_retiring()
             await self._cancel_watchdog(slot)
             try:
                 self._registry.withdraw(slot.config.runtime_id)
@@ -673,7 +694,14 @@ class SidecarSupervisor:
                 self._transition(slot, "unavailable")
                 local_error = LeaseConflict("sidecar cleanup was not confirmed")
                 handle._fail_recovery(local_error)
-            elif fatal_error is None and local_error is None:
+            else:
+                handle._mark_closed()
+                if (
+                    handle._lease().state in {"accepted", "running", "paused"}
+                    and not handle._has_terminal_proof()
+                ):
+                    handle._mark_requires_reconcile()
+            if confirmed and fatal_error is None and local_error is None:
                 now = self._clock()
                 try:
                     outcome = self._assignments.recover_failed_lease(
@@ -704,6 +732,21 @@ class SidecarSupervisor:
                     handle._set_recovery(
                         SupervisedRecoveryResult(outcome.decision)
                     )
+            if confirmed and fatal_error is None and local_error is not None:
+                try:
+                    takeover = self._assignments.get_lease(lease.lease_id)
+                except LeaseConflict:
+                    takeover = None
+                except BaseException as error:
+                    fatal_error = error
+                if fatal_error is None:
+                    if takeover is not None and takeover.state == "released":
+                        slot.handle = None
+                        slot.active = False
+                    else:
+                        slot.active = True
+                    self._transition(slot, "unavailable")
+                    handle._fail_recovery(local_error)
         if fatal_error is not None:
             await self._supervisor_fatal(fatal_error)
             if self._shutdown_task is not None:
@@ -783,9 +826,9 @@ class SidecarSupervisor:
                 return
             lease = handle._lease()
             slot.last_error_category = "lease_expired"
+            handle._mark_retiring()
             self._registry.withdraw(slot.config.runtime_id)
             self._transition(slot, "restarting")
-            handle._mark_closed()
             if handle._has_run():
                 try:
                     await slot.client.cancel(handle._run_id(), reason="lease_expired")
@@ -799,6 +842,12 @@ class SidecarSupervisor:
                     LeaseConflict("sidecar cleanup was not confirmed")
                 )
                 return
+            handle._mark_closed()
+            if (
+                handle._lease().state in {"accepted", "running", "paused"}
+                and not handle._has_terminal_proof()
+            ):
+                handle._mark_requires_reconcile()
             try:
                 restarted = await self._restart_with_budget(slot)
             except BaseException as error:
@@ -817,34 +866,41 @@ class SidecarSupervisor:
                     fatal_error = error
                 else:
                     self._complete_source_recovery(slot, handle, outcome)
-            elif not await self._validate_replacement_assignment(
-                slot, handle._assignment(), handle=handle
-            ):
-                return
             else:
-                now = self._clock()
-                next_fence = token_urlsafe(32)
                 try:
-                    outcome = self._assignments.recover_expired_lease(
-                        lease.lease_id,
-                        owner=self._owner,
-                        instance_id="instance-" + uuid4().hex,
-                        instance_nonce=token_urlsafe(24),
-                        host_generation=str(slot.host_generation),
-                        client_lease_id="client-lease-" + uuid4().hex,
-                        fence_token=next_fence,
-                        expires_at=now + self._lease_seconds,
-                        trusted_time=now,
-                        consumer_id="supervisor-" + uuid4().hex,
+                    valid = await self._validate_replacement_assignment(
+                        slot, handle._assignment(), handle=handle
                     )
                 except LeaseConflict as error:
                     handle._fail_recovery(error)
+                    valid = False
                 except BaseException as error:
                     fatal_error = error
-                else:
-                    self._complete_source_recovery(
-                        slot, handle, outcome, next_fence=next_fence
-                    )
+                    valid = False
+                if fatal_error is None and valid:
+                    now = self._clock()
+                    next_fence = token_urlsafe(32)
+                    try:
+                        outcome = self._assignments.recover_expired_lease(
+                            lease.lease_id,
+                            owner=self._owner,
+                            instance_id="instance-" + uuid4().hex,
+                            instance_nonce=token_urlsafe(24),
+                            host_generation=str(slot.host_generation),
+                            client_lease_id="client-lease-" + uuid4().hex,
+                            fence_token=next_fence,
+                            expires_at=now + self._lease_seconds,
+                            trusted_time=now,
+                            consumer_id="supervisor-" + uuid4().hex,
+                        )
+                    except LeaseConflict as error:
+                        handle._fail_recovery(error)
+                    except BaseException as error:
+                        fatal_error = error
+                    else:
+                        self._complete_source_recovery(
+                            slot, handle, outcome, next_fence=next_fence
+                        )
         if fatal_error is not None:
             await self._supervisor_fatal(fatal_error)
 
@@ -920,21 +976,27 @@ class SidecarSupervisor:
         self, handle: "SupervisedRuntimeLease", envelope: RunEnvelopeV2
     ):
         slot, lease, client = self._validate_envelope(handle, envelope)
-        async with slot.lock:
-            slot, lease, client = self._validate_envelope(handle, envelope)
-            now = self._clock()
-            for target in ("starting", "accepting"):
-                lease = self._assignments.transition_lease(
-                    lease.lease_id,
-                    expected_state=lease.state,
-                    new_state=target,
-                    attempt=lease.attempt,
-                    owner=self._owner,
-                    lease_generation_seq=lease.lease_generation_seq,
-                    fence_token=handle._fence(),
-                    trusted_time=now,
-                )
-            handle._replace_lease(lease)
+        try:
+            async with slot.lock:
+                slot, lease, client = self._validate_envelope(handle, envelope)
+                now = self._clock()
+                for target in ("starting", "accepting"):
+                    lease = self._assignments.transition_lease(
+                        lease.lease_id,
+                        expected_state=lease.state,
+                        new_state=target,
+                        attempt=lease.attempt,
+                        owner=self._owner,
+                        lease_generation_seq=lease.lease_generation_seq,
+                        fence_token=handle._fence(),
+                        trusted_time=now,
+                    )
+                handle._replace_lease(lease)
+        except LeaseConflict:
+            raise
+        except BaseException as error:
+            await self._supervisor_fatal(error)
+            raise
 
         terminal = False
         try:
@@ -949,12 +1011,25 @@ class SidecarSupervisor:
                     and event.payload.get("status")
                     in {"completed", "failed", "cancelled"}
                 )
+                if terminal:
+                    handle._mark_terminal_proof()
+                if handle._is_retiring():
+                    continue
                 yield event
         except RuntimeClientError:
             await self._recover_failed_handle(handle)
             raise
+        except LeaseConflict:
+            raise
+        except BaseException as error:
+            await self._supervisor_fatal(error)
+            raise
         finally:
-            if terminal and not handle._is_closed():
+            if (
+                terminal
+                and not handle._is_closed()
+                and not handle._is_retiring()
+            ):
                 await self._finish_terminal_handle(handle)
 
     async def _recover_failed_handle(
@@ -965,10 +1040,13 @@ class SidecarSupervisor:
         fatal_error: BaseException | None = None
         async with slot.lock:
             slot, lease = self._require_current_handle(handle)
-            self._registry.withdraw(slot.config.runtime_id)
-            self._transition(slot, "restarting")
-            await self._cancel_watchdog(slot)
-            handle._mark_closed()
+            handle._mark_retiring()
+            try:
+                self._registry.withdraw(slot.config.runtime_id)
+                self._transition(slot, "restarting")
+                await self._cancel_watchdog(slot)
+            except BaseException as error:
+                fatal_error = error
             confirmed = await self._close_slot_client(slot)
             if not confirmed:
                 slot.last_error_category = "cleanup_unconfirmed"
@@ -977,11 +1055,20 @@ class SidecarSupervisor:
                     LeaseConflict("sidecar cleanup was not confirmed")
                 )
                 return
-            try:
-                restarted = await self._restart_with_budget(slot)
-            except BaseException as error:
-                fatal_error = error
+            handle._mark_closed()
+            if (
+                handle._lease().state in {"accepted", "running", "paused"}
+                and not handle._has_terminal_proof()
+            ):
+                handle._mark_requires_reconcile()
+            if fatal_error is not None:
                 restarted = False
+            else:
+                try:
+                    restarted = await self._restart_with_budget(slot)
+                except BaseException as error:
+                    fatal_error = error
+                    restarted = False
             if fatal_error is not None:
                 pass
             elif not restarted:
@@ -995,41 +1082,51 @@ class SidecarSupervisor:
                     fatal_error = error
                 else:
                     self._complete_source_recovery(slot, handle, outcome)
-            elif not await self._validate_replacement_assignment(
-                slot, handle._assignment(), handle=handle
-            ):
-                return
             else:
-                now = self._clock()
-                next_fence = token_urlsafe(32)
                 try:
-                    outcome = self._assignments.recover_failed_lease(
-                        lease.lease_id,
-                        source_owner=self._owner,
-                        source_attempt=lease.attempt,
-                        source_lease_generation_seq=lease.lease_generation_seq,
-                        source_fence_token=handle._fence(),
-                        owner=self._owner,
-                        instance_id="instance-" + uuid4().hex,
-                        instance_nonce=token_urlsafe(24),
-                        host_generation=str(slot.host_generation),
-                        client_lease_id="client-lease-" + uuid4().hex,
-                        fence_token=next_fence,
-                        expires_at=now + self._lease_seconds,
-                        trusted_time=now,
-                        consumer_id="supervisor-" + uuid4().hex,
-                        force_reconcile=handle._requires_reconcile(),
+                    valid = await self._validate_replacement_assignment(
+                        slot, handle._assignment(), handle=handle
                     )
                 except LeaseConflict as error:
                     handle._fail_recovery(error)
+                    valid = False
                 except BaseException as error:
                     fatal_error = error
-                else:
-                    self._complete_source_recovery(
-                        slot, handle, outcome, next_fence=next_fence
-                    )
+                    valid = False
+                if fatal_error is None and valid:
+                    now = self._clock()
+                    next_fence = token_urlsafe(32)
+                    try:
+                        outcome = self._assignments.recover_failed_lease(
+                            lease.lease_id,
+                            source_owner=self._owner,
+                            source_attempt=lease.attempt,
+                            source_lease_generation_seq=lease.lease_generation_seq,
+                            source_fence_token=handle._fence(),
+                            owner=self._owner,
+                            instance_id="instance-" + uuid4().hex,
+                            instance_nonce=token_urlsafe(24),
+                            host_generation=str(slot.host_generation),
+                            client_lease_id="client-lease-" + uuid4().hex,
+                            fence_token=next_fence,
+                            expires_at=now + self._lease_seconds,
+                            trusted_time=now,
+                            consumer_id="supervisor-" + uuid4().hex,
+                            force_reconcile=handle._requires_reconcile(),
+                        )
+                    except LeaseConflict as error:
+                        handle._fail_recovery(error)
+                    except BaseException as error:
+                        fatal_error = error
+                    else:
+                        self._complete_source_recovery(
+                            slot, handle, outcome, next_fence=next_fence
+                        )
         if fatal_error is not None:
             await self._supervisor_fatal(fatal_error)
+            raise SupervisorFatalError(
+                "supervisor infrastructure failure"
+            ) from fatal_error
 
     def _recover_without_retry(
         self,
@@ -1090,7 +1187,7 @@ class SidecarSupervisor:
         handle: "SupervisedRuntimeLease",
         observation: RuntimeClientObservation,
     ) -> None:
-        slot, lease = self._require_current_handle(handle)
+        slot, lease = self._require_observer_handle(handle)
         assignment = handle._assignment()
         if observation.envelope.command_id != assignment.command_id:
             raise LeaseConflict("observer envelope identity drifted")
@@ -1145,6 +1242,10 @@ class SidecarSupervisor:
         if event is None:
             raise LeaseConflict("effect observer event is unavailable")
         payload = event.payload
+        reported_state = observation.kind
+        if handle._is_retiring() and observation.kind == "write_started":
+            handle._mark_requires_reconcile()
+            reported_state = "unknown_write"
         evidence = {
             "assignment_digest": assignment.assignment_digest,
             "attempt": lease.attempt,
@@ -1157,9 +1258,11 @@ class SidecarSupervisor:
             "tool_call_id": payload.get("tool_call_id") or payload.get("call_id"),
             "tool_id": payload.get("tool_id"),
             "effect_id": payload.get("effect_id"),
-            "effect_state": observation.kind,
+            "effect_state": reported_state,
             "trusted_time": now,
         }
+        if reported_state != observation.kind:
+            evidence["reported_effect_state"] = observation.kind
         try:
             authority.record_effect_evidence(lease.lease_id, **evidence)
         except BaseException:
@@ -1181,75 +1284,91 @@ class SidecarSupervisor:
         fatal_error: BaseException | None = None
         async with slot.lock:
             slot, lease = self._require_current_handle(handle)
-            now = self._clock()
-            for target in ("terminal", "released"):
-                lease = self._assignments.transition_lease(
-                    lease.lease_id,
-                    expected_state=lease.state,
-                    new_state=target,
-                    attempt=lease.attempt,
-                    owner=self._owner,
-                    lease_generation_seq=lease.lease_generation_seq,
-                    fence_token=handle._fence(),
-                    trusted_time=now,
-                )
-            handle._replace_lease(lease)
-            await self._cancel_watchdog(slot)
-            handle._mark_closed()
-            slot.handle = None
-            slot.active = False
-            self._transition(slot, "restarting")
-            self._registry.withdraw(slot.config.runtime_id)
-            confirmed = await self._close_slot_client(slot)
-            if not confirmed:
-                self._transition(slot, "unavailable")
-                handle._set_recovery(SupervisedRecoveryResult("released"))
-                return
+            handle._mark_terminal_proof()
+            handle._mark_retiring()
             try:
+                now = self._clock()
+                for target in ("terminal", "released"):
+                    lease = self._assignments.transition_lease(
+                        lease.lease_id,
+                        expected_state=lease.state,
+                        new_state=target,
+                        attempt=lease.attempt,
+                        owner=self._owner,
+                        lease_generation_seq=lease.lease_generation_seq,
+                        fence_token=handle._fence(),
+                        trusted_time=now,
+                    )
+                    handle._replace_lease(lease)
+                await self._cancel_watchdog(slot)
+                self._transition(slot, "restarting")
+                self._registry.withdraw(slot.config.runtime_id)
+                confirmed = await self._close_slot_client(slot)
+                if not confirmed:
+                    self._transition(slot, "unavailable")
+                    error = LeaseConflict("sidecar cleanup was not confirmed")
+                    handle._fail_recovery(error)
+                    raise error
+                handle._mark_closed()
+                slot.handle = None
+                slot.active = False
                 await self._start_recycled_client(slot)
                 if slot.state != "ready":
                     await self._restart_with_budget(slot)
+                handle._set_recovery(SupervisedRecoveryResult("released"))
             except BaseException as error:
                 fatal_error = error
-            handle._set_recovery(SupervisedRecoveryResult("released"))
         if fatal_error is not None:
             await self._supervisor_fatal(fatal_error)
+            raise fatal_error
 
     async def _pause_handle(self, handle: "SupervisedRuntimeLease") -> None:
         slot, lease = self._require_current_handle(handle)
         if lease.state != "running":
             raise LeaseConflict("pause requires a running lease")
         await slot.client.pause(handle._run_id())
-        now = self._clock()
-        updated = self._assignments.transition_lease(
-            lease.lease_id,
-            expected_state="running",
-            new_state="paused",
-            attempt=lease.attempt,
-            owner=self._owner,
-            lease_generation_seq=lease.lease_generation_seq,
-            fence_token=handle._fence(),
-            trusted_time=now,
-        )
-        handle._replace_lease(updated)
+        try:
+            now = self._clock()
+            updated = self._assignments.transition_lease(
+                lease.lease_id,
+                expected_state="running",
+                new_state="paused",
+                attempt=lease.attempt,
+                owner=self._owner,
+                lease_generation_seq=lease.lease_generation_seq,
+                fence_token=handle._fence(),
+                trusted_time=now,
+            )
+            handle._replace_lease(updated)
+        except LeaseConflict:
+            raise
+        except BaseException as error:
+            await self._supervisor_fatal(error)
+            raise
 
     async def _resume_handle(self, handle: "SupervisedRuntimeLease") -> None:
         slot, lease = self._require_current_handle(handle)
         if lease.state != "paused":
             raise LeaseConflict("resume requires a paused lease")
         await slot.client.resume(handle._run_id())
-        now = self._clock()
-        updated = self._assignments.transition_lease(
-            lease.lease_id,
-            expected_state="paused",
-            new_state="running",
-            attempt=lease.attempt,
-            owner=self._owner,
-            lease_generation_seq=lease.lease_generation_seq,
-            fence_token=handle._fence(),
-            trusted_time=now,
-        )
-        handle._replace_lease(updated)
+        try:
+            now = self._clock()
+            updated = self._assignments.transition_lease(
+                lease.lease_id,
+                expected_state="paused",
+                new_state="running",
+                attempt=lease.attempt,
+                owner=self._owner,
+                lease_generation_seq=lease.lease_generation_seq,
+                fence_token=handle._fence(),
+                trusted_time=now,
+            )
+            handle._replace_lease(updated)
+        except LeaseConflict:
+            raise
+        except BaseException as error:
+            await self._supervisor_fatal(error)
+            raise
 
     async def _cancel_handle(
         self, handle: "SupervisedRuntimeLease", reason: str
@@ -1330,10 +1449,19 @@ class SidecarSupervisor:
             ):
                 return True
         self._registry.withdraw(slot.config.runtime_id)
-        await self._close_slot_client(slot)
-        slot.last_error_category = "identity_mismatch"
+        confirmed = await self._close_slot_client(slot)
+        slot.last_error_category = (
+            "identity_mismatch" if confirmed else "cleanup_unconfirmed"
+        )
         if slot.state != "unavailable":
             self._transition(slot, "unavailable")
+        if not confirmed:
+            slot.active = handle is not None or orphan is not None
+            if handle is not None:
+                handle._fail_recovery(
+                    LeaseConflict("replacement cleanup was not confirmed")
+                )
+            return False
         now = self._clock()
         if handle is not None:
             lease = handle._lease()
@@ -1498,6 +1626,8 @@ class SupervisedRuntimeLease:
         "__lease_record",
         "__fence_token",
         "__closed",
+        "__retiring",
+        "__terminal_proof",
         "__run_identity",
         "__recovery",
         "__requires_reconcile",
@@ -1517,6 +1647,8 @@ class SupervisedRuntimeLease:
         self.__lease_record = lease
         self.__fence_token = fence_token
         self.__closed = False
+        self.__retiring = False
+        self.__terminal_proof = False
         self.__run_identity: str | None = None
         self.__recovery: asyncio.Future[SupervisedRecoveryResult] = (
             asyncio.get_running_loop().create_future()
@@ -1532,7 +1664,7 @@ class SupervisedRuntimeLease:
             async for event in self.__supervisor._run_handle_query(self, controlled):
                 yield event
         finally:
-            if not self.__closed:
+            if not self.__closed and not self.__retiring:
                 await self.__supervisor._close_handle(self)
 
     async def intervene(self, payload: dict[str, Any]) -> None:
@@ -1576,6 +1708,18 @@ class SupervisedRuntimeLease:
 
     def _mark_closed(self) -> None:
         self.__closed = True
+
+    def _is_retiring(self) -> bool:
+        return self.__retiring
+
+    def _mark_retiring(self) -> None:
+        self.__retiring = True
+
+    def _mark_terminal_proof(self) -> None:
+        self.__terminal_proof = True
+
+    def _has_terminal_proof(self) -> bool:
+        return self.__terminal_proof
 
     def _assignment(self) -> RuntimeAssignment:
         return self.__assignment

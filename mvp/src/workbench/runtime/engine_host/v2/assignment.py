@@ -305,6 +305,7 @@ class RuntimeLeaseEffectEvidence:
     tool_id: str | None
     effect_id: str | None
     effect_state: EffectEvidenceState
+    reported_effect_state: EffectEvidenceState | Literal["legacy"]
     canonical_digest: str
     created_at: float
 
@@ -321,6 +322,21 @@ class RuntimeLeaseEffectEvidence:
             "write_started", "read_only", "committed_write", "unknown_write"
         }:
             raise ValueError("invalid effect evidence state")
+        if self.reported_effect_state not in {
+            "write_started", "read_only", "committed_write", "unknown_write", "legacy"
+        }:
+            raise ValueError("invalid reported effect evidence state")
+        if (
+            self.reported_effect_state != "legacy"
+            and self.effect_state != self.reported_effect_state
+            and not (
+                self.effect_state == "unknown_write"
+                and self.reported_effect_state in {
+                    "write_started", "committed_write"
+                }
+            )
+        ):
+            raise ValueError("invalid effect evidence promotion provenance")
         _require_digest(self.canonical_digest, "canonical_digest")
         _require_time(self.created_at, "created_at")
 
@@ -394,6 +410,7 @@ class _RuntimeEvidenceAuthority:
         effect_id: str | None,
         effect_state: EffectEvidenceState,
         trusted_time: float,
+        reported_effect_state: EffectEvidenceState | None = None,
     ) -> RuntimeLeaseEffectEvidence:
         return self._repository._record_effect_evidence(
             lease_id,
@@ -409,6 +426,7 @@ class _RuntimeEvidenceAuthority:
             tool_id=tool_id,
             effect_id=effect_id,
             effect_state=effect_state,
+            reported_effect_state=reported_effect_state,
             trusted_time=trusted_time,
         )
 
@@ -1053,23 +1071,25 @@ class AssignmentRepository:
         tool_id: str | None,
         effect_id: str | None,
         effect_state: EffectEvidenceState,
+        reported_effect_state: EffectEvidenceState | None = None,
     ) -> str:
+        document: dict[str, object] = {
+            "lease_id": lease_id,
+            "run_id": run_id,
+            "term_id": term_id,
+            "step_id": step_id,
+            "event_cursor": event_cursor,
+            "event_id": event_id,
+            "tool_call_id": tool_call_id,
+            "tool_id": tool_id,
+            "effect_id": effect_id,
+            "effect_state": effect_state,
+        }
+        if reported_effect_state is not None:
+            document["reported_effect_state"] = reported_effect_state
         return _digest(
             _EFFECT_EVIDENCE_DOMAIN
-            + canonical_json(
-                {
-                    "lease_id": lease_id,
-                    "run_id": run_id,
-                    "term_id": term_id,
-                    "step_id": step_id,
-                    "event_cursor": event_cursor,
-                    "event_id": event_id,
-                    "tool_call_id": tool_call_id,
-                    "tool_id": tool_id,
-                    "effect_id": effect_id,
-                    "effect_state": effect_state,
-                }
-            )
+            + canonical_json(document)
         )
 
     def _record_effect_evidence(
@@ -1089,6 +1109,7 @@ class AssignmentRepository:
         effect_id: str | None,
         effect_state: EffectEvidenceState,
         trusted_time: float,
+        reported_effect_state: EffectEvidenceState | None = None,
     ) -> RuntimeLeaseEffectEvidence:
         _require_digest(assignment_digest, "assignment_digest")
         for field, value in (
@@ -1105,6 +1126,16 @@ class AssignmentRepository:
             "write_started", "read_only", "committed_write", "unknown_write"
         }:
             raise ValueError("invalid effect evidence state")
+        reported_effect_state = reported_effect_state or effect_state
+        if reported_effect_state not in {
+            "write_started", "read_only", "committed_write", "unknown_write"
+        }:
+            raise ValueError("invalid reported effect evidence state")
+        if effect_state != reported_effect_state and not (
+            effect_state == "unknown_write"
+            and reported_effect_state in {"write_started", "committed_write"}
+        ):
+            raise ValueError("invalid durable effect evidence promotion")
         for field, value in (
             ("tool_call_id", tool_call_id),
             ("tool_id", tool_id),
@@ -1126,6 +1157,7 @@ class AssignmentRepository:
             tool_id=tool_id,
             effect_id=effect_id,
             effect_state=effect_state,
+            reported_effect_state=reported_effect_state,
         )
 
         def record(connection: sqlite3.Connection) -> RuntimeLeaseEffectEvidence:
@@ -1149,7 +1181,9 @@ class AssignmentRepository:
                 replay_digest = digest
                 if (
                     current.effect_state == "unknown_write"
-                    and effect_state == "write_started"
+                    and current.reported_effect_state == "write_started"
+                    and reported_effect_state == "write_started"
+                    and effect_state in {"write_started", "unknown_write"}
                 ):
                     replay_digest = self._effect_evidence_digest(
                         lease_id=lease_id,
@@ -1162,6 +1196,7 @@ class AssignmentRepository:
                         tool_id=tool_id,
                         effect_id=effect_id,
                         effect_state="unknown_write",
+                        reported_effect_state="write_started",
                     )
                 if current.canonical_digest != replay_digest:
                     raise LeaseConflict("effect cursor content changed")
@@ -1202,6 +1237,7 @@ class AssignmentRepository:
                 tool_id=tool_id,
                 effect_id=effect_id,
                 effect_state=durable_state,
+                reported_effect_state=reported_effect_state,
             )
             evidence = RuntimeLeaseEffectEvidence(
                 lease_id=lease_id,
@@ -1214,12 +1250,16 @@ class AssignmentRepository:
                 tool_id=tool_id,
                 effect_id=effect_id,
                 effect_state=durable_state,
+                reported_effect_state=reported_effect_state,
                 canonical_digest=durable_digest,
                 created_at=now,
             )
             try:
                 connection.execute(
-                    "INSERT INTO runtime_lease_effect_evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO runtime_lease_effect_evidence "
+                    "(lease_id,run_id,term_id,step_id,event_cursor,event_id,"
+                    "tool_call_id,tool_id,effect_id,effect_state,reported_effect_state,"
+                    "canonical_digest,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         evidence.lease_id,
                         evidence.run_id,
@@ -1231,6 +1271,7 @@ class AssignmentRepository:
                         evidence.tool_id,
                         evidence.effect_id,
                         evidence.effect_state,
+                        evidence.reported_effect_state,
                         evidence.canonical_digest,
                         evidence.created_at,
                     ),
@@ -1283,6 +1324,7 @@ class AssignmentRepository:
                 tool_id=row["tool_id"],
                 effect_id=row["effect_id"],
                 effect_state=row["effect_state"],
+                reported_effect_state=row["reported_effect_state"],
                 canonical_digest=row["canonical_digest"],
                 created_at=row["created_at"],
             )
@@ -1297,6 +1339,11 @@ class AssignmentRepository:
                 tool_id=evidence.tool_id,
                 effect_id=evidence.effect_id,
                 effect_state=evidence.effect_state,
+                reported_effect_state=(
+                    None
+                    if evidence.reported_effect_state == "legacy"
+                    else evidence.reported_effect_state
+                ),
             )
             if expected != evidence.canonical_digest:
                 raise ValueError

@@ -50,6 +50,7 @@ from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeCatalogEntry,
     RuntimeAdmissionProbe,
 )
+from workbench.workflow.schema import PHASE1_SCHEMA_VERSION
 from workbench.protocol.events import DomainEvent
 from workbench.workflow.event_store import EventStore
 
@@ -1054,7 +1055,7 @@ def test_schema_upgrade_marks_only_pre_feature_host_pins_as_legacy(tmp_path: Pat
     with intents.store.connect() as connection:
         assert connection.execute(
             "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 30
+        ).fetchone()[0] == PHASE1_SCHEMA_VERSION
 
 
 def test_self_consistent_invalid_intent_state_fails_closed(tmp_path: Path) -> None:

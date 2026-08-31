@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 30
+PHASE1_SCHEMA_VERSION = 31
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -206,6 +206,7 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             tool_id TEXT,
             effect_id TEXT,
             effect_state TEXT NOT NULL,
+            reported_effect_state TEXT NOT NULL,
             canonical_digest TEXT NOT NULL,
             created_at REAL NOT NULL,
             PRIMARY KEY(lease_id, run_id, term_id, step_id, event_cursor),
@@ -781,6 +782,12 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(
         connection, "runtime_lease_recoveries", "consumed_at", "REAL"
+    )
+    _add_column_if_missing(
+        connection,
+        "runtime_lease_effect_evidence",
+        "reported_effect_state",
+        "TEXT NOT NULL DEFAULT 'legacy'",
     )
     connection.execute(
         "UPDATE runtime_lease_recoveries SET consumer_id='legacy-consumed' "

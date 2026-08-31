@@ -249,3 +249,72 @@
 - 标准后端仍按仓库合同排除 8 个递归 `development_graph_meta_e2e`；其要求的后端与 Electron 全量已分别直接运行。
 - Electron build 仍输出既有 Vite native-config warning；不影响 build 或 50 项 Playwright。
 - 本环境仍提示未设置 `OPENAI_API_KEY`，只跳过 trace export；本任务不需要且未使用真实凭据。
+
+## Fix round 3/5（2026-08-31）
+
+### 结论
+
+复审提出的 5 项 P0/P1 已按 TDD 修复。Supervisor 现在把“停止 outward delivery”与“继续接收 durable observer evidence”分成独立 fence：retirement 开始即禁止控制面继续观察/操作，但直到 cancel、client close 与 containment cleanup 确认后才关闭 evidence observer。accepted/running/paused 若没有 Host terminal proof，统一保守进入 reconciliation；窗口内 late `write_started` 固化为带原始 provenance 的 `unknown_write`。本轮只强化共用 Supervisor/Repository 合同，未实现 RF-2C Provider Grant，也不宣称 Goose/DeepSeek 真实 Runtime GO。
+
+### 实现内容
+
+1. `SupervisedRuntimeLease` 新增 retiring fence 与 terminal-proof 标记。正常控制操作拒绝 retiring handle；observer 在 cleanup 确认前仍可写 durable evidence；outward stream 在 retiring 后丢弃后续事件。fatal、crash、expiry、显式 close 与 shutdown 均遵循该顺序。
+2. late write 在 retiring 窗口直接持久化为 `unknown_write`，同时保存 `reported_effect_state=write_started` 并强制 reconciliation。非终态 retirement、stream 提前退出/取消、无 terminal proof 的 crash/restart exhaustion 同样保守 reconciliation；收到可信 cancelled/completed/failed terminal proof 后才允许 clean release。
+3. terminal→released 每一步成功后立即更新 handle 的 durable lease snapshot；任一 DB/Registry/状态不变量错误保留首个原始异常，进入 `_supervisor_fatal`，并发撤销、取消和关闭所有 Runtime，不再被 finally 中的 lease drift 覆盖。
+4. crash/expiry replacement 的 assignment snapshot validation 与 drift finalization 全部纳入 fatal boundary。withdraw/recover 的 DB/Registry 错误会终结 recovery future 并回收全局；replacement cleanup 未确认则保留 source active lease，禁止写 recovery/retry。
+5. retirement 的预期 `LeaseConflict` 会把 slot 置为 `unavailable` 并失败 recovery future；若 outcome 已被外部 consumer 消费，则显式读取 source durable state，已 `released` 时清理本 Supervisor 的 handle/active，否则保留 active 诊断。
+6. effect evidence schema 升至 v31，新增 append-only `reported_effect_state`。duplicate identity promotion 生成 canonical `(unknown_write, original write_started)` digest，因此同 cursor 原事件重放幂等；原生 explicit `unknown_write` 的 provenance 为 unknown，同 cursor 改报 `write_started` 仍 fail closed。v30 数据迁移为保守 `legacy` provenance，并按旧 digest 校验。
+7. starting/accepting、observer、renew、pause/resume、terminal 与 foreground recovery 的非业务异常统一进入 supervisor-fatal；预期 `LeaseConflict` 仍保持业务边界。
+
+### 本轮 TDD RED 证据
+
+所有对应生产修改前均先增加/收紧测试并观察预期 RED：
+
+| 逻辑组 | RED 命令（摘要） | 实际 RED |
+|---|---|---|
+| provenance/schema | `pytest -q test_assignment.py -k 'promoted_duplicate_effect_replay or explicit_unknown_write or schema_v30_effect'` | `3 failed`：evidence 缺少 provenance；explicit unknown 与 promoted unknown 无法区分；v30 migration 缺列 |
+| retiring/late-effect | `pytest -q test_supervisor.py -k 'retirement_freezes_late_effects or active_close_and_shutdown'` | `5 failed, 2 passed`：retirement 过早关闭 observer，late write 被报 stale；无 terminal proof 的非终态 lease 被错误 released |
+| terminal release fatal | `pytest -q test_supervisor.py -k terminal_release_database_failure` | `1 failed`：首次 release DB error 被 finally 的 lease identity drift 覆盖，另一 Runtime 未进入统一 fatal |
+| replacement finalization fatal | `pytest -q test_supervisor.py -k replacement_drift_finalization_database_failure` | `1 failed`：drift recovery DB error 逃逸，其他 Runtime 仍 ready |
+| recovery conflict/takeover | `pytest -q test_supervisor.py -k 'retirement_lease_conflict or retirement_detects_outcome_consumed'` | `2 failed`：slot 卡在 restarting，future 未完成，外部已消费的 released state 未被读取 |
+| no-proof crash | `pytest -q test_supervisor.py -k immediate_query_crash_recovers` | `1 failed`：accepted/running crash 无 terminal proof 仍创建 read-only retry |
+| replacement cleanup | `pytest -q test_supervisor.py -k replacement_drift_cleanup_unconfirmed` | `1 failed`：cleanup 未确认仍写 drift outcome 并错误清 source active lease |
+| schema consumer | `pytest -q test_runtime_admission.py -k schema` | `1 failed`：旧测试固定断言 schema v30，实际已升级 v31 |
+
+### GREEN 与最终验证
+
+1. Repository + Supervisor 组合单元回归：`106 passed in 3.25s`。
+2. 最终 focused gate（任务 8 文件，加 assignment/runtime-admission）：`306 passed in 19.32s`。
+3. Python Term manifest：使用既有生成器重建，输出 `generated_files=139 build_inputs=7`。
+4. 最终后端标准全量：`2896 passed, 6 skipped, 8 deselected in 322.22s`；命令为 `pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'`。
+5. Goose/DeepSeek source gates：acceptance `4 passed in 0.72s`；CLI 分别输出 `GO_GOOSE_SOURCE_READY` 与 `GO_DSH_SOURCE_READY`，后者 scope 为 `source_build_provenance_only`。
+6. Electron/Playwright 全量：`npm test` 完成 Vite/TypeScript build，`50 passed (1.6m)`。
+7. `py_compile` 与 `git diff --check`：通过。
+
+### 本轮文件清单
+
+- `mvp/src/workbench/runtime/engine_host/v2/assignment.py`
+- `mvp/src/workbench/runtime/engine_host/v2/supervisor.py`
+- `mvp/src/workbench/workflow/schema.py`
+- `mvp/src/workbench/runtime/python_term/gate_manifest.json`（既有生成器重建）
+- `mvp/tests/unit/runtime/engine_host/v2/test_assignment.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_supervisor.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_runtime_admission.py`
+- 本报告
+
+### 本轮自审
+
+- 时序：retiring 在任何 cancel/cleanup await 前建立；observer 仅在 cleanup 确认后关闭，且 retiring 后不再对外 yield Event。
+- durable truth：所有非终态、无 Host terminal proof 的 retirement 均 reconciliation；late write 的 durable state/provenance 可审计，不能被误判为 read-only retry。
+- 错误保真：terminal release 的 handle snapshot 每步同步，首个基础设施异常不会再被 finally 或 fence drift 覆盖；fatal 会回收所有 Runtime。
+- replacement：snapshot validation、withdraw、cleanup、drift finalization 与 recover 在同一安全边界；cleanup 未确认绝不释放 source 或创建 retry。
+- takeover：预期 recovery conflict 会显式完成 future；只有 durable source 已 released 时才清本地 active，未确认状态保持 unavailable + active。
+- schema：fresh v31 与 v30 migration 均覆盖；legacy 行使用旧 canonical digest，新增行使用含 provenance 的新 digest。
+- 安全/边界：未写入 API key/token/password，未增加公开 PID/argv/fence/nonce，未删除文件，未修改或暂存 `progress.md`。
+
+### 本轮问题与边界
+
+- 后端标准合同继续排除 8 个递归 `development_graph_meta_e2e`；其要求的后端与 Electron 全量已分别直接运行。
+- Goose CLI 首次手工调用漏传必填 `--repo-root`，参数校验按预期失败；按 acceptance 测试中的规范参数立即重跑并得到 `GO_GOOSE_SOURCE_READY`，不属于产品失败。
+- Electron build 仍有既有 Vite native-config warning；50 项 Playwright 全绿。
+- 环境未设置 `OPENAI_API_KEY`，仅跳过 trace export；本任务不需要且未使用真实凭据。
