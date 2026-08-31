@@ -780,17 +780,28 @@ class SidecarSupervisor:
                 LeaseConflict("replacement cleanup was not confirmed")
             )
             return
-        try:
-            takeover = self._assignments.get_lease(handle._lease().lease_id)
-        except LeaseConflict:
-            takeover = None
-        if takeover is not None and takeover.state == "released":
+        view = self._assignments.recovery_settlement_view(
+            handle._lease().lease_id
+        )
+        active = view.active_leases
+        if len(active) > 1:
+            raise LeaseConflict(
+                "multiple active leases prevent recovery settlement"
+            )
+        orphan = active[0] if active else None
+        if orphan is None:
             slot.handle = None
             slot.active = False
         else:
             slot.active = True
+            if view.source.state == "released":
+                slot.handle = None
         if slot.state != "unavailable":
             self._transition(slot, "unavailable")
+        if orphan is not None and orphan.lease_id != view.source.lease_id:
+            slot.watchdog_task = self._spawn_background(
+                self._orphan_watchdog(slot, orphan)
+            )
         handle._fail_recovery(error)
 
     def _schedule_watchdog(

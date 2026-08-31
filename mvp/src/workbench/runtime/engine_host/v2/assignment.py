@@ -350,6 +350,15 @@ class RecoveryOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoverySettlementView:
+    """One durable snapshot used to settle a competing recovery consumer."""
+
+    source: RuntimeInstanceLease
+    recovery: RecoveryOutcome | None
+    active_leases: tuple[RuntimeInstanceLease, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _RecoveryRecord:
     source_lease_id: str
     source_assignment_digest: str
@@ -853,6 +862,40 @@ class AssignmentRepository:
                     "ORDER BY lease_generation_seq"
                 ).fetchall()
         return tuple(self._lease_from_row(row) for row in rows)
+
+    def recovery_settlement_view(
+        self, source_lease_id: str
+    ) -> RecoverySettlementView:
+        """Read source, persisted recovery and runtime-active leases atomically."""
+        _require_text(source_lease_id, "source_lease_id")
+        with self.store.connect() as connection:
+            connection.execute("BEGIN")
+            try:
+                source = self._load_lease(connection, source_lease_id)
+                assignment_row = connection.execute(
+                    "SELECT * FROM runtime_assignments WHERE assignment_digest=?",
+                    (source.assignment_digest,),
+                ).fetchone()
+                if assignment_row is None:
+                    raise CorruptAssignmentState(
+                        "runtime lease assignment is unavailable"
+                    )
+                assignment = self._assignment_from_row(assignment_row)
+                recovery = self._load_recovery(connection, source_lease_id)
+                rows = connection.execute(
+                    "SELECT leases.* FROM runtime_instance_leases AS leases "
+                    "JOIN runtime_assignments AS assignments "
+                    "ON assignments.assignment_digest=leases.assignment_digest "
+                    "WHERE leases.state!='released' AND assignments.runtime_id=? "
+                    "ORDER BY leases.lease_generation_seq",
+                    (assignment.runtime_id,),
+                ).fetchall()
+                active = tuple(self._lease_from_row(row) for row in rows)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return RecoverySettlementView(source, recovery, active)
 
     def get_lease(self, lease_id: str) -> RuntimeInstanceLease:
         """Return one integrity-checked durable lease for handle fencing."""

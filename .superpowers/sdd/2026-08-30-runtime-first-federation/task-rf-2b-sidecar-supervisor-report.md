@@ -377,3 +377,58 @@
 - 后端标准合同继续排除 8 个递归 `development_graph_meta_e2e`；要求的后端与 Electron 全量已分别直接运行。
 - Electron build 仍输出既有 Vite native-config warning；50 项 Playwright 全绿。
 - 环境未设置 `OPENAI_API_KEY`，仅跳过 trace export；本任务不需要且未使用真实凭据。
+
+## Fix round 5/5（2026-08-31）
+
+### 结论
+
+最后一轮质量审查的 P1 已按 TDD 修复。`_settle_recovery_conflict` 不再仅凭 source lease 已 released 清除本地 active：Repository 现在用同一个 SQLite 读事务返回 source、已消费的 recovery outcome 与该 Runtime 的全部 active leases。外部消费者若在 recovery 事务中同时创建 successor，Supervisor 不猜测其 fence、也不构造 retry handle，而是保持 slot `unavailable + active=True`，清除旧 source handle，并为不可接管 successor 建立 orphan/expiry watchdog。
+
+### 实现内容
+
+1. 新增 `RecoverySettlementView` 与 `AssignmentRepository.recovery_settlement_view()`；显式开启单一读事务，并在同一 durable snapshot 内完整校验 source lease、persisted recovery、assignment 与 runtime-scoped active leases。
+2. `_settle_recovery_conflict` 在 replacement containment cleanup 确认后使用上述 view：只有 active leases 为空时才清 `handle/active`；source 仍 active 时保留原 ownership 诊断；source 已 released 且 successor active 时清旧 handle、保持 `active=True`。
+3. 对未知 fence 的 successor 不进行隐式接管。Supervisor 保持 unavailable，并将唯一 successor 交给既有 orphan watchdog；watchdog 只在 durable expiry 后重新启动 containment 并走既有 assignment snapshot 校验与 expired recovery。
+4. 同一 Runtime 出现多个 active leases 被视为 settlement 不变量冲突，继续沿既有 infrastructure-fatal 边界 fail closed。
+
+### 本轮 TDD RED 证据
+
+生产代码修改前，先增加 Repository 原子视图测试并收紧 failed/expired external-consumed Supervisor 测试：
+
+- 命令：`pytest -q test_assignment.py::test_recovery_settlement_view_reads_consumed_outcome_and_active_successor test_supervisor.py::test_recovery_conflict_withdraws_replacement_and_reads_source_state`
+- 实际 RED：`3 failed, 2 passed`。Repository 缺少 `recovery_settlement_view`；failed 与 expired 的 external-consumed 分支均显示 durable successor 存在，但 `snapshot.active=False`。
+
+### GREEN 与最终验证
+
+1. 定向 RED 组转 GREEN：`5 passed in 0.28s`。
+2. Repository + Supervisor 组合单元回归：`115 passed in 3.69s`。
+3. 最终 focused gate（任务 8 文件，加 assignment/runtime-admission）：`315 passed in 20.36s`。
+4. Python Term manifest：既有生成器输出 `generated_files=139 build_inputs=7`；diff 仅更新测试集合及 `assignment.py`、`supervisor.py` 的预期 digest/size。
+5. 最终后端标准全量：`2905 passed, 6 skipped, 8 deselected in 329.94s`；环境未设置 `OPENAI_API_KEY`，只跳过 trace export。
+6. Goose/DeepSeek source gates：acceptance `4 passed in 0.73s`；CLI 输出 `GO_GOOSE_SOURCE_READY` 与 `GO_DSH_SOURCE_READY`，DeepSeek scope 为 `source_build_provenance_only`。
+7. Electron/Playwright 全量：`mvp/canvas-spike` 下 `npm test` 完成 Vite/TypeScript build，`50 passed (1.7m)`。
+8. `py_compile` 与 `git diff --check`：通过。
+
+### 本轮文件清单
+
+- `mvp/src/workbench/runtime/engine_host/v2/assignment.py`
+- `mvp/src/workbench/runtime/engine_host/v2/supervisor.py`
+- `mvp/src/workbench/runtime/python_term/gate_manifest.json`（既有生成器重建）
+- `mvp/tests/unit/runtime/engine_host/v2/test_assignment.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_supervisor.py`
+- 本报告
+
+### 本轮自审
+
+- durable 一致性：测试直接断言 `snapshot.active == bool(active_leases)`，并分别覆盖 failed/expired external-consumed successor；source-only 判断已移除。
+- fence 边界：persisted outcome 的 embedded lease 只用于完整性验证；Supervisor 未持有外部 consumer 的明文 fence，因此默认不构造 retry handle，避免伪造 ownership。
+- 生命周期：replacement 先 withdraw/close；settlement 后 successor 无 outward handle、slot unavailable，并由强引用 background watchdog 等待 durable expiry，不产生无人观察 task exception。
+- 异常边界：DB/assignment/recovery 完整性失败和多 active 不变量仍由调用方升级 supervisor-fatal；预期单 consumer conflict 仍以原始 `LeaseConflict` 终结 recovery future。
+- 安全/范围：未删除文件，未写入 API key/token/password，未实现 RF-2C，未宣称 Goose/DeepSeek Runtime GO，未修改或暂存 `progress.md`。
+
+### 本轮问题与边界
+
+- 后端标准合同继续排除 8 个递归 `development_graph_meta_e2e`；后端与 Electron 全量均已分别直接运行。
+- 首次在仓库根目录运行 `npm test` 时该 package 无 test script；随后在 brief 对应的 `mvp/canvas-spike` package 运行完整 Electron/Playwright gate 并通过，不属于产品失败。
+- Electron build 仍输出既有 Vite native-config warning；50 项 Playwright 全绿。
+- 环境未设置 `OPENAI_API_KEY`，仅跳过 trace export；本任务不需要且未使用真实凭据。

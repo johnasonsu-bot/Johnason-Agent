@@ -329,6 +329,43 @@ def test_active_lease_query_is_read_only_and_runtime_scoped(tmp_path: Path) -> N
     assert repository.active_leases(runtime_ids=("other-runtime",)) == ()
 
 
+def test_recovery_settlement_view_reads_consumed_outcome_and_active_successor(
+    tmp_path: Path,
+) -> None:
+    """Catches source-only settlement losing a retry created by recovery."""
+    repository, assignment = _admitted(tmp_path / "state.sqlite")
+    source = repository.acquire_initial_lease(
+        assignment.assignment_digest,
+        instance_id="instance-1",
+        instance_nonce="nonce-1",
+        host_generation="generation-1",
+        client_lease_id="client-1",
+        owner="owner-1",
+        fence_token="fence-1",
+        expires_at=45.0,
+        trusted_time=40.0,
+    )
+    outcome = repository.recover_expired_lease(
+        source.lease_id,
+        owner="owner-2",
+        instance_id="instance-2",
+        instance_nonce="nonce-2",
+        host_generation="generation-2",
+        client_lease_id="client-2",
+        fence_token="fence-2",
+        expires_at=80.0,
+        trusted_time=50.0,
+        consumer_id="external-consumer",
+    )
+    assert outcome.lease is not None
+
+    view = repository.recovery_settlement_view(source.lease_id)
+
+    assert view.source.state == "released"
+    assert view.recovery == outcome
+    assert view.active_leases == (outcome.lease,)
+
+
 def test_takeover_increments_sequence_and_old_owner_cannot_renew_or_cause_aba(tmp_path: Path) -> None:
     repository, assignment = _admitted(tmp_path / "state.sqlite")
     old = repository.acquire_lease(

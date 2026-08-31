@@ -1640,7 +1640,10 @@ async def test_recovery_conflict_withdraws_replacement_and_reads_source_state(
 
     async def sleep(delay: float) -> None:
         if delay == 30.0:
-            await wake.wait()
+            if not wake.is_set():
+                await wake.wait()
+            else:
+                await asyncio.Event().wait()
         else:
             await asyncio.sleep(0)
 
@@ -1694,11 +1697,18 @@ async def test_recovery_conflict_withdraws_replacement_and_reads_source_state(
 
     snapshot = supervisor.snapshot()[0]
     source = assignments.get_lease(handle._lease().lease_id)
+    active = assignments.active_leases(runtime_ids=("goose",))
     assert clients[1].closed is True
     assert snapshot.state == "unavailable"
-    assert snapshot.active is (not externally_consumed)
+    assert snapshot.active is bool(active)
     if externally_consumed:
         assert source.state == "released"
+        assert len(active) == 1
+        assert active[0].attempt == source.attempt + 1
+        slot = supervisor._slots["goose"]
+        assert slot.handle is None
+        assert slot.watchdog_task is not None
+        assert not slot.watchdog_task.done()
     else:
         assert source.state != "released"
 
