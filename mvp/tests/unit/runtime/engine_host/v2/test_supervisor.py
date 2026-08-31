@@ -386,12 +386,108 @@ async def test_clean_release_never_starts_replacement_when_cleanup_is_unconfirme
     await supervisor.start()
     handle = await supervisor.acquire_initial(assignment)
 
-    await handle.aclose()
+    with pytest.raises(LeaseConflict, match="cleanup"):
+        await handle.aclose()
 
     assert len(clients) == 1
     snapshot = supervisor.snapshot()[0]
     assert snapshot.state == "unavailable"
     assert snapshot.last_error_category == "cleanup_unconfirmed"
+    assert snapshot.active is True
+    assert len(assignments.active_leases(runtime_ids=("goose",))) == 1
+
+
+@pytest.mark.asyncio
+async def test_retirement_freezes_late_effects_before_cancel_and_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a late write-start racing retirement after outward freeze."""
+
+    class BlockingCancelClient(_Client):
+        def __init__(self) -> None:
+            super().__init__("goose")
+            self.cancel_started = asyncio.Event()
+            self.allow_cancel = asyncio.Event()
+
+        async def cancel(self, run_id=None, reason="user_requested") -> None:
+            del run_id, reason
+            self.cancel_count += 1
+            self.cancel_started.set()
+            await self.allow_cancel.wait()
+            self.release_query.set()
+
+    database = tmp_path / "late-effect.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-late-effect", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    first = BlockingCancelClient()
+    first.capabilities = capabilities
+    clients: list[_Client] = [first]
+
+    def factory(config, generation, containment_lock):
+        del config, containment_lock
+        if generation == 1:
+            return first
+        client = _Client("goose")
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    query = asyncio.create_task(_collect_supervised(handle.run_query(envelope)))
+    await asyncio.wait_for(first.query_started.wait(), timeout=1.0)
+    watchdog_cancel_started = asyncio.Event()
+    allow_watchdog_cancel = asyncio.Event()
+    original_cancel_watchdog = supervisor._cancel_watchdog
+
+    async def delayed_watchdog_cancel(slot) -> None:
+        watchdog_cancel_started.set()
+        await allow_watchdog_cancel.wait()
+        await original_cancel_watchdog(slot)
+
+    monkeypatch.setattr(supervisor, "_cancel_watchdog", delayed_watchdog_cancel)
+    retirement = asyncio.create_task(handle.aclose())
+    await asyncio.wait_for(watchdog_cancel_started.wait(), timeout=1.0)
+    late = runtime_event(
+        "tool.started",
+        payload={
+            "tool_call_id": "call-late",
+            "tool_id": "tool-1",
+            "effect_id": "effect-late",
+        },
+    )
+
+    with pytest.raises(LeaseConflict, match="stale"):
+        supervisor._observe_handle(
+            handle,
+            RuntimeClientObservation(
+                kind="write_started",
+                envelope=envelope,
+                capabilities=capabilities,
+                event=late,
+            ),
+        )
+    allow_watchdog_cancel.set()
+    await asyncio.wait_for(first.cancel_started.wait(), timeout=1.0)
+    first.allow_cancel.set()
+    await asyncio.wait_for(retirement, timeout=1.0)
+    await asyncio.wait_for(query, timeout=1.0)
+
+    assert assignments.effect_evidence(handle._lease().lease_id) == ()
+    assert assignments.active_leases(runtime_ids=("goose",)) == ()
 
 
 @pytest.mark.asyncio
@@ -745,7 +841,10 @@ async def test_control_fails_closed_before_client_call_when_durable_lease_drifts
 
     query.cancel()
     await asyncio.gather(query, return_exceptions=True)
-    await supervisor.aclose()
+    with pytest.raises(SupervisorShutdownError, match="durable"):
+        await supervisor.aclose()
+    assert client.closed is True
+    assert supervisor.snapshot()[0].state == "unavailable"
 
 
 async def _collect_supervised(stream):
@@ -847,6 +946,71 @@ async def test_replacement_handshake_failures_consume_the_cumulative_budget(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_kind", ["crash", "expiry"])
+async def test_replacement_exhaustion_durably_releases_the_source_lease(
+    tmp_path: Path, recovery_kind: str
+) -> None:
+    """Catches restart exhaustion leaving the source lease active forever."""
+    database = tmp_path / f"exhausted-{recovery_kind}.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id=f"command-{recovery_kind}",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    now = [10.0]
+    wake = asyncio.Event()
+    clients: list[_Client] = []
+
+    async def sleep(delay: float) -> None:
+        if delay == 30.0:
+            await wake.wait()
+        else:
+            await asyncio.sleep(0)
+
+    def factory(config, generation, containment_lock):
+        del config, containment_lock
+        client = _Client(
+            "goose", fail_query=recovery_kind == "crash" and generation == 1,
+            fail_start=generation > 1,
+        )
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: now[0],
+        sleep=sleep,
+        max_restarts=1,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    if recovery_kind == "crash":
+        with pytest.raises(RuntimeUnavailableError):
+            _ = [event async for event in handle.run_query(envelope)]
+    else:
+        now[0] = 41.0
+        wake.set()
+
+    recovery = await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
+
+    assert recovery.decision == "released"
+    assert recovery.retry_handle is None
+    assert assignments.get_lease(handle._lease().lease_id).state == "released"
+    assert assignments.active_leases(runtime_ids=("goose",)) == ()
+    snapshot = supervisor.snapshot()[0]
+    assert snapshot.state == "unavailable"
+    assert snapshot.active is False
+    assert snapshot.last_error_category == "restart_exhausted"
+
+
+@pytest.mark.asyncio
 async def test_recycle_registry_integrity_failure_is_supervisor_fatal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -880,6 +1044,60 @@ async def test_recycle_registry_integrity_failure_is_supervisor_fatal(
     assert all(item.last_error_category == "protocol_failed"
                for item in supervisor.snapshot())
     assert all(item.state != "ready" for item in registry.snapshot())
+
+
+@pytest.mark.asyncio
+async def test_clean_retirement_recycle_integrity_failure_is_supervisor_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches foreground recycle integrity errors escaping global cleanup."""
+    database = tmp_path / "retirement-recycle-fatal.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    capabilities = runtime_capabilities("alpha", query=True)
+    envelope = run_envelope(
+        runtime_id="alpha", command_id="command-retire-recycle",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: dict[str, list[_Client]] = {"alpha": [], "zeta": []}
+
+    def factory(config, generation, containment_lock):
+        del generation, containment_lock
+        client = _Client(config.runtime_id)
+        if config.runtime_id == "alpha":
+            client.capabilities = capabilities
+        clients[config.runtime_id].append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=tuple(
+            RuntimeProcessConfig(runtime_id=item, argv=(item,))
+            for item in ("alpha", "zeta")
+        ),
+        registry=registry,
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    original_register = registry.register
+
+    def fail_alpha_recycle(capability, *, status="ready"):
+        if capability.runtime_id == "alpha":
+            raise RuntimeRegistryIntegrityError("fixture retire recycle failure")
+        return original_register(capability, status=status)
+
+    monkeypatch.setattr(registry, "register", fail_alpha_recycle)
+    with pytest.raises(RuntimeError, match="infrastructure"):
+        await handle.aclose()
+    await _wait_for_all_state(supervisor, "unavailable")
+
+    assert all(client.closed for items in clients.values() for client in items)
+    assert assignments.active_leases(runtime_ids=("alpha",)) == ()
 
 
 @pytest.mark.asyncio
@@ -935,6 +1153,250 @@ async def test_expiry_repository_failure_is_supervisor_fatal(
         await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
     assert all(client.closed for items in clients.values() for client in items)
     assert assignments.active_leases(runtime_ids=("alpha",)) == ()
+
+
+@pytest.mark.asyncio
+async def test_query_recovery_database_failure_is_fatal_for_every_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches local handling of a shared recovery database failure."""
+    database = tmp_path / "query-recovery-fatal.sqlite"
+    capabilities = runtime_capabilities("alpha", query=True)
+    envelope = run_envelope(
+        runtime_id="alpha", command_id="command-query-db-fatal",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: dict[str, list[_Client]] = {"alpha": [], "zeta": []}
+
+    def factory(config, generation, containment_lock):
+        del containment_lock
+        client = _Client(
+            config.runtime_id,
+            fail_query=config.runtime_id == "alpha" and generation == 1,
+        )
+        if config.runtime_id == "alpha":
+            client.capabilities = capabilities
+        clients[config.runtime_id].append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=tuple(
+            RuntimeProcessConfig(runtime_id=item, argv=(item,))
+            for item in ("alpha", "zeta")
+        ),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+        sleep=lambda delay: asyncio.sleep(0),
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    def fail_recovery(*args, **kwargs):
+        raise sqlite3.DatabaseError("fixture query recovery database failure")
+
+    monkeypatch.setattr(assignments, "recover_failed_lease", fail_recovery)
+    with pytest.raises(RuntimeUnavailableError):
+        _ = [event async for event in handle.run_query(envelope)]
+    await _wait_for_all_state(supervisor, "unavailable")
+
+    assert all(client.closed for items in clients.values() for client in items)
+    assert len(assignments.active_leases(runtime_ids=("alpha",))) == 1
+    with pytest.raises(RuntimeError, match="supervisor infrastructure failure"):
+        await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_query_recovery_registry_failure_is_fatal_for_every_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a foreground withdraw failure bypassing supervisor-fatal cleanup."""
+    database = tmp_path / "query-registry-fatal.sqlite"
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+    capabilities = runtime_capabilities("alpha", query=True)
+    envelope = run_envelope(
+        runtime_id="alpha", command_id="command-query-registry-fatal",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: dict[str, _Client] = {}
+
+    def factory(config, generation, containment_lock):
+        del containment_lock
+        client = _Client(
+            config.runtime_id,
+            fail_query=config.runtime_id == "alpha" and generation == 1,
+        )
+        if config.runtime_id == "alpha":
+            client.capabilities = capabilities
+        clients[config.runtime_id] = client
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=tuple(
+            RuntimeProcessConfig(runtime_id=item, argv=(item,))
+            for item in ("alpha", "zeta")
+        ),
+        registry=registry,
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    original_withdraw = registry.withdraw
+
+    def fail_alpha_withdraw(runtime_id: str):
+        if runtime_id == "alpha":
+            raise RuntimeRegistryIntegrityError("fixture query withdraw failure")
+        return original_withdraw(runtime_id)
+
+    monkeypatch.setattr(registry, "withdraw", fail_alpha_withdraw)
+    with pytest.raises(RuntimeError, match="infrastructure"):
+        _ = [event async for event in handle.run_query(envelope)]
+    await _wait_for_all_state(supervisor, "unavailable")
+
+    assert all(client.closed for client in clients.values())
+    with pytest.raises(RuntimeError, match="supervisor infrastructure failure"):
+        await asyncio.wait_for(handle.wait_recovery(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_retirement_repository_read_failure_still_cleans_every_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches durable validation failure escaping before process-tree cleanup."""
+    database = tmp_path / "retirement-read-fatal.sqlite"
+    capabilities = runtime_capabilities("alpha", query=True)
+    envelope = run_envelope(
+        runtime_id="alpha", command_id="command-retirement-read",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: dict[str, _Client] = {}
+
+    def factory(config, generation, containment_lock):
+        del generation, containment_lock
+        client = _Client(config.runtime_id)
+        if config.runtime_id == "alpha":
+            client.capabilities = capabilities
+        clients[config.runtime_id] = client
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=tuple(
+            RuntimeProcessConfig(runtime_id=item, argv=(item,))
+            for item in ("alpha", "zeta")
+        ),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    def fail_read(lease_id: str):
+        del lease_id
+        raise sqlite3.DatabaseError("fixture retirement read failure")
+
+    monkeypatch.setattr(assignments, "get_lease", fail_read)
+    with pytest.raises(RuntimeError, match="infrastructure"):
+        await handle.aclose()
+    await _wait_for_all_state(supervisor, "unavailable")
+
+    assert all(client.closed for client in clients.values())
+    assert assignments.active_leases(runtime_ids=("alpha",)) == ()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_durable_retirement_failure_preserves_active_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches shutdown forging a recovery outcome after persistence fails."""
+    database = tmp_path / "shutdown-db-failure.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-shutdown-db", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    def fail_recovery(*args, **kwargs):
+        raise sqlite3.DatabaseError("fixture shutdown database failure")
+
+    monkeypatch.setattr(assignments, "recover_failed_lease", fail_recovery)
+    with pytest.raises(SupervisorShutdownError, match="durable"):
+        await supervisor.aclose()
+
+    snapshot = supervisor.snapshot()[0]
+    assert client.closed is True
+    assert snapshot.state == "unavailable"
+    assert snapshot.active is True
+    assert len(assignments.active_leases(runtime_ids=("goose",))) == 1
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(handle.wait_recovery(), timeout=0.05)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_unconfirmed_cleanup_never_releases_the_source_lease(
+    tmp_path: Path,
+) -> None:
+    """Catches durable release occurring before containment cleanup is confirmed."""
+    database = tmp_path / "shutdown-cleanup-failure.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-shutdown-cleanup",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose", fail_close=True)
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    with pytest.raises(SupervisorShutdownError, match="cleanup"):
+        await supervisor.aclose()
+
+    snapshot = supervisor.snapshot()[0]
+    assert snapshot.state == "unavailable"
+    assert snapshot.active is True
+    assert len(assignments.active_leases(runtime_ids=("goose",))) == 1
+    with pytest.raises(LeaseConflict, match="cleanup"):
+        await handle.wait_recovery()
 
 
 @pytest.mark.asyncio

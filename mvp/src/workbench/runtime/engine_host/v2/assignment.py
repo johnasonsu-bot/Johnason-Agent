@@ -1146,7 +1146,24 @@ class AssignmentRepository:
             ).fetchone()
             if cursor_row is not None:
                 current = self._effect_evidence_from_row(cursor_row)
-                if current.canonical_digest != digest:
+                replay_digest = digest
+                if (
+                    current.effect_state == "unknown_write"
+                    and effect_state == "write_started"
+                ):
+                    replay_digest = self._effect_evidence_digest(
+                        lease_id=lease_id,
+                        run_id=run_id,
+                        term_id=term_id,
+                        step_id=step_id,
+                        event_cursor=event_cursor,
+                        event_id=event_id,
+                        tool_call_id=tool_call_id,
+                        tool_id=tool_id,
+                        effect_id=effect_id,
+                        effect_state="unknown_write",
+                    )
+                if current.canonical_digest != replay_digest:
                     raise LeaseConflict("effect cursor content changed")
                 return current
 
@@ -1648,8 +1665,8 @@ class AssignmentRepository:
             expected_source_state = {
                 "release_retry": "released",
                 "read_only_retry": "released",
-                "reuse_committed_write": "terminal",
-                "reconcile": "reconciliation_required",
+                "reuse_committed_write": "released",
+                "reconcile": "released",
                 "released": "released",
             }[record.decision]
             if source.state != expected_source_state:

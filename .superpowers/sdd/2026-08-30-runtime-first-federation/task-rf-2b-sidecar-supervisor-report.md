@@ -185,3 +185,67 @@
 - 最终后端全量有 1 条既有 `RuntimeWarning`：`test_tool_router.py` 报另一测试 fixture 的 `never_approves` coroutine 未 awaited；不在 RF-2B 修改路径，未造成测试失败。
 - `npm test` 有既有 Vite native config warning；不影响 build 或 50 项 Playwright 通过。
 - 本轮仍只证明共用 Supervisor/fake Host 合同，不证明真实 Goose/DeepSeek runtime 或 Provider Grant。
+
+---
+
+## Fix round 2/5（2026-08-31）
+
+### 结论
+
+复审遗留的 6 项 P0/P1 均已按 TDD 修复。Supervisor 现在严格执行“冻结 outward observation → cancel → 确认 containment cleanup → durable classify/完成 recovery”的顺序；cleanup、durable persistence 或共享 Registry/DB 完整性失败不再伪造 released/reconcile/stopped。replacement 预算耗尽也会在 cleanup 已确认后对 source lease 做无 retry 的最终 durable 分类，不残留 active lease。
+
+### 修复内容
+
+1. crash/expiry replacement start 或 handshake 用尽累计 restart budget 后，调用对应 failed/expired recovery 且固定 `create_retry=False`；成功持久化最终分类后才清理 `slot.handle/active` 并完成 recovery future。
+2. `_retire_handle` 在任何可等待操作前切换槽位状态并冻结 handle，随后取消 watchdog/Query、关闭 client 并检查 `cleanup_confirmed`，最后才写 durable recovery。cleanup 未确认时保留 active handle/lease，公开 `cleanup_unconfirmed` 并显式失败。
+3. durable lease read/recovery、Registry register/withdraw 与完整性异常统一进入 supervisor-fatal；fatal 并发撤销 advertisement、取消后台任务并关闭全部 Runtime。只有 `LeaseConflict` 等预期业务冲突保留局部处理。
+4. shutdown 不再吞 retirement 异常或构造伪 `reconcile/stopped`。durable persistence 失败返回 `SupervisorShutdownError`，槽位保持 `unavailable + active`，未持久化的 recovery future 不被伪完成；cleanup 未确认同样不释放 source lease。
+5. recovery record 的 source 最终状态校验统一为真实持久化状态 `released`，包括 `reconcile` 与 `reuse_committed_write`；合法重复消费稳定返回 `LeaseConflict`，不再误报 `CorruptAssignmentState`。
+6. duplicate Tool/Effect identity promotion 为 `unknown_write` 后，同 cursor、同原始 `write_started` 事件的重放使用 promotion 后 canonical digest 比较，继续幂等；内容/身份漂移仍 fail closed。
+
+### 本轮 TDD RED 证据
+
+所有生产修改前均先增加或收紧测试并观察 RED：
+
+| 逻辑组 | RED 命令（摘要） | 实际 RED |
+|---|---|---|
+| Repository recovery/effect replay | `pytest -q test_assignment.py -k 'promoted_duplicate_effect_replay or non_retry_recovery_is_consumed'` | `3 failed`：promotion 后相同 cursor 重放冲突；reconcile/reuse 重复消费被误报 corrupt |
+| retirement/exhaustion/fatal/shutdown | `pytest -q test_supervisor.py -k 'clean_release_never or retirement_freezes or replacement_exhaustion or query_recovery_database or shutdown_durable or shutdown_unconfirmed'` | `6 failed, 1 passed`：cleanup 前释放；预算耗尽 future 失败且 lease 残留；Query DB failure 未回收另一 Runtime；shutdown 吞持久化失败 |
+| foreground recycle integrity | `pytest -q test_supervisor.py -k clean_retirement_recycle_integrity` | `1 failed`：Registry integrity error 直接逃逸，另一 Runtime 仍存活 |
+| freeze-before-await race | `pytest -q test_supervisor.py -k retirement_freezes_late_effects` | `1 failed`：watchdog cancel 等待期间 late `write_started` 仍可持久化；失败后测试清理等待被中断，不作为 GREEN 证据 |
+| retirement durable read | `pytest -q test_supervisor.py -k retirement_repository_read_failure` | `1 failed`：DB read error 在 process cleanup 前直接逃逸 |
+
+### 本轮 GREEN 与最终验证
+
+1. Repository + Supervisor 组合单元回归：`97 passed in 2.90s`（后续自审再增加 1 个 Registry 场景并纳入 focused/全量）。
+2. 最终 focused gate（任务 8 文件，加 assignment/runtime-admission）：`298 passed in 19.08s`。
+3. 最终后端标准全量：命令为 `pytest tests/unit tests/integration tests/acceptance -q -m 'not development_graph_meta_e2e'`，结果 `2888 passed, 6 skipped, 8 deselected in 320.97s`。
+4. Goose/DeepSeek source gates：acceptance `4 passed in 0.71s`；CLI 输出 `GO_GOOSE_SOURCE_READY` 与 `GO_DSH_SOURCE_READY`，DeepSeek scope 为 `source_build_provenance_only`。
+5. Python Term manifest：生产源码修改后使用既有生成器重建，输出 `generated_files=139 build_inputs=7`；最终后端全量验证安装清单。
+6. Electron/Playwright 全量：`npm test` 完成 Vite/TypeScript build，`50 passed (1.6m)`。
+7. `python -m py_compile` 与 `git diff --check`：通过。
+
+### 本轮文件清单
+
+- `mvp/src/workbench/runtime/engine_host/v2/assignment.py`
+- `mvp/src/workbench/runtime/engine_host/v2/supervisor.py`
+- `mvp/src/workbench/runtime/python_term/gate_manifest.json`（既有生成器重建）
+- `mvp/tests/unit/runtime/engine_host/v2/test_assignment.py`
+- `mvp/tests/unit/runtime/engine_host/v2/test_supervisor.py`
+- 本报告
+
+### 本轮自审
+
+- 时序：所有 retirement outward freeze 都发生在 watchdog cancellation 的首个 await 前；late observer 无法越过 closed handle/state fence。
+- cleanup：`slot.client` 只有在 cleanup 确认后才清空；未确认时保留可诊断/可再次关闭的受控引用，不创建 replacement 或 retry。
+- durable truth：只有 recovery 事务成功后才清 `slot.handle/active`；DB 持久化失败时 snapshot 明确 unavailable，shutdown 不报告 stopped。
+- fatal：foreground/background 的 DB、Registry、factory 与 integrity 异常均触发共享 Runtime 回收；fatal cleanup 后若仍无法 durable classify，保留 active source lease 而不是伪释放。
+- 一次性消费：所有 recovery decision 的持久化 source 终态与实际 DB row 一致；重复消费者先校验有效 durable row，再得到 `LeaseConflict`。
+- 安全/边界：没有新增公开进程/凭据字段，没有写入 API key/token/password，没有实现 RF-2C，也不宣称真实 Goose/DeepSeek Runtime GO。
+- 仓库卫生：未删除文件；未修改、暂存或提交 `progress.md` 的既有外部改动。
+
+### 本轮问题与边界
+
+- 标准后端仍按仓库合同排除 8 个递归 `development_graph_meta_e2e`；其要求的后端与 Electron 全量已分别直接运行。
+- Electron build 仍输出既有 Vite native-config warning；不影响 build 或 50 项 Playwright。
+- 本环境仍提示未设置 `OPENAI_API_KEY`，只跳过 trace export；本任务不需要且未使用真实凭据。

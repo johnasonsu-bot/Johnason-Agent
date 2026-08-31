@@ -669,6 +669,101 @@ def test_completed_effect_identity_cannot_be_reused_for_a_second_write(
     assert outcome == RecoveryOutcome("reconcile", None)
 
 
+def test_promoted_duplicate_effect_replay_is_idempotent_at_the_same_cursor(
+    tmp_path: Path,
+) -> None:
+    """Catches canonical promotion making an identical event replay conflict."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / "promoted-replay.sqlite"
+    )
+    common = {
+        "lease_id": lease.lease_id,
+        "assignment_digest": assignment.assignment_digest,
+        "attempt": 0,
+        "lease_generation_seq": lease.lease_generation_seq,
+        "run_id": "run-1",
+        "term_id": "term-1",
+        "step_id": "step-1",
+        "tool_call_id": "call-1",
+        "tool_id": "tool-1",
+        "effect_id": "effect-1",
+    }
+    authority.record_effect_evidence(
+        **common, event_cursor=1, event_id="event-1",
+        effect_state="write_started", trusted_time=44.0,
+    )
+    promoted = authority.record_effect_evidence(
+        **common, event_cursor=2, event_id="event-2",
+        effect_state="write_started", trusted_time=45.0,
+    )
+
+    replay = authority.record_effect_evidence(
+        **common, event_cursor=2, event_id="event-2",
+        effect_state="write_started", trusted_time=46.0,
+    )
+
+    assert promoted.effect_state == "unknown_write"
+    assert replay == promoted
+
+
+@pytest.mark.parametrize(
+    ("states", "decision"),
+    [
+        (("write_started",), "reconcile"),
+        (("write_started", "committed_write"), "reuse_committed_write"),
+    ],
+)
+def test_non_retry_recovery_is_consumed_once_after_source_is_released(
+    tmp_path: Path, states: tuple[str, ...], decision: str
+) -> None:
+    """Catches released reconcile/reuse outcomes being misread as corrupt."""
+    repository, assignment, lease, authority = _accepted_lease_for_effects(
+        tmp_path / f"{decision}-consumed.sqlite"
+    )
+    for cursor, state in enumerate(states, start=1):
+        authority.record_effect_evidence(
+            lease.lease_id,
+            assignment_digest=assignment.assignment_digest,
+            attempt=0,
+            lease_generation_seq=lease.lease_generation_seq,
+            run_id="run-1",
+            term_id="term-1",
+            step_id="step-1",
+            event_cursor=cursor,
+            event_id=f"event-{cursor}",
+            tool_call_id="call-1",
+            tool_id="tool-1",
+            effect_id="effect-1",
+            effect_state=state,
+            trusted_time=44.0 + cursor,
+        )
+    kwargs = {
+        "source_owner": "owner-1",
+        "source_attempt": 0,
+        "source_lease_generation_seq": lease.lease_generation_seq,
+        "source_fence_token": "fence-1",
+        "owner": "owner-2",
+        "instance_id": "instance-2",
+        "instance_nonce": "nonce-2",
+        "host_generation": "generation-2",
+        "client_lease_id": "client-2",
+        "fence_token": "fence-2",
+        "expires_at": 100.0,
+        "trusted_time": 60.0,
+        "consumer_id": "consumer-1",
+    }
+
+    first = repository.recover_failed_lease(lease.lease_id, **kwargs)
+
+    assert first == RecoveryOutcome(decision, None)
+    assert repository.get_lease(lease.lease_id).state == "released"
+    with pytest.raises(LeaseConflict, match="consumed"):
+        repository.recover_failed_lease(
+            lease.lease_id,
+            **{**kwargs, "consumer_id": "consumer-2", "trusted_time": 61.0},
+        )
+
+
 def test_recovery_outcome_is_consumed_exactly_once(tmp_path: Path) -> None:
     repository, assignment = _admitted(tmp_path / "state.sqlite")
     source = repository.acquire_lease(
