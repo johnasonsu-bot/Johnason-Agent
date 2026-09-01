@@ -1,0 +1,14 @@
+{
+  "name": "@johnason/deepseek-harness-host-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.9.3",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "npm run build && node --experimental-strip-types --no-warnings --test tests/*.test.mjs"
+  }
+}

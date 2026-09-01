@@ -1,0 +1,88 @@
+{
+  "command_id": "start-1",
+  "payload": {
+    "envelope": {
+      "agent_id": "agent-1",
+      "agent_role": "worker",
+      "attempt": 0,
+      "checkpoint_cursor": 0,
+      "command_id": "start-1",
+      "context": {
+        "snapshot_digest": "60a8e7ae4a7682fe73ac475f5fedc5c9464c46112136a83b272e94b2f47bc5fb",
+        "snapshot_ref": "snapshot-1",
+        "version": 0
+      },
+      "context_budget": {
+        "compaction_policy": "summarize",
+        "max_input_tokens": 4096,
+        "protected_message_ids": ["message-user"],
+        "protected_prompt_section_ids": ["section-user"],
+        "reserved_output_tokens": 0,
+        "summary_ref": null
+      },
+      "deadline_ms": 1,
+      "extensions": {},
+      "message_snapshot_digest": "be0844a7bdb9f43dd0f67b9ee319f0859cf24635128450b711abee02694967d7",
+      "model": "fixture-model",
+      "model_options_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "permission_policy_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "plugin_manifest_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "plugin_pins": [],
+      "prompt_manifest_digest": "7fec0c5d11b17fe80ae2791ad4d6f903b30196d73997f96e3cb5d3ab281aea15",
+      "protocol_version": "2.0",
+      "provider_ref": "provider-profile:fixture-completed",
+      "run_id": "run-wire",
+      "runtime": {
+        "build_id": "dsh:fixed-host-v2-smoke",
+        "config_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "host_generation": "host-a",
+        "runtime_id": "dsh"
+      },
+      "session_id": "session-1",
+      "skill_manifest_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "skill_pins": [],
+      "step_id": "step-wire",
+      "term_id": "term-wire",
+      "tool_manifest": [{
+        "idempotency": "idempotent",
+        "read_only": true,
+        "schema": {"type": "object"},
+        "timeout_ms": 1,
+        "tool_id": "tool-1",
+        "version": "1"
+      }],
+      "tool_manifest_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "traceparent": "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+      "workspace_grant": {
+        "command_policy": "ask",
+        "expires_at_ms": 1,
+        "grant_id": "workspace-1",
+        "network_policy": "deny",
+        "readable_paths": ["/workspace/read"],
+        "workspace_snapshot_ref": "workspace-ref-1",
+        "writable_paths": []
+      }
+    },
+    "runtime_input": {
+      "context_items": [{
+        "content": "context evidence",
+        "item_id": "context-1",
+        "kind": "document"
+      }],
+      "context_snapshot_digest": "60a8e7ae4a7682fe73ac475f5fedc5c9464c46112136a83b272e94b2f47bc5fb",
+      "message_snapshot_digest": "be0844a7bdb9f43dd0f67b9ee319f0859cf24635128450b711abee02694967d7",
+      "messages": [{
+        "content": "hello from message",
+        "message_id": "message-user",
+        "role": "user"
+      }],
+      "prompt_manifest_digest": "7fec0c5d11b17fe80ae2791ad4d6f903b30196d73997f96e3cb5d3ab281aea15",
+      "prompt_sections": [{
+        "content": "system fixture",
+        "order": 10,
+        "section_id": "section-user"
+      }]
+    }
+  },
+  "type": "query.start"
+}

@@ -1,17 +1,50 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 
 import pytest
 
+from workbench.runtime.engine_host.v2.contracts import (
+    QueryCommandV2,
+    RunEnvelopeV2,
+    RuntimeQueryInputV2,
+)
 from workbench.runtime.deepseek_harness.source_gate import (
     DeepSeekSourceVerifier,
     SourceReadinessError,
     canonical_manifest_bytes,
     select_release_build_command,
 )
+
+
+def test_published_wire_fixture_is_a_shared_host_v2_query() -> None:
+    mvp_root = Path(__file__).resolve().parents[4]
+    fixture = json.loads(
+        (
+            mvp_root
+            / "sidecars"
+            / "deepseek-harness"
+            / "tests"
+            / "runtime-query-v2-fixture.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    command = QueryCommandV2.model_validate(fixture)
+    RunEnvelopeV2.model_validate(command.payload["envelope"])
+    runtime_input = RuntimeQueryInputV2.model_validate(command.payload["runtime_input"])
+
+    assert set(command.payload["runtime_input"]) == {
+        "messages",
+        "message_snapshot_digest",
+        "context_items",
+        "context_snapshot_digest",
+        "prompt_sections",
+        "prompt_manifest_digest",
+    }
+    assert runtime_input.prompt_sections[0].section_id == "section-user"
 
 
 def _git(directory: Path, *arguments: str) -> str:
@@ -28,6 +61,121 @@ def _git(directory: Path, *arguments: str) -> str:
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _write_host_v2_sidecar(root: Path) -> None:
+    sidecar = root / "mvp" / "sidecars" / "deepseek-harness"
+    _write(
+        sidecar / "package.json",
+        json.dumps(
+            {
+                "name": "@johnason/deepseek-harness-host-v2",
+                "private": True,
+                "version": "0.1.0",
+                "type": "module",
+                "packageManager": "npm@10.9.3",
+                "scripts": {"build": "node scripts/build.mjs"},
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    _write(
+        sidecar / "package-lock.json",
+        json.dumps(
+            {
+                "name": "@johnason/deepseek-harness-host-v2",
+                "version": "0.1.0",
+                "lockfileVersion": 3,
+                "requires": True,
+                "packages": {},
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    _write(sidecar / "tsconfig.json", "{}\n")
+    _write(
+        sidecar / "cordis.host-v2.yml",
+        json.dumps(
+            {
+                "schema": "workbench.runtime.dsh.fixed_preset.v1",
+                "runtime_id": "dsh",
+                "plugins": [
+                    "@deepseek-ai/dsh-agent",
+                    "@deepseek-ai/dsh-session-persistence-jsonl",
+                    "@deepseek-ai/dsh-session-checkpoint-policy",
+                    "@deepseek-ai/dsh-llm-deepseek",
+                    "@johnason/deepseek-harness-host-v2",
+                ],
+                "policy": {
+                    "plugin_download": False,
+                    "user_plugin_scan": False,
+                },
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    source_relatives = (
+        "package.json",
+        "tsconfig.json",
+        "cordis.host-v2.yml",
+        "scripts/build.mjs",
+        "src/bootstrap.ts",
+        "src/checkpoint.ts",
+        "src/event-mapper.ts",
+        "src/grant-channel.ts",
+        "src/server.ts",
+    )
+    for relative in source_relatives[3:]:
+        _write(sidecar / relative, f"// fixture {relative}\n")
+    artifact_names = (
+        "bootstrap.mjs",
+        "checkpoint.mjs",
+        "deepseek-harness-host-v2.mjs",
+        "event-mapper.mjs",
+        "grant-channel.mjs",
+        "server.mjs",
+    )
+    for artifact in artifact_names:
+        _write(sidecar / "dist" / artifact, f"// built fixture {artifact}\n")
+
+    def record(relative: str) -> dict[str, object]:
+        repository_relative = f"mvp/sidecars/deepseek-harness/{relative}"
+        payload = (root / repository_relative).read_bytes()
+        return {
+            "path": repository_relative,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+
+    def digest(records: list[dict[str, object]]) -> str:
+        encoded = json.dumps(
+            records, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    sources = [record(relative) for relative in source_relatives]
+    artifacts = [record(f"dist/{name}") for name in artifact_names]
+    _write(
+        sidecar / "dist" / "build-receipt.json",
+        json.dumps(
+            {
+                "schema": "workbench.runtime.dsh.host_v2_build_receipt.v1",
+                "command": "npm run build",
+                "source_digest": digest(sources),
+                "artifact_digest": digest(artifacts),
+                "artifacts": artifacts,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+    )
 
 
 @pytest.fixture()
@@ -106,6 +254,7 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
     )
     manifest_path = root / "mvp" / "src" / "workbench" / "runtime" / "deepseek_harness" / "source_manifest.json"
     manifest_path.parent.mkdir(parents=True)
+    _write_host_v2_sidecar(root)
     manifest_path.write_bytes(canonical_manifest_bytes(verifier.build_manifest(root)))
     return root, verifier, manifest_path
 
@@ -171,6 +320,129 @@ def test_manifest_records_frozen_build_boundary_and_sidecar_inputs(
         "node24-linux-arm64",
         "node24-macos-arm64",
     ]
+
+
+def test_manifest_records_fixed_host_v2_sidecar_and_actual_artifact(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, _ = source_repository
+
+    host_v2 = verifier.build_manifest(root)["host_v2_sidecar"]
+
+    assert host_v2["schema"] == "workbench.runtime.dsh.host_v2_build.v1"
+    assert host_v2["package_lock"]["path"] == (
+        "mvp/sidecars/deepseek-harness/package-lock.json"
+    )
+    assert host_v2["preset"]["path"] == (
+        "mvp/sidecars/deepseek-harness/cordis.host-v2.yml"
+    )
+    assert host_v2["preset_policy"] == {
+        "plugin_download": False,
+        "user_plugin_scan": False,
+    }
+    assert host_v2["fixed_plugins"] == [
+        "@deepseek-ai/dsh-agent",
+        "@deepseek-ai/dsh-session-persistence-jsonl",
+        "@deepseek-ai/dsh-session-checkpoint-policy",
+        "@deepseek-ai/dsh-llm-deepseek",
+        "@johnason/deepseek-harness-host-v2",
+    ]
+    assert host_v2["build"]["actual_build_attested"] is True
+    assert host_v2["build"]["command"] == "npm run build"
+    assert len(host_v2["source_digest"]) == 64
+    assert len(host_v2["build"]["artifact_digest"]) == 64
+    assert host_v2["terminal_events"] == [
+        "query.completed",
+        "query.failed",
+        "query.cancelled",
+    ]
+
+
+def test_plugin_smoke_gate_requires_the_recorded_actual_artifact(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    artifact = (
+        root
+        / "mvp/sidecars/deepseek-harness/dist/deepseek-harness-host-v2.mjs"
+    )
+    artifact.unlink()
+
+    with pytest.raises(SourceReadinessError, match="build artifact"):
+        verifier.verify_plugin_smoke(root, manifest_path)
+
+
+def test_plugin_smoke_gate_rejects_stale_artifact_after_source_change(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    server = root / "mvp/sidecars/deepseek-harness/src/server.ts"
+    server.write_text(server.read_text(encoding="utf-8") + "// changed\n", encoding="utf-8")
+
+    with pytest.raises(SourceReadinessError, match="build receipt source digest"):
+        verifier.verify_plugin_smoke(root, manifest_path)
+
+
+def test_plugin_smoke_gate_rejects_extra_sidecar_source(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    _write(
+        root / "mvp/sidecars/deepseek-harness/src/untracked-plugin.ts",
+        "export const unexpected = true;\n",
+    )
+
+    with pytest.raises(SourceReadinessError, match="source file set"):
+        verifier.verify_plugin_smoke(root, manifest_path)
+
+
+def test_plugin_smoke_gate_rejects_extra_dist_artifact(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    _write(
+        root / "mvp/sidecars/deepseek-harness/dist/untracked-plugin.mjs",
+        "export const unexpected = true;\n",
+    )
+
+    with pytest.raises(SourceReadinessError, match="dist file set"):
+        verifier.verify_plugin_smoke(root, manifest_path)
+
+
+def test_plugin_smoke_gate_rejects_dynamic_plugin_policy(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+    preset = root / "mvp/sidecars/deepseek-harness/cordis.host-v2.yml"
+    document = json.loads(preset.read_text(encoding="utf-8"))
+    document["policy"]["plugin_download"] = True
+    preset.write_text(json.dumps(document) + "\n", encoding="utf-8")
+
+    with pytest.raises(SourceReadinessError, match="dynamic plugin"):
+        verifier.verify_plugin_smoke(root, manifest_path)
+
+
+def test_plugin_smoke_gate_returns_only_fixed_sidecar_evidence(
+    source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
+) -> None:
+    root, verifier, manifest_path = source_repository
+
+    verdict = verifier.verify_plugin_smoke(root, manifest_path)
+
+    assert verdict == {
+        "decision": "GO_DSH_PLUGIN_SMOKE",
+        "scope": "fixed_host_v2_sidecar_smoke",
+        "manifest_digest": verdict["manifest_digest"],
+        "source_digest": verdict["source_digest"],
+        "artifact_digest": verdict["artifact_digest"],
+        "preset_digest": verdict["preset_digest"],
+    }
+    assert all(len(verdict[field]) == 64 for field in (
+        "manifest_digest",
+        "source_digest",
+        "artifact_digest",
+        "preset_digest",
+    ))
 
 
 @pytest.mark.parametrize(

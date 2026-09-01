@@ -1,0 +1,1 @@
+{"plugins":["@deepseek-ai/dsh-agent","@deepseek-ai/dsh-session-persistence-jsonl","@deepseek-ai/dsh-session-checkpoint-policy","@deepseek-ai/dsh-llm-deepseek","@johnason/deepseek-harness-host-v2"],"policy":{"plugin_download":false,"user_plugin_scan":false},"runtime_id":"dsh","schema":"workbench.runtime.dsh.fixed_preset.v1"}

@@ -1,7 +1,8 @@
-"""Reproducible source/build provenance for the pinned DeepSeek Harness.
+"""Reproducible provenance for pinned DSH source and its fixed Host-v2 smoke.
 
-This module deliberately stops at source readiness.  It does not import, boot,
-or attest the DSH runtime, Host adapter, provider, or plugin implementation.
+The source verdict remains separate from the fixed-sidecar smoke verdict.  The
+latter attests only checked-in source, preset, lock and an actually materialized
+local build artifact; it does not claim the full DSH runtime gate.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ DSH_SUBMODULE_PATH = "third_party/deepseek-harness"
 DSH_SUBMODULE_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
 DSH_PINNED_REVISION = "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
 DSH_SOURCE_MANIFEST_SCHEMA = "workbench.runtime.dsh.source_manifest.v1"
+DSH_HOST_V2_BUILD_SCHEMA = "workbench.runtime.dsh.host_v2_build.v1"
 
 _DEPENDENCY_PREPARATION_COMMAND = (
     "corepack pnpm@11.7.0 install --frozen-lockfile"
@@ -41,6 +43,36 @@ _BUILD_POLICY_FILES = (
     _SIDECAR_ENTRYPOINT_SOURCE,
 )
 _REQUIRED_LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+_HOST_V2_ROOT = "mvp/sidecars/deepseek-harness"
+_HOST_V2_PRESET = f"{_HOST_V2_ROOT}/cordis.host-v2.yml"
+_HOST_V2_PACKAGE_LOCK = f"{_HOST_V2_ROOT}/package-lock.json"
+_HOST_V2_BUILD_RECEIPT = f"{_HOST_V2_ROOT}/dist/build-receipt.json"
+_HOST_V2_SOURCE_FILES = (
+    f"{_HOST_V2_ROOT}/package.json",
+    f"{_HOST_V2_ROOT}/tsconfig.json",
+    _HOST_V2_PRESET,
+    f"{_HOST_V2_ROOT}/scripts/build.mjs",
+    f"{_HOST_V2_ROOT}/src/bootstrap.ts",
+    f"{_HOST_V2_ROOT}/src/checkpoint.ts",
+    f"{_HOST_V2_ROOT}/src/event-mapper.ts",
+    f"{_HOST_V2_ROOT}/src/grant-channel.ts",
+    f"{_HOST_V2_ROOT}/src/server.ts",
+)
+_HOST_V2_ARTIFACT_FILES = (
+    f"{_HOST_V2_ROOT}/dist/bootstrap.mjs",
+    f"{_HOST_V2_ROOT}/dist/checkpoint.mjs",
+    f"{_HOST_V2_ROOT}/dist/deepseek-harness-host-v2.mjs",
+    f"{_HOST_V2_ROOT}/dist/event-mapper.mjs",
+    f"{_HOST_V2_ROOT}/dist/grant-channel.mjs",
+    f"{_HOST_V2_ROOT}/dist/server.mjs",
+)
+_FIXED_HOST_V2_PLUGINS = (
+    "@deepseek-ai/dsh-agent",
+    "@deepseek-ai/dsh-session-persistence-jsonl",
+    "@deepseek-ai/dsh-session-checkpoint-policy",
+    "@deepseek-ai/dsh-llm-deepseek",
+    "@johnason/deepseek-harness-host-v2",
+)
 
 
 class SourceReadinessError(RuntimeError):
@@ -173,6 +205,154 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(document, dict):
         raise SourceReadinessError(f"invalid {label}: expected object")
     return document
+
+
+def _require_exact_regular_file_set(
+    repository_root: Path,
+    directory: str,
+    expected_names: set[str],
+    label: str,
+) -> None:
+    root = repository_root / directory
+    try:
+        entries = tuple(root.iterdir())
+    except OSError as error:
+        raise SourceReadinessError(
+            f"DeepSeek Harness {label} directory is unavailable"
+        ) from error
+    if {entry.name for entry in entries} != expected_names:
+        prefix = "actual build artifact " if label == "dist" else ""
+        raise SourceReadinessError(
+            f"DeepSeek Harness {prefix}{label} file set drift"
+        )
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        raise SourceReadinessError(
+            f"DeepSeek Harness {label} must contain only regular files"
+        )
+
+
+def _host_v2_sidecar_manifest(repository_root: Path) -> dict[str, Any]:
+    """Return exact fixed-sidecar source and materialized artifact evidence."""
+
+    package = _load_json(
+        repository_root / f"{_HOST_V2_ROOT}/package.json",
+        "DeepSeek Harness Host v2 package.json",
+    )
+    if (
+        package.get("name") != "@johnason/deepseek-harness-host-v2"
+        or package.get("private") is not True
+        or package.get("packageManager") != "npm@10.9.3"
+        or package.get("scripts", {}).get("build") != "node scripts/build.mjs"
+    ):
+        raise SourceReadinessError("DeepSeek Harness Host v2 package drift")
+
+    preset = _load_json(
+        repository_root / _HOST_V2_PRESET,
+        "DeepSeek Harness fixed Host v2 preset",
+    )
+    policy = preset.get("policy")
+    if (
+        not isinstance(policy, dict)
+        or policy.get("plugin_download") is not False
+        or policy.get("user_plugin_scan") is not False
+    ):
+        raise SourceReadinessError(
+            "DeepSeek Harness dynamic plugin loading or user plugin scan is forbidden"
+        )
+    if set(policy) != {"plugin_download", "user_plugin_scan"}:
+        raise SourceReadinessError("DeepSeek Harness fixed preset policy drift")
+    if (
+        preset.get("schema") != "workbench.runtime.dsh.fixed_preset.v1"
+        or preset.get("runtime_id") != "dsh"
+        or preset.get("plugins") != list(_FIXED_HOST_V2_PLUGINS)
+        or set(preset) != {"schema", "runtime_id", "plugins", "policy"}
+    ):
+        raise SourceReadinessError("DeepSeek Harness fixed preset plugin set drift")
+
+    _require_exact_regular_file_set(
+        repository_root,
+        f"{_HOST_V2_ROOT}/src",
+        {
+            Path(relative_path).name
+            for relative_path in _HOST_V2_SOURCE_FILES
+            if "/src/" in relative_path
+        },
+        "source",
+    )
+    _require_exact_regular_file_set(
+        repository_root,
+        f"{_HOST_V2_ROOT}/dist",
+        {
+            *(Path(relative_path).name for relative_path in _HOST_V2_ARTIFACT_FILES),
+            Path(_HOST_V2_BUILD_RECEIPT).name,
+        },
+        "dist",
+    )
+    source_records = [
+        _file_record(repository_root, relative_path)
+        for relative_path in _HOST_V2_SOURCE_FILES
+    ]
+    try:
+        artifact_records = [
+            _file_record(repository_root, relative_path)
+            for relative_path in _HOST_V2_ARTIFACT_FILES
+        ]
+    except SourceReadinessError as error:
+        raise SourceReadinessError(
+            f"DeepSeek Harness actual build artifact is missing: {error}"
+        ) from error
+    if any(record["size"] <= 0 for record in artifact_records):
+        raise SourceReadinessError("DeepSeek Harness actual build artifact is empty")
+    source_digest = _canonical_digest(source_records)
+    artifact_digest = _canonical_digest(artifact_records)
+    receipt = _load_json(
+        repository_root / _HOST_V2_BUILD_RECEIPT,
+        "DeepSeek Harness Host v2 build receipt",
+    )
+    if (
+        receipt.get("schema")
+        != "workbench.runtime.dsh.host_v2_build_receipt.v1"
+        or receipt.get("command") != "npm run build"
+        or set(receipt)
+        != {"schema", "command", "source_digest", "artifact_digest", "artifacts"}
+    ):
+        raise SourceReadinessError("DeepSeek Harness build receipt is invalid")
+    if receipt.get("source_digest") != source_digest:
+        raise SourceReadinessError(
+            "DeepSeek Harness build receipt source digest does not match current source"
+        )
+    if (
+        receipt.get("artifact_digest") != artifact_digest
+        or receipt.get("artifacts") != artifact_records
+    ):
+        raise SourceReadinessError(
+            "DeepSeek Harness build receipt artifact digest does not match actual build"
+        )
+
+    return {
+        "schema": DSH_HOST_V2_BUILD_SCHEMA,
+        "package_lock": _file_record(repository_root, _HOST_V2_PACKAGE_LOCK),
+        "preset": _file_record(repository_root, _HOST_V2_PRESET),
+        "preset_policy": {
+            "plugin_download": False,
+            "user_plugin_scan": False,
+        },
+        "fixed_plugins": list(_FIXED_HOST_V2_PLUGINS),
+        "sources": source_records,
+        "source_digest": source_digest,
+        "build": {
+            "command": "npm run build",
+            "actual_build_attested": True,
+            "receipt": _file_record(repository_root, _HOST_V2_BUILD_RECEIPT),
+            "artifacts": artifact_records,
+            "artifact_digest": artifact_digest,
+        },
+        "terminal_events": [
+            "query.completed",
+            "query.failed",
+            "query.cancelled",
+        ],
+    }
 
 
 @dataclass(frozen=True)
@@ -369,6 +549,7 @@ class DeepSeekSourceVerifier:
                 "entrypoint_source": _SIDECAR_ENTRYPOINT_SOURCE,
                 "targets": [target for target, _, _ in _RELEASE_TARGETS],
             },
+            "host_v2_sidecar": _host_v2_sidecar_manifest(repository_root),
         }
 
     def verify(
@@ -404,4 +585,37 @@ class DeepSeekSourceVerifier:
             "decision": "GO_DSH_SOURCE_READY",
             "scope": "source_build_provenance_only",
             "manifest_digest": _sha256_bytes(manifest_bytes),
+        }
+
+    def verify_plugin_smoke(
+        self,
+        repository_root: Path,
+        manifest_path: Path,
+    ) -> dict[str, str]:
+        """Grant only the fixed Host-v2 sidecar smoke after exact build evidence."""
+
+        source_verdict = self.verify(repository_root, manifest_path)
+        manifest = _load_json(manifest_path, "DeepSeek Harness source manifest")
+        host_v2 = manifest.get("host_v2_sidecar")
+        if not isinstance(host_v2, dict):
+            raise SourceReadinessError("DeepSeek Harness Host v2 build evidence is missing")
+        build = host_v2.get("build")
+        if not isinstance(build, dict) or build.get("actual_build_attested") is not True:
+            raise SourceReadinessError(
+                "DeepSeek Harness actual build evidence is not attested"
+            )
+        for field, value in (
+            ("source digest", host_v2.get("source_digest")),
+            ("artifact digest", build.get("artifact_digest")),
+            ("preset digest", host_v2.get("preset", {}).get("sha256")),
+        ):
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise SourceReadinessError(f"DeepSeek Harness {field} is invalid")
+        return {
+            "decision": "GO_DSH_PLUGIN_SMOKE",
+            "scope": "fixed_host_v2_sidecar_smoke",
+            "manifest_digest": source_verdict["manifest_digest"],
+            "source_digest": host_v2["source_digest"],
+            "artifact_digest": build["artifact_digest"],
+            "preset_digest": host_v2["preset"]["sha256"],
         }
