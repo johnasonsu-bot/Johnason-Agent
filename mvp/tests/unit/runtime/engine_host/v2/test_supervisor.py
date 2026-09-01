@@ -470,6 +470,54 @@ async def test_provider_grant_delivery_deadline_cancels_before_transport_observe
 
 
 @pytest.mark.asyncio
+async def test_provider_grant_delivery_rejects_operation_that_swallows_cancel(
+    tmp_path: Path,
+) -> None:
+    """An operation cannot turn an expired timeout cancellation into success."""
+    database = tmp_path / "provider-grant-swallowed-cancel.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose",
+        command_id="command-swallowed-cancel",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    target = handle.provider_grant_target(envelope)
+    cancellation_observed = False
+
+    async def swallow_one_cancellation() -> str:
+        nonlocal cancellation_observed
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancellation_observed = True
+            return "must-not-succeed"
+
+    with pytest.raises(ProviderGrantAuthorityError, match="deadline"):
+        await supervisor.deliver_if_current(
+            target,
+            swallow_one_cancellation,
+            deadline=10.01,
+        )
+
+    assert cancellation_observed is True
+    await handle.aclose()
+
+
+@pytest.mark.asyncio
 async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
     tmp_path: Path,
 ) -> None:

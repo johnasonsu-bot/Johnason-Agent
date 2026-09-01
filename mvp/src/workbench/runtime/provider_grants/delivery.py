@@ -8,7 +8,11 @@ from .contracts import ProviderGrantAck, ProviderGrantBinding
 
 
 class ProviderGrantDelivery(Protocol):
-    """Deliver one transient credential buffer to an already fenced sidecar."""
+    """Deliver a transient credential buffer to an already fenced sidecar.
+
+    Implementations must be cancellation-safe: propagate ``CancelledError``
+    without retaining the view or observing it after cancellation.
+    """
 
     async def deliver(
         self, binding: ProviderGrantBinding, secret: memoryview

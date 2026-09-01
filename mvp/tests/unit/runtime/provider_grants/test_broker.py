@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from pathlib import Path
@@ -22,7 +23,11 @@ from workbench.runtime.provider_grants.contracts import (
     ProviderGrantContainmentReceipt,
     ProviderGrantTarget,
 )
-from workbench.runtime.provider_grants.repository import ProviderGrantConflict
+from workbench.runtime.provider_grants.repository import (
+    ProviderGrantConflict,
+    ProviderGrantContainmentRequired,
+    ProviderGrantRepository,
+)
 
 
 PROVIDER_VALUE = "test-provider-value-never-persisted"
@@ -51,6 +56,7 @@ class _Authority:
         self.reject_validation_at: int | None = None
         self.retirement_barrier: threading.Event | None = None
         self.retire_on_delivery = False
+        self.delivery_timeout_seconds: float | None = None
 
     def validate_target(self, target: ProviderGrantTarget) -> None:
         self.target_validation_count += 1
@@ -73,7 +79,13 @@ class _Authority:
             if self.retirement_barrier is not None:
                 self.retirement_barrier.set()
         self.validate_target(target)
-        return await operation()
+        if self.delivery_timeout_seconds is None:
+            return await operation()
+        try:
+            async with asyncio.timeout(self.delivery_timeout_seconds):
+                return await operation()
+        except TimeoutError:
+            raise ProviderGrantAuthorityError("delivery deadline expired") from None
 
     def contain(
         self,
@@ -154,6 +166,21 @@ class _DigestOnlyDelivery:
         )
 
 
+class _CancelledViewProbeDelivery:
+    def __init__(self) -> None:
+        self.view: memoryview | None = None
+        self.cancelled = False
+
+    async def deliver(self, binding, secret: memoryview) -> ProviderGrantAck:
+        del binding
+        self.view = secret
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
 @pytest.mark.asyncio
 async def test_broker_delivers_only_for_live_target_and_keeps_repository_private(
     tmp_path: Path,
@@ -229,10 +256,12 @@ async def test_target_is_revalidated_immediately_before_claim(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_retirement_after_claim_blocks_secret_delivery(tmp_path: Path) -> None:
-    """A retirement barrier between claim and delivery must keep secret private."""
+async def test_authority_rejection_before_operation_keeps_grant_issued(
+    tmp_path: Path,
+) -> None:
+    """Authority rejection before its operation must not consume the challenge."""
     target = _target()
-    broker, _, _, authority, clock, envelope, _ = _services(
+    broker, _, _, authority, clock, envelope, database = _services(
         tmp_path, target=target
     )
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
@@ -247,8 +276,50 @@ async def test_retirement_after_claim_blocks_secret_delivery(tmp_path: Path) -> 
 
     assert barrier.is_set()
     assert delivery.view is None
+    assert ProviderGrantRepository(database).get(offer.grant_id).state == "issued"
     containment = authority.contain(target)
     broker.revoke(offer, containment, 120.0)
+
+
+@pytest.mark.asyncio
+async def test_timeout_after_claim_requires_containment_before_revoke(
+    tmp_path: Path,
+) -> None:
+    """A timed-out transport is delivering until exact containment is proven."""
+    target = _target()
+    broker, _, _, authority, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    authority.delivery_timeout_seconds = 0.01
+    clock[0] = 110.0
+    delivery = _CancelledViewProbeDelivery()
+
+    with pytest.raises(ProviderGrantDeliveryFailed) as captured:
+        await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert captured.value.__cause__ is None
+    assert PROVIDER_VALUE not in str(captured.value)
+    assert delivery.cancelled is True
+    assert delivery.view is not None
+    assert bytes(delivery.view) == b"\x00" * len(PROVIDER_VALUE.encode("utf-8"))
+    repository = ProviderGrantRepository(database)
+    assert repository.get(offer.grant_id).state == "delivering"
+    with pytest.raises(ProviderGrantContainmentRequired):
+        repository.revoke(
+            offer.grant_id,
+            reason="delivery_failed",
+            containment_confirmed=False,
+            now=111.0,
+        )
+    retry = _DigestOnlyDelivery()
+    with pytest.raises(ProviderGrantDeliveryFailed):
+        await broker.deliver(offer, target=target, delivery=retry)
+    assert retry.view is None
+
+    containment = authority.contain(target)
+    broker.revoke(offer, containment, 120.0)
+    assert repository.get(offer.grant_id).state == "revoked"
 
 
 @pytest.mark.asyncio

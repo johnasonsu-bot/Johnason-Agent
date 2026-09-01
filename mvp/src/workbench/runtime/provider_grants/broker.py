@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
@@ -151,24 +152,39 @@ class ProviderGrantBroker:
 
         secret = bytearray(value.encode("utf-8"))
         view = memoryview(secret)
-        try:
-            claim_time = _time(self._clock())
-            self._validate_target(target)
+        claimed = False
+
+        async def claim_and_deliver():
+            nonlocal claimed
             self._grants.claim(
                 offer.grant_id,
                 challenge=offer.challenge,
                 target=target,
-                now=claim_time,
+                now=_time(self._clock()),
             )
+            claimed = True
+            return await delivery.deliver(record.binding, view)
+
+        try:
             try:
                 ack = await self._authority.deliver_if_current(
                     target,
-                    lambda: delivery.deliver(record.binding, view),
+                    claim_and_deliver,
                     deadline=record.binding.expires_at,
                 )
             except ProviderGrantAuthorityError:
+                if claimed:
+                    raise ProviderGrantDeliveryFailed(
+                        "provider grant delivery was not acknowledged"
+                    ) from None
                 raise ProviderGrantUnavailable(
                     "runtime target is not live"
+                ) from None
+            except asyncio.CancelledError:
+                if not claimed:
+                    raise
+                raise ProviderGrantDeliveryFailed(
+                    "provider grant delivery was not acknowledged"
                 ) from None
             except Exception:
                 raise ProviderGrantDeliveryFailed(

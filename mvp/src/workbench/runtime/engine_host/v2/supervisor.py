@@ -1145,13 +1145,19 @@ class SidecarSupervisor:
                 raise ProviderGrantAuthorityError(
                     "provider grant delivery deadline expired"
                 )
+            timeout = asyncio.timeout(remaining)
             try:
-                async with asyncio.timeout(remaining):
-                    return await operation()
+                async with timeout:
+                    result = await operation()
             except TimeoutError:
                 raise ProviderGrantAuthorityError(
                     "provider grant delivery deadline expired"
                 ) from None
+            if timeout.expired():
+                raise ProviderGrantAuthorityError(
+                    "provider grant delivery deadline expired"
+                )
+            return result
 
     def _provider_grant_monotonic_time(self) -> float:
         now = self._monotonic_clock()
