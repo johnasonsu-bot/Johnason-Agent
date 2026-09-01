@@ -10,8 +10,8 @@
           理论筑基 × 实战驱动 × 开源共建
         </p>
         <div class="hero-buttons">
-          <a class="btn-primary" :href="'/hello-generic-agent/part1/chapter1/'" >开始学习</a>
-          <a class="btn-secondary" href="https://github.com/datawhalechina/hello-generic-agent" target="_blank">GitHub ↗</a>
+          <a class="btn-primary" :href="withBase('/part1/chapter1/')" >开始学习</a>
+          <a class="btn-secondary" href="https://github.com/johnasonsu-bot/Johnason-Agent" target="_blank">GitHub ↗</a>
         </div>
       </div>
 
@@ -82,7 +82,7 @@
         <a
           v-for="(ch, idx) in doubledChapters"
           :key="idx"
-          :href="'/hello-generic-agent' + ch.link"
+          :href="withBase(ch.link)"
           class="carousel-card"
         >
           <span class="carousel-tag" :class="ch.tag === '应用篇' ? 'tag-app' : 'tag-theory'">{{ ch.tag }}</span>
@@ -108,7 +108,7 @@
     <div class="jump-section">
       <h2 class="section-title">快速跳转</h2>
       <div class="jump-cta-row">
-        <a class="jump-card" :href="item.external ? item.link : '/hello-generic-agent' + item.link" :target="item.external ? '_blank' : '_self'" v-for="(item, idx) in jumpLinks" :key="idx">
+        <a class="jump-card" :href="item.external ? item.link : withBase(item.link)" :target="item.external ? '_blank' : '_self'" v-for="(item, idx) in jumpLinks" :key="idx">
           <span class="jump-icon">{{ item.icon }}</span>
           <div>
             <h4>{{ item.title }}</h4>
@@ -206,9 +206,9 @@ const jumpLinks = [
   { icon: '🚀', title: '快速开始', desc: '10 分钟搭好环境', link: '/part1/chapter1/', external: false },
   { icon: '📖', title: '应用篇', desc: '从安装到实战', link: '/part1/chapter1/', external: false },
   { icon: '⚙️', title: '原理篇', desc: '深入设计哲学', link: '/part2/chapter7/', external: false },
-  { icon: '🐙', title: 'GitHub', desc: '查看GA源码，记得Star！', link: 'https://github.com/lsdefine/GenericAgent', external: true },
-  { icon: '📥', title: 'PDF 下载', desc: '离线阅读', link: 'https://github.com/datawhalechina/hello-generic-agent/releases', external: true },
-  { icon: '💬', title: '提 Issue', desc: '反馈与讨论', link: 'https://github.com/datawhalechina/hello-generic-agent/issues', external: true },
+  { icon: '🐙', title: 'GitHub', desc: '查看GA源码，记得Star！', link: 'https://github.com/johnasonsu-bot/Johnason-Agent', external: true },
+  { icon: '📥', title: '版本发布', desc: '查看发布版本', link: 'https://github.com/johnasonsu-bot/Johnason-Agent/releases', external: true },
+  { icon: '💬', title: '提 Issue', desc: '反馈与讨论', link: 'https://github.com/johnasonsu-bot/Johnason-Agent/issues', external: true },
 ]
 
 
