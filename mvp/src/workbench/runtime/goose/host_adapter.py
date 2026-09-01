@@ -9,7 +9,9 @@ import json
 from types import MappingProxyType
 from typing import Any
 
-from workbench.orchestration.contracts import _require_opaque_identifier
+from pydantic import TypeAdapter, ValidationError
+
+from workbench.orchestration.contracts import OpaqueIdentifier, OpaqueReference
 from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2, RuntimeEventV2
 from workbench.runtime.goose.message_mapper import (
     GooseEventMappingError,
@@ -71,6 +73,8 @@ _DIGEST_FIELDS = (
     "tool_manifest_digest",
     "command_identity_digest",
 )
+_OPAQUE_IDENTIFIER_ADAPTER = TypeAdapter(OpaqueIdentifier)
+_OPAQUE_REFERENCE_ADAPTER = TypeAdapter(OpaqueReference)
 
 
 class GooseHostAdapter:
@@ -153,22 +157,16 @@ def _canonical_json(value: object) -> str:
 
 
 def _validate_prepared_query_fields(prepared: GoosePreparedQuery) -> None:
-    for field in (
-        "runtime_id",
-        "runtime_build_id",
-        "provider_ref",
-        "model",
-        "context_snapshot_ref",
-    ):
+    for field in ("runtime_id", "runtime_build_id", "model"):
         value = getattr(prepared, field)
         if not isinstance(value, str) or not value:
             raise GooseAdapterError(f"{field} must be non-empty text")
-        try:
-            _require_opaque_identifier(value)
-        except ValueError as error:
-            raise GooseAdapterError(
-                f"{field} must be a bounded opaque identifier"
-            ) from error
+        _validate_opaque(value, field=field, adapter=_OPAQUE_IDENTIFIER_ADAPTER)
+    for field in ("provider_ref", "context_snapshot_ref"):
+        value = getattr(prepared, field)
+        if not isinstance(value, str) or not value:
+            raise GooseAdapterError(f"{field} must be non-empty text")
+        _validate_opaque(value, field=field, adapter=_OPAQUE_REFERENCE_ADAPTER)
     if prepared.runtime_id != _GOOSE_RUNTIME_ID:
         raise GooseAdapterError("prepared query runtime must be goose")
     for field in _DIGEST_FIELDS:
@@ -197,12 +195,9 @@ def _normalize_command_identity(
     context = identity["context"]
     if not isinstance(command_id, str) or not command_id:
         raise GooseAdapterError("invalid Goose command identity command_id")
-    try:
-        _require_opaque_identifier(command_id)
-    except ValueError as error:
-        raise GooseAdapterError(
-            "command_id must be a bounded opaque identifier"
-        ) from error
+    _validate_opaque(
+        command_id, field="command_id", adapter=_OPAQUE_IDENTIFIER_ADAPTER
+    )
     if not isinstance(runtime, Mapping) or set(runtime) != _RUNTIME_IDENTITY_FIELDS:
         raise GooseAdapterError("invalid Goose command identity runtime")
     if not isinstance(context, Mapping) or set(context) != _CONTEXT_IDENTITY_FIELDS:
@@ -227,6 +222,13 @@ def _normalize_command_identity(
     if identity != normalized:
         raise GooseAdapterError("command identity does not match prepared evidence")
     return normalized
+
+
+def _validate_opaque(value: str, *, field: str, adapter: TypeAdapter[str]) -> None:
+    try:
+        adapter.validate_python(value)
+    except ValidationError as error:
+        raise GooseAdapterError(f"{field} must be a bounded opaque identifier") from error
 
 
 def _validate_supported_message_frame(frame: Any) -> None:

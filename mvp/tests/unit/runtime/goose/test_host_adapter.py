@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import hashlib
+import importlib
 import json
 
 import pytest
@@ -412,3 +413,10 @@ def test_direct_prepared_query_rejects_identifiers_that_host_v2_would_reject(
     """Catches direct construction bypassing Host v2's opaque public identifiers."""
     with pytest.raises(GooseAdapterError, match="opaque identifier"):
         GoosePreparedQuery(**_direct_prepared_query_values(**{override: invalid_value}))
+
+
+def test_public_prepared_query_boundary_does_not_bind_a_private_host_validator() -> None:
+    """Catches Goose importing orchestration's private validator as a public dependency."""
+    adapter_module = importlib.import_module("workbench.runtime.goose.host_adapter")
+
+    assert "_require_opaque_identifier" not in vars(adapter_module)
