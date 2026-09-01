@@ -357,6 +357,52 @@ async def test_initial_acquire_is_exclusive_renewable_and_clean_recycle_fences_o
 
 
 @pytest.mark.asyncio
+async def test_current_handle_projects_a_secret_free_provider_grant_target(
+    tmp_path: Path,
+) -> None:
+    """Catches a Grant target escaping lease fencing or exposing raw identities."""
+    database = tmp_path / "provider-grant-target.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-grant", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    raw_lease = handle._lease()
+
+    target = handle.provider_grant_target(envelope)
+
+    assert target.runtime_id == "goose"
+    assert target.build_id == capabilities.build_id
+    assert target.lease_id == raw_lease.lease_id
+    assert target.host_generation == raw_lease.host_generation
+    assert target.lease_generation_seq == raw_lease.lease_generation_seq
+    serialized = target.model_dump_json()
+    assert raw_lease.instance_id not in serialized
+    assert raw_lease.instance_nonce not in serialized
+    assert handle._fence() not in serialized
+
+    drifted = envelope.model_copy(update={"model": "different-model"})
+    with pytest.raises(LeaseConflict, match="identity"):
+        handle.provider_grant_target(drifted)
+    await handle.aclose()
+    with pytest.raises(LeaseConflict):
+        handle.provider_grant_target(envelope)
+
+
+@pytest.mark.asyncio
 async def test_clean_release_never_starts_replacement_when_cleanup_is_unconfirmed(
     tmp_path: Path,
 ) -> None:

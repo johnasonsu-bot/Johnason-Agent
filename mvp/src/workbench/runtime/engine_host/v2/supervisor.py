@@ -34,6 +34,7 @@ from workbench.runtime.engine_host.v2.contracts import (
 )
 from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.provider_grants.contracts import ProviderGrantTarget
 from workbench.settings import RuntimeProcessConfig
 
 
@@ -1012,6 +1013,27 @@ class SidecarSupervisor:
         self._validate_envelope(handle, controlled)
         return controlled
 
+    def _provider_grant_target(
+        self, handle: "SupervisedRuntimeLease", envelope: RunEnvelopeV2
+    ) -> ProviderGrantTarget:
+        """Project only the current fenced lease identity for the Grant Broker."""
+        _, lease, _ = self._validate_envelope(handle, envelope)
+        assignment = handle._assignment()
+        return ProviderGrantTarget(
+            runtime_id=assignment.runtime_id,
+            build_id=assignment.build_id,
+            lease_id=lease.lease_id,
+            instance_id_digest=hashlib.sha256(
+                lease.instance_id.encode("utf-8")
+            ).hexdigest(),
+            instance_nonce_digest=hashlib.sha256(
+                lease.instance_nonce.encode("utf-8")
+            ).hexdigest(),
+            host_generation=lease.host_generation,
+            lease_generation_seq=lease.lease_generation_seq,
+            expires_at=lease.expires_at,
+        )
+
     async def _run_handle_query(
         self, handle: "SupervisedRuntimeLease", envelope: RunEnvelopeV2
     ):
@@ -1720,6 +1742,13 @@ class SupervisedRuntimeLease:
         finally:
             if not self.__closed and not self.__retiring:
                 await self.__supervisor._close_handle(self)
+
+    def provider_grant_target(
+        self, envelope: RunEnvelopeV2
+    ) -> ProviderGrantTarget:
+        """Return the secret-free Grant target for this exact live envelope."""
+        controlled = self.__supervisor._controlled_envelope(self, envelope)
+        return self.__supervisor._provider_grant_target(self, controlled)
 
     async def intervene(self, payload: dict[str, Any]) -> None:
         await self.__supervisor._intervene_handle(self, payload)
