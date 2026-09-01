@@ -4,7 +4,7 @@
 
 **Goal:** 在不引入运行时专属凭据配置的前提下，补齐统一 Host v2 的物化查询输入，并让 Goose 与 DeepSeek Harness 各自形成可构建、可验收的第一条真实运行通道。
 
-**Architecture:** 控制面先冻结一个无凭据的 `RuntimeQueryInputV2`，其中只包含消息快照、上下文投影和有序 PromptSection；`RunEnvelopeV2` 仍保存不可变身份与摘要。Goose 和 DeepSeek Harness 分别拥有独立的 sidecar 包装层，但两者只消费同一 Host v2 输入并通过统一 Provider Grant 私有通道获得临时凭据，不读取运行时专属 API Key。三条工作线可并行开发，最终在 Host v2 conformance 与运行时冒烟测试汇合。
+**Architecture:** 控制面先冻结一个不携带明文凭据的 `RuntimeQueryInputV2`，其中只包含消息快照、上下文投影和有序 PromptSection；`RunEnvelopeV2` 仍保存不可变身份与摘要。Codex/Python、Goose 和 DeepSeek Harness 共同使用共享 Vault / Provider Grant 密钥隔离边界；各 Runtime Adapter 只消费同一 Host v2 输入，并通过统一私有通道获得一次性临时 Grant，不读取或配置运行时专属 API Key。三条工作线可并行开发，最终在 Host v2 conformance 与运行时冒烟测试汇合。
 
 **Tech Stack:** Python 3.13、Pydantic v2、pytest、Rust/Cargo（Goose wrapper）、TypeScript/Node（DeepSeek Harness sidecar）、Engine Host v2 NDJSON 控制协议。
 
@@ -152,7 +152,7 @@ Run: `cd mvp/sidecars/deepseek-harness && npm test`
 
 Run: `cd mvp && .venv/bin/python -m pytest tests/unit/runtime/deepseek_harness tests/acceptance/test_deepseek_harness_source_gate.py -q`
 
-### Task 4: 三运行时联邦汇合门控
+### Task 4A: 三运行时 fixed-smoke 证据汇合
 
 **Files:**
 - Modify: `mvp/tests/conformance/host_v2.py`
@@ -162,19 +162,19 @@ Run: `cd mvp && .venv/bin/python -m pytest tests/unit/runtime/deepseek_harness t
 
 **Interfaces:**
 - Consumes: Tasks 1-3 的 Host 输入、Goose wrapper 与 DSH sidecar。
-- Produces: 独立的 `GO_GOOSE_QUERY_SMOKE`、`GO_DSH_PLUGIN_SMOKE` 与联邦汇合结论；一个运行时失败不得伪装成其他运行时通过。
+- Produces: 独立的 `GO_GOOSE_QUERY_SMOKE`、`GO_DSH_PLUGIN_SMOKE` 与 fixed-smoke 汇合证据；一个运行时失败不得伪装成其他运行时通过。该任务不得授予或暗示 `GO_RUNTIME_FEDERATION`。
 
 - [ ] **Step 1: 添加跨通道失败测试**
 
-同一份 `RuntimeQueryInputV2` 分别路由到 Python/Codex、Goose、DSH fixture，断言三者都产生有序输出、唯一终态、seal ACK，并断言普通 Host 帧与进程环境中不存在 credential 值或 Vault secret ID。
+同一份 canonical `RuntimeQueryInputV2` 证据分别用于 Python projection、Goose release smoke、DSH built sidecar smoke，断言三个 lane 的输入摘要一致，且各自结果独立、有序、唯一终态、seal ACK；普通 Host 帧与进程环境中不得出现 credential 值或 Vault secret ID。
 
 - [ ] **Step 2: 运行测试并确认在真实 wrapper/sidecar 未接线时失败**
 
 Run: `cd mvp && .venv/bin/python -m pytest tests/integration/test_federated_runtime_query_smoke.py -q`
 
-- [ ] **Step 3: 接线并更新门控清单**
+- [ ] **Step 3: 汇合证据并更新门控清单**
 
-只记录可复现的源码、构建与测试证据；不得因为一个 lane 通过而授予整体联邦 GO。
+只记录可复现的源码、构建与测试证据；不得因为一个 lane 通过而授予整体联邦 GO。若三 lane 均通过，结论仍标注为 fixed-smoke convergence evidence only。
 
 - [ ] **Step 4: 运行聚焦与标准回归**
 
@@ -182,3 +182,15 @@ Run: `cd mvp && .venv/bin/python -m pytest tests/unit/runtime/engine_host/v2 tes
 
 Run: `cd mvp && .venv/bin/python -m pytest -q`
 
+### Task 4B: Supervisor / Broker / sidecar 生产接线
+
+**Precondition:** Task 4A clean；Goose 与 DSH 仍保持 fixed-smoke scope，直到真实上游模型循环另行验收。
+
+**Required slices:**
+
+1. `SupervisedRuntimeLease.run_query()` 与 Supervisor 内部路径接收 keyword-only `RuntimeQueryInputV2`，原样透传 `EngineHostV2Client`，不得重新物化或丢弃摘要绑定。
+2. 实现共享的 live sidecar `ProviderGrantDelivery`：使用私有、双向、有界 transport 交付一次性 binding 与可擦除 secret，并返回绑定当前 fenced target 的 ACK。
+3. Client / process guard 只透传显式私有 descriptor；普通 argv、环境、Host NDJSON、日志和持久化仍不得承载 credential 或 Vault secret ID。
+4. Goose 与 DSH 的 fixed sidecar 在 capability handshake 后等待 Grant，消费正式 `ProviderGrantBinding`，回写 ACK；不得预读 FD、硬编码 instance digest 或增加 runtime 专属 API Key。
+5. 新增协调器，按 lease → target/issue → private deliver/ACK → public query events → terminal/seal/containment 的顺序执行；一条 lane 失败不得污染其他 lane verdict。
+6. fixed sidecar 的 capability 继续诚实声明；不得为了通过生产 client 测试把 `model=false` 伪装成 `true`。真实 `GO_RUNTIME_FEDERATION` 必须等待 upstream Codex/Goose/DeepSeek Harness 模型能力分别接入并通过独立验收。

@@ -24,7 +24,7 @@
 | 泳道 | 本轮切片 | 结果 | 门禁状态 |
 |---|---|---|---|
 | Codex/Python | 同 cursor checkpoint 不覆盖 Event 投影状态；刷新可信 build manifest | manifest 门 `30 passed`，稳定哈希已确认 | 保持现有 Python 路径；非新 Runtime GO |
-| Goose | 固定上游 `StreamEvent::Message` 到 Host v2 `assistant.delta` 映射；无凭据 prepared query；未知输入 fail closed | Goose lane/source `40 passed` | Adapter/source readiness；不是 Goose Runtime GO |
+| Goose | 固定上游 `StreamEvent::Message` 到 Host v2 `assistant.delta` 映射；使用共享 Vault / Provider Grant 密钥隔离边界的 prepared query；未知输入 fail closed | Goose lane/source `40 passed` | Adapter/source readiness；不是 Goose Runtime GO |
 | DeepSeek Harness | PromptSection 确定性排序、digest、不可变注册快照与无凭据 prepared query | DSH lane/source `36 passed` | Adapter/source readiness；不是 DSH Runtime GO |
 | 联邦集成 | live-target authority、交付临界区、fenced containment receipt、私有 Repository 与完整泄漏验收 | Task 1 聚焦 `112 passed`；独立最终复审 `CLEAN` | `GO_PROVIDER_GRANT_BROKER` |
 
