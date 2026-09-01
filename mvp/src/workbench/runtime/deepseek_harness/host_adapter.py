@@ -93,7 +93,11 @@ class DeepSeekPreparedQuery:
             raise DeepSeekHostAdapterError("model reference is invalid")
         if not isinstance(self.context_snapshot_ref, str) or not self.context_snapshot_ref:
             raise DeepSeekHostAdapterError("context snapshot reference is invalid")
-        if not isinstance(self.context_version, int) or isinstance(self.context_version, bool):
+        if (
+            not isinstance(self.context_version, int)
+            or isinstance(self.context_version, bool)
+            or self.context_version < 0
+        ):
             raise DeepSeekHostAdapterError("context version is invalid")
         for value in (
             self.model_options_digest,
@@ -160,6 +164,8 @@ class DeepSeekHarnessHostAdapter:
             or envelope.runtime.build_id != self._build_id
         ):
             raise DeepSeekHostAdapterError("runtime/build identity does not match adapter")
+        if envelope.extensions:
+            raise DeepSeekHostAdapterError("envelope extensions are not supported")
         if not isinstance(prompt_sections, Sequence) or isinstance(
             prompt_sections, str | bytes
         ):

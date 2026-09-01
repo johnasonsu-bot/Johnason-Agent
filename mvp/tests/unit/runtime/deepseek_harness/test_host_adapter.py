@@ -123,6 +123,16 @@ def test_prepare_rejects_a_runtime_or_build_other_than_its_bound_host() -> None:
         adapter.prepare(wrong_build, ())
 
 
+def test_prepare_rejects_non_empty_host_v2_extensions() -> None:
+    """Fails if a future DSH input is silently dropped at the adapter boundary."""
+    envelope = _envelope().model_copy(
+        update={"extensions": {"future-dsh-input": "unreviewed"}}
+    )
+
+    with pytest.raises(DeepSeekHostAdapterError, match="extensions"):
+        _adapter().prepare(envelope, ())
+
+
 def test_prepare_preserves_an_unresolved_provider_reference_without_credentials() -> None:
     """Fails if preparation resolves provider secrets or rewrites opaque references."""
     envelope = _envelope().model_copy(
@@ -135,6 +145,30 @@ def test_prepare_preserves_an_unresolved_provider_reference_without_credentials(
     assert "credential" not in prepared.__dataclass_fields__
     assert "api_key" not in prepared.__dataclass_fields__
     assert "authorization" not in prepared.__dataclass_fields__
+
+
+def test_prepared_query_rejects_a_negative_context_version_at_construction() -> None:
+    """Fails if a public prepared query can bypass Host v2's context-version bound."""
+    prepared = _adapter().prepare(_envelope(), ())
+
+    with pytest.raises(DeepSeekHostAdapterError, match="context version"):
+        DeepSeekPreparedQuery(
+            provider_ref=prepared.provider_ref,
+            model=prepared.model,
+            model_options_digest=prepared.model_options_digest,
+            message_snapshot_digest=prepared.message_snapshot_digest,
+            prompt_registrations=prepared.prompt_registrations,
+            prompt_digest=prepared.prompt_digest,
+            context_snapshot_ref=prepared.context_snapshot_ref,
+            context_digest=prepared.context_digest,
+            context_version=-1,
+            tool_manifest_digest=prepared.tool_manifest_digest,
+            skill_manifest_digest=prepared.skill_manifest_digest,
+            plugin_manifest_digest=prepared.plugin_manifest_digest,
+            permission_policy_digest=prepared.permission_policy_digest,
+            command_identity=prepared.command_identity,
+            evidence_digest=prepared.evidence_digest,
+        )
 
 
 def test_prepare_accepts_only_a_validated_envelope_and_normalized_sections() -> None:
