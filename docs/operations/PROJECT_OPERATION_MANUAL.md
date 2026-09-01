@@ -344,8 +344,8 @@ cd mvp
 
 ## 12. 关联资料
 
-- [产品 README](../../README.md)
-- [构建与运行 README](../../mvp/README.md)
+- [产品 README](https://github.com/johnasonsu-bot/Johnason-Agent/blob/main/README.md)
+- [构建与运行 README](https://github.com/johnasonsu-bot/Johnason-Agent/blob/main/mvp/README.md)
 - [API/接口清单](api-inventory.json)
 - [交互式能力与差距图谱](project-operation-knowledge-graph.html)
 - [LangGraph 设计](../superpowers/specs/2026-08-12-langgraph-graph-blueprint-design.md)

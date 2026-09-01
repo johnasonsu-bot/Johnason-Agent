@@ -3,17 +3,20 @@ import { defineConfig } from 'vitepress'
 
 // 1. 获取环境变量并判断
 // 如果环境变量 EDGEONE 等于 '1'，说明在 EdgeOne 环境，使用根路径 '/'
-// 否则默认是 GitHub Pages 环境，使用仓库子路径 '/easy-vecdb/'
+// 否则默认是 GitHub Pages 环境，使用仓库子路径 '/Johnason-Agent/'
 const isEdgeOne = process.env.EDGEONE === '1'
-const baseConfig = isEdgeOne ? '/' : '/hello-generic-agent/'
+const baseConfig = isEdgeOne ? '/' : '/Johnason-Agent/'
 
 export default defineConfig({
   lang: 'zh-CN',
-  title: "Datawhale开源教程",
-  description: "AI前沿知识开源教程",
+  title: "Johnason Agent",
+  description: "本地优先、多运行时 Agent 工作台",
   base: baseConfig,
   ignoreDeadLinks: [
     /\.py$/,
+    /2026-08-10-dintal-claw-gap-graph(?:\.html)?$/,
+    /2026-08-10-dintal-complete-snapshot-gap-graph(?:\.html)?$/,
+    /project-operation-knowledge-graph(?:\.html)?$/,
   ],
   markdown: {
     math: true
@@ -22,7 +25,7 @@ export default defineConfig({
     // https://vitepress.dev/reference/default-theme-config
     logo: '/datawhale-logo.png',
     nav: [
-      { text: 'PDF版本下载', link: 'https://github.com/datawhalechina/hello-generic-agent/releases' },
+      { text: '版本发布', link: 'https://github.com/johnasonsu-bot/Johnason-Agent/releases' },
     ],
     search: {
       provider: 'local',
@@ -80,11 +83,11 @@ export default defineConfig({
     ],
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/datawhalechina/hello-generic-agent' }
+      { icon: 'github', link: 'https://github.com/johnasonsu-bot/Johnason-Agent' }
     ],
 
     editLink: {
-      pattern: 'https://github.com/datawhalechina/hello-generic-agent/blob/main/docs/:path'
+      pattern: 'https://github.com/johnasonsu-bot/Johnason-Agent/blob/main/docs/:path'
     },
 
     footer: {
