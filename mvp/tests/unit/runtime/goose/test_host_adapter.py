@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
+import json
 
 import pytest
 
@@ -350,3 +352,63 @@ def test_direct_prepared_query_construction_rejects_unvalidated_evidence(
             command_identity=identity,
             command_identity_digest=digest,
         )
+
+
+def _direct_prepared_query_values(**overrides: object) -> dict[str, object]:
+    """Hand-build one valid public PreparedQuery and its evidence digest."""
+    values: dict[str, object] = {
+        "runtime_id": "goose",
+        "runtime_build_id": "goose-build-2026",
+        "runtime_config_digest": "1" * 64,
+        "provider_ref": "provider-profile:unresolved-openai",
+        "model": "gpt-5",
+        "message_snapshot_digest": "3" * 64,
+        "context_snapshot_ref": "context-snapshot-1",
+        "context_snapshot_digest": "4" * 64,
+        "context_version": 7,
+        "tool_manifest_digest": "5" * 64,
+        "command_id": "command-1",
+    }
+    values.update(overrides)
+    identity = {
+        "command_id": values.pop("command_id"),
+        "context": {
+            "snapshot_digest": values["context_snapshot_digest"],
+            "snapshot_ref": values["context_snapshot_ref"],
+            "version": values["context_version"],
+        },
+        "message_snapshot_digest": values["message_snapshot_digest"],
+        "model": values["model"],
+        "provider_ref": values["provider_ref"],
+        "runtime": {
+            "build_id": values["runtime_build_id"],
+            "config_digest": values["runtime_config_digest"],
+            "runtime_id": values["runtime_id"],
+        },
+        "tool_manifest_digest": values["tool_manifest_digest"],
+    }
+    values["command_identity"] = identity
+    values["command_identity_digest"] = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    return values
+
+
+@pytest.mark.parametrize(
+    ("override", "invalid_value"),
+    [
+        ("provider_ref", "provider-secret-material"),
+        ("command_id", "command-secret-material"),
+        ("runtime_build_id", "build id"),
+        ("model", "model with spaces"),
+        ("context_snapshot_ref", "context?ref"),
+    ],
+)
+def test_direct_prepared_query_rejects_identifiers_that_host_v2_would_reject(
+    override: str, invalid_value: str
+) -> None:
+    """Catches direct construction bypassing Host v2's opaque public identifiers."""
+    with pytest.raises(GooseAdapterError, match="opaque identifier"):
+        GoosePreparedQuery(**_direct_prepared_query_values(**{override: invalid_value}))

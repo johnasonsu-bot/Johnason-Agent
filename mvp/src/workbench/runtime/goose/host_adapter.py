@@ -9,6 +9,7 @@ import json
 from types import MappingProxyType
 from typing import Any
 
+from workbench.orchestration.contracts import _require_opaque_identifier
 from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2, RuntimeEventV2
 from workbench.runtime.goose.message_mapper import (
     GooseEventMappingError,
@@ -162,6 +163,12 @@ def _validate_prepared_query_fields(prepared: GoosePreparedQuery) -> None:
         value = getattr(prepared, field)
         if not isinstance(value, str) or not value:
             raise GooseAdapterError(f"{field} must be non-empty text")
+        try:
+            _require_opaque_identifier(value)
+        except ValueError as error:
+            raise GooseAdapterError(
+                f"{field} must be a bounded opaque identifier"
+            ) from error
     if prepared.runtime_id != _GOOSE_RUNTIME_ID:
         raise GooseAdapterError("prepared query runtime must be goose")
     for field in _DIGEST_FIELDS:
@@ -190,6 +197,12 @@ def _normalize_command_identity(
     context = identity["context"]
     if not isinstance(command_id, str) or not command_id:
         raise GooseAdapterError("invalid Goose command identity command_id")
+    try:
+        _require_opaque_identifier(command_id)
+    except ValueError as error:
+        raise GooseAdapterError(
+            "command_id must be a bounded opaque identifier"
+        ) from error
     if not isinstance(runtime, Mapping) or set(runtime) != _RUNTIME_IDENTITY_FIELDS:
         raise GooseAdapterError("invalid Goose command identity runtime")
     if not isinstance(context, Mapping) or set(context) != _CONTEXT_IDENTITY_FIELDS:
