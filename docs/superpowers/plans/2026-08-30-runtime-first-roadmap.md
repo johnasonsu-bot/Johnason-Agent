@@ -1,7 +1,9 @@
 # Runtime-First 开发排期
 
 **基准：** Task 8 已完成。
-**资源假设：** 一个主实现流、独立规格/质量审核；供应链准备可由两个子任务并行。
+**资源假设：** 一个公共合同/集成流，加 Codex-compatible Python、Goose、
+DeepSeek Harness 三条独立 Runtime 泳道；四条泳道可并行开发和迭代，集成流统一
+维护 Host v2、Supervisor、Provider Grant、Conformance 与最终 Gate。
 **优先级：** P0 Runtime Federation → P1 五项架构级更新 → P2 原 Agent 产品功能。
 
 ## 1. 调整后的排期
@@ -31,9 +33,11 @@ P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Conte
 
 ## 2. 依赖与可并行项
 
-- Goose 与 DSH 的 source pin、license、lock 和离线 build proof 可并行；生产 sidecar supervisor 和 Provider Grant 必须共用一套实现。
+- Codex-compatible Python、Goose 与 DSH 的 lane-local Adapter、消息映射、Context/Prompt、Checkpoint/Event 和测试可并行开发；三条泳道不得各建一套 Host、Grant、Effect 或恢复合同。
+- 生产 Sidecar Supervisor 和 Provider Grant 由公共集成泳道独占维护。公共接口冻结后，三条 Runtime 泳道可以立即消费并继续并行；公共 Gate 尚未通过只阻止真实凭据 Smoke/GO，不阻止不依赖该能力的 lane-local TDD。
 - Release 构建必须绑定各自 source/build manifest、仓库声明的 toolchain/engine、目标平台、frozen lock、binary/package、SBOM 和 license digest。fixture 不得进入真实 Gate receipt。
-- Goose 完整门禁先于 DSH 完整门禁，保持既有批准依赖；DSH 的供应链和接口准备可以提前进行，但不得提前宣称 GO。
+- Goose 与 DSH 不再互为开发顺序依赖，各自 Smoke/完整门禁可独立推进；`GO_RUNTIME_FEDERATION` 仍需 Codex、Goose、DSH 和公共合同全部通过，任何 fixture 或单泳道结果都不能替代联合门禁。
+- 共享文件采用单写者规则：`engine_host/v2`、`provider_grants`、`workflow/schema.py`、应用组合和公共 conformance 只由集成泳道修改；Runtime 泳道只修改各自目录和测试，合同变更以结构化 Handoff 回到集成泳道。
 - 五项架构更新不阻塞 P0；P0 期间只实现其不可缺少的最小前置，例如 cursor、Effect reconciliation 和安全 grant，不提前建设完整 Spec/taint/OTel 产品。
 - RF-3B/RF-4B 中的 compact/checkpoint 仅做 runtime 原生能力探测、事件透传和恢复 fixture，不开放控制面的 durable Context mutation；厂商中立 compact/rewind 的生产语义和 Context Pin 等价性从 AR-2 才启用。
 - AR-1 必须先产出厂商中立 `GateProfile/GateCycle/GateAttempt/GateReceipt/GateReleaseReceipt` 和 L1–L4 状态机；AR-2～AR-5只消费该公共合同，不各建一套门控。
@@ -44,6 +48,22 @@ P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Conte
 - UX 只实现 Runtime 选择、健康、进度、错误和测试证据；其余视觉与 Agent 市场功能后移。
 
 ## 3. 下一批可执行任务
+
+当前 RF-1、RF-2A、RF-2B 已完成，RF-2C 基础能力通过但纠正门尚未关闭。下一批不再按 Goose → DeepSeek Harness 串行推进，而是同时启动 RF-3A 与 RF-4A 的 lane-local Adapter；集成泳道并行修复 Supervisor live-target、fenced containment receipt、Provider Grant 私有 transport fixture 和完整泄漏验收。任一 Runtime 的开发失败只阻塞该 Runtime 的 GO，不冻结另一条泳道；两条真实凭据 Smoke 都等待 RF-2C GO。
+
+### Task RF-3A：Goose 最小真实 Query Smoke
+
+实现 Goose Sidecar Host v2 Adapter、assistant/tool/event 映射与无凭据 transport fixture；Provider Grant 纠正门通过后再运行用户可操作的真实凭据 Smoke。只授予 `GO_GOOSE_QUERY_SMOKE`，不替代完整 Runtime Gate。
+
+### Task RF-4A：DeepSeek Harness Plugin Smoke
+
+实现 DSH Sidecar Host v2 Adapter、PromptSection 注入、事件映射与无凭据 transport fixture；Provider Grant 纠正门通过后再运行用户可操作的真实凭据 Smoke。只授予 `GO_DSH_PLUGIN_SMOKE`，不替代完整 Runtime Gate。
+
+### Integration：公共联邦收口
+
+完成 Supervisor-backed live-target authority、fenced containment receipt、私有 Grant Repository、Delivery conformance、完整泄漏验收、Runtime Adapter fixture、manifest/build evidence 和跨 Runtime 诊断格式；共享文件继续执行单写者规则。
+
+以下已完成任务保留为实施记录。
 
 ### Task RF-1.0：Runtime assignment control-plane contracts
 

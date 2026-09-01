@@ -384,6 +384,22 @@ def test_each_build_app_host_instance_gets_a_new_comparable_generation(
     assert first.host_generation != second.host_generation
 
 
+def test_build_app_composes_one_shared_provider_grant_broker(
+    tmp_path: Path,
+) -> None:
+    from workbench.runtime.provider_grants import ProviderGrantBroker
+
+    settings = WorkbenchSettings(runtime_dir=tmp_path)
+
+    app = main.build_app(settings, runner=NoopRunner())
+
+    assert isinstance(app.state.provider_grant_broker, ProviderGrantBroker)
+    assert app.state.provider_grant_broker.grants.store.path == settings.database
+    assert all(
+        "provider-grant" not in getattr(route, "path", "") for route in app.routes
+    )
+
+
 def test_create_app_passes_host_generation_to_worker_repository(
     tmp_path: Path,
 ) -> None:
