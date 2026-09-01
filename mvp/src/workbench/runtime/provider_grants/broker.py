@@ -160,11 +160,21 @@ class ProviderGrantBroker:
                 target=target,
                 now=claim_time,
             )
-            # Claim and this final validation are synchronous: on the owning
-            # event loop no retirement task can run before the secret handoff.
-            self._validate_target(target)
             try:
-                ack = await delivery.deliver(record.binding, view)
+                ack = await self._authority.deliver_if_current(
+                    target,
+                    lambda: delivery.deliver(record.binding, view),
+                    deadline=record.binding.expires_at,
+                )
+            except ProviderGrantAuthorityError:
+                raise ProviderGrantUnavailable(
+                    "runtime target is not live"
+                ) from None
+            except Exception:
+                raise ProviderGrantDeliveryFailed(
+                    "provider grant delivery was not acknowledged"
+                ) from None
+            try:
                 consumed = self._grants.acknowledge(
                     ack, now=_time(self._clock())
                 )
@@ -246,6 +256,10 @@ class _UnavailableProviderGrantAuthority:
 
     def validate_target(self, target: ProviderGrantTarget) -> None:
         del target
+        raise ProviderGrantAuthorityError("runtime target is not live")
+
+    async def deliver_if_current(self, target, operation, *, deadline):
+        del target, operation, deadline
         raise ProviderGrantAuthorityError("runtime target is not live")
 
     def validate_containment_receipt(

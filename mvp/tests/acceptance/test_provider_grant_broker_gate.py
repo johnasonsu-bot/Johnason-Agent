@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -15,9 +16,11 @@ from tests.fixtures.host_v2 import run_envelope, runtime_capabilities
 from workbench.main import build_app
 from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
 from workbench.runtime.provider_grants import (
+    ProviderGrantAck,
     ProviderGrantConflict,
     ProviderGrantDeliveryFailed,
     ProviderGrantUnavailable,
+    canonical_grant_digest,
 )
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 
@@ -31,12 +34,14 @@ class _SupervisorClient:
         )
         self.cleanup_confirmed: bool | None = False
         self.closed = False
+        self.close_started = asyncio.Event()
         self.terminated = asyncio.Event()
 
     async def start(self) -> None:
         return None
 
     async def aclose(self) -> None:
+        self.close_started.set()
         self.closed = True
         self.cleanup_confirmed = True
         self.terminated.set()
@@ -56,6 +61,28 @@ class _SecretBearingFailureProbe:
         self.view = secret
         self.received_digest = hashlib.sha256(bytes(secret)).hexdigest()
         raise RuntimeError(f"provider fixture rejected {self.credential}")
+
+
+class _BlockingAckDeliveryProbe:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.received_digest: str | None = None
+        self.target_instance_digest: str | None = None
+        self.view: memoryview | None = None
+
+    async def deliver(self, binding, secret: memoryview) -> ProviderGrantAck:
+        self.view = secret
+        self.entered.set()
+        await self.release.wait()
+        self.received_digest = hashlib.sha256(bytes(secret)).hexdigest()
+        self.target_instance_digest = binding.target.instance_id_digest
+        return ProviderGrantAck(
+            grant_id=binding.grant_id,
+            grant_digest=canonical_grant_digest(binding),
+            target_instance_digest=binding.target.instance_id_digest,
+            acknowledged_at=binding.issued_at,
+        )
 
 
 def test_supervisor_backed_broker_contains_failure_without_public_leak(
@@ -141,6 +168,11 @@ def test_supervisor_backed_broker_contains_failure_without_public_leak(
                 envelope, target=target, ttl_seconds=30
             )
         )
+        blocking_offer = client.portal.call(
+            lambda: app.state.provider_grant_broker.issue(
+                envelope, target=target, ttl_seconds=30
+            )
+        )
         stale_offer = client.portal.call(
             lambda: app.state.provider_grant_broker.issue(
                 envelope, target=target, ttl_seconds=30
@@ -164,7 +196,52 @@ def test_supervisor_backed_broker_contains_failure_without_public_leak(
         assert delivery.view is not None
         assert bytes(delivery.view) == b"\x00" * len(credential.encode("utf-8"))
 
-        client.portal.call(handle.aclose)
+        blocking_delivery = _BlockingAckDeliveryProbe()
+
+        async def deliver_while_close_waits():
+            delivery_task = asyncio.create_task(
+                app.state.provider_grant_broker.deliver(
+                    blocking_offer,
+                    target=target,
+                    delivery=blocking_delivery,
+                )
+            )
+            await blocking_delivery.entered.wait()
+            close_started = asyncio.Event()
+
+            async def close_handle() -> None:
+                close_started.set()
+                await handle.aclose()
+
+            close_task = asyncio.create_task(close_handle())
+            await close_started.wait()
+            try:
+                await asyncio.wait_for(
+                    clients[0].close_started.wait(), timeout=0.05
+                )
+            except TimeoutError:
+                close_reached_client = False
+            else:
+                close_reached_client = True
+            blocking_delivery.release.set()
+            receipt = await delivery_task
+            await close_task
+            return receipt, close_reached_client
+
+        blocking_receipt, close_reached_client = client.portal.call(
+            deliver_while_close_waits
+        )
+        assert close_reached_client is False
+        assert blocking_receipt.state == "consumed"
+        assert blocking_delivery.target_instance_digest == target.instance_id_digest
+        assert blocking_delivery.received_digest == hashlib.sha256(
+            credential.encode("utf-8")
+        ).hexdigest()
+        assert blocking_delivery.view is not None
+        assert bytes(blocking_delivery.view) == b"\x00" * len(
+            credential.encode("utf-8")
+        )
+
         locked = client.post("/api/vault/lock")
         public_responses.append(locked.text)
         assert locked.status_code == 200

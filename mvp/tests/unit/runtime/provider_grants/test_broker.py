@@ -49,15 +49,11 @@ class _Authority:
         self.receipts: list[ProviderGrantContainmentReceipt] = []
         self.target_validation_count = 0
         self.reject_validation_at: int | None = None
-        self.retire_validation_at: int | None = None
         self.retirement_barrier: threading.Event | None = None
+        self.retire_on_delivery = False
 
     def validate_target(self, target: ProviderGrantTarget) -> None:
         self.target_validation_count += 1
-        if self.target_validation_count == self.retire_validation_at:
-            self.live.discard(target)
-            if self.retirement_barrier is not None:
-                self.retirement_barrier.set()
         if (
             target not in self.live
             or self.target_validation_count == self.reject_validation_at
@@ -69,6 +65,15 @@ class _Authority:
     ) -> None:
         if receipt not in self.receipts:
             raise ProviderGrantAuthorityError("containment receipt is invalid")
+
+    async def deliver_if_current(self, target, operation, *, deadline):
+        del deadline
+        if self.retire_on_delivery:
+            self.live.discard(target)
+            if self.retirement_barrier is not None:
+                self.retirement_barrier.set()
+        self.validate_target(target)
+        return await operation()
 
     def contain(
         self,
@@ -233,7 +238,7 @@ async def test_retirement_after_claim_blocks_secret_delivery(tmp_path: Path) -> 
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
     barrier = threading.Event()
     authority.retirement_barrier = barrier
-    authority.retire_validation_at = authority.target_validation_count + 3
+    authority.retire_on_delivery = True
     clock[0] = 110.0
     delivery = _DigestOnlyDelivery()
 

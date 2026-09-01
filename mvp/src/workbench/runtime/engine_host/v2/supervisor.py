@@ -8,6 +8,7 @@ from dataclasses import field
 import hashlib
 import hmac
 import json
+import math
 from pathlib import Path
 from secrets import token_bytes, token_urlsafe
 import threading
@@ -162,6 +163,7 @@ class SidecarSupervisor:
             [RuntimeProcessConfig, int, Path], Any
         ] | None = None,
         clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = time.monotonic,
         lease_seconds: float = 30.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         initial_backoff: float = 0.25,
@@ -192,6 +194,8 @@ class SidecarSupervisor:
         self._owner = f"sidecar-supervisor:{app_instance_id}"
         self._client_factory = client_factory or self._default_client_factory
         self._clock = clock
+        self._monotonic_clock = monotonic_clock
+        self._provider_grant_monotonic_time()
         self._lease_seconds = float(lease_seconds)
         self._sleep = sleep
         self._initial_backoff = float(initial_backoff)
@@ -210,7 +214,7 @@ class SidecarSupervisor:
             )
         ).hexdigest()
         self._provider_grant_contained: dict[
-            str, tuple[ProviderGrantTarget, float]
+            str, tuple[ProviderGrantTarget, float, float]
         ] = {}
         self._started = False
         self._closing = False
@@ -1102,25 +1106,88 @@ class SidecarSupervisor:
         if target != expected or self._clock() >= lease.expires_at:
             raise ProviderGrantAuthorityError("provider grant target is not live")
 
+    async def deliver_if_current(
+        self,
+        target: ProviderGrantTarget,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        deadline: float,
+    ) -> Any:
+        """Run one delivery while the exact runtime generation cannot retire."""
+        if not isinstance(target, ProviderGrantTarget):
+            raise TypeError("target must be a ProviderGrantTarget")
+        if not callable(operation):
+            raise TypeError("operation must be callable")
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+        ):
+            raise ProviderGrantAuthorityError(
+                "provider grant delivery deadline is invalid"
+            )
+        slot = self._slots.get(target.runtime_id)
+        if slot is None:
+            raise ProviderGrantAuthorityError("provider grant target is not live")
+        async with slot.lock:
+            self.validate_target(target)
+            now = self._clock()
+            if (
+                isinstance(now, bool)
+                or not isinstance(now, (int, float))
+                or not math.isfinite(float(now))
+            ):
+                raise ProviderGrantAuthorityError(
+                    "provider grant delivery deadline is invalid"
+                )
+            remaining = float(deadline) - float(now)
+            if remaining <= 0:
+                raise ProviderGrantAuthorityError(
+                    "provider grant delivery deadline expired"
+                )
+            try:
+                async with asyncio.timeout(remaining):
+                    return await operation()
+            except TimeoutError:
+                raise ProviderGrantAuthorityError(
+                    "provider grant delivery deadline expired"
+                ) from None
+
+    def _provider_grant_monotonic_time(self) -> float:
+        now = self._monotonic_clock()
+        if isinstance(now, bool) or not isinstance(now, (int, float)):
+            raise TypeError("provider grant monotonic clock must be numeric")
+        timestamp = float(now)
+        if not math.isfinite(timestamp) or timestamp < 0:
+            raise ValueError(
+                "provider grant monotonic clock must be finite and non-negative"
+            )
+        return timestamp
+
     def _record_provider_grant_containment(self, slot: _RuntimeSlot) -> None:
         handle = slot.handle
         if handle is None:
             return
         target = self._provider_grant_target_for(handle, handle._lease())
         completed_at = float(self._clock())
+        monotonic_now = self._provider_grant_monotonic_time()
         with self._snapshot_lock:
-            self._prune_provider_grant_containment_locked(completed_at)
+            self._prune_provider_grant_containment_locked(monotonic_now)
             self._provider_grant_contained.setdefault(
                 self._provider_grant_target_key(target),
-                (target, completed_at),
+                (
+                    target,
+                    completed_at,
+                    monotonic_now
+                    + _PROVIDER_GRANT_CONTAINMENT_EVIDENCE_SECONDS,
+                ),
             )
 
     def _prune_provider_grant_containment_locked(self, now: float) -> set[str]:
         expired = {
             key
-            for key, (_, completed_at) in self._provider_grant_contained.items()
-            if now
-            >= completed_at + _PROVIDER_GRANT_CONTAINMENT_EVIDENCE_SECONDS
+            for key, contained in self._provider_grant_contained.items()
+            if now >= contained[2]
         }
         for key in expired:
             self._provider_grant_contained.pop(key, None)
@@ -1128,9 +1195,9 @@ class SidecarSupervisor:
 
     def _provider_grant_containment_evidence(
         self, target: ProviderGrantTarget
-    ) -> tuple[ProviderGrantTarget, float] | None:
+    ) -> tuple[ProviderGrantTarget, float, float] | None:
         key = self._provider_grant_target_key(target)
-        now = float(self._clock())
+        now = self._provider_grant_monotonic_time()
         with self._snapshot_lock:
             expired = self._prune_provider_grant_containment_locked(now)
             contained = self._provider_grant_contained.get(key)
@@ -1153,7 +1220,7 @@ class SidecarSupervisor:
             raise ProviderGrantAuthorityError(
                 "provider grant target cleanup is not confirmed"
             )
-        _, completed_at = contained
+        _, completed_at, _ = contained
         authority_digest = self._provider_grant_authority_digest
         proof = hmac.new(
             self._provider_grant_proof_key,

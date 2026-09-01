@@ -5,8 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
-from typing import Annotated, Any, Literal, Protocol, Self
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Annotated, Any, Literal, Protocol, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -36,6 +36,7 @@ ProviderGrantRevocationReason = Literal[
     "shutdown",
     "target_changed",
 ]
+_DeliveryResult = TypeVar("_DeliveryResult")
 
 
 class FrozenGrantModel(BaseModel):
@@ -107,6 +108,14 @@ class ProviderGrantAuthority(Protocol):
     """Live Supervisor authority consumed by the private Grant Broker."""
 
     def validate_target(self, target: ProviderGrantTarget) -> None: ...
+
+    async def deliver_if_current(
+        self,
+        target: ProviderGrantTarget,
+        operation: Callable[[], Awaitable[_DeliveryResult]],
+        *,
+        deadline: float,
+    ) -> _DeliveryResult: ...
 
     def validate_containment_receipt(
         self, receipt: ProviderGrantContainmentReceipt

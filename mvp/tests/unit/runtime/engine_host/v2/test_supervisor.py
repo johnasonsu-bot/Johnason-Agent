@@ -423,6 +423,53 @@ async def test_current_handle_projects_a_secret_free_provider_grant_target(
 
 
 @pytest.mark.asyncio
+async def test_provider_grant_delivery_deadline_cancels_before_transport_observes(
+    tmp_path: Path,
+) -> None:
+    """The Supervisor lock must bound a stalled private transport operation."""
+    database = tmp_path / "provider-grant-delivery-deadline.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-deadline", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    target = handle.provider_grant_target(envelope)
+    entered = asyncio.Event()
+    never_release = asyncio.Event()
+    transport_observed = False
+
+    async def stalled_operation() -> None:
+        nonlocal transport_observed
+        entered.set()
+        await never_release.wait()
+        transport_observed = True
+
+    with pytest.raises(ProviderGrantAuthorityError, match="deadline"):
+        await supervisor.deliver_if_current(
+            target,
+            stalled_operation,
+            deadline=10.01,
+        )
+
+    assert entered.is_set()
+    assert transport_observed is False
+    await handle.aclose()
+
+
+@pytest.mark.asyncio
 async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -436,6 +483,7 @@ async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
     client = _Client("goose")
     client.capabilities = capabilities
     now = [10.0]
+    monotonic_now = [1000.0]
     supervisor = SidecarSupervisor(
         runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
         registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
@@ -444,6 +492,7 @@ async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
         app_instance_id="app-instance-1",
         client_factory=lambda config, generation, containment_lock: client,
         clock=lambda: now[0],
+        monotonic_clock=lambda: monotonic_now[0],
     )
     await supervisor.start()
     handle = await supervisor.acquire_initial(assignment)
@@ -473,14 +522,36 @@ async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
     with pytest.raises(ProviderGrantAuthorityError, match="proof"):
         supervisor.validate_containment_receipt(forged)
 
-    now[0] = 129.999
+    now[0] = 1.0
+    monotonic_now[0] = 1119.999
     supervisor.validate_containment_receipt(receipt)
-    now[0] = 130.0
+    monotonic_now[0] = 1120.0
     with pytest.raises(ProviderGrantAuthorityError, match="expired"):
         supervisor.validate_containment_receipt(receipt)
     now[0] = 10.0
+    monotonic_now[0] = 1000.0
     with pytest.raises(ProviderGrantAuthorityError, match="cleanup"):
         supervisor.provider_grant_containment_receipt(target, "delivery_failed")
+
+
+@pytest.mark.parametrize(
+    "invalid_clock", [float("nan"), float("inf"), float("-inf")]
+)
+def test_supervisor_rejects_non_finite_containment_monotonic_clock(
+    tmp_path: Path,
+    invalid_clock: float,
+) -> None:
+    database = tmp_path / "provider-grant-invalid-monotonic.sqlite"
+
+    with pytest.raises(ValueError, match="monotonic"):
+        SidecarSupervisor(
+            runtimes=(),
+            registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+            assignments=AssignmentRepository.production(database),
+            runtime_dir=tmp_path,
+            app_instance_id="app-instance-1",
+            monotonic_clock=lambda: invalid_clock,
+        )
 
 
 @pytest.mark.asyncio
