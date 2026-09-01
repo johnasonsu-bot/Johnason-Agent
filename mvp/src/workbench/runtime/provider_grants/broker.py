@@ -263,9 +263,10 @@ class ProviderGrantBroker:
         if claimed:
             return True
         try:
-            return self._grants.get(grant_id).state == "delivering"
+            state = self._grants.get(grant_id).state
         except Exception:
-            return False
+            return True
+        return state not in {"issued", "expired", "revoked", "consumed"}
 
     def _profile(self, provider_id: str) -> ProviderProfileRecord:
         try:

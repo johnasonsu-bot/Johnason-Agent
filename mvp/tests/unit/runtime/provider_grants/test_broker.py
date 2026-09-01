@@ -8,6 +8,7 @@ import threading
 
 import pytest
 
+import workbench.runtime.provider_grants.broker as broker_module
 from tests.fixtures.host_v2 import run_envelope
 from workbench.credentials.service import VaultService
 from workbench.models.profiles import ProviderProfileRecord
@@ -26,6 +27,7 @@ from workbench.runtime.provider_grants.contracts import (
 from workbench.runtime.provider_grants.repository import (
     ProviderGrantConflict,
     ProviderGrantContainmentRequired,
+    ProviderGrantIntegrityError,
     ProviderGrantRepository,
 )
 
@@ -431,6 +433,70 @@ async def test_task_cancel_after_claim_requires_containment_before_revoke(
     containment = authority.contain(target, reason="query_cancelled")
     broker.revoke(offer, containment, 120.0)
     assert repository.get(offer.grant_id).state == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_committed_claim_with_unreadable_state_requires_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unreadable state after commit cannot prove that delivery never started."""
+    target = _target()
+    broker, _, _, authority, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    clock[0] = 110.0
+    delivery = _DigestOnlyDelivery()
+    original_get = broker._grants.get
+    get_calls = 0
+
+    def fail_after_initial_read(grant_id: str):
+        nonlocal get_calls
+        get_calls += 1
+        if get_calls == 1:
+            return original_get(grant_id)
+        raise ProviderGrantIntegrityError("injected durable state read failure")
+
+    captured_buffers: list[bytearray] = []
+    real_memoryview = memoryview
+
+    def capture_secret_buffer(secret: bytearray):
+        captured_buffers.append(secret)
+        return real_memoryview(secret)
+
+    monkeypatch.setattr(broker._grants, "get", fail_after_initial_read)
+    monkeypatch.setattr(
+        broker_module,
+        "memoryview",
+        capture_secret_buffer,
+        raising=False,
+    )
+
+    with pytest.raises(ProviderGrantDeliveryFailed) as captured:
+        await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert captured.value.__cause__ is None
+    assert PROVIDER_VALUE not in str(captured.value)
+    assert get_calls >= 3
+    assert delivery.view is None
+    assert len(captured_buffers) == 1
+    assert bytes(captured_buffers[0]) == b"\x00" * len(
+        PROVIDER_VALUE.encode("utf-8")
+    )
+    repository = ProviderGrantRepository(database)
+    assert repository.get(offer.grant_id).state == "delivering"
+    with pytest.raises(ProviderGrantContainmentRequired):
+        repository.revoke(
+            offer.grant_id,
+            reason="delivery_failed",
+            containment_confirmed=False,
+            now=111.0,
+        )
+
+    containment = authority.contain(target)
+    with pytest.raises(ProviderGrantIntegrityError):
+        broker.revoke(offer, containment, 120.0)
 
 
 @pytest.mark.asyncio
