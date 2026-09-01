@@ -13,7 +13,11 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimeRefV2,
     WorkspaceGrantV2,
 )
-from workbench.runtime.goose.host_adapter import GooseAdapterError, GooseHostAdapter
+from workbench.runtime.goose.host_adapter import (
+    GooseAdapterError,
+    GooseHostAdapter,
+    GoosePreparedQuery,
+)
 
 
 def _envelope(*, runtime_id: str = "goose") -> RunEnvelopeV2:
@@ -176,3 +180,173 @@ def test_map_event_rejects_unknown_input_and_new_goose_events() -> None:
         adapter.map_event(event)
     with pytest.raises(GooseAdapterError, match="unknown adapter event fields"):
         adapter.map_event({**event, "ignored": True})
+
+
+@pytest.mark.parametrize(
+    ("path", "frame", "message"),
+    [
+        (
+            "frame",
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                },
+                "ignored": True,
+            },
+            "unknown Goose frame fields",
+        ),
+        (
+            "message",
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "ignored": True,
+                },
+            },
+            "unknown Goose message fields",
+        ),
+        (
+            "content block",
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "hello", "ignored": True}
+                    ],
+                },
+            },
+            "unknown Goose text content fields",
+        ),
+    ],
+)
+def test_map_event_rejects_unknown_fields_at_each_supported_goose_level(
+    path: str, frame: dict[str, object], message: str
+) -> None:
+    """Catches newly-added Goose fields being silently erased at the adapter boundary."""
+    payload = {
+        "event_id": "event-1",
+        "run_id": "run-1",
+        "term_id": "term-1",
+        "step_id": "step-1",
+        "cursor": 1,
+        "frame": frame,
+    }
+
+    with pytest.raises(GooseAdapterError, match=message):
+        GooseHostAdapter().map_event(payload)
+
+
+def test_direct_prepared_query_construction_recursively_freezes_command_identity() -> None:
+    """Catches callers retaining a mutable nested identity after direct construction."""
+    identity = {
+        "command_id": "command-1",
+        "context": {
+            "snapshot_digest": "4" * 64,
+            "snapshot_ref": "context-snapshot-1",
+            "version": 7,
+        },
+        "message_snapshot_digest": "3" * 64,
+        "model": "gpt-5",
+        "provider_ref": "provider-profile:unresolved-openai",
+        "runtime": {
+            "build_id": "goose-build-2026",
+            "config_digest": "1" * 64,
+            "runtime_id": "goose",
+        },
+        "tool_manifest_digest": "5" * 64,
+    }
+    prepared = GoosePreparedQuery(
+        runtime_id="goose",
+        runtime_build_id="goose-build-2026",
+        runtime_config_digest="1" * 64,
+        provider_ref="provider-profile:unresolved-openai",
+        model="gpt-5",
+        message_snapshot_digest="3" * 64,
+        context_snapshot_ref="context-snapshot-1",
+        context_snapshot_digest="4" * 64,
+        context_version=7,
+        tool_manifest_digest="5" * 64,
+        command_identity=identity,
+        command_identity_digest=(
+            "2321d3f0d5d182c7a0068dd639ca855ccd2335637124d65cc926080bc2ad6db4"
+        ),
+    )
+
+    identity["context"]["version"] = 99
+    assert prepared.command_identity["context"]["version"] == 7
+    with pytest.raises(TypeError):
+        prepared.command_identity["context"]["version"] = 99  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("identity", "digest", "message"),
+    [
+        (
+            {
+                "command_id": "command-1",
+                "context": {
+                    "snapshot_digest": "4" * 64,
+                    "snapshot_ref": "context-snapshot-1",
+                    "version": 7,
+                },
+                "message_snapshot_digest": "3" * 64,
+                "model": "gpt-5",
+                "provider_ref": "provider-profile:unresolved-openai",
+                "runtime": {
+                    "build_id": "goose-build-2026",
+                    "config_digest": "1" * 64,
+                    "runtime_id": "goose",
+                },
+                "tool_manifest_digest": "5" * 64,
+                "ignored": True,
+            },
+            "2321d3f0d5d182c7a0068dd639ca855ccd2335637124d65cc926080bc2ad6db4",
+            "command identity",
+        ),
+        (
+            {
+                "command_id": "command-1",
+                "context": {
+                    "snapshot_digest": "4" * 64,
+                    "snapshot_ref": "context-snapshot-1",
+                    "version": 7,
+                },
+                "message_snapshot_digest": "3" * 64,
+                "model": "gpt-5",
+                "provider_ref": "provider-profile:unresolved-openai",
+                "runtime": {
+                    "build_id": "goose-build-2026",
+                    "config_digest": "1" * 64,
+                    "runtime_id": "goose",
+                },
+                "tool_manifest_digest": "5" * 64,
+            },
+            "0" * 64,
+            "digest",
+        ),
+    ],
+)
+def test_direct_prepared_query_construction_rejects_unvalidated_evidence(
+    identity: dict[str, object], digest: str, message: str
+) -> None:
+    """Catches direct construction that bypasses identity shape or digest validation."""
+    with pytest.raises(GooseAdapterError, match=message):
+        GoosePreparedQuery(
+            runtime_id="goose",
+            runtime_build_id="goose-build-2026",
+            runtime_config_digest="1" * 64,
+            provider_ref="provider-profile:unresolved-openai",
+            model="gpt-5",
+            message_snapshot_digest="3" * 64,
+            context_snapshot_ref="context-snapshot-1",
+            context_snapshot_digest="4" * 64,
+            context_version=7,
+            tool_manifest_digest="5" * 64,
+            command_identity=identity,
+            command_identity_digest=digest,
+        )
