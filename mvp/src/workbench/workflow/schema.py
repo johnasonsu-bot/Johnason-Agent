@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 
-PHASE1_SCHEMA_VERSION = 31
+PHASE1_SCHEMA_VERSION = 32
 
 
 def migrate_phase1(connection: sqlite3.Connection) -> None:
@@ -181,6 +181,31 @@ def migrate_phase1(connection: sqlite3.Connection) -> None:
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             watermark REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS provider_grants_private (
+            grant_id TEXT PRIMARY KEY,
+            binding_digest TEXT NOT NULL,
+            binding_json TEXT NOT NULL,
+            challenge_digest TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            lease_id TEXT NOT NULL,
+            host_generation TEXT NOT NULL,
+            lease_generation_seq INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(
+                state IN ('issued', 'delivering', 'consumed', 'revoked', 'expired')
+            ),
+            reason TEXT,
+            issued_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            delivery_started_at REAL,
+            acknowledged_at REAL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_grants_target
+            ON provider_grants_private(
+                runtime_id, build_id, lease_id, host_generation,
+                lease_generation_seq, state
+            );
         CREATE TABLE IF NOT EXISTS runtime_lease_evidence (
             lease_id TEXT PRIMARY KEY,
             assignment_digest TEXT NOT NULL,

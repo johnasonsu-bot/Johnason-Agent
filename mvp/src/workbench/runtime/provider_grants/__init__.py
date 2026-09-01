@@ -7,11 +7,25 @@ from .contracts import (
     ProviderGrantTarget,
     canonical_grant_digest,
 )
+from .repository import (
+    ProviderGrantConflict,
+    ProviderGrantContainmentRequired,
+    ProviderGrantExpired,
+    ProviderGrantIntegrityError,
+    ProviderGrantRecord,
+    ProviderGrantRepository,
+)
 
 __all__ = [
     "ProviderGrantAck",
     "ProviderGrantBinding",
     "ProviderGrantOffer",
     "ProviderGrantTarget",
+    "ProviderGrantConflict",
+    "ProviderGrantContainmentRequired",
+    "ProviderGrantExpired",
+    "ProviderGrantIntegrityError",
+    "ProviderGrantRecord",
+    "ProviderGrantRepository",
     "canonical_grant_digest",
 ]
