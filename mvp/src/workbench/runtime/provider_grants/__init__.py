@@ -2,8 +2,12 @@
 
 from .contracts import (
     ProviderGrantAck,
+    ProviderGrantAuthority,
+    ProviderGrantAuthorityError,
     ProviderGrantBinding,
+    ProviderGrantContainmentReceipt,
     ProviderGrantOffer,
+    ProviderGrantRevocationReason,
     ProviderGrantTarget,
     canonical_grant_digest,
 )
@@ -20,16 +24,19 @@ from .repository import (
     ProviderGrantExpired,
     ProviderGrantIntegrityError,
     ProviderGrantRecord,
-    ProviderGrantRepository,
 )
 
 __all__ = [
     "ProviderGrantAck",
+    "ProviderGrantAuthority",
+    "ProviderGrantAuthorityError",
     "ProviderGrantBroker",
     "ProviderGrantBinding",
+    "ProviderGrantContainmentReceipt",
     "ProviderGrantDelivery",
     "ProviderGrantDeliveryFailed",
     "ProviderGrantOffer",
+    "ProviderGrantRevocationReason",
     "ProviderGrantTarget",
     "ProviderGrantConflict",
     "ProviderGrantContainmentRequired",
@@ -37,7 +44,6 @@ __all__ = [
     "ProviderGrantIntegrityError",
     "ProviderGrantRecord",
     "ProviderGrantReceipt",
-    "ProviderGrantRepository",
     "ProviderGrantUnavailable",
     "canonical_grant_digest",
 ]

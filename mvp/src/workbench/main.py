@@ -80,10 +80,7 @@ from workbench.runtime.python_term.gate import (
     compose_python_term_production,
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
-from workbench.runtime.provider_grants import (
-    ProviderGrantBroker,
-    ProviderGrantRepository,
-)
+from workbench.runtime.provider_grants import ProviderGrantBroker
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
 from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
@@ -673,11 +670,6 @@ def build_app(
         }
     )
     providers = ProviderRepository(resolved.database)
-    provider_grant_broker = ProviderGrantBroker(
-        grants=ProviderGrantRepository(resolved.database),
-        providers=providers,
-        vault=vault,
-    )
 
     def active_profile(provider_id: str | None = None):
         enabled = [profile for profile in providers.list() if profile.enabled]
@@ -731,6 +723,12 @@ def build_app(
         )
         if runtime_registry_v2 is not None and resolved.engine_host_v2_runtimes
         else None
+    )
+    provider_grant_broker = ProviderGrantBroker(
+        database=resolved.database,
+        providers=providers,
+        vault=vault,
+        authority=sidecar_supervisor,
     )
     python_term_runtime = None
     python_term_executor = None

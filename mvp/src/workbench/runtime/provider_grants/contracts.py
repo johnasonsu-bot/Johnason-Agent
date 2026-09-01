@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from typing import Annotated, Any, Self
+from typing import Annotated, Any, Literal, Protocol, Self
 
 from pydantic import (
     BaseModel,
@@ -28,6 +28,13 @@ GrantChallenge = Annotated[
         max_length=256,
         pattern=r"^[A-Za-z0-9_-]+$",
     ),
+]
+ProviderGrantRevocationReason = Literal[
+    "deadline",
+    "delivery_failed",
+    "query_cancelled",
+    "shutdown",
+    "target_changed",
 ]
 
 
@@ -75,6 +82,35 @@ class ProviderGrantTarget(FrozenGrantModel):
     @classmethod
     def validate_expiry(cls, value: float) -> float:
         return _finite_positive(value, "target expiry")
+
+
+class ProviderGrantAuthorityError(RuntimeError):
+    """The Supervisor rejected a live target or containment proof."""
+
+
+class ProviderGrantContainmentReceipt(FrozenGrantModel):
+    """Supervisor proof that one exact fenced sidecar has been contained."""
+
+    target: ProviderGrantTarget
+    reason: ProviderGrantRevocationReason
+    completed_at: float
+    authority_digest: Digest
+    proof: Digest = Field(repr=False)
+
+    @field_validator("completed_at")
+    @classmethod
+    def validate_completed_at(cls, value: float) -> float:
+        return _finite_positive(value, "containment completion")
+
+
+class ProviderGrantAuthority(Protocol):
+    """Live Supervisor authority consumed by the private Grant Broker."""
+
+    def validate_target(self, target: ProviderGrantTarget) -> None: ...
+
+    def validate_containment_receipt(
+        self, receipt: ProviderGrantContainmentReceipt
+    ) -> None: ...
 
 
 class ProviderGrantBinding(FrozenGrantModel):
@@ -164,8 +200,12 @@ def canonical_grant_digest(binding: ProviderGrantBinding) -> str:
 
 __all__ = [
     "ProviderGrantAck",
+    "ProviderGrantAuthority",
+    "ProviderGrantAuthorityError",
     "ProviderGrantBinding",
+    "ProviderGrantContainmentReceipt",
     "ProviderGrantOffer",
+    "ProviderGrantRevocationReason",
     "ProviderGrantTarget",
     "canonical_grant_digest",
 ]

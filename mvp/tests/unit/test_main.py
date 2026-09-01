@@ -394,7 +394,7 @@ def test_build_app_composes_one_shared_provider_grant_broker(
     app = main.build_app(settings, runner=NoopRunner())
 
     assert isinstance(app.state.provider_grant_broker, ProviderGrantBroker)
-    assert app.state.provider_grant_broker.grants.store.path == settings.database
+    assert not hasattr(app.state.provider_grant_broker, "grants")
     assert all(
         "provider-grant" not in getattr(route, "path", "") for route in app.routes
     )

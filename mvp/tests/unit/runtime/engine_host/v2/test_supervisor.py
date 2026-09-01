@@ -25,6 +25,7 @@ from workbench.runtime.engine_host.v2.registry import (
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
 from workbench.runtime.engine_host.v2.supervisor import SupervisorShutdownError
+from workbench.runtime.provider_grants import ProviderGrantAuthorityError
 from workbench.settings import RuntimeProcessConfig
 
 
@@ -369,6 +370,7 @@ async def test_current_handle_projects_a_secret_free_provider_grant_target(
     assignments, assignment = admitted_assignment(database, envelope, capabilities)
     client = _Client("goose")
     client.capabilities = capabilities
+    now = [10.0]
     supervisor = SidecarSupervisor(
         runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
         registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
@@ -376,13 +378,27 @@ async def test_current_handle_projects_a_secret_free_provider_grant_target(
         runtime_dir=tmp_path,
         app_instance_id="app-instance-1",
         client_factory=lambda config, generation, containment_lock: client,
-        clock=lambda: 10.0,
+        clock=lambda: now[0],
     )
     await supervisor.start()
     handle = await supervisor.acquire_initial(assignment)
     raw_lease = handle._lease()
 
     target = handle.provider_grant_target(envelope)
+    supervisor.validate_target(target)
+    with pytest.raises(ProviderGrantAuthorityError, match="live"):
+        supervisor.validate_target(
+            target.model_copy(
+                update={
+                    "lease_id": "replacement-lease",
+                    "lease_generation_seq": target.lease_generation_seq + 1,
+                }
+            )
+        )
+    now[0] = target.expires_at
+    with pytest.raises(ProviderGrantAuthorityError, match="live"):
+        supervisor.validate_target(target)
+    now[0] = 10.0
 
     assert target.runtime_id == "goose"
     assert target.build_id == capabilities.build_id
@@ -398,8 +414,61 @@ async def test_current_handle_projects_a_secret_free_provider_grant_target(
     with pytest.raises(LeaseConflict, match="identity"):
         handle.provider_grant_target(drifted)
     await handle.aclose()
+    with pytest.raises(ProviderGrantAuthorityError, match="live"):
+        supervisor.validate_target(target)
     with pytest.raises(LeaseConflict):
         handle.provider_grant_target(envelope)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
+    tmp_path: Path,
+) -> None:
+    """Catches forged caller containment or receipts minted before cleanup."""
+    database = tmp_path / "provider-grant-containment.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-containment", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    lease = handle._lease()
+    target = handle.provider_grant_target(envelope)
+
+    with pytest.raises(ProviderGrantAuthorityError, match="cleanup"):
+        supervisor.provider_grant_containment_receipt(target, "delivery_failed")
+
+    await handle.aclose()
+    receipt = supervisor.provider_grant_containment_receipt(
+        target, "delivery_failed"
+    )
+    supervisor.validate_containment_receipt(receipt)
+
+    assert receipt.target == target
+    assert receipt.reason == "delivery_failed"
+    assert receipt.completed_at == 10.0
+    assert len(receipt.authority_digest) == 64
+    assert len(receipt.proof) == 64
+    serialized = receipt.model_dump_json()
+    assert lease.instance_id not in serialized
+    assert lease.instance_nonce not in serialized
+    assert handle._fence() not in serialized
+
+    forged = receipt.model_copy(update={"proof": "f" * 64})
+    with pytest.raises(ProviderGrantAuthorityError, match="proof"):
+        supervisor.validate_containment_receipt(forged)
 
 
 @pytest.mark.asyncio
@@ -1784,6 +1853,7 @@ async def test_shutdown_unconfirmed_cleanup_never_releases_the_source_lease(
     )
     await supervisor.start()
     handle = await supervisor.acquire_initial(assignment)
+    target = handle.provider_grant_target(envelope)
 
     with pytest.raises(SupervisorShutdownError, match="cleanup"):
         await supervisor.aclose()
@@ -1794,6 +1864,8 @@ async def test_shutdown_unconfirmed_cleanup_never_releases_the_source_lease(
     assert len(assignments.active_leases(runtime_ids=("goose",))) == 1
     with pytest.raises(LeaseConflict, match="cleanup"):
         await handle.wait_recovery()
+    with pytest.raises(ProviderGrantAuthorityError, match="cleanup"):
+        supervisor.provider_grant_containment_receipt(target, "shutdown")
 
 
 @pytest.mark.asyncio

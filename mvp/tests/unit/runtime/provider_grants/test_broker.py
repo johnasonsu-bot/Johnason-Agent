@@ -17,9 +17,11 @@ from workbench.runtime.provider_grants.broker import (
 )
 from workbench.runtime.provider_grants.contracts import (
     ProviderGrantAck,
+    ProviderGrantAuthorityError,
+    ProviderGrantContainmentReceipt,
     ProviderGrantTarget,
 )
-from workbench.runtime.provider_grants.repository import ProviderGrantRepository
+from workbench.runtime.provider_grants.repository import ProviderGrantConflict
 
 
 PROVIDER_VALUE = "test-provider-value-never-persisted"
@@ -40,7 +42,47 @@ def _target(**updates: object) -> ProviderGrantTarget:
     return ProviderGrantTarget.model_validate(values)
 
 
-def _services(tmp_path: Path):
+class _Authority:
+    def __init__(self, *targets: ProviderGrantTarget) -> None:
+        self.live = set(targets)
+        self.receipts: list[ProviderGrantContainmentReceipt] = []
+        self.target_validation_count = 0
+        self.reject_validation_at: int | None = None
+
+    def validate_target(self, target: ProviderGrantTarget) -> None:
+        self.target_validation_count += 1
+        if (
+            target not in self.live
+            or self.target_validation_count == self.reject_validation_at
+        ):
+            raise ProviderGrantAuthorityError("target is not live")
+
+    def validate_containment_receipt(
+        self, receipt: ProviderGrantContainmentReceipt
+    ) -> None:
+        if receipt not in self.receipts:
+            raise ProviderGrantAuthorityError("containment receipt is invalid")
+
+    def contain(
+        self,
+        target: ProviderGrantTarget,
+        *,
+        reason: str = "delivery_failed",
+        completed_at: float = 120.0,
+    ) -> ProviderGrantContainmentReceipt:
+        receipt = ProviderGrantContainmentReceipt(
+            target=target,
+            reason=reason,
+            completed_at=completed_at,
+            authority_digest="a" * 64,
+            proof="e" * 64,
+        )
+        self.receipts.append(receipt)
+        self.live.discard(target)
+        return receipt
+
+
+def _services(tmp_path: Path, *, target: ProviderGrantTarget | None = None):
     database = tmp_path / "runtime.sqlite"
     providers = ProviderRepository(database)
     _, profile = providers.upsert(
@@ -51,10 +93,12 @@ def _services(tmp_path: Path):
     assert profile.secret_id is not None
     vault.put(profile.secret_id, PROVIDER_VALUE)
     clock = [100.0]
+    authority = _Authority(target or _target())
     broker = ProviderGrantBroker(
-        grants=ProviderGrantRepository(database),
+        database=database,
         providers=providers,
         vault=vault,
+        authority=authority,
         clock=lambda: clock[0],
     )
     envelope = run_envelope(
@@ -69,7 +113,7 @@ def _services(tmp_path: Path):
             "model": "default",
         }
     )
-    return broker, providers, vault, clock, envelope, database
+    return broker, providers, vault, authority, clock, envelope, database
 
 
 class _DigestOnlyDelivery:
@@ -77,8 +121,10 @@ class _DigestOnlyDelivery:
         self.fail = fail
         self.view: memoryview | None = None
         self.received_digest: str | None = None
+        self.binding = None
 
     async def deliver(self, binding, secret: memoryview) -> ProviderGrantAck:
+        self.binding = binding
         self.view = secret
         self.received_digest = hashlib.sha256(bytes(secret)).hexdigest()
         if self.fail:
@@ -97,23 +143,23 @@ class _DigestOnlyDelivery:
 
 
 @pytest.mark.asyncio
-async def test_broker_delivers_exact_provider_once_and_clears_buffer(
+async def test_broker_delivers_only_for_live_target_and_keeps_repository_private(
     tmp_path: Path,
 ) -> None:
-    broker, _, _, clock, envelope, database = _services(tmp_path)
     target = _target()
+    broker, _, _, _, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
-    record = broker.grants.get(offer.grant_id)
-
-    assert record.binding.provider_id == "deepseek-primary"
-    assert record.binding.model == "deepseek-v4-flash"
-    assert len(record.binding.provider_profile_digest) == 64
 
     delivery = _DigestOnlyDelivery()
     clock[0] = 110.0
     receipt = await broker.deliver(offer, target=target, delivery=delivery)
 
     assert receipt.state == "consumed"
+    assert delivery.binding.provider_id == "deepseek-primary"
+    assert delivery.binding.model == "deepseek-v4-flash"
+    assert len(delivery.binding.provider_profile_digest) == 64
     assert delivery.received_digest == hashlib.sha256(
         PROVIDER_VALUE.encode("utf-8")
     ).hexdigest()
@@ -123,14 +169,61 @@ async def test_broker_delivers_exact_provider_once_and_clears_buffer(
         path.read_bytes() for path in tmp_path.glob("runtime.sqlite*")
     )
     assert PROVIDER_VALUE.encode("utf-8") not in database_bytes
+    assert not hasattr(broker, "grants")
+
+
+def test_issue_rejects_a_target_that_is_not_current_and_live(tmp_path: Path) -> None:
+    target = _target()
+    broker, _, _, authority, _, envelope, _ = _services(tmp_path, target=target)
+    authority.live.clear()
+
+    with pytest.raises(ProviderGrantUnavailable, match="runtime target"):
+        broker.issue(envelope, target=target)
+
+
+@pytest.mark.asyncio
+async def test_stale_target_is_rejected_before_secret_resolution(tmp_path: Path) -> None:
+    target = _target()
+    broker, _, vault, authority, clock, envelope, _ = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    authority.live.clear()
+    vault.lock()
+    clock[0] = 110.0
+    delivery = _DigestOnlyDelivery()
+
+    with pytest.raises(ProviderGrantUnavailable, match="runtime target"):
+        await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert delivery.view is None
+
+
+@pytest.mark.asyncio
+async def test_target_is_revalidated_immediately_before_claim(tmp_path: Path) -> None:
+    target = _target()
+    broker, _, _, authority, clock, envelope, _ = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    authority.reject_validation_at = authority.target_validation_count + 2
+    clock[0] = 110.0
+    delivery = _DigestOnlyDelivery()
+
+    with pytest.raises(ProviderGrantUnavailable, match="runtime target"):
+        await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert delivery.view is None
 
 
 @pytest.mark.asyncio
 async def test_delivery_failure_is_fixed_and_clears_buffer_without_fallback(
     tmp_path: Path,
 ) -> None:
-    broker, _, _, clock, envelope, _ = _services(tmp_path)
     target = _target()
+    broker, _, _, authority, clock, envelope, _ = _services(
+        tmp_path, target=target
+    )
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
     delivery = _DigestOnlyDelivery(fail=True)
     clock[0] = 110.0
@@ -142,18 +235,45 @@ async def test_delivery_failure_is_fixed_and_clears_buffer_without_fallback(
     assert captured.value.__cause__ is None
     assert delivery.view is not None
     assert bytes(delivery.view) == b"\x00" * len(PROVIDER_VALUE.encode("utf-8"))
-    record = broker.grants.get(offer.grant_id)
-    assert record.state == "delivering"
-    assert record.binding.provider_id == "deepseek-primary"
-    assert record.binding.model == "deepseek-v4-flash"
+    containment = authority.contain(target)
+    broker.revoke(offer, containment, now=120.0)
+    with pytest.raises(ProviderGrantConflict):
+        broker.revoke(offer, containment, now=121.0)
+
+
+def test_revocation_rejects_forged_old_generation_and_cross_lease_receipts(
+    tmp_path: Path,
+) -> None:
+    target = _target()
+    broker, _, _, authority, _, envelope, _ = _services(tmp_path, target=target)
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    valid = authority.contain(target)
+    forged = valid.model_copy(update={"proof": "f" * 64})
+    old_generation = authority.contain(
+        target.model_copy(update={"lease_generation_seq": 2})
+    )
+    cross_lease = authority.contain(
+        target.model_copy(update={"lease_id": "lease-elsewhere"})
+    )
+
+    with pytest.raises(ProviderGrantUnavailable, match="containment receipt"):
+        broker.revoke(offer, forged, now=120.0)
+    with pytest.raises(ProviderGrantUnavailable, match="containment target"):
+        broker.revoke(offer, old_generation, now=120.0)
+    with pytest.raises(ProviderGrantUnavailable, match="containment target"):
+        broker.revoke(offer, cross_lease, now=120.0)
+
+    broker.revoke(offer, valid, 120.0)
 
 
 @pytest.mark.asyncio
 async def test_profile_drift_is_rejected_before_secret_delivery(
     tmp_path: Path,
 ) -> None:
-    broker, providers, _, clock, envelope, _ = _services(tmp_path)
     target = _target()
+    broker, providers, _, _, clock, envelope, _ = _services(
+        tmp_path, target=target
+    )
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
     current = providers.get("deepseek-primary")
     providers.upsert(
@@ -168,13 +288,12 @@ async def test_profile_drift_is_rejected_before_secret_delivery(
         await broker.deliver(offer, target=target, delivery=delivery)
 
     assert delivery.view is None
-    assert broker.grants.get(offer.grant_id).state == "issued"
 
 
 @pytest.mark.asyncio
 async def test_locked_vault_does_not_consume_offer(tmp_path: Path) -> None:
-    broker, _, vault, clock, envelope, _ = _services(tmp_path)
     target = _target()
+    broker, _, vault, _, clock, envelope, _ = _services(tmp_path, target=target)
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
     vault.lock()
     clock[0] = 110.0
@@ -183,5 +302,3 @@ async def test_locked_vault_does_not_consume_offer(tmp_path: Path) -> None:
         await broker.deliver(
             offer, target=target, delivery=_DigestOnlyDelivery()
         )
-
-    assert broker.grants.get(offer.grant_id).state == "issued"

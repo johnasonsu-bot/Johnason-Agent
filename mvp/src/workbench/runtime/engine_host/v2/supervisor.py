@@ -6,9 +6,10 @@ import asyncio
 from dataclasses import dataclass
 from dataclasses import field
 import hashlib
+import hmac
 import json
 from pathlib import Path
-from secrets import token_urlsafe
+from secrets import token_bytes, token_urlsafe
 import threading
 import time
 from typing import Any, Awaitable, Callable, Literal
@@ -34,7 +35,12 @@ from workbench.runtime.engine_host.v2.contracts import (
 )
 from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
-from workbench.runtime.provider_grants.contracts import ProviderGrantTarget
+from workbench.runtime.provider_grants.contracts import (
+    ProviderGrantAuthorityError,
+    ProviderGrantContainmentReceipt,
+    ProviderGrantRevocationReason,
+    ProviderGrantTarget,
+)
 from workbench.settings import RuntimeProcessConfig
 
 
@@ -77,6 +83,28 @@ SIDECAR_STATE_TRANSITIONS: dict[SidecarState, frozenset[SidecarState]] = {
     "stopping": frozenset({"stopped", "unavailable"}),
     "stopped": frozenset(),
 }
+
+
+def _provider_grant_containment_message(
+    *,
+    target: ProviderGrantTarget,
+    reason: ProviderGrantRevocationReason,
+    completed_at: float,
+    authority_digest: str,
+) -> bytes:
+    document = {
+        "authority_digest": authority_digest,
+        "completed_at": completed_at,
+        "reason": reason,
+        "target": target.model_dump(mode="json"),
+    }
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return b"johnason.provider-grant-containment/v1\0" + encoded
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +201,16 @@ class SidecarSupervisor:
             config.runtime_id: _RuntimeSlot(config=config) for config in runtimes
         }
         self._snapshot_lock = threading.RLock()
+        self._provider_grant_proof_key = token_bytes(32)
+        authority_id = token_urlsafe(32)
+        self._provider_grant_authority_digest = hashlib.sha256(
+            ("johnason.provider-grant-authority/v1\0" + authority_id).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        self._provider_grant_contained: dict[
+            str, tuple[ProviderGrantTarget, float]
+        ] = {}
         self._started = False
         self._closing = False
         self._shutdown_task: asyncio.Task[None] | None = None
@@ -380,6 +418,7 @@ class SidecarSupervisor:
         except RuntimeClientError:
             slot.last_error_category = "cleanup_unconfirmed"
         if confirmed:
+            self._record_provider_grant_containment(slot)
             slot.client = None
         else:
             slot.last_error_category = "cleanup_unconfirmed"
@@ -1018,6 +1057,12 @@ class SidecarSupervisor:
     ) -> ProviderGrantTarget:
         """Project only the current fenced lease identity for the Grant Broker."""
         _, lease, _ = self._validate_envelope(handle, envelope)
+        return self._provider_grant_target_for(handle, lease)
+
+    @staticmethod
+    def _provider_grant_target_for(
+        handle: "SupervisedRuntimeLease", lease: RuntimeInstanceLease
+    ) -> ProviderGrantTarget:
         assignment = handle._assignment()
         return ProviderGrantTarget(
             runtime_id=assignment.runtime_id,
@@ -1033,6 +1078,115 @@ class SidecarSupervisor:
             lease_generation_seq=lease.lease_generation_seq,
             expires_at=lease.expires_at,
         )
+
+    @staticmethod
+    def _provider_grant_target_key(target: ProviderGrantTarget) -> str:
+        return target.model_dump_json()
+
+    def validate_target(self, target: ProviderGrantTarget) -> None:
+        """Reject anything except the exact current, unexpired leased handle."""
+        if not isinstance(target, ProviderGrantTarget):
+            raise TypeError("target must be a ProviderGrantTarget")
+        slot = self._slots.get(target.runtime_id)
+        handle = None if slot is None else slot.handle
+        if handle is None or self._closing:
+            raise ProviderGrantAuthorityError("provider grant target is not live")
+        try:
+            _, lease = self._require_current_handle(handle)
+        except LeaseConflict:
+            raise ProviderGrantAuthorityError(
+                "provider grant target is not live"
+            ) from None
+        expected = self._provider_grant_target_for(handle, lease)
+        if target != expected or self._clock() >= lease.expires_at:
+            raise ProviderGrantAuthorityError("provider grant target is not live")
+
+    def _record_provider_grant_containment(self, slot: _RuntimeSlot) -> None:
+        handle = slot.handle
+        if handle is None:
+            return
+        target = self._provider_grant_target_for(handle, handle._lease())
+        completed_at = float(self._clock())
+        with self._snapshot_lock:
+            self._provider_grant_contained.setdefault(
+                self._provider_grant_target_key(target),
+                (target, completed_at),
+            )
+
+    def provider_grant_containment_receipt(
+        self,
+        target: ProviderGrantTarget,
+        reason: ProviderGrantRevocationReason,
+    ) -> ProviderGrantContainmentReceipt:
+        """Sign containment only after cleanup of the exact sidecar was confirmed."""
+        if not isinstance(target, ProviderGrantTarget):
+            raise TypeError("target must be a ProviderGrantTarget")
+        with self._snapshot_lock:
+            contained = self._provider_grant_contained.get(
+                self._provider_grant_target_key(target)
+            )
+        if contained is None or contained[0] != target:
+            raise ProviderGrantAuthorityError(
+                "provider grant target cleanup is not confirmed"
+            )
+        _, completed_at = contained
+        authority_digest = self._provider_grant_authority_digest
+        proof = hmac.new(
+            self._provider_grant_proof_key,
+            _provider_grant_containment_message(
+                target=target,
+                reason=reason,
+                completed_at=completed_at,
+                authority_digest=authority_digest,
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        return ProviderGrantContainmentReceipt(
+            target=target,
+            reason=reason,
+            completed_at=completed_at,
+            authority_digest=authority_digest,
+            proof=proof,
+        )
+
+    def validate_containment_receipt(
+        self, receipt: ProviderGrantContainmentReceipt
+    ) -> None:
+        """Verify authority identity, cleanup evidence, and the complete HMAC."""
+        if not isinstance(receipt, ProviderGrantContainmentReceipt):
+            raise TypeError("receipt must be a ProviderGrantContainmentReceipt")
+        if not hmac.compare_digest(
+            receipt.authority_digest, self._provider_grant_authority_digest
+        ):
+            raise ProviderGrantAuthorityError(
+                "provider grant containment authority does not match"
+            )
+        with self._snapshot_lock:
+            contained = self._provider_grant_contained.get(
+                self._provider_grant_target_key(receipt.target)
+            )
+        if (
+            contained is None
+            or contained[0] != receipt.target
+            or contained[1] != receipt.completed_at
+        ):
+            raise ProviderGrantAuthorityError(
+                "provider grant target cleanup is not confirmed"
+            )
+        expected = hmac.new(
+            self._provider_grant_proof_key,
+            _provider_grant_containment_message(
+                target=receipt.target,
+                reason=receipt.reason,
+                completed_at=receipt.completed_at,
+                authority_digest=receipt.authority_digest,
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(receipt.proof, expected):
+            raise ProviderGrantAuthorityError(
+                "provider grant containment proof does not match"
+            )
 
     async def _run_handle_query(
         self, handle: "SupervisedRuntimeLease", envelope: RunEnvelopeV2

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+from pathlib import Path
 from secrets import token_urlsafe
 import time
 from typing import Callable
@@ -18,7 +19,10 @@ from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2
 
 from .contracts import (
+    ProviderGrantAuthority,
+    ProviderGrantAuthorityError,
     ProviderGrantBinding,
+    ProviderGrantContainmentReceipt,
     ProviderGrantOffer,
     ProviderGrantTarget,
     canonical_grant_digest,
@@ -52,14 +56,16 @@ class ProviderGrantBroker:
     def __init__(
         self,
         *,
-        grants: ProviderGrantRepository,
+        database: Path,
         providers: ProviderRepository,
         vault: VaultService,
+        authority: ProviderGrantAuthority | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self.grants = grants
+        self._grants = ProviderGrantRepository(database)
         self._providers = providers
         self._vault = vault
+        self._authority = authority or _UnavailableProviderGrantAuthority()
         self._clock = clock
 
     def issue(
@@ -80,6 +86,7 @@ class ProviderGrantBroker:
             or envelope.runtime.host_generation != target.host_generation
         ):
             raise ProviderGrantUnavailable("runtime target does not match envelope")
+        self._validate_target(target)
         ttl = _ttl(ttl_seconds)
         now = _time(self._clock())
         expires_at = min(now + ttl, target.expires_at)
@@ -106,7 +113,7 @@ class ProviderGrantBroker:
             expires_at=expires_at,
             grant_nonce_digest=hashlib.sha256(nonce.encode("utf-8")).hexdigest(),
         )
-        record = self.grants.issue(binding, challenge=challenge, now=now)
+        record = self._grants.issue(binding, challenge=challenge, now=now)
         return ProviderGrantOffer(
             grant_id=binding.grant_id,
             grant_digest=record.binding_digest,
@@ -123,7 +130,8 @@ class ProviderGrantBroker:
     ) -> ProviderGrantReceipt:
         if not isinstance(offer, ProviderGrantOffer):
             raise TypeError("offer must be a ProviderGrantOffer")
-        record = self.grants.get(offer.grant_id)
+        self._validate_target(target)
+        record = self._grants.get(offer.grant_id)
         if (
             offer.grant_digest != record.binding_digest
             or offer.expires_at != record.binding.expires_at
@@ -144,15 +152,17 @@ class ProviderGrantBroker:
         secret = bytearray(value.encode("utf-8"))
         view = memoryview(secret)
         try:
-            self.grants.claim(
+            claim_time = _time(self._clock())
+            self._validate_target(target)
+            self._grants.claim(
                 offer.grant_id,
                 challenge=offer.challenge,
                 target=target,
-                now=_time(self._clock()),
+                now=claim_time,
             )
             try:
                 ack = await delivery.deliver(record.binding, view)
-                consumed = self.grants.acknowledge(
+                consumed = self._grants.acknowledge(
                     ack, now=_time(self._clock())
                 )
             except (Exception, ProviderGrantConflict):
@@ -172,6 +182,42 @@ class ProviderGrantBroker:
             consumed_at=consumed.acknowledged_at,
         )
 
+    def revoke(
+        self,
+        offer: ProviderGrantOffer,
+        receipt: ProviderGrantContainmentReceipt,
+        now: float,
+    ) -> None:
+        """Revoke one bound Grant only after Supervisor containment proof."""
+        if not isinstance(offer, ProviderGrantOffer):
+            raise TypeError("offer must be a ProviderGrantOffer")
+        if not isinstance(receipt, ProviderGrantContainmentReceipt):
+            raise TypeError("receipt must be a ProviderGrantContainmentReceipt")
+        try:
+            self._authority.validate_containment_receipt(receipt)
+        except ProviderGrantAuthorityError:
+            raise ProviderGrantUnavailable("containment receipt is invalid") from None
+        record = self._grants.get(offer.grant_id)
+        if (
+            offer.grant_digest != record.binding_digest
+            or offer.expires_at != record.binding.expires_at
+        ):
+            raise ProviderGrantUnavailable("grant offer binding changed")
+        if receipt.target != record.binding.target:
+            raise ProviderGrantUnavailable("containment target does not match grant")
+        self._grants.revoke(
+            offer.grant_id,
+            reason=receipt.reason,
+            containment_confirmed=True,
+            now=_time(now),
+        )
+
+    def _validate_target(self, target: ProviderGrantTarget) -> None:
+        try:
+            self._authority.validate_target(target)
+        except ProviderGrantAuthorityError:
+            raise ProviderGrantUnavailable("runtime target is not live") from None
+
     def _profile(self, provider_id: str) -> ProviderProfileRecord:
         try:
             profile = self._providers.get(provider_id)
@@ -190,6 +236,20 @@ def _provider_id(provider_ref: str) -> str:
     if ":" in provider_id or "/" in provider_id:
         raise ProviderGrantUnavailable("provider reference is not grantable")
     return provider_id
+
+
+class _UnavailableProviderGrantAuthority:
+    """Fail closed when no Supervisor owns a live runtime fleet."""
+
+    def validate_target(self, target: ProviderGrantTarget) -> None:
+        del target
+        raise ProviderGrantAuthorityError("runtime target is not live")
+
+    def validate_containment_receipt(
+        self, receipt: ProviderGrantContainmentReceipt
+    ) -> None:
+        del receipt
+        raise ProviderGrantAuthorityError("containment receipt is invalid")
 
 
 def _profile_digest(profile: ProviderProfileRecord) -> str:
