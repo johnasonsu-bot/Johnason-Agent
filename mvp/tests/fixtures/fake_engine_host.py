@@ -364,9 +364,31 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         payload = command.get("payload")
         if not isinstance(payload, dict) or "envelope" not in payload:
             return True
+        expected_payload_fields = (
+            {"envelope", "runtime_input"}
+            if mode == "require_runtime_input"
+            else {"envelope"}
+        )
+        if set(payload) != expected_payload_fields:
+            return True
         envelope = payload["envelope"]
         if not isinstance(envelope, dict):
             return True
+        if mode == "require_runtime_input":
+            runtime_input = payload.get("runtime_input")
+            messages = (
+                runtime_input.get("messages")
+                if isinstance(runtime_input, dict)
+                else None
+            )
+            if (
+                not isinstance(messages, list)
+                or len(messages) != 1
+                or not isinstance(messages[0], dict)
+                or messages[0].get("content") != "materialized hello"
+            ):
+                write_v2(v2_response(command, {"accepted": False}))
+                return False
         contract_results = None
         if mode == "contract_inputs":
             contract_results = _contract_input_results(envelope)

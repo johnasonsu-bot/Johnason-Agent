@@ -7,10 +7,15 @@ from .contracts import (
     QueryCommandV2,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
+    RuntimeContextItemV2,
     RuntimeEventV2,
+    RuntimeMessageInputV2,
+    RuntimePromptSectionInputV2,
+    RuntimeQueryInputV2,
     SkillPinV2,
     ToolManifestEntryV2,
     WorkspaceGrantV2,
+    canonical_runtime_input_digest,
 )
 
 __all__ = [
@@ -20,8 +25,13 @@ __all__ = [
     "QueryCommandV2",
     "RunEnvelopeV2",
     "RuntimeCapabilitiesV2",
+    "RuntimeContextItemV2",
     "RuntimeEventV2",
+    "RuntimeMessageInputV2",
+    "RuntimePromptSectionInputV2",
+    "RuntimeQueryInputV2",
     "SkillPinV2",
     "ToolManifestEntryV2",
     "WorkspaceGrantV2",
+    "canonical_runtime_input_digest",
 ]

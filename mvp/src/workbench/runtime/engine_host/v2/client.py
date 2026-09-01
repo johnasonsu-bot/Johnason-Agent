@@ -22,12 +22,16 @@ from .contracts import (
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
     RuntimeEventV2,
+    RuntimeQueryInputV2,
 )
 from .security import validate_runtime_argv
 
 
 MAX_FRAME_BYTES = 1_048_576
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+MATERIALIZED_INPUT_REQUIRED_RUNTIMES = frozenset(
+    {"goose", "deepseek-harness", "dsh"}
+)
 STATE_TRANSITIONS = {
     "created": frozenset({"starting", "unavailable"}),
     "starting": frozenset({"ready", "unavailable"}),
@@ -465,11 +469,46 @@ class EngineHostV2Client:
         self,
         envelope: RunEnvelopeV2,
         *,
+        runtime_input: RuntimeQueryInputV2 | None = None,
         observer: Callable[[RuntimeClientObservation], None] | None = None,
     ) -> AsyncIterator[RuntimeEventV2]:
         """Accept one pinned Query and stream cursor-checked normalized events."""
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
+        if (
+            envelope.runtime.runtime_id in MATERIALIZED_INPUT_REQUIRED_RUNTIMES
+            and runtime_input is None
+        ):
+            raise RuntimeControlError(
+                "federated runtime requires materialized runtime input"
+            )
+        if runtime_input is not None:
+            if not isinstance(runtime_input, RuntimeQueryInputV2):
+                raise TypeError("runtime_input must be a RuntimeQueryInputV2")
+            if runtime_input.message_snapshot_digest != envelope.message_snapshot_digest:
+                raise RuntimeControlError(
+                    "runtime input message snapshot digest does not match envelope"
+                )
+            if runtime_input.context_snapshot_digest != envelope.context.snapshot_digest:
+                raise RuntimeControlError(
+                    "runtime input context snapshot digest does not match envelope"
+                )
+            if runtime_input.prompt_manifest_digest != envelope.prompt_manifest_digest:
+                raise RuntimeControlError(
+                    "runtime input prompt manifest digest does not match envelope"
+                )
+            allowed_prompt_ids = set(
+                envelope.context_budget.protected_prompt_section_ids
+            )
+            for pin in envelope.skill_pins:
+                allowed_prompt_ids.update(pin.prompt_section_ids)
+            supplied_prompt_ids = {
+                section.section_id for section in runtime_input.prompt_sections
+            }
+            if supplied_prompt_ids != allowed_prompt_ids:
+                raise RuntimeControlError(
+                    "runtime input prompt section set does not match pinned sections"
+                )
         if self._state != "ready":
             raise RuntimeControlError("engine-host v2 must be ready before query")
         if self._active is not None:
@@ -495,10 +534,13 @@ class EngineHostV2Client:
         self._transition("accepting", expected={"ready"})
         try:
             try:
+                query_payload: dict[str, object] = {
+                    "envelope": envelope.model_dump(mode="json")
+                }
+                if runtime_input is not None:
+                    query_payload["runtime_input"] = runtime_input.model_dump(mode="json")
                 response = await self._request(
-                    "query.start",
-                    {"envelope": envelope.model_dump(mode="json")},
-                    command_id=envelope.command_id,
+                    "query.start", query_payload, command_id=envelope.command_id
                 )
             except RuntimeClientError as error:
                 failure = self._classify_interruption(stream, str(error), error)

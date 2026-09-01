@@ -9,7 +9,12 @@ from workbench.runtime.engine_host.v2.contracts import (
     CheckpointHintV2,
     QueryCommandV2,
     RunEnvelopeV2,
+    RuntimeContextItemV2,
     RuntimeEventV2,
+    RuntimeMessageInputV2,
+    RuntimePromptSectionInputV2,
+    RuntimeQueryInputV2,
+    canonical_runtime_input_digest,
 )
 
 
@@ -18,6 +23,107 @@ def _nested_json(depth: int, leaf: object = "safe") -> object:
     for _ in range(depth):
         value = {"safe": value}
     return value
+
+
+def test_runtime_query_input_binds_materialized_messages_context_and_prompts() -> None:
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1", role="user", content="hello runtime"
+        ),
+    )
+    context_items = (
+        RuntimeContextItemV2(
+            item_id="context-1", kind="project-note", content="shared context"
+        ),
+    )
+    prompt_sections = (
+        RuntimePromptSectionInputV2(
+            section_id="section-1", order=0, content="follow the plan"
+        ),
+    )
+
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=context_items,
+        context_snapshot_digest=canonical_runtime_input_digest(context_items),
+        prompt_sections=prompt_sections,
+        prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
+    )
+
+    assert runtime_input.messages[0].content == "hello runtime"
+    assert runtime_input.context_items[0].kind == "project-note"
+    assert runtime_input.prompt_sections[0].section_id == "section-1"
+
+
+def test_runtime_query_input_rejects_message_digest_mismatch() -> None:
+    messages = (
+        RuntimeMessageInputV2(message_id="message-1", role="user", content="hello"),
+    )
+
+    with pytest.raises(ValueError, match="message snapshot digest"):
+        RuntimeQueryInputV2(
+            messages=messages,
+            message_snapshot_digest="0" * 64,
+            context_items=(),
+            context_snapshot_digest=canonical_runtime_input_digest(()),
+            prompt_sections=(),
+            prompt_manifest_digest=canonical_runtime_input_digest(()),
+        )
+
+
+def test_query_start_allows_credential_shaped_business_text_only_in_runtime_input() -> None:
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1",
+            role="user",
+            content="Explain the placeholder sk-abcdefghijklmnopqrstuvwx",
+        ),
+    )
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=(),
+        prompt_manifest_digest=canonical_runtime_input_digest(()),
+    )
+    envelope = run_envelope(
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        }
+    )
+
+    command = QueryCommandV2.model_validate(
+        {
+            "type": "query.start",
+            "command_id": envelope.command_id,
+            "payload": {
+                "envelope": envelope.model_dump(mode="json"),
+                "runtime_input": runtime_input.model_dump(mode="json"),
+            },
+        }
+    )
+
+    assert command.payload["runtime_input"]["messages"][0]["content"].startswith(
+        "Explain"
+    )
+
+
+def test_legacy_query_start_rejects_unknown_safe_payload_fields() -> None:
+    with pytest.raises(ValueError, match="unknown or missing"):
+        QueryCommandV2.model_validate(
+            {
+                "type": "query.start",
+                "command_id": "command-1",
+                "payload": {
+                    "envelope": run_envelope().model_dump(mode="json"),
+                    "debug_label": "safe-but-not-contractual",
+                },
+            }
+        )
 
 
 def test_run_envelope_freezes_every_resume_identity() -> None:
@@ -211,8 +317,13 @@ def test_workspace_grant_accepts_canonical_root_and_nested_posix_paths() -> None
 )
 def test_query_command_accepts_only_declared_command_types(command_type: str) -> None:
     """Catches a command discriminator that accepts unregistered commands."""
+    payload = (
+        {"envelope": run_envelope().model_dump(mode="json")}
+        if command_type == "query.start"
+        else {"request": "safe"}
+    )
     command = QueryCommandV2(
-        type=command_type, command_id="command-1", payload={"request": "safe"}
+        type=command_type, command_id="command-1", payload=payload
     )
 
     assert command.type == command_type
@@ -533,14 +644,19 @@ def test_v2_package_exports_only_task_one_contracts() -> None:
     assert set(v2.__all__) == {
         "RunEnvelopeV2",
         "RuntimeCapabilitiesV2",
+        "RuntimeContextItemV2",
         "QueryCommandV2",
         "RuntimeEventV2",
+        "RuntimeMessageInputV2",
+        "RuntimePromptSectionInputV2",
+        "RuntimeQueryInputV2",
         "ContextBudgetV2",
         "ToolManifestEntryV2",
         "SkillPinV2",
         "PluginPinV2",
         "WorkspaceGrantV2",
         "CheckpointHintV2",
+        "canonical_runtime_input_digest",
     }
 
 

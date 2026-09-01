@@ -21,7 +21,14 @@ from workbench.runtime.engine_host.v2.client import (
     RuntimeReconciliationRequired,
     RuntimeUnavailableError,
 )
-from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2, RuntimeEventV2
+from workbench.runtime.engine_host.v2.contracts import (
+    RunEnvelopeV2,
+    RuntimeEventV2,
+    RuntimeMessageInputV2,
+    RuntimePromptSectionInputV2,
+    RuntimeQueryInputV2,
+    canonical_runtime_input_digest,
+)
 
 
 @pytest.mark.parametrize(
@@ -193,6 +200,94 @@ async def test_query_negotiates_capabilities_before_streaming_normal_events() ->
     ]
     assert events[1].payload == {"text": "hello"}
     assert events[-1].payload == {"status": "completed"}
+
+
+@pytest.mark.asyncio
+async def test_query_start_sends_digest_bound_materialized_runtime_input() -> None:
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1", role="user", content="materialized hello"
+        ),
+    )
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=(
+            RuntimePromptSectionInputV2(
+                section_id="section-1", order=0, content="fixed prompt"
+            ),
+        ),
+        prompt_manifest_digest=canonical_runtime_input_digest(
+            (
+                RuntimePromptSectionInputV2(
+                    section_id="section-1", order=0, content="fixed prompt"
+                ),
+            )
+        ),
+    )
+    envelope = run_envelope(
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        }
+    )
+    client = EngineHostV2Client(fake_v2_command("require_runtime_input"))
+    await client.start()
+    try:
+        events = [
+            event
+            async for event in client.run_query(
+                envelope,
+                runtime_input=runtime_input,
+            )
+        ]
+    finally:
+        await client.aclose()
+
+    assert events[-1].payload == {"status": "completed"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_id", ["goose", "deepseek-harness", "dsh"])
+async def test_federated_runtime_rejects_envelope_only_query(
+    runtime_id: str,
+) -> None:
+    client = EngineHostV2Client(fake_v2_command("normal"))
+    stream = client.run_query(run_envelope(runtime_id=runtime_id))
+
+    with pytest.raises(RuntimeControlError, match="materialized runtime input"):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_client_rejects_prompt_manifest_digest_drift_before_query_start() -> None:
+    messages = (
+        RuntimeMessageInputV2(message_id="message-1", role="user", content="hello"),
+    )
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=(),
+        prompt_manifest_digest=canonical_runtime_input_digest(()),
+    )
+    envelope = run_envelope(
+        runtime_id="goose",
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": "9" * 64,
+        },
+    )
+    client = EngineHostV2Client(fake_v2_command("normal"))
+    stream = client.run_query(envelope, runtime_input=runtime_input)
+
+    with pytest.raises(RuntimeControlError, match="prompt manifest digest"):
+        await anext(stream)
 
 
 @pytest.mark.asyncio

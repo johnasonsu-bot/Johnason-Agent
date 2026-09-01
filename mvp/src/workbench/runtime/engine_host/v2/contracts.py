@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import re
 import warnings
+import hashlib
+import json
 from collections.abc import Mapping
 from typing import Annotated, Any, Literal, Self
 
@@ -144,6 +146,10 @@ WorkspacePath = Annotated[
     StringConstraints(min_length=1, max_length=1024, pattern=r"^[^\x00\r\n]+$"),
     AfterValidator(_validate_workspace_path),
 ]
+RuntimeInputText = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=1_048_576, pattern=r"^[^\x00]*$"),
+]
 
 
 class FrozenModel(BaseModel):
@@ -168,6 +174,109 @@ class FrozenModel(BaseModel):
         if update is not None:
             values.update(update)
         return type(self).model_validate(values)
+
+
+def _canonical_runtime_input_value(value: Any) -> JsonValue:
+    """Project validated input models into deterministic, JSON-safe evidence."""
+    if isinstance(value, BaseModel):
+        return _canonical_runtime_input_value(value.model_dump(mode="json"))
+    if isinstance(value, Mapping):
+        return {
+            key: _canonical_runtime_input_value(nested)
+            for key, nested in sorted(value.items())
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_runtime_input_value(item) for item in value]
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise TypeError("runtime input evidence must contain JSON values only")
+
+
+def canonical_runtime_input_digest(value: Any) -> str:
+    """Return the canonical SHA-256 digest for one materialized input sequence."""
+    encoded = json.dumps(
+        _canonical_runtime_input_value(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+EMPTY_RUNTIME_INPUT_DIGEST = canonical_runtime_input_digest(())
+
+
+class RuntimeMessageInputV2(FrozenModel):
+    """One materialized conversation message; never contains Provider metadata."""
+
+    message_id: OpaqueIdentifier
+    role: Literal["system", "user", "assistant", "tool"]
+    content: RuntimeInputText
+
+
+class RuntimeContextItemV2(FrozenModel):
+    """One bounded materialized context item selected by the control plane."""
+
+    item_id: OpaqueIdentifier
+    kind: OpaqueIdentifier
+    content: RuntimeInputText
+
+
+class RuntimePromptSectionInputV2(FrozenModel):
+    """One ordered PromptSection shared by runtimes that support prompt sections."""
+
+    section_id: OpaqueIdentifier
+    order: StrictInt = Field(ge=0)
+    content: RuntimeInputText
+
+
+class RuntimeQueryInputV2(FrozenModel):
+    """Secret-free materialized query data bound to the durable Run envelope."""
+
+    messages: tuple[RuntimeMessageInputV2, ...]
+    message_snapshot_digest: Digest
+    context_items: tuple[RuntimeContextItemV2, ...] = ()
+    context_snapshot_digest: Digest
+    prompt_sections: tuple[RuntimePromptSectionInputV2, ...] = ()
+    prompt_manifest_digest: Digest
+
+    @model_validator(mode="after")
+    def validate_materialized_evidence(self) -> Self:
+        if not self.messages:
+            raise ValueError("runtime input requires at least one message")
+        identities = (
+            ("message", tuple(item.message_id for item in self.messages)),
+            ("context", tuple(item.item_id for item in self.context_items)),
+            ("prompt section", tuple(item.section_id for item in self.prompt_sections)),
+        )
+        for name, values in identities:
+            if len(values) != len(set(values)):
+                raise ValueError(f"runtime input contains duplicate {name} IDs")
+        expected_prompt_order = tuple(
+            sorted(self.prompt_sections, key=lambda item: (item.order, item.section_id))
+        )
+        if self.prompt_sections != expected_prompt_order:
+            raise ValueError("prompt sections must use stable order and identifier ordering")
+        expected = {
+            "message snapshot digest": (
+                self.message_snapshot_digest,
+                canonical_runtime_input_digest(self.messages),
+            ),
+            "context snapshot digest": (
+                self.context_snapshot_digest,
+                canonical_runtime_input_digest(self.context_items),
+            ),
+            "prompt manifest digest": (
+                self.prompt_manifest_digest,
+                canonical_runtime_input_digest(self.prompt_sections),
+            ),
+        }
+        for name, (actual, calculated) in expected.items():
+            if actual != calculated:
+                raise ValueError(f"{name} does not match materialized input")
+        return self
 
 
 class RuntimeRefV2(FrozenModel):
@@ -310,10 +419,27 @@ class QueryCommandV2(FrozenModel):
     command_id: OpaqueIdentifier
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
 
-    @field_validator("payload", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def validate_payload(cls, value: Any) -> Any:
-        _validate_json_value(value)
+    def validate_command_payload(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        payload = value.get("payload", {})
+        if not isinstance(payload, Mapping):
+            raise ValueError("command payload must be an object")
+        if value.get("type") == "query.start":
+            expected_fields = (
+                {"envelope", "runtime_input"}
+                if "runtime_input" in payload
+                else {"envelope"}
+            )
+            if set(payload) != expected_fields:
+                raise ValueError("query.start payload has unknown or missing fields")
+            _validate_json_value(payload["envelope"])
+            if "runtime_input" in payload:
+                RuntimeQueryInputV2.model_validate(payload["runtime_input"])
+        else:
+            _validate_json_value(payload)
         return value
 
     @field_validator("payload")
@@ -389,6 +515,7 @@ class RunEnvelopeV2(FrozenModel):
     deadline_ms: StrictInt = Field(gt=0)
     traceparent: OpaqueIdentifier
     extensions: Mapping[str, JsonValue] = Field(default_factory=dict)
+    prompt_manifest_digest: Digest = EMPTY_RUNTIME_INPUT_DIGEST
 
     @field_validator("extensions", mode="before")
     @classmethod
