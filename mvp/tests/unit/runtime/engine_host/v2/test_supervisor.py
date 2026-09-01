@@ -2183,6 +2183,115 @@ async def test_startup_orphan_scan_never_takes_over_an_unexpired_lease(
 
 
 @pytest.mark.asyncio
+async def test_startup_orphan_watchdog_follows_chained_external_successor(
+    tmp_path: Path,
+) -> None:
+    """Catches a watchdog starting locally while a newer external lease is live."""
+    database = tmp_path / "state.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(runtime_id="goose", command_id="orphan-successors")
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    source = assignments.acquire_initial_lease(
+        assignment.assignment_digest,
+        instance_id="old-instance",
+        instance_nonce="old-nonce",
+        host_generation="old-generation",
+        client_lease_id="old-client",
+        owner="sidecar-supervisor:old-app",
+        fence_token="old-fence",
+        expires_at=80.0,
+        trusted_time=10.0,
+    )
+    clients: list[_Client] = []
+    local_started = asyncio.Event()
+    following_successor = asyncio.Event()
+    now = [20.0]
+    sleep_calls = 0
+
+    async def sleep(delay: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            assert delay == 60.0
+            first = assignments.recover_expired_lease(
+                source.lease_id,
+                owner="sidecar-supervisor:external-1",
+                instance_id="external-instance-1",
+                instance_nonce="external-nonce-1",
+                host_generation="external-generation-1",
+                client_lease_id="external-client-1",
+                fence_token="external-fence-1",
+                expires_at=100.0,
+                trusted_time=81.0,
+                consumer_id="external-consumer-1",
+            )
+            assert first.lease is not None
+            second = assignments.recover_expired_lease(
+                first.lease.lease_id,
+                owner="sidecar-supervisor:external-2",
+                instance_id="external-instance-2",
+                instance_nonce="external-nonce-2",
+                host_generation="external-generation-2",
+                client_lease_id="external-client-2",
+                fence_token="external-fence-2",
+                expires_at=200.0,
+                trusted_time=101.0,
+                consumer_id="external-consumer-2",
+            )
+            assert second.lease is not None
+            now[0] = 150.0
+            return
+        assert delay == 50.0
+        following_successor.set()
+        await asyncio.Event().wait()
+
+    def factory(config, generation, containment_lock):
+        del config, generation, containment_lock
+        local_started.set()
+        client = _Client("goose")
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="new-app",
+        client_factory=factory,
+        clock=lambda: now[0],
+        sleep=sleep,
+    )
+
+    try:
+        await supervisor.start()
+        successor_wait = asyncio.create_task(following_successor.wait())
+        local_wait = asyncio.create_task(local_started.wait())
+        done, pending = await asyncio.wait(
+            {successor_wait, local_wait},
+            timeout=1.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        assert done
+        assert following_successor.is_set()
+        assert local_started.is_set() is False
+        assert clients == []
+        active = assignments.active_leases(runtime_ids=("goose",))
+        assert len(active) == 1
+        assert active[0].attempt == 2
+        assert active[0].owner.endswith("external-2")
+        assert supervisor.snapshot()[0].state == "unavailable"
+    finally:
+        await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_expired_orphan_recovers_only_after_replacement_handshake(
     tmp_path: Path,
 ) -> None:

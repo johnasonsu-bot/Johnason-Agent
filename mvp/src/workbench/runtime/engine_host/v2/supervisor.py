@@ -268,10 +268,11 @@ class SidecarSupervisor:
                 active = self._assignments.active_leases(
                     runtime_ids=(slot.config.runtime_id,)
                 )
-                current = next(
-                    (item for item in active if item.lease_id == orphan.lease_id),
-                    None,
-                )
+                if len(active) > 1:
+                    raise LeaseConflict(
+                        "multiple active orphan leases share a runtime"
+                    )
+                current = active[0] if active else None
                 if current is not None and current.expires_at >= self._clock():
                     continue
                 await self._start_slot_and_recover(slot, current)
