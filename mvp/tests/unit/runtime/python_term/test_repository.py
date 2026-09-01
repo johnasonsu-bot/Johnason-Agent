@@ -797,6 +797,86 @@ def test_checkpoint_digest_is_idempotent_but_conflicting_reuse_is_rejected(tmp_p
         )
 
 
+def test_same_cursor_checkpoint_cannot_rewrite_event_projected_status(tmp_path) -> None:
+    """A Checkpoint is recovery evidence, not authority to rewrite event state."""
+    repository = PythonTermRepository(tmp_path / "checkpoint-projection.sqlite")
+    context = _context(tmp_path)
+    _save_aggregate(repository, context, tmp_path)
+    event = StepEventRecord(
+        event_id="event-running",
+        run_id="run-1",
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        type="runtime.status",
+        payload={"status": "running"},
+    )
+    repository.append_event(
+        _transition(event, step_status="running", term_status="running")
+    )
+    checkpoint = StepCheckpointRecord(
+        checkpoint_ref="checkpoint-conflicting-status",
+        checkpoint_digest="c" * 64,
+        term_id="term-1",
+        step_id="step-1",
+        cursor=1,
+        public_projection=PublicStepProjection(status="completed"),
+    )
+
+    with pytest.raises(
+        RepositoryConflict, match="checkpoint.*status|status.*checkpoint"
+    ):
+        repository.save_checkpoint(checkpoint)
+
+    assert repository.get_step("term-1", "step-1").status == "running"
+    assert repository.get_term("term-1").status == "running"
+    assert repository.latest_checkpoint("term-1") is None
+
+
+def test_multi_step_checkpoint_can_advance_past_another_steps_cursor(tmp_path) -> None:
+    """A lagging Step may establish the next Term-global cursor with a checkpoint."""
+    repository = PythonTermRepository(tmp_path / "multi-step-checkpoint.sqlite")
+    first_context = _context(tmp_path)
+    term = first_context.to_term_record(
+        _envelope_for(first_context, tmp_path)
+    ).model_copy(update={"step_ids": ("step-1", "step-2")})
+    first = first_context.to_step_record()
+    second_envelope = _envelope_for(first_context, tmp_path).model_copy(
+        update={"step_id": "step-2", "command_id": "command-2"}
+    )
+    second = _context(tmp_path, envelope=second_envelope).to_step_record(ordinal=1)
+    repository.save_aggregate(term, (first, second))
+    repository.append_event(
+        _transition(
+            StepEventRecord(
+                event_id="event-step-1-running",
+                run_id="run-1",
+                term_id="term-1",
+                step_id="step-1",
+                cursor=1,
+                type="runtime.status",
+                payload={"status": "running"},
+            ),
+            step_status="running",
+            term_status="running",
+        )
+    )
+    checkpoint = StepCheckpointRecord(
+        checkpoint_ref="checkpoint-step-2-running",
+        checkpoint_digest="d" * 64,
+        term_id="term-1",
+        step_id="step-2",
+        cursor=2,
+        public_projection=PublicStepProjection(status="running"),
+    )
+
+    repository.save_checkpoint(checkpoint)
+
+    assert tuple(step.cursor for step in repository.list_steps("term-1")) == (1, 2)
+    assert repository.get_term("term-1").cursor == 2
+    assert repository.latest_checkpoint("term-1") == checkpoint
+
+
 def test_tool_effect_terminal_state_cannot_be_replayed_or_changed(tmp_path) -> None:
     repository = PythonTermRepository(tmp_path / "runtime.sqlite")
     context = _context(tmp_path)

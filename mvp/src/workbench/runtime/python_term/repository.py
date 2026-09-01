@@ -2029,6 +2029,13 @@ class PythonTermRepository:
             )
             if validated.cursor < term.cursor or validated.cursor < step.cursor:
                 raise RepositoryConflict("checkpoint cursor cannot move backwards")
+            if (
+                validated.cursor == step.cursor
+                and validated.public_projection.status != step.status
+            ):
+                raise RepositoryConflict(
+                    "checkpoint status cannot rewrite the current event projection"
+                )
             step_updates = {
                 "cursor": validated.cursor,
                 "status": validated.public_projection.status,
