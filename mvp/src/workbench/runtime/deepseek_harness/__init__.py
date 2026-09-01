@@ -1,5 +1,11 @@
 """DeepSeek Harness source gates and lane-local runtime bridges."""
 
+from .host_adapter import (
+    DeepSeekHarnessHostAdapter,
+    DeepSeekHostAdapterError,
+    DeepSeekPreparedQuery,
+)
+
 from .prompt_sections import (
     DeepSeekPromptSection,
     PromptSectionAssembly,
@@ -17,6 +23,9 @@ from .source_gate import (
 
 __all__ = [
     "DSH_PINNED_REVISION",
+    "DeepSeekHarnessHostAdapter",
+    "DeepSeekHostAdapterError",
+    "DeepSeekPreparedQuery",
     "DeepSeekPromptSection",
     "DeepSeekSourceVerifier",
     "PromptSectionAssembly",
