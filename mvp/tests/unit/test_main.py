@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import workbench.main as main
+from tests.fixtures.host_v2 import run_envelope
 from workbench.api.app import AppSettings, create_app
 from workbench.conversations.worker import ConversationTaskWorker
 from workbench.conversations.models import ConversationMessage
@@ -387,7 +388,11 @@ def test_each_build_app_host_instance_gets_a_new_comparable_generation(
 def test_build_app_composes_one_shared_provider_grant_broker(
     tmp_path: Path,
 ) -> None:
-    from workbench.runtime.provider_grants import ProviderGrantBroker
+    from workbench.runtime.provider_grants import (
+        ProviderGrantBroker,
+        ProviderGrantTarget,
+        ProviderGrantUnavailable,
+    )
 
     settings = WorkbenchSettings(runtime_dir=tmp_path)
 
@@ -398,6 +403,28 @@ def test_build_app_composes_one_shared_provider_grant_broker(
     assert all(
         "provider-grant" not in getattr(route, "path", "") for route in app.routes
     )
+    envelope = run_envelope(
+        overrides={
+            "runtime": {
+                "runtime_id": "goose",
+                "build_id": "goose-build-001",
+                "config_digest": "1" * 64,
+                "host_generation": "7",
+            }
+        }
+    )
+    target = ProviderGrantTarget(
+        runtime_id="goose",
+        build_id="goose-build-001",
+        lease_id="lease-without-supervisor",
+        instance_id_digest="1" * 64,
+        instance_nonce_digest="2" * 64,
+        host_generation="7",
+        lease_generation_seq=1,
+        expires_at=4_102_444_800.0,
+    )
+    with pytest.raises(ProviderGrantUnavailable, match="runtime target"):
+        app.state.provider_grant_broker.issue(envelope, target=target)
 
 
 def test_create_app_passes_host_generation_to_worker_repository(

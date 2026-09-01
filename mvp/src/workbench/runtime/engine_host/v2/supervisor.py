@@ -63,6 +63,7 @@ SidecarErrorCategory = Literal[
     "cleanup_unconfirmed",
     "lease_expired",
 ]
+_PROVIDER_GRANT_CONTAINMENT_EVIDENCE_SECONDS = 120.0
 
 
 class SupervisorShutdownError(RuntimeError):
@@ -414,7 +415,7 @@ class SidecarSupervisor:
         confirmed = False
         try:
             await client.aclose()
-            confirmed = getattr(client, "cleanup_confirmed", True) is not False
+            confirmed = getattr(client, "cleanup_confirmed", None) is True
         except RuntimeClientError:
             slot.last_error_category = "cleanup_unconfirmed"
         if confirmed:
@@ -1108,10 +1109,36 @@ class SidecarSupervisor:
         target = self._provider_grant_target_for(handle, handle._lease())
         completed_at = float(self._clock())
         with self._snapshot_lock:
+            self._prune_provider_grant_containment_locked(completed_at)
             self._provider_grant_contained.setdefault(
                 self._provider_grant_target_key(target),
                 (target, completed_at),
             )
+
+    def _prune_provider_grant_containment_locked(self, now: float) -> set[str]:
+        expired = {
+            key
+            for key, (_, completed_at) in self._provider_grant_contained.items()
+            if now
+            >= completed_at + _PROVIDER_GRANT_CONTAINMENT_EVIDENCE_SECONDS
+        }
+        for key in expired:
+            self._provider_grant_contained.pop(key, None)
+        return expired
+
+    def _provider_grant_containment_evidence(
+        self, target: ProviderGrantTarget
+    ) -> tuple[ProviderGrantTarget, float] | None:
+        key = self._provider_grant_target_key(target)
+        now = float(self._clock())
+        with self._snapshot_lock:
+            expired = self._prune_provider_grant_containment_locked(now)
+            contained = self._provider_grant_contained.get(key)
+        if key in expired:
+            raise ProviderGrantAuthorityError(
+                "provider grant containment evidence expired"
+            )
+        return contained
 
     def provider_grant_containment_receipt(
         self,
@@ -1121,10 +1148,7 @@ class SidecarSupervisor:
         """Sign containment only after cleanup of the exact sidecar was confirmed."""
         if not isinstance(target, ProviderGrantTarget):
             raise TypeError("target must be a ProviderGrantTarget")
-        with self._snapshot_lock:
-            contained = self._provider_grant_contained.get(
-                self._provider_grant_target_key(target)
-            )
+        contained = self._provider_grant_containment_evidence(target)
         if contained is None or contained[0] != target:
             raise ProviderGrantAuthorityError(
                 "provider grant target cleanup is not confirmed"
@@ -1161,10 +1185,7 @@ class SidecarSupervisor:
             raise ProviderGrantAuthorityError(
                 "provider grant containment authority does not match"
             )
-        with self._snapshot_lock:
-            contained = self._provider_grant_contained.get(
-                self._provider_grant_target_key(receipt.target)
-            )
+        contained = self._provider_grant_containment_evidence(receipt.target)
         if (
             contained is None
             or contained[0] != receipt.target

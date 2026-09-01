@@ -160,6 +160,9 @@ class ProviderGrantBroker:
                 target=target,
                 now=claim_time,
             )
+            # Claim and this final validation are synchronous: on the owning
+            # event loop no retirement task can run before the secret handoff.
+            self._validate_target(target)
             try:
                 ack = await delivery.deliver(record.binding, view)
                 consumed = self._grants.acknowledge(

@@ -29,6 +29,7 @@ class _SupervisorClient:
         self.capabilities = runtime_capabilities(
             "goose", build_id="goose:test", query=True
         )
+        self.cleanup_confirmed: bool | None = False
         self.closed = False
         self.terminated = asyncio.Event()
 
@@ -37,6 +38,7 @@ class _SupervisorClient:
 
     async def aclose(self) -> None:
         self.closed = True
+        self.cleanup_confirmed = True
         self.terminated.set()
 
     async def wait_terminated(self) -> None:
@@ -182,6 +184,11 @@ def test_supervisor_backed_broker_contains_failure_without_public_leak(
         client.portal.call(
             lambda: app.state.provider_grant_broker.revoke(
                 offer, containment, now=containment.completed_at
+            )
+        )
+        client.portal.call(
+            lambda: app.state.provider_grant_broker.revoke(
+                stale_offer, containment, now=containment.completed_at
             )
         )
         with pytest.raises(ProviderGrantConflict):

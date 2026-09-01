@@ -42,6 +42,7 @@ class _Client:
         self.fail_start = fail_start
         self.fail_query = fail_query
         self.fail_close = fail_close
+        self.cleanup_confirmed: bool | None = False
         self.closed = False
         self.cancel_count = 0
         self.pause_count = 0
@@ -59,6 +60,7 @@ class _Client:
         if self.fail_close:
             raise RuntimeUnavailableError("fixture cleanup failure")
         self.closed = True
+        self.cleanup_confirmed = True
         self.terminated.set()
 
     async def wait_terminated(self) -> None:
@@ -433,6 +435,7 @@ async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
     assignments, assignment = admitted_assignment(database, envelope, capabilities)
     client = _Client("goose")
     client.capabilities = capabilities
+    now = [10.0]
     supervisor = SidecarSupervisor(
         runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
         registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
@@ -440,7 +443,7 @@ async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
         runtime_dir=tmp_path,
         app_instance_id="app-instance-1",
         client_factory=lambda config, generation, containment_lock: client,
-        clock=lambda: 10.0,
+        clock=lambda: now[0],
     )
     await supervisor.start()
     handle = await supervisor.acquire_initial(assignment)
@@ -469,6 +472,61 @@ async def test_supervisor_issues_fenced_receipt_only_after_confirmed_cleanup(
     forged = receipt.model_copy(update={"proof": "f" * 64})
     with pytest.raises(ProviderGrantAuthorityError, match="proof"):
         supervisor.validate_containment_receipt(forged)
+
+    now[0] = 129.999
+    supervisor.validate_containment_receipt(receipt)
+    now[0] = 130.0
+    with pytest.raises(ProviderGrantAuthorityError, match="expired"):
+        supervisor.validate_containment_receipt(receipt)
+    now[0] = 10.0
+    with pytest.raises(ProviderGrantAuthorityError, match="cleanup"):
+        supervisor.provider_grant_containment_receipt(target, "delivery_failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_evidence", ["missing", "none"])
+async def test_containment_requires_explicit_true_cleanup_confirmation(
+    tmp_path: Path,
+    cleanup_evidence: str,
+) -> None:
+    """Missing or indeterminate client cleanup evidence must fail closed."""
+    database = tmp_path / f"provider-grant-{cleanup_evidence}.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose",
+        command_id=f"command-{cleanup_evidence}",
+        host_generation="1",
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    target = handle.provider_grant_target(envelope)
+
+    async def close_without_confirmation() -> None:
+        client.closed = True
+        client.terminated.set()
+
+    client.aclose = close_without_confirmation
+    if cleanup_evidence == "missing":
+        del client.cleanup_confirmed
+    else:
+        client.cleanup_confirmed = None
+
+    with pytest.raises(LeaseConflict, match="cleanup"):
+        await handle.aclose()
+    with pytest.raises(ProviderGrantAuthorityError, match="cleanup"):
+        supervisor.provider_grant_containment_receipt(target, "delivery_failed")
 
 
 @pytest.mark.asyncio

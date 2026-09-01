@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -48,9 +49,15 @@ class _Authority:
         self.receipts: list[ProviderGrantContainmentReceipt] = []
         self.target_validation_count = 0
         self.reject_validation_at: int | None = None
+        self.retire_validation_at: int | None = None
+        self.retirement_barrier: threading.Event | None = None
 
     def validate_target(self, target: ProviderGrantTarget) -> None:
         self.target_validation_count += 1
+        if self.target_validation_count == self.retire_validation_at:
+            self.live.discard(target)
+            if self.retirement_barrier is not None:
+                self.retirement_barrier.set()
         if (
             target not in self.live
             or self.target_validation_count == self.reject_validation_at
@@ -217,6 +224,29 @@ async def test_target_is_revalidated_immediately_before_claim(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_retirement_after_claim_blocks_secret_delivery(tmp_path: Path) -> None:
+    """A retirement barrier between claim and delivery must keep secret private."""
+    target = _target()
+    broker, _, _, authority, clock, envelope, _ = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    barrier = threading.Event()
+    authority.retirement_barrier = barrier
+    authority.retire_validation_at = authority.target_validation_count + 3
+    clock[0] = 110.0
+    delivery = _DigestOnlyDelivery()
+
+    with pytest.raises(ProviderGrantUnavailable, match="runtime target"):
+        await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert barrier.is_set()
+    assert delivery.view is None
+    containment = authority.contain(target)
+    broker.revoke(offer, containment, 120.0)
+
+
+@pytest.mark.asyncio
 async def test_delivery_failure_is_fixed_and_clears_buffer_without_fallback(
     tmp_path: Path,
 ) -> None:
@@ -247,6 +277,7 @@ def test_revocation_rejects_forged_old_generation_and_cross_lease_receipts(
     target = _target()
     broker, _, _, authority, _, envelope, _ = _services(tmp_path, target=target)
     offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    second_offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
     valid = authority.contain(target)
     forged = valid.model_copy(update={"proof": "f" * 64})
     old_generation = authority.contain(
@@ -264,6 +295,26 @@ def test_revocation_rejects_forged_old_generation_and_cross_lease_receipts(
         broker.revoke(offer, cross_lease, now=120.0)
 
     broker.revoke(offer, valid, 120.0)
+    broker.revoke(second_offer, valid, 120.0)
+
+
+def test_broker_without_supervisor_authority_fails_closed(tmp_path: Path) -> None:
+    target = _target()
+    broker, providers, vault, authority, _, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    containment = authority.contain(target)
+    unbound = ProviderGrantBroker(
+        database=database,
+        providers=providers,
+        vault=vault,
+    )
+
+    with pytest.raises(ProviderGrantUnavailable, match="runtime target"):
+        unbound.issue(envelope, target=target)
+    with pytest.raises(ProviderGrantUnavailable, match="containment receipt"):
+        unbound.revoke(offer, containment, 120.0)
 
 
 @pytest.mark.asyncio
