@@ -88,6 +88,7 @@ class ProviderGrantBinding(FrozenGrantModel):
     term_id: OpaqueIdentifier
     step_id: OpaqueIdentifier
     provider_id: OpaqueIdentifier
+    provider_profile_digest: Digest
     model: OpaqueIdentifier
     scopes: tuple[OpaqueIdentifier, ...]
     issued_at: float

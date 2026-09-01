@@ -46,6 +46,7 @@ def _binding(**updates: object) -> ProviderGrantBinding:
         "term_id": "term-001",
         "step_id": "step-001",
         "provider_id": "deepseek-primary",
+        "provider_profile_digest": "4" * 64,
         "model": "deepseek-chat",
         "scopes": ("inference",),
         "issued_at": 100.0,

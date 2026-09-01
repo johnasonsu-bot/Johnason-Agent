@@ -37,6 +37,7 @@ def _binding(**updates: object) -> ProviderGrantBinding:
         "term_id": "term-001",
         "step_id": "step-001",
         "provider_id": "deepseek-primary",
+        "provider_profile_digest": "4" * 64,
         "model": "deepseek-chat",
         "scopes": ("inference",),
         "issued_at": 100.0,
@@ -51,7 +52,7 @@ def test_grant_digest_is_stable_and_secret_free() -> None:
     binding = _binding()
 
     assert canonical_grant_digest(binding) == (
-        "2ad8fbd14f8ac26805dc062f890bba4e6a4155a9ba4b49a1d135d51a306c567f"
+        "cf2757a12eb05aa214db778f3d40263df40fa7043266e3f1516250c39eda63c1"
     )
     serialized = binding.model_dump_json()
     assert "instance-nonce-plaintext" not in serialized
