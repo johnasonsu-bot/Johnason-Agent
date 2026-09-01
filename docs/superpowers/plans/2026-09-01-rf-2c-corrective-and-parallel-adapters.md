@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 关闭 Provider Grant 的 live-lease/containment/公开面门禁，同时让 Goose 与 DeepSeek Harness 的 Host v2 无凭据 Adapter 独立并行演进。
+**Goal:** 关闭 Provider Grant 的 live-lease/containment/公开面门禁，同时让 Goose 与 DeepSeek Harness 的 Host v2 Adapter 独立并行演进，并与 Codex/Python Runtime 共同接入联邦 Host 的统一无凭据 Provider Grant 机制。
 
-**Architecture:** 公共集成泳道独占修改 Supervisor、Provider Grant、应用组合和公共验收；Goose 与 DeepSeek Harness 泳道只修改各自 Adapter 目录及测试。Broker 在 issue 和 deliver 时都通过 Supervisor-backed authority 验证当前 fenced target；撤销只接受 Supervisor 产生并验证的 containment receipt。真实凭据 Smoke 在公共纠正门通过前保持关闭。
+**Architecture:** 公共集成泳道独占修改 Supervisor、Provider Grant、应用组合和公共验收；Codex/Python、Goose 与 DeepSeek Harness 都只在各自 Adapter 中处理查询、事件、工具和上下文差异，密钥始终由同一套 Vault/Provider Grant 通道管理。任何 Runtime Adapter 只传递不透明 `provider_ref` 和 model 引用，不自己保存或解析 API Key。Broker 在 issue 和 deliver 时都通过 Supervisor-backed authority 验证当前 fenced target；撤销只接受 Supervisor 产生并验证的 containment receipt。真实凭据 Smoke 在公共纠正门通过前保持关闭。
 
 **Tech Stack:** Python 3.13、Pydantic v2、SQLite、FastAPI、pytest/pytest-asyncio、Host v2 contracts、pinned Goose/DeepSeek Harness sources。
 
@@ -88,7 +88,7 @@
 
   Expected: import failure because `host_adapter.py` is absent.
 
-- [ ] **Step 3: Implement minimal secret-free Adapter**
+- [ ] **Step 3: Implement the Goose Adapter against the shared credential-free Host boundary**
 
   Freeze prepared data, use canonical JSON SHA-256 for evidence, delegate stream mapping to the existing lane-local mapper, and reject extra/unknown runtime input. Do not create IPC, Vault, Supervisor or shared Host changes.
 
@@ -122,7 +122,7 @@
 
   Expected: import failure because `host_adapter.py` is absent.
 
-- [ ] **Step 3: Implement minimal secret-free Adapter**
+- [ ] **Step 3: Implement the DeepSeek Harness Adapter against the shared credential-free Host boundary**
 
   Reuse the existing PromptSection bridge, freeze all prepared structures, derive canonical evidence, and reject unknown/extra input. Do not create Vault, Plugin execution, IPC, Supervisor or shared Host changes.
 

@@ -53,7 +53,7 @@ P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Conte
 
 ### Task RF-3A：Goose 最小真实 Query Smoke
 
-实现 Goose Sidecar Host v2 Adapter、assistant/tool/event 映射与无凭据 transport fixture；Provider Grant 纠正门通过后再运行用户可操作的真实凭据 Smoke。只授予 `GO_GOOSE_QUERY_SMOKE`，不替代完整 Runtime Gate。
+实现 Goose Sidecar Host v2 Adapter 及 assistant/tool/event 映射；凭据处理不是 Goose 专属能力，它与 Codex/Python、DeepSeek Harness 共用联邦 Host 的 Vault/Provider Grant 通道。Provider Grant 纠正门通过后再运行用户可操作的真实凭据 Smoke。只授予 `GO_GOOSE_QUERY_SMOKE`，不替代完整 Runtime Gate。
 
 ### Task RF-4A：DeepSeek Harness Plugin Smoke
 

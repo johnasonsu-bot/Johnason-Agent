@@ -2,7 +2,9 @@
 
 ## 结论
 
-`GO_PROVIDER_GRANT_BROKER` 暂不授予。控制面已经具备共享、短期、单次、可撤销的 Provider Grant 合同、状态机、Broker 和 Supervisor target 投影，但独立审查确认交付瞬间尚未重新验证 target 仍属于当前存活 lease，containment 也尚未升级为不可伪造的 fenced receipt。当前结果允许三条 Runtime 泳道继续 lane-local 并行开发，不允许真实凭据 Smoke。
+`GO_PROVIDER_GRANT_BROKER` 授予。Codex/Python、Goose、DeepSeek Harness 共用联邦 Host 的统一无凭据 Vault/Provider Grant 边界：Runtime Adapter 只持有不透明 Provider/model 引用，明文凭据只在共享 Broker 的受控交付临界区内由 Vault 解析并交给当前受 Supervisor fencing 的 Runtime target。独立最终复审结论为 `CLEAN`。
+
+该 GO 只证明公共 Provider Grant Broker 安全门已经关闭，不是 Goose 或 DeepSeek Harness 的 Runtime GO。两条 Adapter 的 source readiness 仍仅证明无凭据准备边界；真实 Runtime Smoke 与最终 `GO_RUNTIME_FEDERATION` 留待后续联合门禁。
 
 ## 已交付能力
 
@@ -10,7 +12,9 @@
 - Provider Profile 只保存 `secret_id`；Broker 在交付瞬间从共享 Vault 解析凭据。
 - challenge 仅保存摘要，凭据不进入普通 Host v2 Event、HTTP API、SQLite 或公开诊断。
 - 交付成功后 Grant 变为 `consumed`，重放被拒绝；ACK 前失败需要 containment 证明后才能撤销。
-- `SupervisedRuntimeLease.provider_grant_target()` 只投影 fenced、无明文的目标身份。
+- `SupervisedRuntimeLease.provider_grant_target()` 只投影 fenced、无明文的目标身份；Broker 在 issue 和交付入口通过 Supervisor authority 校验 target，claim 与真实 transport 则在 Supervisor 持有 exact Runtime slot 锁的同一临界区内执行。
+- Supervisor 在确认 sidecar cleanup 后签发绑定 authority、lease、generation 与 target 的 fenced containment receipt；伪造、旧 generation 和跨 lease receipt 均被拒绝。
+- Grant Repository 由 Broker 私有持有；无 Supervisor authority 时发行、交付和撤销均 fail closed。
 - `build_app()` 只组合一个共享 Broker，不增加公开 Provider Grant 路由。
 
 ## 并行开发验证
@@ -19,23 +23,24 @@
 
 | 泳道 | 本轮切片 | 结果 | 门禁状态 |
 |---|---|---|---|
-| Codex-compatible Python | 同 cursor checkpoint 不覆盖 Event 投影状态；刷新可信 build manifest | 相关回归与 manifest gate 通过 | 保持现有 Python 路径；非新 GO |
-| Goose | 固定上游 `StreamEvent::Message` 到 Host v2 `assistant.delta` 映射；未知消息 fail closed | 聚合门通过 | 尚未 `GO_GOOSE_QUERY_SMOKE` |
-| DeepSeek Harness | PromptSection 确定性排序、digest 与不可变注册快照 | 聚合门通过 | 尚未 `GO_DSH_PLUGIN_SMOKE` |
-| 联邦集成 | Grant contracts、状态机、Broker、Supervisor target、应用组合与基础验收 | 基础回归通过，交付闭环待补 | `PENDING_PROVIDER_GRANT_BROKER` |
+| Codex/Python | 同 cursor checkpoint 不覆盖 Event 投影状态；刷新可信 build manifest | manifest 门 `30 passed`，稳定哈希已确认 | 保持现有 Python 路径；非新 Runtime GO |
+| Goose | 固定上游 `StreamEvent::Message` 到 Host v2 `assistant.delta` 映射；无凭据 prepared query；未知输入 fail closed | Goose lane/source `40 passed` | Adapter/source readiness；不是 Goose Runtime GO |
+| DeepSeek Harness | PromptSection 确定性排序、digest、不可变注册快照与无凭据 prepared query | DSH lane/source `36 passed` | Adapter/source readiness；不是 DSH Runtime GO |
+| 联邦集成 | live-target authority、交付临界区、fenced containment receipt、私有 Repository 与完整泄漏验收 | Task 1 聚焦 `112 passed`；独立最终复审 `CLEAN` | `GO_PROVIDER_GRANT_BROKER` |
 
 ## 验证证据
 
-- 跨线聚合门：`220 passed`。
-- Python Term manifest 专项：`30 passed`。
-- 标准后端门：`2932 passed, 6 skipped`。
-- Provider Grant 基础 acceptance：真实 `build_app()`、Vault API、Provider API、issue、delivery、replay rejection、revoke 与 SQLite 字节扫描均通过。
-- 首轮标准门暴露 Python lane 修改后 build manifest 摘要过期；由集成泳道刷新 manifest 后，原 12 个失败全部通过。这证明共享构建证据必须保持单写，而非要求 Runtime 泳道串行。
+- Provider Grant Task 1 聚焦门：`112 passed`。
+- Goose lane/source 门：`40 passed`。
+- DeepSeek Harness lane/source 门：`36 passed`。
+- 跨泳道聚合门：`218 passed`。
+- Python Term manifest 专项：`30 passed`；稳定哈希为 `ef0e09d9bf6e3819dd66ca7870cddcdd45e87257bc6b0cb07d21663ebb0c4436`。
+- 标准后端门：`2985 passed, 6 skipped, 8 deselected`。
+- Provider Grant acceptance 使用真实 `build_app()`、Vault API、Provider API、Broker、Supervisor handle 与受控 transport，覆盖 issue、delivery、replay rejection、revocation、stale lease、伪造/跨 lease containment、交付失败和持久化/公开面泄漏扫描。
+- 独立最终复审：`CLEAN`，无遗留 blocking/important finding。
 
-## 阻断项与下一步
+## 边界与下一步
 
-- Broker 在 claim 前必须通过 Supervisor authority 重新验证 current lease、generation、instance digest 与 expiry；发行后关闭或替换 lease 必须拒绝交付。
-- `containment_confirmed: bool` 必须替换为 Supervisor 产生并验证的 fenced containment receipt，且 Repository 不再由 Broker 公开。
-- acceptance 必须增加 stale lease、伪造/跨 lease containment、secret-bearing delivery failure、Host Event、diagnostics、日志及 OpenAPI 泄漏检查。
-- RF-3A 与 RF-4A 可同时开发消息、Prompt、Event、Checkpoint 和无凭据 transport Adapter；真实 Provider Smoke 等 `GO_PROVIDER_GRANT_BROKER` 后放行。
-- 只有三 Runtime 与公共合同联合通过后，才授予 `GO_RUNTIME_FEDERATION`。
+- “无凭据”是联邦 Host 的统一边界，不是 Goose 专属能力；Codex/Python、Goose、DeepSeek Harness 都不得在 Adapter、Host Event、argv、环境快照或普通持久化中持有明文 Provider 凭据。
+- `GO_PROVIDER_GRANT_BROKER` 已解除公共 Broker 安全门，但不替代各 Runtime 的真实启动、IPC、Provider 调用与行为验证。
+- 下一阶段分别执行 Goose 与 DeepSeek Harness 的真实 Runtime Smoke，再由三 Runtime 与公共合同的联合证据决定是否授予 `GO_RUNTIME_FEDERATION`。

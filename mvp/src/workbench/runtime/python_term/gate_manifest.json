@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "7bf6a71a097cd8a98a5522719b3eb106ad642f4d7084042e561485d60259f123",
-      "size": 1798113
+      "sha256": "f6ce0ea3c9f3450d861fbea64c3a8ae296120f36655f5c330f0f54c8f7b1196f",
+      "size": 1851914
     },
     {
       "path": "uv.lock",
@@ -239,8 +239,8 @@
     },
     {
       "path": "main.py",
-      "sha256": "7492d3d99c0ed4ab5be9b2dc6e3ccda32a295bb39ab77ee67d333680936cf136",
-      "size": 41877
+      "sha256": "cc389ec53ecfe954133c929c43a60fb23300516c5c44a08fdb42a29d6394163a",
+      "size": 41854
     },
     {
       "path": "models/__init__.py",
@@ -469,8 +469,13 @@
     },
     {
       "path": "runtime/deepseek_harness/__init__.py",
-      "sha256": "bcee53b0afdd2d6d78bb18ca3bc8b75e19c0d6289d54d35c3f7de235a7e78b8d",
-      "size": 657
+      "sha256": "9b74f1bc0409869ca25d181db5a2f2a6569b92fb40660f4c3b66883cb37a33a1",
+      "size": 872
+    },
+    {
+      "path": "runtime/deepseek_harness/host_adapter.py",
+      "sha256": "7c341ed66c7ef61d98560e83c19b2297ca7ea5a8b12f6e916cbd1ae22db0398b",
+      "size": 9052
     },
     {
       "path": "runtime/deepseek_harness/prompt_sections.py",
@@ -574,13 +579,18 @@
     },
     {
       "path": "runtime/engine_host/v2/supervisor.py",
-      "sha256": "82bae67cfcad943caa6902495d9b889e6fd12963e12f5c7809436400d5c74ebd",
-      "size": 74314
+      "sha256": "1229c43639a908f8222a52b949df066d10a2cd06ffa3b019b4f06f36047c3c88",
+      "size": 84126
     },
     {
       "path": "runtime/goose/__init__.py",
-      "sha256": "bc79d78b4b2bc46a3a56c9093450783bbf3e2d70b3abbd295605e628fdf00d0d",
-      "size": 40
+      "sha256": "8020e0fa55aa5dae3f385a096b7c6837eb2c2d4a3cca07fbc40ac39f49c2be86",
+      "size": 218
+    },
+    {
+      "path": "runtime/goose/host_adapter.py",
+      "sha256": "38821337a35d1951625e661dbe1a8f4b1eacb48703f588eaa691776bd3ede64d",
+      "size": 10853
     },
     {
       "path": "runtime/goose/message_mapper.py",
@@ -599,23 +609,23 @@
     },
     {
       "path": "runtime/provider_grants/__init__.py",
-      "sha256": "cb3720b7f832f96263c789bf6ccdd0abbc31d7356d1348e6eb5d7ed5955a1ae8",
-      "size": 1099
+      "sha256": "feb21cdb2642651ec26f1dcbf6ee0cc06c48d1846fd7ff0066ad3b6312acadb8",
+      "size": 1313
     },
     {
       "path": "runtime/provider_grants/broker.py",
-      "sha256": "87b9dd409797db0a5928b5345a39828c240de99b2f49353774042570592cb623",
-      "size": 8551
+      "sha256": "cd62e749e89a811e280281a3db2216830a02c8f842ef254c4598c2617cf020d8",
+      "size": 13043
     },
     {
       "path": "runtime/provider_grants/contracts.py",
-      "sha256": "fca04f25b49adedbf6a889277a94c3f0b3aeb4fba0fd2bb817c3d572e3636d0f",
-      "size": 4955
+      "sha256": "b8245acadccbc957e416dcf67c2245863e5deb93dd87a03858c89e3c8a9826f1",
+      "size": 6450
     },
     {
       "path": "runtime/provider_grants/delivery.py",
-      "sha256": "563c9a16baa509b8a96dea86c8bf5277be736a25bfb12fae926283117b919a44",
-      "size": 478
+      "sha256": "641cfa99f5d8810f4fb00cacb264ba36575ae6246144006775b45e323f2d9cc2",
+      "size": 625
     },
     {
       "path": "runtime/provider_grants/repository.py",
