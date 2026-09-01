@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 from importlib.util import find_spec
 from pathlib import Path
@@ -6,11 +7,14 @@ from pathlib import Path
 import pytest
 
 from workbench.runtime.goose.source_gate import (
+    GO_GOOSE_QUERY_SMOKE,
     GO_GOOSE_SOURCE_READY,
     GooseSourceReadinessError,
+    build_and_attest_goose_query_smoke,
     build_plan_for_target,
     canonical_manifest_bytes,
     default_manifest_path,
+    verify_goose_query_smoke_readiness,
     verify_goose_source_readiness,
 )
 
@@ -30,7 +34,12 @@ def test_pinned_goose_source_and_build_inputs_are_ready() -> None:
     assert receipt.status == GO_GOOSE_SOURCE_READY
     assert receipt.revision == PINNED_REVISION
     assert len(receipt.build_plans) == 4
-    assert receipt.claims == ("source_provenance", "frozen_build_inputs")
+    assert receipt.claims == (
+        "source_provenance",
+        "frozen_build_inputs",
+        "wrapper_source_provenance",
+        "frozen_wrapper_build_inputs",
+    )
 
 
 def test_manifest_is_canonical_and_binds_every_required_input() -> None:
@@ -50,12 +59,58 @@ def test_manifest_is_canonical_and_binds_every_required_input() -> None:
         "third_party/goose/LICENSE",
         "third_party/goose/crates/goose-cli/Cargo.toml",
     ]
-    assert document["sidecar"] == {
-        "binary": "goose",
-        "manifest_path": "third_party/goose/crates/goose-cli/Cargo.toml",
-        "package": "goose-cli",
+    wrapper = document["wrapper"]
+    assert wrapper["root"] == "mvp/runtime-hosts/goose-host-v2"
+    assert wrapper["manifest_path"] == "mvp/runtime-hosts/goose-host-v2/Cargo.toml"
+    assert wrapper["lockfile_path"] == "mvp/runtime-hosts/goose-host-v2/Cargo.lock"
+    assert [entry["path"] for entry in wrapper["source_inputs"]] == [
+        "mvp/runtime-hosts/goose-host-v2/Cargo.toml",
+        "mvp/runtime-hosts/goose-host-v2/Cargo.lock",
+        "mvp/runtime-hosts/goose-host-v2/.gitignore",
+        "mvp/runtime-hosts/goose-host-v2/src/main.rs",
+        "mvp/runtime-hosts/goose-host-v2/src/protocol.rs",
+        "mvp/runtime-hosts/goose-host-v2/src/query.rs",
+        "mvp/runtime-hosts/goose-host-v2/src/event_mapper.rs",
+        "mvp/runtime-hosts/goose-host-v2/src/provider_bridge.rs",
+        "mvp/runtime-hosts/goose-host-v2/src/grant_channel.rs",
+    ]
+    assert wrapper["closure"] == {
+        "optional_generated_directories": ["target"],
+        "root_files": [".gitignore", "Cargo.toml", "Cargo.lock"],
+        "source_directory": "src",
+        "source_files": [
+            "event_mapper.rs", "grant_channel.rs", "main.rs", "protocol.rs",
+            "provider_bridge.rs", "query.rs",
+        ],
+        "symlinks": "forbidden",
+        "unlisted_entries": "forbidden",
     }
-    assert document["claims"] == ["source_provenance", "frozen_build_inputs"]
+    assert document["query_smoke"] == {
+        "binary_name": "goose-host-v2",
+        "build_id": "goose-host-v2:fixture-wrapper-r2",
+        "builder": "johnason.goose.fixture-wrapper.local-release.v1",
+        "build_command": [
+            "cargo", "+1.96.1", "build", "--locked", "--release",
+        ],
+        "evidence_path": (
+            "mvp/runtime-hosts/goose-host-v2/target/release/"
+            "goose-host-v2.build-evidence.json"
+        ),
+        "evidence_schema": "workbench.runtime.goose.fixture-build-evidence.v1",
+        "host_target_policy": "native-only",
+        "smoke_protocol": (
+            "host-v2-closed-input-fixture-binding-completed-failed-cancelled.v3"
+        ),
+        "status": GO_GOOSE_QUERY_SMOKE,
+        "toolchain": "1.96.1",
+        "trust_tier": "local_fixture_smoke",
+    }
+    assert document["claims"] == [
+        "source_provenance",
+        "frozen_build_inputs",
+        "wrapper_source_provenance",
+        "frozen_wrapper_build_inputs",
+    ]
     for plan in document["build_plans"]:
         assert plan["cwd"] == "third_party/goose"
         assert plan["host"] == plan["target"]
@@ -66,6 +121,45 @@ def test_manifest_is_canonical_and_binds_every_required_input() -> None:
             "cargo", "+1.96.1", "build", "--offline", "--locked", "--release",
             "--package", "goose-cli", "--bin", "goose", "--target", plan["target"],
         ]
+
+
+def test_query_smoke_fails_closed_without_real_binary_evidence(tmp_path: Path) -> None:
+    with pytest.raises(GooseSourceReadinessError, match="fixed evidence path"):
+        verify_goose_query_smoke_readiness(
+            REPOSITORY_ROOT,
+            evidence_path=tmp_path / "missing-build-evidence.json",
+        )
+
+
+def test_query_smoke_build_and_gate_replay_the_exact_release_binary() -> None:
+    evidence = build_and_attest_goose_query_smoke(REPOSITORY_ROOT)
+    receipt = verify_goose_query_smoke_readiness(REPOSITORY_ROOT)
+
+    assert evidence["trust_tier"] == "local_fixture_smoke"
+    assert evidence["host_triple"] == evidence["target_triple"]
+    assert evidence["binary"]["size"] > 0
+    assert len(evidence["smoke"]["completed_transcript_sha256"]) == 64
+    assert len(evidence["smoke"]["cancel_transcript_sha256"]) == 64
+    assert len(evidence["smoke"]["failed_transcript_sha256"]) == 64
+    assert len(evidence["smoke"]["invalid_input_transcript_sha256"]) == 64
+    assert receipt.status == GO_GOOSE_QUERY_SMOKE
+
+
+def test_query_smoke_rejects_cross_platform_or_self_authored_evidence() -> None:
+    evidence_path = (
+        REPOSITORY_ROOT
+        / "mvp/runtime-hosts/goose-host-v2/target/release/"
+        "goose-host-v2.build-evidence.json"
+    )
+    evidence = json.loads(evidence_path.read_bytes())
+    original = evidence_path.read_bytes()
+    evidence["target_triple"] = "x86_64-unknown-linux-gnu"
+    evidence_path.write_bytes(canonical_manifest_bytes(evidence))
+    try:
+        with pytest.raises(GooseSourceReadinessError, match="target_triple"):
+            verify_goose_query_smoke_readiness(REPOSITORY_ROOT)
+    finally:
+        evidence_path.write_bytes(original)
 
 
 def test_empty_cargo_home_build_plan_separates_network_prepare_and_offline_release(
@@ -190,6 +284,39 @@ def test_required_file_drift_fails_closed(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize("relative_path", ["build.rs", ".cargo/config.toml", "src/extra.rs"])
+def test_wrapper_build_input_closure_rejects_unlisted_files(
+    tmp_path: Path, relative_path: str
+) -> None:
+    repository = _repository_fixture(tmp_path / "wrapper-extra")
+    extra = repository / "mvp/runtime-hosts/goose-host-v2" / relative_path
+    extra.parent.mkdir(parents=True, exist_ok=True)
+    extra.write_text("unlisted", encoding="utf-8")
+
+    with pytest.raises(GooseSourceReadinessError, match="closure"):
+        verify_goose_source_readiness(repository, manifest_path=default_manifest_path())
+
+
+def test_wrapper_build_input_closure_rejects_symlinks(tmp_path: Path) -> None:
+    repository = _repository_fixture(tmp_path / "wrapper-symlink")
+    wrapper = repository / "mvp/runtime-hosts/goose-host-v2"
+    (wrapper / "src/linked.rs").symlink_to(wrapper / "src/main.rs")
+
+    with pytest.raises(GooseSourceReadinessError, match="symlink|closure"):
+        verify_goose_source_readiness(repository, manifest_path=default_manifest_path())
+
+
+def test_wrapper_build_input_closure_rejects_broken_generated_directory_symlink(
+    tmp_path: Path,
+) -> None:
+    repository = _repository_fixture(tmp_path / "wrapper-broken-target-symlink")
+    wrapper = repository / "mvp/runtime-hosts/goose-host-v2"
+    (wrapper / "target").symlink_to(wrapper / "missing-generated-output")
+
+    with pytest.raises(GooseSourceReadinessError, match="symlink|closure"):
+        verify_goose_source_readiness(repository, manifest_path=default_manifest_path())
+
+
 def _repository_fixture(root: Path) -> Path:
     source = REPOSITORY_ROOT / "third_party/goose"
     checkout = root / "third_party/goose"
@@ -214,6 +341,11 @@ def _repository_fixture(root: Path) -> Path:
     )
     _set_index_gitlink(root, PINNED_REVISION)
     _commit_index(root, "fixture")
+    shutil.copytree(
+        REPOSITORY_ROOT / "mvp/runtime-hosts/goose-host-v2",
+        root / "mvp/runtime-hosts/goose-host-v2",
+        ignore=shutil.ignore_patterns("target"),
+    )
     return root
 
 

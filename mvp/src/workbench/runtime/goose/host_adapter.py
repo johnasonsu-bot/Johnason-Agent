@@ -25,7 +25,7 @@ class GooseAdapterError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class GoosePreparedQuery:
-    """Frozen, credential-free evidence needed to start a future Goose query."""
+    """Frozen Goose query evidence using the shared Provider Grant boundary."""
 
     runtime_id: str
     runtime_build_id: str
