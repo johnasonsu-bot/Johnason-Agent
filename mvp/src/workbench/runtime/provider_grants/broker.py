@@ -173,7 +173,9 @@ class ProviderGrantBroker:
                     deadline=record.binding.expires_at,
                 )
             except ProviderGrantAuthorityError:
-                if claimed:
+                if self._delivery_requires_containment(
+                    offer.grant_id, claimed=claimed
+                ):
                     raise ProviderGrantDeliveryFailed(
                         "provider grant delivery was not acknowledged"
                     ) from None
@@ -181,14 +183,22 @@ class ProviderGrantBroker:
                     "runtime target is not live"
                 ) from None
             except asyncio.CancelledError:
-                if not claimed:
+                if not self._delivery_requires_containment(
+                    offer.grant_id, claimed=claimed
+                ):
                     raise
                 raise ProviderGrantDeliveryFailed(
                     "provider grant delivery was not acknowledged"
                 ) from None
             except Exception:
-                raise ProviderGrantDeliveryFailed(
-                    "provider grant delivery was not acknowledged"
+                if self._delivery_requires_containment(
+                    offer.grant_id, claimed=claimed
+                ):
+                    raise ProviderGrantDeliveryFailed(
+                        "provider grant delivery was not acknowledged"
+                    ) from None
+                raise ProviderGrantUnavailable(
+                    "provider grant is not available"
                 ) from None
             try:
                 consumed = self._grants.acknowledge(
@@ -246,6 +256,16 @@ class ProviderGrantBroker:
             self._authority.validate_target(target)
         except ProviderGrantAuthorityError:
             raise ProviderGrantUnavailable("runtime target is not live") from None
+
+    def _delivery_requires_containment(
+        self, grant_id: str, *, claimed: bool
+    ) -> bool:
+        if claimed:
+            return True
+        try:
+            return self._grants.get(grant_id).state == "delivering"
+        except Exception:
+            return False
 
     def _profile(self, provider_id: str) -> ProviderProfileRecord:
         try:

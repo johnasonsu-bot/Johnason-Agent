@@ -170,10 +170,12 @@ class _CancelledViewProbeDelivery:
     def __init__(self) -> None:
         self.view: memoryview | None = None
         self.cancelled = False
+        self.entered = asyncio.Event()
 
     async def deliver(self, binding, secret: memoryview) -> ProviderGrantAck:
         del binding
         self.view = secret
+        self.entered.set()
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -318,6 +320,115 @@ async def test_timeout_after_claim_requires_containment_before_revoke(
     assert retry.view is None
 
     containment = authority.contain(target)
+    broker.revoke(offer, containment, 120.0)
+    assert repository.get(offer.grant_id).state == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_expired_offer_replay_is_unavailable_without_secret_delivery(
+    tmp_path: Path,
+) -> None:
+    target = _target()
+    broker, _, _, _, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    clock[0] = 130.0
+    delivery = _DigestOnlyDelivery()
+
+    with pytest.raises(ProviderGrantUnavailable) as captured:
+        await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert captured.value.__cause__ is None
+    assert delivery.view is None
+    assert ProviderGrantRepository(database).get(offer.grant_id).state == "expired"
+
+
+@pytest.mark.asyncio
+async def test_consumed_offer_replay_is_unavailable_without_secret_delivery(
+    tmp_path: Path,
+) -> None:
+    target = _target()
+    broker, _, _, _, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    clock[0] = 110.0
+    await broker.deliver(
+        offer,
+        target=target,
+        delivery=_DigestOnlyDelivery(),
+    )
+    clock[0] = 111.0
+    replay = _DigestOnlyDelivery()
+
+    with pytest.raises(ProviderGrantUnavailable) as captured:
+        await broker.deliver(offer, target=target, delivery=replay)
+
+    assert captured.value.__cause__ is None
+    assert replay.view is None
+    assert ProviderGrantRepository(database).get(offer.grant_id).state == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_revoked_offer_replay_is_unavailable_without_secret_delivery(
+    tmp_path: Path,
+) -> None:
+    target = _target()
+    broker, _, _, authority, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    containment = authority.contain(target)
+    broker.revoke(offer, containment, 120.0)
+    authority.live.add(target)
+    clock[0] = 121.0
+    replay = _DigestOnlyDelivery()
+
+    with pytest.raises(ProviderGrantUnavailable) as captured:
+        await broker.deliver(offer, target=target, delivery=replay)
+
+    assert captured.value.__cause__ is None
+    assert replay.view is None
+    assert ProviderGrantRepository(database).get(offer.grant_id).state == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_after_claim_requires_containment_before_revoke(
+    tmp_path: Path,
+) -> None:
+    target = _target()
+    broker, _, _, authority, clock, envelope, database = _services(
+        tmp_path, target=target
+    )
+    offer = broker.issue(envelope, target=target, ttl_seconds=30.0)
+    clock[0] = 110.0
+    delivery = _CancelledViewProbeDelivery()
+    task = asyncio.create_task(
+        broker.deliver(offer, target=target, delivery=delivery)
+    )
+    await asyncio.wait_for(delivery.entered.wait(), timeout=1.0)
+
+    task.cancel()
+    with pytest.raises(ProviderGrantDeliveryFailed) as captured:
+        await task
+
+    assert captured.value.__cause__ is None
+    assert task.cancelled() is False
+    assert delivery.cancelled is True
+    assert delivery.view is not None
+    assert bytes(delivery.view) == b"\x00" * len(PROVIDER_VALUE.encode("utf-8"))
+    repository = ProviderGrantRepository(database)
+    assert repository.get(offer.grant_id).state == "delivering"
+    with pytest.raises(ProviderGrantContainmentRequired):
+        repository.revoke(
+            offer.grant_id,
+            reason="query_cancelled",
+            containment_confirmed=False,
+            now=111.0,
+        )
+
+    containment = authority.contain(target, reason="query_cancelled")
     broker.revoke(offer, containment, 120.0)
     assert repository.get(offer.grant_id).state == "revoked"
 
