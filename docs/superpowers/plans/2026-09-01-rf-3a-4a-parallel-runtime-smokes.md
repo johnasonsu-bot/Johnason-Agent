@@ -178,6 +178,8 @@ Run: `cd mvp && .venv/bin/python -m pytest tests/integration/test_federated_runt
 
 - [ ] **Step 4: 运行聚焦与标准回归**
 
+聚焦回归已通过：1148 tests passed。标准回归中的 development-graph 重型验收单独运行通过（其后端子进程 3012 passed / 6 skipped，Electron 子进程 50 passed），但外层标准套件仍出现同一用例的非确定性失败，因此本步骤与联邦总门保持未完成。
+
 Run: `cd mvp && .venv/bin/python -m pytest tests/unit/runtime/engine_host/v2 tests/unit/runtime/goose tests/unit/runtime/deepseek_harness tests/integration/test_engine_host_v2_query.py tests/integration/test_federated_runtime_query_smoke.py tests/acceptance/test_goose_source_readiness.py tests/acceptance/test_deepseek_harness_source_gate.py -q`
 
 Run: `cd mvp && .venv/bin/python -m pytest -q`
@@ -188,11 +190,11 @@ Run: `cd mvp && .venv/bin/python -m pytest -q`
 
 **Required slices:**
 
-1. `SupervisedRuntimeLease.run_query()` 与 Supervisor 内部路径接收 keyword-only `RuntimeQueryInputV2`，原样透传 `EngineHostV2Client`，不得重新物化或丢弃摘要绑定。
-2. 实现共享的 live sidecar `ProviderGrantDelivery`：每个 sidecar 进程独占一个全双工 Unix socketpair，以有界二进制 framing 交付 canonical、secret-free binding header 与 raw mutable secret，并返回绑定当前 fenced target 的 closed ACK；macOS/Linux 支持，Windows 在本切片 fail closed。
-3. Client / process guard 只透传显式私有 descriptor；普通 argv、环境、Host NDJSON、日志和持久化仍不得承载 credential 或 Vault secret ID。sidecar 接管后必须恢复 `FD_CLOEXEC`，其后启动的 Provider/tool 子进程不得继承私有通道。
-4. Goose 与 DSH 的 fixed sidecar 先启动后台 Grant receiver，再完成 capability handshake；消费正式 `ProviderGrantBinding` 并回写 ACK，不得预读 FD、等待 query.start 才读、硬编码 instance digest 或增加 runtime 专属 API Key。模型匹配使用 Provider Profile alias 解析后的 `binding.model`，不得继续假定 envelope 中的 alias 就是实际模型 ID。
-5. 新增协调器，按 lease → target/issue → private deliver/ACK → public query events → terminal/seal/containment 的顺序执行；一条 lane 失败不得污染其他 lane verdict。
-6. fixed sidecar 的 capability 继续诚实声明；不得为了通过生产 client 测试把 `model=false` 伪装成 `true`。真实 `GO_RUNTIME_FEDERATION` 必须等待 upstream Codex/Goose/DeepSeek Harness 模型能力分别接入并通过独立验收。
+- [x] `SupervisedRuntimeLease.run_query()` 与 Supervisor 内部路径接收 keyword-only `RuntimeQueryInputV2`，原样透传 `EngineHostV2Client`，不得重新物化或丢弃摘要绑定。
+- [x] 实现共享的 live sidecar `ProviderGrantDelivery`：每个 sidecar 进程独占一个全双工 Unix socketpair，以有界二进制 framing 交付 canonical、secret-free binding header 与 raw mutable secret，并返回绑定当前 fenced target 的 closed ACK；macOS/Linux 支持，Windows 在本切片 fail closed。
+- [x] Client / process guard 只透传显式私有 descriptor；普通 argv、环境、Host NDJSON、日志和持久化仍不得承载 credential 或 Vault secret ID。sidecar 接管后必须恢复 `FD_CLOEXEC`，其后启动的 Provider/tool 子进程不得继承私有通道。
+- [x] Goose 与 DSH 的 fixed sidecar 先启动后台 Grant receiver，再完成 capability handshake；消费正式 `ProviderGrantBinding` 并回写 ACK，不得预读 FD、等待 query.start 才读、硬编码 instance digest 或增加 runtime 专属 API Key。模型匹配使用 Provider Profile alias 解析后的 `binding.model`，不得继续假定 envelope 中的 alias 就是实际模型 ID。
+- [x] 新增协调器，按 lease → target/issue → private deliver/ACK → public query events → terminal/seal/containment 的顺序执行；一条 lane 失败不得污染其他 lane verdict。
+- [x] fixed sidecar 的 capability 继续诚实声明；不得为了通过生产 client 测试把 `model=false` 伪装成 `true`。真实 `GO_RUNTIME_FEDERATION` 必须等待 upstream Codex/Goose/DeepSeek Harness 模型能力分别接入并通过独立验收。
 
 **Containment acceptance:** ACK 丢失、超时、取消或非法均视为 ambiguous delivery，不得重投；必须先关闭 exact handle、获得当前 Supervisor containment receipt，再撤销 Grant。正常 ACK 仅证明一次性 secret 已进入 sidecar 的短生命周期内存，不代表 Provider 请求完成，也不得宣称 Vault 返回值、内核 socket buffer 或第三方 SDK 内部副本可被物理擦除。
