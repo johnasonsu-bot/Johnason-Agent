@@ -452,6 +452,54 @@ async def test_current_handle_projects_a_secret_free_provider_grant_target(
 
 
 @pytest.mark.asyncio
+async def test_current_handle_exposes_only_its_private_provider_delivery(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "provider-grant-delivery.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-grant-delivery", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+
+    class _PrivateDelivery:
+        async def deliver(self, binding, secret):
+            del binding, secret
+
+    private_delivery = _PrivateDelivery()
+    client.provider_grant_delivery = private_delivery
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+    target = handle.provider_grant_target(envelope)
+
+    assert (
+        handle.provider_grant_delivery(envelope, target=target)
+        is private_delivery
+    )
+    with pytest.raises(ProviderGrantAuthorityError, match="target"):
+        handle.provider_grant_delivery(
+            envelope,
+            target=target.model_copy(update={"lease_generation_seq": 2}),
+        )
+    receipt = await handle.contain_provider_grant(
+        target, reason="delivery_failed"
+    )
+    supervisor.validate_containment_receipt(receipt)
+    assert receipt.target == target
+
+
+@pytest.mark.asyncio
 async def test_provider_grant_delivery_deadline_cancels_before_transport_observes(
     tmp_path: Path,
 ) -> None:

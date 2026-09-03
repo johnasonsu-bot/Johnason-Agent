@@ -43,6 +43,7 @@ from workbench.runtime.provider_grants.contracts import (
     ProviderGrantRevocationReason,
     ProviderGrantTarget,
 )
+from workbench.runtime.provider_grants.delivery import ProviderGrantDelivery
 from workbench.settings import RuntimeProcessConfig
 
 
@@ -1066,6 +1067,27 @@ class SidecarSupervisor:
         _, lease, _ = self._validate_envelope(handle, envelope)
         return self._provider_grant_target_for(handle, lease)
 
+    def _provider_grant_delivery(
+        self,
+        handle: "SupervisedRuntimeLease",
+        envelope: RunEnvelopeV2,
+        *,
+        target: ProviderGrantTarget,
+    ) -> ProviderGrantDelivery:
+        """Return only the private endpoint bound to the current fenced lease."""
+        _, lease, client = self._validate_envelope(handle, envelope)
+        expected = self._provider_grant_target_for(handle, lease)
+        if target != expected:
+            raise ProviderGrantAuthorityError(
+                "provider grant target does not match current lease"
+            )
+        delivery = getattr(client, "provider_grant_delivery", None)
+        if delivery is None or not callable(getattr(delivery, "deliver", None)):
+            raise ProviderGrantAuthorityError(
+                "provider grant private delivery is unavailable"
+            )
+        return delivery
+
     @staticmethod
     def _provider_grant_target_for(
         handle: "SupervisedRuntimeLease", lease: RuntimeInstanceLease
@@ -2020,6 +2042,35 @@ class SupervisedRuntimeLease:
         """Return the secret-free Grant target for this exact live envelope."""
         controlled = self.__supervisor._controlled_envelope(self, envelope)
         return self.__supervisor._provider_grant_target(self, controlled)
+
+    def provider_grant_delivery(
+        self,
+        envelope: RunEnvelopeV2,
+        *,
+        target: ProviderGrantTarget,
+    ) -> ProviderGrantDelivery:
+        """Return only this lease's private Grant endpoint, never its client."""
+        controlled = self.__supervisor._controlled_envelope(self, envelope)
+        return self.__supervisor._provider_grant_delivery(
+            self, controlled, target=target
+        )
+
+    async def contain_provider_grant(
+        self,
+        target: ProviderGrantTarget,
+        *,
+        reason: ProviderGrantRevocationReason,
+    ) -> ProviderGrantContainmentReceipt:
+        """Close this exact sidecar before minting a containment receipt."""
+        _, lease = self.__supervisor._require_current_handle(self)
+        if target != self.__supervisor._provider_grant_target_for(self, lease):
+            raise ProviderGrantAuthorityError(
+                "provider grant target does not match current lease"
+            )
+        await self.__supervisor._close_handle(self)
+        return self.__supervisor.provider_grant_containment_receipt(
+            target, reason
+        )
 
     async def intervene(self, payload: dict[str, Any]) -> None:
         await self.__supervisor._intervene_handle(self, payload)

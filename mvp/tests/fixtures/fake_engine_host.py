@@ -8,7 +8,9 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 from threading import Lock, Thread
@@ -37,7 +39,71 @@ V2_STATE: dict[str, object] = {
     "resume_count": 0,
     "grandchild": None,
     "envelope": None,
+    "provider_grant_ready": False,
 }
+
+
+def _receive_exact(endpoint: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = endpoint.recv(remaining)
+        if not chunk:
+            raise ValueError("private Provider Grant frame is incomplete")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def receive_test_provider_grant(fd: int) -> None:
+    """Consume the formal private frame used by the process-level test host."""
+    endpoint = socket.socket(fileno=fd)
+    secret = bytearray()
+    try:
+        prefix = _receive_exact(endpoint, 17)
+        magic, version, header_size, secret_size = struct.unpack(
+            "!8sBII", prefix
+        )
+        if (
+            magic != b"JAGTGRN1"
+            or version != 1
+            or not 0 < header_size <= 65_536
+            or not 0 < secret_size <= 65_536
+        ):
+            raise ValueError("private Provider Grant frame is invalid")
+        document = json.loads(_receive_exact(endpoint, header_size))
+        secret.extend(_receive_exact(endpoint, secret_size))
+        binding = document.get("binding") if isinstance(document, dict) else None
+        target = binding.get("target") if isinstance(binding, dict) else None
+        if (
+            set(document) != {"schema", "binding", "grant_digest"}
+            or document.get("schema")
+            != "workbench.runtime.provider_grant_private.v1"
+            or not isinstance(binding, dict)
+            or not isinstance(target, dict)
+            or target.get("runtime_id") != "fake-v2"
+            or target.get("build_id") != "python:test-build"
+            or document.get("grant_digest") != _safe_digest(binding)
+        ):
+            raise ValueError("private Provider Grant binding is invalid")
+        acknowledgement = json.dumps(
+            {
+                "schema": "workbench.runtime.provider_grant_ack.v1",
+                "grant_id": binding["grant_id"],
+                "grant_digest": document["grant_digest"],
+                "target_instance_digest": target["instance_id_digest"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        endpoint.sendall(
+            struct.pack("!8sBI", b"JAGTACK1", 1, len(acknowledgement))
+            + acknowledgement
+        )
+        V2_STATE["provider_grant_ready"] = True
+    finally:
+        secret[:] = b"\x00" * len(secret)
+        endpoint.close()
 
 
 def record_frame(direction: str, frame: dict[str, object], byte_count: int) -> None:
@@ -360,6 +426,9 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
     if command_type == "query.start":
         if mode == "ignore_query_start":
             return False
+        if mode == "provider_grant_query" and not V2_STATE["provider_grant_ready"]:
+            write_v2(v2_response(command, {"accepted": False}))
+            return False
         if not V2_STATE["accepted"]:
             V2_STATE["accepted"] = True
         payload = command.get("payload")
@@ -367,7 +436,7 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             return True
         expected_payload_fields = (
             {"envelope", "runtime_input"}
-            if mode == "require_runtime_input"
+            if mode in {"require_runtime_input", "provider_grant_query"}
             else {"envelope"}
         )
         if set(payload) != expected_payload_fields:
@@ -435,7 +504,7 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             running_payload["grandchild_pid"] = grandchild.pid
         write_v2(v2_event(first_cursor, "runtime.status", running_payload))
 
-        if mode == "ack_terminal_same_batch":
+        if mode in {"ack_terminal_same_batch", "provider_grant_query"}:
             write_v2_terminal(first_cursor + 1)
             return False
         if mode == "runtime_reconciliation_status":
@@ -989,7 +1058,7 @@ def main_v2(mode: str, checkpoint_store: str | None = None) -> int:
         "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
     ):
         return 3
-    if mode == "provider_grant_descriptor":
+    if mode in {"provider_grant_descriptor", "provider_grant_query"}:
         descriptor = os.environ.get("WORKBENCH_PROVIDER_GRANT_FD", "")
         try:
             metadata = os.fstat(int(descriptor))
@@ -997,6 +1066,13 @@ def main_v2(mode: str, checkpoint_store: str | None = None) -> int:
             return 3
         if not descriptor.isdecimal() or not stat.S_ISSOCK(metadata.st_mode):
             return 3
+        if mode == "provider_grant_query":
+            del os.environ["WORKBENCH_PROVIDER_GRANT_FD"]
+            Thread(
+                target=receive_test_provider_grant,
+                args=(int(descriptor),),
+                daemon=True,
+            ).start()
     if mode in {
         "cancel_timeout_delayed_unknown_write",
         "cancel_timeout_delayed_unknown_write_tool_2",

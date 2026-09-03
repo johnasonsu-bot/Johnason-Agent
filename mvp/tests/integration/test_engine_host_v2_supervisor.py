@@ -4,6 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 import socket
+from secrets import token_urlsafe
 import sys
 
 import pytest
@@ -25,6 +26,13 @@ from workbench.runtime.engine_host.v2 import process_guard
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
+from workbench.credentials.service import VaultService
+from workbench.models.profiles import ProviderProfileRecord
+from workbench.providers.repository import ProviderRepository
+from workbench.runtime.provider_grants import (
+    FederatedRuntimeCoordinator,
+    ProviderGrantBroker,
+)
 from workbench.settings import RuntimeProcessConfig
 
 
@@ -312,3 +320,107 @@ def test_client_rejects_private_grant_transport_without_process_guard() -> None:
             fake_v2_command("normal"),
             provider_grant_transport=True,
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private descriptor is POSIX-only")
+@pytest.mark.asyncio
+async def test_coordinator_delivers_private_grant_before_real_supervised_query(
+    tmp_path: Path,
+) -> None:
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1", role="user", content="coordinated query"
+        ),
+    )
+    prompt_sections = (
+        RuntimePromptSectionInputV2(
+            section_id="section-1", order=0, content="pinned instructions"
+        ),
+    )
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=prompt_sections,
+        prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
+    )
+    envelope = run_envelope(
+        command_id="command-coordinated-query",
+        host_generation="1",
+        overrides={
+            "provider_ref": "provider-profile:deepseek-primary",
+            "model": "default",
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        },
+    )
+    capabilities = runtime_capabilities(
+        "fake-v2",
+        build_id="python:test-build",
+        query=True,
+        model=True,
+        tools=True,
+        skills=True,
+        plugins=True,
+        workspace=True,
+        interventions=True,
+        pause_resume=True,
+        compaction=True,
+        checkpoints=True,
+        streaming=True,
+        plan=True,
+        todo=True,
+        prompt_sections=True,
+        tool_interceptors=True,
+        event_cursor=True,
+    )
+    database = tmp_path / "coordinator.sqlite"
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    supervisor = SidecarSupervisor(
+        runtimes=(
+            RuntimeProcessConfig(
+                runtime_id="fake-v2",
+                argv=fake_v2_command("provider_grant_query"),
+            ),
+        ),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-coordinator",
+    )
+    providers = ProviderRepository(database)
+    _, profile = providers.upsert(
+        ProviderProfileRecord.deepseek(id="deepseek-primary")
+    )
+    vault = VaultService(tmp_path / "coordinator.vault")
+    vault.create(token_urlsafe(24))
+    assert profile.secret_id is not None
+    vault.put(profile.secret_id, token_urlsafe(32))
+    broker = ProviderGrantBroker(
+        database=database,
+        providers=providers,
+        vault=vault,
+        authority=supervisor,
+    )
+    coordinator = FederatedRuntimeCoordinator(broker)
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    async def run_coordinated_query():
+        return [
+            event
+            async for event in coordinator.run_query(
+                handle,
+                envelope,
+                runtime_input=runtime_input,
+            )
+        ]
+
+    try:
+        events = await asyncio.wait_for(run_coordinated_query(), timeout=2.0)
+    finally:
+        await supervisor.aclose()
+
+    assert events[-1].payload == {"status": "completed"}
