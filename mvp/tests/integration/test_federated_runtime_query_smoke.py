@@ -103,6 +103,67 @@ def _wire_commands(
     ]
 
 
+def _formal_private_frame(
+    envelope: dict[str, object],
+    *,
+    grant_id: str,
+    runtime_id: str,
+    build_id: str,
+    provider_id: str,
+    instance_id_digest: str,
+) -> bytes:
+    now = time.time()
+    binding = {
+        "grant_id": grant_id,
+        "target": {
+            "runtime_id": runtime_id,
+            "build_id": build_id,
+            "lease_id": f"lease-{grant_id}",
+            "instance_id_digest": instance_id_digest,
+            "instance_nonce_digest": "c" * 64,
+            "host_generation": "host-a",
+            "lease_generation_seq": 1,
+            "expires_at": now + 60,
+        },
+        "session_id": envelope["session_id"],
+        "command_id": envelope["command_id"],
+        "run_id": envelope["run_id"],
+        "term_id": envelope["term_id"],
+        "step_id": envelope["step_id"],
+        "provider_id": provider_id,
+        "provider_profile_digest": "d" * 64,
+        "model": "fixture-model-resolved",
+        "scopes": ["inference"],
+        "issued_at": now,
+        "expires_at": now + 30,
+        "grant_nonce_digest": "e" * 64,
+    }
+    grant_digest = hashlib.sha256(
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    header = json.dumps(
+        {
+            "schema": "workbench.runtime.provider_grant_private.v1",
+            "binding": binding,
+            "grant_digest": grant_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    secret = TEST_SECRET_VALUE.encode("utf-8")
+    return (
+        struct.pack("!8sBII", b"JAGTGRN1", 1, len(header), len(secret))
+        + header
+        + secret
+    )
+
+
 def _run_process(
     argv: tuple[str, ...],
     commands: list[dict[str, object]],
@@ -210,19 +271,17 @@ def _goose_release_lane(runtime_input: dict[str, object]) -> FixedSmokeVerdict:
         runtime_input=runtime_input,
     )
     commands = _wire_commands(start, envelope, terminal_cursor=4)
-    private_record = {
-        "schema": "goose.fixture.binding.v1",
-        "command_id": envelope["command_id"],
-        "run_id": envelope["run_id"],
-        "term_id": envelope["term_id"],
-        "step_id": envelope["step_id"],
-        "provider_ref": envelope["provider_ref"],
-        "model": envelope["model"],
-        "outcome": "complete",
-    }
+    private_frame = _formal_private_frame(
+        envelope,
+        grant_id="grant-goose-convergence",
+        runtime_id="goose",
+        build_id="goose-host-v2:fixture-wrapper-r2",
+        provider_id="fixture",
+        instance_id_digest="1" * 64,
+    )
     binary = MVP_ROOT / "runtime-hosts/goose-host-v2/target/release/goose-host-v2"
     frames, surfaces = _run_process(
-        (str(binary),), commands, private_record=private_record
+        (str(binary),), commands, private_frame=private_frame
     )
     return assert_fixed_smoke_transcript(
         lane="goose_release_smoke",
@@ -244,55 +303,13 @@ def _dsh_built_lane(runtime_input: dict[str, object]) -> FixedSmokeVerdict:
         runtime_input=runtime_input,
     )
     commands = _wire_commands(start, envelope, terminal_cursor=3)
-    now = time.time()
-    binding = {
-        "grant_id": "grant-dsh-convergence",
-        "target": {
-            "runtime_id": "dsh",
-            "build_id": "dsh:fixed-host-v2-smoke",
-            "lease_id": "lease-dsh-convergence",
-            "instance_id_digest": "b" * 64,
-            "instance_nonce_digest": "c" * 64,
-            "host_generation": "host-a",
-            "lease_generation_seq": 1,
-            "expires_at": now + 60,
-        },
-        "session_id": envelope["session_id"],
-        "command_id": envelope["command_id"],
-        "run_id": envelope["run_id"],
-        "term_id": envelope["term_id"],
-        "step_id": envelope["step_id"],
-        "provider_id": "fixture-completed",
-        "provider_profile_digest": "d" * 64,
-        "model": "fixture-model-resolved",
-        "scopes": ["inference"],
-        "issued_at": now,
-        "expires_at": now + 30,
-        "grant_nonce_digest": "e" * 64,
-    }
-    grant_digest = hashlib.sha256(
-        json.dumps(
-            binding,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
-    header = json.dumps(
-        {
-            "schema": "workbench.runtime.provider_grant_private.v1",
-            "binding": binding,
-            "grant_digest": grant_digest,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    secret = TEST_SECRET_VALUE.encode("utf-8")
-    private_frame = (
-        struct.pack("!8sBII", b"JAGTGRN1", 1, len(header), len(secret))
-        + header
-        + secret
+    private_frame = _formal_private_frame(
+        envelope,
+        grant_id="grant-dsh-convergence",
+        runtime_id="dsh",
+        build_id="dsh:fixed-host-v2-smoke",
+        provider_id="fixture-completed",
+        instance_id_digest="b" * 64,
     )
     node = shutil.which("node")
     assert node is not None

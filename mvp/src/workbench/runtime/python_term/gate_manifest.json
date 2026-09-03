@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "12e31a8a4ea346d61f3d403d5fadd3acf0c975a5070bf1b43ba0177b5fc6e86b",
-      "size": 1913981
+      "sha256": "045bf30c043f675212293d12c76b97daf859304ee08b4ef1e38dadc04db6a6ca",
+      "size": 1914297
     },
     {
       "path": "uv.lock",
@@ -489,7 +489,7 @@
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "89d2de9deefbc0c808dbd633cbaf92b2f19c6c71324d9cb86b423d860f8b34b1",
+      "sha256": "d327f57bfc11e306ee7b865cc738f06ccf7a58458db4701565d601e787eb42fa",
       "size": 6585
     },
     {
@@ -599,13 +599,13 @@
     },
     {
       "path": "runtime/goose/source_gate.py",
-      "sha256": "0a7a473583ecb21727b1ee99085c5359a9c03c40cbf2135c4287ec96c33ea3b7",
-      "size": 34955
+      "sha256": "141cf6e3ad26f1ced9373667688bdbeb3e1c9370d33c640e34b6f03579396e5e",
+      "size": 37437
     },
     {
       "path": "runtime/goose/source_manifest.json",
-      "sha256": "e921890d1058cbefa890bcb6248db694a1ffe3a89f288970a7296d4d2b8dd18a",
-      "size": 4787
+      "sha256": "0f84ded65fdc64215db8a0d1d0f9ce0b5af8d62f71e4dc740de128918fe65553",
+      "size": 4779
     },
     {
       "path": "runtime/provider_grants/__init__.py",

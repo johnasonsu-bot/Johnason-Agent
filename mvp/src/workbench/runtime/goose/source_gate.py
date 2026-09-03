@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
+import struct
 import subprocess
-import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,7 +74,7 @@ _QUERY_SMOKE_SCHEMA = "workbench.runtime.goose.fixture-build-evidence.v1"
 _QUERY_SMOKE_BUILDER = "johnason.goose.fixture-wrapper.local-release.v1"
 _QUERY_SMOKE_BUILD_ID = "goose-host-v2:fixture-wrapper-r2"
 _QUERY_SMOKE_PROTOCOL = (
-    "host-v2-closed-input-fixture-binding-completed-failed-cancelled.v3"
+    "host-v2-private-framed-grant-completed-failed-cancelled.v4"
 )
 _QUERY_SMOKE_TRUST_TIER = "local_fixture_smoke"
 _QUERY_SMOKE_BUILD_COMMAND = (
@@ -427,12 +429,16 @@ def _run_protocol_path(binary: Path, *, scenario: str) -> list[dict[str, Any]]:
             raise GooseSourceReadinessError(
                 "Goose invalid fixture input must fail the shared Python contract"
             )
+    provider_id = {
+        "cancelled": "fixture-held",
+        "failed": "fixture-failed",
+    }.get(scenario, "fixture-completed")
     envelope = {
         "context": {"snapshot_digest": runtime_input["context_snapshot_digest"]},
         "message_snapshot_digest": runtime_input["message_snapshot_digest"],
-        "model": "fixture-model",
+        "model": "fixture-model-alias",
         "prompt_manifest_digest": runtime_input["prompt_manifest_digest"],
-        "provider_ref": "provider-profile:fixture",
+        "provider_ref": f"provider-profile:{provider_id}",
         "run_id": run_id,
         "runtime": {"runtime_id": "goose"},
         "step_id": step_id,
@@ -470,52 +476,88 @@ def _run_protocol_path(binary: Path, *, scenario: str) -> list[dict[str, Any]]:
             },
         })
     stdin = b"".join(canonical_manifest_bytes(command) for command in commands)
+    now = time.time()
     binding = {
+        "grant_id": f"grant-goose-{suffix}",
+        "target": {
+            "runtime_id": "goose",
+            "build_id": _QUERY_SMOKE_BUILD_ID,
+            "lease_id": f"lease-goose-{suffix}",
+            "instance_id_digest": "1" * 64,
+            "instance_nonce_digest": "2" * 64,
+            "host_generation": "host-a",
+            "lease_generation_seq": 1,
+            "expires_at": now + 60,
+        },
+        "session_id": "session-goose-smoke",
         "command_id": f"start-{suffix}",
-        "model": "fixture-model",
-        "outcome": {
-            "cancelled": "hold",
-            "failed": "fail",
-        }.get(scenario, "complete"),
-        "provider_ref": "provider-profile:fixture",
         "run_id": run_id,
-        "schema": "goose.fixture.binding.v1",
-        "step_id": step_id,
         "term_id": term_id,
+        "step_id": step_id,
+        "provider_id": provider_id,
+        "provider_profile_digest": "3" * 64,
+        "model": "fixture-model-resolved",
+        "scopes": ["inference"],
+        "issued_at": now,
+        "expires_at": now + 30,
+        "grant_nonce_digest": "4" * 64,
     }
+    grant_digest = _sha256(
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+    header = json.dumps(
+        {
+            "schema": "workbench.runtime.provider_grant_private.v1",
+            "binding": binding,
+            "grant_digest": grant_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    secret = b"goose-fixed-smoke-private-value"
+    private_frame = (
+        struct.pack("!8sBII", b"JAGTGRN1", 1, len(header), len(secret))
+        + header
+        + secret
+    )
     child_environment = {
         name: os.environ[name] for name in _RUNTIME_ENVIRONMENT_ALLOWLIST if name in os.environ
     }
-    read_fd, write_fd = os.pipe()
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        os.write(write_fd, canonical_manifest_bytes(binding))
-        os.close(write_fd)
-
-        private_fd_launcher = (
-            "import os,sys; source=int(sys.argv[1]); "
-            "os.dup2(source,3); os.set_inheritable(3,True); "
-            "os.execve(sys.argv[2],[sys.argv[2]],dict(os.environ))"
-        )
+        parent.settimeout(1.0)
+        parent.sendall(private_frame)
+        child_environment["WORKBENCH_PROVIDER_GRANT_FD"] = str(child.fileno())
         process = subprocess.run(
-            [sys.executable, "-c", private_fd_launcher, str(read_fd), str(binary)],
+            [str(binary)],
             input=stdin,
             capture_output=True,
             timeout=10,
             env=child_environment,
             check=False,
-            pass_fds=(read_fd,),
+            pass_fds=(child.fileno(),),
         )
+        child.close()
+        acknowledgement = parent.recv(8_192)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise GooseSourceReadinessError("Goose wrapper protocol smoke could not execute") from error
     finally:
-        try:
-            os.close(read_fd)
-        except OSError:
-            pass
+        child.close()
+        parent.close()
     if process.returncode != 0 or process.stderr:
         diagnostic = process.stderr.decode("utf-8", errors="replace").strip()[:240]
         raise GooseSourceReadinessError(
             f"Goose wrapper protocol smoke failed: {diagnostic or 'nonzero exit'}"
+        )
+    if not acknowledgement.startswith(b"JAGTACK1\x01"):
+        raise GooseSourceReadinessError(
+            "Goose wrapper Provider Grant acknowledgement drift"
         )
     try:
         frames = [json.loads(line) for line in process.stdout.splitlines()]
@@ -655,6 +697,34 @@ def _query_smoke_contract() -> dict[str, Any]:
         "toolchain": PINNED_TOOLCHAIN,
         "trust_tier": _QUERY_SMOKE_TRUST_TIER,
     }
+
+
+def refresh_goose_wrapper_manifest(
+    repository_root: Path, *, manifest_path: Path | None = None
+) -> None:
+    """Refresh only repository-owned wrapper hashes and fixed-smoke contract."""
+    root = Path(repository_root).resolve()
+    target = default_manifest_path() if manifest_path is None else Path(manifest_path)
+    try:
+        document = json.loads(target.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise GooseSourceReadinessError("Goose source manifest is unavailable") from error
+    wrapper_inputs = [
+        {"path": path, "sha256": _sha256((root / path).read_bytes())}
+        for path in _WRAPPER_INPUTS
+    ]
+    document["wrapper"] = {
+        "closure": _wrapper_closure_contract(),
+        "lockfile_path": _WRAPPER_LOCKFILE_PATH,
+        "manifest_path": _WRAPPER_MANIFEST_PATH,
+        "root": _WRAPPER_ROOT,
+        "source_digest": _sha256(
+            canonical_manifest_bytes({"inputs": wrapper_inputs})
+        ),
+        "source_inputs": wrapper_inputs,
+    }
+    document["query_smoke"] = _query_smoke_contract()
+    target.write_bytes(canonical_manifest_bytes(document))
 
 
 def _verify_manifest_contract(document: Mapping[str, Any]) -> None:

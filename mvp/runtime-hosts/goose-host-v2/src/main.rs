@@ -15,8 +15,17 @@ use protocol::{ControlFrame, response};
 use provider_bridge::ProviderRequest;
 use query::QueryMachine;
 
-const ALLOWED_PROCESS_ENVIRONMENT_NAMES: &[&str] =
-    &["HOME", "LANG", "LC_ALL", "LC_CTYPE", "PATH", "TMPDIR", "TZ"];
+const BUILD_ID: &str = "goose-host-v2:fixture-wrapper-r2";
+const ALLOWED_PROCESS_ENVIRONMENT_NAMES: &[&str] = &[
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "PYTHONUTF8",
+    "TMPDIR",
+    "TZ",
+];
 
 fn validate_argv(arguments: &[String]) -> Result<(), String> {
     if arguments.len() != 1 {
@@ -57,7 +66,15 @@ fn main() {
 fn run() -> Result<(), String> {
     let arguments: Vec<String> = env::args().collect();
     validate_argv(&arguments)?;
+    let descriptor = env::var(grant_channel::PROVIDER_GRANT_FD_ENV)
+        .map_err(|_| "Goose Provider Grant descriptor is missing")?
+        .parse::<i32>()
+        .map_err(|_| "Goose Provider Grant descriptor is invalid")?;
+    // SAFETY: no thread exists yet, so mutating this one internal variable
+    // cannot race another environment reader.
+    unsafe { env::remove_var(grant_channel::PROVIDER_GRANT_FD_ENV) };
     validate_process_environment(env::vars())?;
+    let mut grant_receiver = grant_channel::GrantReceiver::start(descriptor)?;
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut machine = QueryMachine::default();
@@ -73,7 +90,7 @@ fn run() -> Result<(), String> {
                         &command.command_id,
                         json!({
                             "runtime_id":"goose",
-                            "build_id":"goose-host-v2:fixture-wrapper-r2",
+                            "build_id":BUILD_ID,
                             "protocol_version":"2.0",
                             "query":true,"model":false,"tools":false,"skills":false,
                             "plugins":false,"workspace":false,"interventions":false,
@@ -109,7 +126,7 @@ fn run() -> Result<(), String> {
                     .get("step_id")
                     .and_then(Value::as_str)
                     .ok_or("step_id is missing")?;
-                let private_grant = grant_channel::read_once(3)?;
+                let private_grant = grant_receiver.receive()?;
                 let fixture_disposition = if provider.is_fixture() {
                     private_grant.fixture_disposition(
                         &command.command_id,

@@ -130,7 +130,7 @@ export class EphemeralGrantChannel {
 }
 
 
-function validateFormalGrant(document, targetInstanceDigest, clock) {
+function validateFormalGrant(document, targetIdentity, clock) {
   if (!exactKeys(document, GRANT_HEADER_FIELDS)
       || document.schema !== "workbench.runtime.provider_grant_private.v1"
       || !DIGEST.test(document.grant_digest)
@@ -141,8 +141,9 @@ function validateFormalGrant(document, targetInstanceDigest, clock) {
   }
   const binding = document.binding;
   const target = binding.target;
-  if (target.runtime_id !== "dsh"
-      || target.instance_id_digest !== targetInstanceDigest
+  if (target.runtime_id !== targetIdentity.runtimeId
+      || target.build_id !== targetIdentity.buildId
+      || !DIGEST.test(target.instance_id_digest)
       || !DIGEST.test(target.instance_nonce_digest)
       || !Number.isSafeInteger(target.lease_generation_seq)
       || target.lease_generation_seq < 1
@@ -189,13 +190,16 @@ function ackFrame(binding, grantDigest) {
 
 export function startPreopenedGrantReceiver(
   fd,
-  targetInstanceDigest,
+  targetIdentity,
   clock = () => Date.now() / 1000,
 ) {
-  if (!Number.isSafeInteger(fd) || fd <= 2 || !DIGEST.test(targetInstanceDigest)) {
+  if (!Number.isSafeInteger(fd) || fd <= 2
+      || targetIdentity === null || typeof targetIdentity !== "object"
+      || typeof targetIdentity.runtimeId !== "string" || targetIdentity.runtimeId.length === 0
+      || typeof targetIdentity.buildId !== "string" || targetIdentity.buildId.length === 0) {
     throw new Error("private provider grant descriptor is invalid");
   }
-  const channel = new EphemeralGrantChannel(clock, targetInstanceDigest);
+  const channel = new EphemeralGrantChannel(clock);
   let endpoint;
   try {
     endpoint = new Socket({ fd, readable: true, writable: true });
@@ -251,7 +255,7 @@ export function startPreopenedGrantReceiver(
       }
       let binding;
       try {
-        binding = validateFormalGrant(document, targetInstanceDigest, clock);
+        binding = validateFormalGrant(document, targetIdentity, clock);
       } catch (error) {
         fail(error instanceof Error ? error.message : "private provider grant is invalid");
         return;
@@ -290,7 +294,7 @@ export function startPreopenedGrantReceiver(
 }
 
 
-export function readPreopenedGrantChannel(fd, targetInstanceDigest, clock) {
-  const receiver = startPreopenedGrantReceiver(fd, targetInstanceDigest, clock);
+export function readPreopenedGrantChannel(fd, targetIdentity, clock) {
+  const receiver = startPreopenedGrantReceiver(fd, targetIdentity, clock);
   return receiver;
 }

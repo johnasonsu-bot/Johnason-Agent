@@ -53,7 +53,11 @@ function queryCommand(providerRef = "provider-profile:fixture-completed") {
 }
 
 
-function privateGrant(providerRef = "provider-profile:fixture-completed", grantId = "grant-wire") {
+function privateGrant(
+  providerRef = "provider-profile:fixture-completed",
+  grantId = "grant-wire",
+  instanceDigest = INSTANCE_DIGEST,
+) {
   const { envelope } = queryCommand(providerRef).payload;
   const issuedAt = Date.now() / 1000;
   const binding = {
@@ -62,7 +66,7 @@ function privateGrant(providerRef = "provider-profile:fixture-completed", grantI
       runtime_id: "dsh",
       build_id: "dsh:fixed-host-v2-smoke",
       lease_id: "lease-wire",
-      instance_id_digest: INSTANCE_DIGEST,
+      instance_id_digest: instanceDigest,
       instance_nonce_digest: "c".repeat(64),
       host_generation: "host-a",
       lease_generation_seq: 1,
@@ -136,7 +140,7 @@ async function launchPublishedSidecar(grant = privateGrant()) {
     schema: "workbench.runtime.provider_grant_ack.v1",
     grant_id: grant.binding.grant_id,
     grant_digest: grant.grant_digest,
-    target_instance_digest: INSTANCE_DIGEST,
+    target_instance_digest: grant.binding.target.instance_id_digest,
   });
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const iterator = lines[Symbol.asyncIterator]();
@@ -425,6 +429,22 @@ test("published NDJSON sidecar accepts before events and seals completed termina
       terminal_cursor: 3,
       sealed: true,
     });
+  } finally {
+    await wire.close();
+  }
+});
+
+
+test("published sidecar binds a Supervisor-issued runtime instance instead of a fixture digest", async () => {
+  const supervisorInstanceDigest = "a".repeat(64);
+  const wire = await launchPublishedSidecar(privateGrant(
+    "provider-profile:fixture-completed",
+    "grant-supervisor-instance",
+    supervisorInstanceDigest,
+  ));
+  try {
+    wire.send(queryCommand());
+    assert.deepEqual((await wire.read()).payload, { accepted: true });
   } finally {
     await wire.close();
   }

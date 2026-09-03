@@ -29,7 +29,7 @@ impl ProviderRequest {
     }
 
     pub fn is_fixture(&self) -> bool {
-        self.provider_ref == "provider-profile:fixture"
+        self.provider_ref.starts_with("provider-profile:fixture")
     }
 }
 

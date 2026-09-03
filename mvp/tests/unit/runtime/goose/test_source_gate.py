@@ -98,9 +98,9 @@ def test_manifest_is_canonical_and_binds_every_required_input() -> None:
         ),
         "evidence_schema": "workbench.runtime.goose.fixture-build-evidence.v1",
         "host_target_policy": "native-only",
-        "smoke_protocol": (
-            "host-v2-closed-input-fixture-binding-completed-failed-cancelled.v3"
-        ),
+            "smoke_protocol": (
+                "host-v2-private-framed-grant-completed-failed-cancelled.v4"
+            ),
         "status": GO_GOOSE_QUERY_SMOKE,
         "toolchain": "1.96.1",
         "trust_tier": "local_fixture_smoke",
