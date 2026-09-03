@@ -127,10 +127,6 @@ struct ProviderGrantRoute {
 }
 
 impl GrantMaterial {
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn fixture_disposition(
         &self,

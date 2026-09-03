@@ -69,10 +69,38 @@ pub(crate) enum ProviderStreamEvent {
     Usage,
 }
 
+#[cfg(test)]
 pub(crate) async fn stream_provider(
-    mut material: ProviderMaterial,
+    material: ProviderMaterial,
     prompt: ProviderPrompt,
 ) -> Result<Vec<ProviderStreamEvent>, String> {
+    let mut events = Vec::new();
+    stream_provider_with(material, prompt, |event| {
+        events.push(event);
+        Ok(())
+    })
+    .await?;
+    Ok(events)
+}
+
+pub(crate) async fn stream_provider_to(
+    material: ProviderMaterial,
+    prompt: ProviderPrompt,
+    sender: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
+) -> Result<(), String> {
+    stream_provider_with(material, prompt, move |event| {
+        sender
+            .send(event)
+            .map_err(|_| "Goose provider event receiver is unavailable".to_owned())
+    })
+    .await
+}
+
+async fn stream_provider_with(
+    mut material: ProviderMaterial,
+    prompt: ProviderPrompt,
+    mut emit: impl FnMut(ProviderStreamEvent) -> Result<(), String>,
+) -> Result<(), String> {
     let secret = match String::from_utf8(material.take_secret()) {
         Ok(secret) => secret,
         Err(error) => {
@@ -127,7 +155,6 @@ pub(crate) async fn stream_provider(
         .stream(&model, &prompt.system, &messages, &[])
         .await
         .map_err(|error| format!("Goose provider request failed: {error}"))?;
-    let mut events = Vec::new();
     while let Some(item) = stream.next().await {
         let (message, usage) =
             item.map_err(|error| format!("Goose provider stream failed: {error}"))?;
@@ -136,12 +163,12 @@ pub(crate) async fn stream_provider(
                 match content {
                     MessageContentBlock::Text(text) => {
                         if !text.text.is_empty() {
-                            events.push(ProviderStreamEvent::OutputToken(text.text));
+                            emit(ProviderStreamEvent::OutputToken(text.text))?;
                         }
                     }
                     MessageContentBlock::Thinking(thinking) => {
                         if !thinking.thinking.is_empty() {
-                            events.push(ProviderStreamEvent::ReasoningToken(thinking.thinking));
+                            emit(ProviderStreamEvent::ReasoningToken(thinking.thinking))?;
                         }
                     }
                     MessageContentBlock::ToolRequest(_) => {
@@ -160,10 +187,10 @@ pub(crate) async fn stream_provider(
             }
         }
         if usage.is_some() {
-            events.push(ProviderStreamEvent::Usage);
+            emit(ProviderStreamEvent::Usage)?;
         }
     }
-    Ok(events)
+    Ok(())
 }
 
 fn completion_prefix(protocol: &str, base_url: &str) -> Result<String, String> {

@@ -9,6 +9,9 @@ pub fn map_event(event: InternalEvent, run_id: &str, term_id: &str, step_id: &st
     let (event_type, payload) = match event {
         InternalEvent::Running { .. } => ("runtime.status", json!({"status":"running"})),
         InternalEvent::OutputToken { text, .. } => ("assistant.delta", json!({"text":text})),
+        InternalEvent::ReasoningObserved { char_count, .. } => {
+            ("reasoning.delta", json!({"char_count":char_count}))
+        }
         InternalEvent::OutputMessage { text, .. } => ("assistant.message", json!({"content":text})),
         InternalEvent::Completed { .. } => ("runtime.status", json!({"status":"completed"})),
         InternalEvent::Failed { .. } => ("runtime.status", json!({"status":"failed"})),

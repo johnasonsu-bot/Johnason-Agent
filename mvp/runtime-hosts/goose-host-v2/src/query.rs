@@ -5,12 +5,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::grant_channel::FixtureDisposition;
-use crate::provider_bridge::ProviderRequest;
+use crate::provider_bridge::{
+    ProviderPrompt, ProviderPromptMessage, ProviderPromptRole, ProviderRequest, ProviderStreamEvent,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalEvent {
     Running { cursor: u64 },
     OutputToken { cursor: u64, text: String },
+    ReasoningObserved { cursor: u64, char_count: usize },
     OutputMessage { cursor: u64, text: String },
     Completed { cursor: u64 },
     Failed { cursor: u64, reason: String },
@@ -22,6 +25,7 @@ impl InternalEvent {
         match self {
             Self::Running { cursor }
             | Self::OutputToken { cursor, .. }
+            | Self::ReasoningObserved { cursor, .. }
             | Self::OutputMessage { cursor, .. }
             | Self::Completed { cursor }
             | Self::Failed { cursor, .. }
@@ -41,6 +45,7 @@ pub struct QueryIdentity {
 pub struct QueryMachine {
     active: Option<QueryIdentity>,
     cursor: u64,
+    output: String,
     terminal: Option<(QueryIdentity, u64, &'static str)>,
 }
 
@@ -76,6 +81,7 @@ impl QueryMachine {
             step_id: required_text(object, "step_id")?,
         };
         self.cursor = 1;
+        self.output.clear();
         self.terminal = None;
         self.active = Some(identity.clone());
         let mut events = vec![InternalEvent::Running { cursor: 1 }];
@@ -109,6 +115,102 @@ impl QueryMachine {
         Ok(events)
     }
 
+    pub fn start_real(
+        &mut self,
+        envelope: &Value,
+        runtime_input: &Value,
+    ) -> Result<(InternalEvent, ProviderPrompt), String> {
+        if self.active.is_some() {
+            return Err("a Goose query is already active".into());
+        }
+        let object = envelope.as_object().ok_or("envelope must be an object")?;
+        if object
+            .get("runtime")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("runtime_id"))
+            .and_then(Value::as_str)
+            != Some("goose")
+        {
+            return Err("query is not assigned to Goose".into());
+        }
+        let provider = ProviderRequest::from_envelope(envelope)?;
+        if provider.is_fixture() {
+            return Err("fixture provider requires the deterministic query path".into());
+        }
+        let validated_input = validate_runtime_input(runtime_input)?;
+        validate_envelope_digests(object, &validated_input)?;
+        let identity = QueryIdentity {
+            run_id: required_text(object, "run_id")?,
+            term_id: required_text(object, "term_id")?,
+            step_id: required_text(object, "step_id")?,
+        };
+        let prompt = materialize_provider_prompt(validated_input)?;
+        self.cursor = 1;
+        self.output.clear();
+        self.terminal = None;
+        self.active = Some(identity);
+        Ok((InternalEvent::Running { cursor: 1 }, prompt))
+    }
+
+    pub fn push_real(
+        &mut self,
+        event: ProviderStreamEvent,
+    ) -> Result<Option<InternalEvent>, String> {
+        if self.active.is_none() {
+            return Err("no active Goose query".into());
+        }
+        match event {
+            ProviderStreamEvent::Usage => Ok(None),
+            ProviderStreamEvent::OutputToken(text) => {
+                self.cursor += 1;
+                self.output.push_str(&text);
+                Ok(Some(InternalEvent::OutputToken {
+                    cursor: self.cursor,
+                    text,
+                }))
+            }
+            ProviderStreamEvent::ReasoningToken(text) => {
+                self.cursor += 1;
+                Ok(Some(InternalEvent::ReasoningObserved {
+                    cursor: self.cursor,
+                    char_count: text.chars().count(),
+                }))
+            }
+        }
+    }
+
+    pub fn complete_real(&mut self) -> Result<Vec<InternalEvent>, String> {
+        let identity = self.active.take().ok_or("no active Goose query")?;
+        if self.output.is_empty() {
+            self.active = Some(identity);
+            return Err("Goose provider completed without assistant output".into());
+        }
+        self.cursor += 1;
+        let message = InternalEvent::OutputMessage {
+            cursor: self.cursor,
+            text: self.output.clone(),
+        };
+        self.cursor += 1;
+        let completed = InternalEvent::Completed {
+            cursor: self.cursor,
+        };
+        self.output.clear();
+        self.terminal = Some((identity, self.cursor, "completed"));
+        Ok(vec![message, completed])
+    }
+
+    pub fn fail_real(&mut self, reason: &str) -> Result<InternalEvent, String> {
+        let identity = self.active.take().ok_or("no active Goose query")?;
+        self.cursor += 1;
+        self.output.clear();
+        let event = InternalEvent::Failed {
+            cursor: self.cursor,
+            reason: reason.to_owned(),
+        };
+        self.terminal = Some((identity, self.cursor, "failed"));
+        Ok(event)
+    }
+
     pub fn cancel(&mut self, run_id: &str) -> Result<InternalEvent, String> {
         let identity = self.active.take().ok_or("no active Goose query")?;
         if identity.run_id != run_id {
@@ -120,6 +222,7 @@ impl QueryMachine {
             cursor: self.cursor,
             reason: "user_requested".into(),
         };
+        self.output.clear();
         self.terminal = Some((identity, self.cursor, "cancelled"));
         Ok(event)
     }
@@ -129,6 +232,48 @@ impl QueryMachine {
             .as_ref()
             .map(|(identity, cursor, status)| (identity, *cursor, *status))
     }
+
+    pub fn active_identity(&self) -> Option<&QueryIdentity> {
+        self.active.as_ref()
+    }
+}
+
+fn materialize_provider_prompt(input: RuntimeQueryInput) -> Result<ProviderPrompt, String> {
+    let mut system_parts: Vec<String> = input
+        .prompt_sections
+        .into_iter()
+        .map(|section| section.content)
+        .collect();
+    system_parts.extend(
+        input
+            .context_items
+            .into_iter()
+            .map(|item| format!("[context {} {}]\n{}", item.kind, item.item_id, item.content)),
+    );
+    let mut messages = Vec::new();
+    for message in input.messages {
+        match message.role {
+            RuntimeMessageRole::System => system_parts.push(message.content),
+            RuntimeMessageRole::User => messages.push(ProviderPromptMessage {
+                role: ProviderPromptRole::User,
+                content: message.content,
+            }),
+            RuntimeMessageRole::Assistant => messages.push(ProviderPromptMessage {
+                role: ProviderPromptRole::Assistant,
+                content: message.content,
+            }),
+            RuntimeMessageRole::Tool => {
+                return Err("tool-role history requires the durable Goose tool bridge".into());
+            }
+        }
+    }
+    if messages.is_empty() {
+        return Err("real Goose query requires a user or assistant message".into());
+    }
+    Ok(ProviderPrompt {
+        system: system_parts.join("\n\n"),
+        messages,
+    })
 }
 
 #[derive(Deserialize)]
@@ -368,6 +513,7 @@ fn required_text(object: &serde_json::Map<String, Value>, key: &str) -> Result<S
 mod tests {
     use super::{InternalEvent, QueryMachine};
     use crate::grant_channel::FixtureDisposition;
+    use crate::provider_bridge::{ProviderPromptRole, ProviderStreamEvent};
     use serde_json::json;
 
     fn envelope() -> serde_json::Value {
@@ -500,5 +646,50 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn real_query_materializes_ordered_prompt_and_terminal_events() {
+        let mut real_envelope = envelope();
+        real_envelope["provider_ref"] = json!("provider-profile:deepseek");
+        real_envelope["model"] = json!("deepseek-chat-alias");
+        let mut machine = QueryMachine::default();
+        let (running, prompt) = machine
+            .start_real(&real_envelope, &shared_runtime_input())
+            .expect("real query start");
+
+        assert!(matches!(running, InternalEvent::Running { cursor: 1 }));
+        assert_eq!(
+            prompt.system,
+            "A\n\nB\n\n[context document context-1]\ncontext"
+        );
+        assert_eq!(prompt.messages.len(), 2);
+        assert_eq!(prompt.messages[0].role, ProviderPromptRole::User);
+        assert_eq!(prompt.messages[0].content, "fixture");
+        assert_eq!(prompt.messages[1].role, ProviderPromptRole::Assistant);
+        assert_eq!(prompt.messages[1].content, "prior");
+
+        let token = machine
+            .push_real(ProviderStreamEvent::OutputToken("hello".into()))
+            .expect("real output token")
+            .expect("public token event");
+        assert!(matches!(
+            token,
+            InternalEvent::OutputToken { cursor: 2, .. }
+        ));
+        assert!(
+            machine
+                .push_real(ProviderStreamEvent::Usage)
+                .expect("private usage")
+                .is_none()
+        );
+        let terminal = machine.complete_real().expect("real terminal");
+        assert!(matches!(
+            terminal.as_slice(),
+            [
+                InternalEvent::OutputMessage { cursor: 3, .. },
+                InternalEvent::Completed { cursor: 4 }
+            ]
+        ));
     }
 }

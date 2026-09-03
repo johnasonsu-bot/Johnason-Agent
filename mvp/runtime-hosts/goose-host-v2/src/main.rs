@@ -5,14 +5,16 @@ mod provider_bridge;
 mod query;
 
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use event_mapper::map_event;
-use grant_channel::FixtureDisposition;
 use protocol::{ControlFrame, response};
-use provider_bridge::ProviderRequest;
+use provider_bridge::{ProviderRequest, ProviderStreamEvent, stream_provider_to};
 use query::QueryMachine;
 
 const BUILD_ID: &str = "goose-host-v2:fixture-wrapper-r2";
@@ -59,14 +61,15 @@ fn write_frame(stdout: &mut impl Write, frame: &Value) -> Result<(), String> {
         .map_err(|_| "Host v2 output flush failed".to_owned())
 }
 
-fn main() {
-    if let Err(message) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(message) = run().await {
         eprintln!("GOOSE_HOST_V2_BLOCKED:{message}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), String> {
+async fn run() -> Result<(), String> {
     let arguments: Vec<String> = env::args().collect();
     validate_argv(&arguments)?;
     let descriptor = env::var(grant_channel::PROVIDER_GRANT_FD_ENV)
@@ -78,13 +81,24 @@ fn run() -> Result<(), String> {
     unsafe { env::remove_var(grant_channel::PROVIDER_GRANT_FD_ENV) };
     validate_process_environment(env::vars())?;
     let mut grant_receiver = grant_channel::GrantReceiver::start(descriptor)?;
-    let stdin = io::stdin();
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = io::stdout().lock();
     let mut machine = QueryMachine::default();
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|_| "Host v2 input failed")?;
-        let command = ControlFrame::parse(line.as_bytes())?;
-        match command.command_type.as_str() {
+    let mut input_open = true;
+    let mut active_task: Option<(String, JoinHandle<Result<(), String>>)> = None;
+    let mut active_events: Option<mpsc::UnboundedReceiver<ProviderStreamEvent>> = None;
+    loop {
+        if !input_open && active_task.is_none() {
+            break;
+        }
+        tokio::select! {
+            line = stdin.next_line(), if input_open => {
+                let Some(line) = line.map_err(|_| "Host v2 input failed")? else {
+                    input_open = false;
+                    continue;
+                };
+                let command = ControlFrame::parse(line.as_bytes())?;
+                match command.command_type.as_str() {
             "runtime.capabilities" => {
                 write_frame(
                     &mut stdout,
@@ -130,7 +144,8 @@ fn run() -> Result<(), String> {
                     .and_then(Value::as_str)
                     .ok_or("step_id is missing")?;
                 let private_grant = grant_receiver.receive()?;
-                let fixture_disposition = if provider.is_fixture() {
+                if provider.is_fixture() {
+                    let fixture_disposition =
                     private_grant.fixture_disposition(
                         &command.command_id,
                         run_id,
@@ -138,36 +153,69 @@ fn run() -> Result<(), String> {
                         step_id,
                         &provider.provider_ref,
                         &provider.model,
-                    )?
-                } else {
-                    if private_grant.is_empty() {
-                        return Err("provider Grant Channel payload is empty".into());
-                    }
-                    FixtureDisposition::Complete
-                };
-                match machine.start(envelope, &runtime_input, fixture_disposition) {
-                    Ok(events) => {
-                        write_frame(
-                            &mut stdout,
-                            &response(
-                                &command.command_type,
-                                &command.command_id,
-                                json!({"accepted":true}),
-                            ),
-                        )?;
-                        for event in events {
-                            write_frame(&mut stdout, &map_event(event, run_id, term_id, step_id))?;
+                    )?;
+                    match machine.start(envelope, &runtime_input, fixture_disposition) {
+                        Ok(events) => {
+                            write_frame(
+                                &mut stdout,
+                                &response(
+                                    &command.command_type,
+                                    &command.command_id,
+                                    json!({"accepted":true}),
+                                ),
+                            )?;
+                            for event in events {
+                                write_frame(&mut stdout, &map_event(event, run_id, term_id, step_id))?;
+                            }
+                        }
+                        Err(_) => {
+                            write_frame(
+                                &mut stdout,
+                                &response(
+                                    &command.command_type,
+                                    &command.command_id,
+                                    json!({"accepted":false}),
+                                ),
+                            )?;
                         }
                     }
-                    Err(_) => {
-                        write_frame(
-                            &mut stdout,
-                            &response(
-                                &command.command_type,
-                                &command.command_id,
-                                json!({"accepted":false}),
-                            ),
-                        )?;
+                } else {
+                    let material = private_grant.into_provider_material(
+                        &command.command_id,
+                        run_id,
+                        term_id,
+                        step_id,
+                        &provider.provider_ref,
+                    )?;
+                    match machine.start_real(envelope, &runtime_input) {
+                        Ok((running, prompt)) => {
+                            write_frame(
+                                &mut stdout,
+                                &response(
+                                    &command.command_type,
+                                    &command.command_id,
+                                    json!({"accepted":true}),
+                                ),
+                            )?;
+                            write_frame(&mut stdout, &map_event(running, run_id, term_id, step_id))?;
+                            let (sender, receiver) = mpsc::unbounded_channel();
+                            let task_run_id = run_id.to_owned();
+                            let task = tokio::spawn(async move {
+                                stream_provider_to(material, prompt, sender).await
+                            });
+                            active_task = Some((task_run_id, task));
+                            active_events = Some(receiver);
+                        }
+                        Err(_) => {
+                            write_frame(
+                                &mut stdout,
+                                &response(
+                                    &command.command_type,
+                                    &command.command_id,
+                                    json!({"accepted":false}),
+                                ),
+                            )?;
+                        }
                     }
                 }
             }
@@ -177,6 +225,14 @@ fn run() -> Result<(), String> {
                     .get("run_id")
                     .and_then(Value::as_str)
                     .ok_or("cancel run_id is missing")?;
+                if active_task
+                    .as_ref()
+                    .is_some_and(|(active_run_id, _)| active_run_id == run_id)
+                {
+                    let (_, task) = active_task.take().expect("active task was checked");
+                    task.abort();
+                    active_events = None;
+                }
                 let event = machine.cancel(run_id)?;
                 write_frame(
                     &mut stdout,
@@ -236,6 +292,56 @@ fn run() -> Result<(), String> {
                     ),
                 )?;
             }
+                }
+            }
+            event = async {
+                active_events
+                    .as_mut()
+                    .expect("active event receiver")
+                    .recv()
+                    .await
+            }, if active_events.is_some() => {
+                if let Some(event) = event {
+                    let identity = machine
+                        .active_identity()
+                        .cloned()
+                        .ok_or("Goose provider emitted an event without an active query")?;
+                    if let Some(event) = machine.push_real(event)? {
+                        write_frame(
+                            &mut stdout,
+                            &map_event(event, &identity.run_id, &identity.term_id, &identity.step_id),
+                        )?;
+                    }
+                } else {
+                    active_events = None;
+                    let (_, task) = active_task
+                        .take()
+                        .ok_or("Goose provider task is unavailable")?;
+                    let identity = machine
+                        .active_identity()
+                        .cloned()
+                        .ok_or("Goose provider completed without an active query")?;
+                    let result = task
+                        .await
+                        .map_err(|_| "Goose provider task failed".to_owned())?;
+                    let events = match result {
+                        Ok(()) => match machine.complete_real() {
+                            Ok(events) => events,
+                            Err(_) => vec![machine.fail_real("empty_output")?],
+                        },
+                        Err(_) => vec![machine.fail_real("provider_failed")?],
+                    };
+                    for event in events {
+                        write_frame(
+                            &mut stdout,
+                            &map_event(event, &identity.run_id, &identity.term_id, &identity.step_id),
+                        )?;
+                    }
+                }
+            }
+        }
+        if !input_open && active_task.is_none() {
+            break;
         }
     }
     Ok(())
