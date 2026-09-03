@@ -25,6 +25,7 @@ from .contracts import (
     ProviderGrantBinding,
     ProviderGrantContainmentReceipt,
     ProviderGrantOffer,
+    ProviderGrantRouteV1,
     ProviderGrantTarget,
     canonical_grant_digest,
 )
@@ -108,6 +109,13 @@ class ProviderGrantBroker:
             step_id=envelope.step_id,
             provider_id=provider_id,
             provider_profile_digest=_profile_digest(profile),
+            route=ProviderGrantRouteV1(
+                protocol=profile.protocol,
+                base_url=profile.base_url,
+                metadata_headers=tuple(profile.headers.items()),
+                thinking_enabled=profile.thinking_enabled,
+                reasoning_effort=profile.reasoning_effort,
+            ),
             model=resolved_model,
             scopes=scopes,
             issued_at=now,

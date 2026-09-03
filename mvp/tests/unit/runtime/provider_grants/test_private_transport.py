@@ -10,6 +10,7 @@ import pytest
 
 from workbench.runtime.provider_grants.contracts import (
     ProviderGrantBinding,
+    ProviderGrantRouteV1,
     ProviderGrantTarget,
     canonical_grant_digest,
 )
@@ -44,6 +45,13 @@ def _binding() -> ProviderGrantBinding:
         step_id="step-001",
         provider_id="deepseek-primary",
         provider_profile_digest="4" * 64,
+        route=ProviderGrantRouteV1(
+            protocol="deepseek",
+            base_url="https://api.deepseek.com",
+            metadata_headers=(),
+            thinking_enabled=True,
+            reasoning_effort="high",
+        ),
         model="deepseek-chat",
         scopes=("inference",),
         issued_at=100.0,

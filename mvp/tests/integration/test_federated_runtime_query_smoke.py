@@ -132,6 +132,13 @@ def _formal_private_frame(
         "step_id": envelope["step_id"],
         "provider_id": provider_id,
         "provider_profile_digest": "d" * 64,
+        "route": {
+            "protocol": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "metadata_headers": [],
+            "thinking_enabled": True,
+            "reasoning_effort": "high",
+        },
         "model": "fixture-model-resolved",
         "scopes": ["inference"],
         "issued_at": now,

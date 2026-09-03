@@ -202,6 +202,9 @@ async def test_broker_delivers_only_for_live_target_and_keeps_repository_private
     assert receipt.state == "consumed"
     assert delivery.binding.provider_id == "deepseek-primary"
     assert delivery.binding.model == "deepseek-v4-flash"
+    assert delivery.binding.route.protocol == "deepseek"
+    assert delivery.binding.route.base_url == "https://api.deepseek.com"
+    assert delivery.binding.route.thinking_enabled is True
     assert len(delivery.binding.provider_profile_digest) == 64
     assert delivery.received_digest == hashlib.sha256(
         PROVIDER_VALUE.encode("utf-8")

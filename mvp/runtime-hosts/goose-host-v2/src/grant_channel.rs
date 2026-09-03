@@ -98,11 +98,22 @@ struct ProviderGrantBinding {
     step_id: String,
     provider_id: String,
     provider_profile_digest: String,
+    route: ProviderGrantRoute,
     model: String,
     scopes: Vec<String>,
     issued_at: f64,
     expires_at: f64,
     grant_nonce_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderGrantRoute {
+    protocol: String,
+    base_url: String,
+    metadata_headers: Vec<(String, String)>,
+    thinking_enabled: bool,
+    reasoning_effort: String,
 }
 
 impl GrantMaterial {
@@ -245,6 +256,7 @@ fn validate_binding(binding: &ProviderGrantBinding) -> Result<(), String> {
         .map_err(|_| "provider Grant Channel clock is invalid")?
         .as_secs_f64();
     let scopes: BTreeSet<&str> = binding.scopes.iter().map(String::as_str).collect();
+    validate_route(&binding.route)?;
     if target.runtime_id != "goose"
         || target.build_id != "goose-host-v2:fixture-wrapper-r2"
         || target.lease_generation_seq == 0
@@ -279,6 +291,67 @@ fn validate_binding(binding: &ProviderGrantBinding) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_route(route: &ProviderGrantRoute) -> Result<(), String> {
+    validate_opaque_route_identifier(&route.protocol)?;
+    validate_route_base_url(&route.base_url)?;
+    if !matches!(route.reasoning_effort.as_str(), "high" | "max") {
+        return Err("provider Grant route is invalid".into());
+    }
+    let _ = route.thinking_enabled;
+    let mut seen = BTreeSet::new();
+    let mut previous: Option<(String, &str)> = None;
+    for (name, _value) in &route.metadata_headers {
+        let normalized: String = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if !matches!(
+            normalized.as_str(),
+            "accept" | "contenttype" | "useragent" | "httpreferer" | "xtitle"
+        ) || !seen.insert(normalized)
+        {
+            return Err("provider Grant route metadata header is invalid".into());
+        }
+        let current = (name.to_ascii_lowercase(), name.as_str());
+        if previous.as_ref().is_some_and(|value| value > &current) {
+            return Err("provider Grant route metadata headers are not canonical".into());
+        }
+        previous = Some(current);
+    }
+    Ok(())
+}
+
+fn validate_opaque_route_identifier(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.as_bytes()[0].is_ascii_alphanumeric()
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'-')
+        })
+    {
+        return Err("provider Grant route is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_route_base_url(value: &str) -> Result<(), String> {
+    let authority_and_path = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or("provider Grant route is invalid")?;
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains('@')
+        || value.contains('?')
+        || value.contains('#')
+        || value.contains('\0')
+    {
+        return Err("provider Grant route is invalid".into());
+    }
+    Ok(())
+}
+
 fn canonical_value_digest(value: Value) -> Result<String, String> {
     let encoded = serde_json::to_vec(&canonical(value))
         .map_err(|_| "provider Grant Channel binding is invalid")?;
@@ -307,7 +380,7 @@ fn is_digest(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_preopened_fd;
+    use super::{ProviderGrantRoute, validate_preopened_fd, validate_route};
 
     #[test]
     fn grant_channel_must_be_private_and_preopened() {
@@ -315,5 +388,30 @@ mod tests {
         assert!(validate_preopened_fd(0).is_err());
         assert!(validate_preopened_fd(1).is_err());
         assert!(validate_preopened_fd(2).is_err());
+    }
+
+    #[test]
+    fn provider_route_accepts_only_secret_free_canonical_metadata() {
+        let route = ProviderGrantRoute {
+            protocol: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            metadata_headers: vec![("Accept".into(), "application/json".into())],
+            thinking_enabled: true,
+            reasoning_effort: "high".into(),
+        };
+        assert!(validate_route(&route).is_ok());
+
+        let credential_url = ProviderGrantRoute {
+            base_url: "https://user:password@example.test".into(),
+            ..route
+        };
+        assert!(validate_route(&credential_url).is_err());
+
+        let credential_header = ProviderGrantRoute {
+            base_url: "https://api.deepseek.com".into(),
+            metadata_headers: vec![("Authorization".into(), "forbidden".into())],
+            ..credential_url
+        };
+        assert!(validate_route(&credential_header).is_err());
     }
 }

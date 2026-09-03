@@ -9,8 +9,11 @@ const BINDING_IDENTITY_FIELDS = Object.freeze([
 const GRANT_HEADER_FIELDS = Object.freeze(["schema", "binding", "grant_digest"]);
 const GRANT_BINDING_FIELDS = Object.freeze([
   "grant_id", "target", "session_id", "command_id", "run_id", "term_id", "step_id",
-  "provider_id", "provider_profile_digest", "model", "scopes", "issued_at", "expires_at",
+  "provider_id", "provider_profile_digest", "route", "model", "scopes", "issued_at", "expires_at",
   "grant_nonce_digest",
+]);
+const GRANT_ROUTE_FIELDS = Object.freeze([
+  "protocol", "base_url", "metadata_headers", "thinking_enabled", "reasoning_effort",
 ]);
 const GRANT_TARGET_FIELDS = Object.freeze([
   "runtime_id", "build_id", "lease_id", "instance_id_digest", "instance_nonce_digest",
@@ -45,6 +48,50 @@ function canonicalDigest(value) {
 }
 
 
+function normalizeRoute(route) {
+  if (!exactKeys(route, GRANT_ROUTE_FIELDS)
+      || typeof route.protocol !== "string" || route.protocol.length === 0
+      || typeof route.base_url !== "string" || route.base_url.length === 0
+      || typeof route.thinking_enabled !== "boolean"
+      || !["high", "max"].includes(route.reasoning_effort)
+      || !Array.isArray(route.metadata_headers)) {
+    throw new Error("provider grant route is invalid");
+  }
+  let url;
+  try {
+    url = new URL(route.base_url);
+  } catch {
+    throw new Error("provider grant route is invalid");
+  }
+  if (!["http:", "https:"].includes(url.protocol)
+      || url.username || url.password || url.search || url.hash) {
+    throw new Error("provider grant route is invalid");
+  }
+  const allowed = new Set(["accept", "contenttype", "useragent", "httpreferer", "xtitle"]);
+  const seen = new Set();
+  const headers = route.metadata_headers.map(item => {
+    if (!Array.isArray(item) || item.length !== 2
+        || item.some(value => typeof value !== "string")) {
+      throw new Error("provider grant route metadata header is invalid");
+    }
+    const normalized = item[0].toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
+    if (!allowed.has(normalized) || seen.has(normalized)) {
+      throw new Error("provider grant route metadata header is invalid");
+    }
+    seen.add(normalized);
+    return Object.freeze([...item]);
+  });
+  const sorted = [...headers].sort((left, right) => (
+    left[0].toLocaleLowerCase("en-US").localeCompare(right[0].toLocaleLowerCase("en-US"))
+      || left[0].localeCompare(right[0])
+  ));
+  if (headers.some((item, index) => item[0] !== sorted[index][0])) {
+    throw new Error("provider grant route metadata headers are not canonical");
+  }
+  return Object.freeze({ ...route, metadata_headers: Object.freeze(headers) });
+}
+
+
 export class EphemeralGrantChannel {
   constructor(clock = () => Date.now() / 1000, targetInstanceDigest = null) {
     this.clock = clock;
@@ -66,6 +113,7 @@ export class EphemeralGrantChannel {
         )) {
       throw new Error("provider grant binding is invalid or expired");
     }
+    const route = normalizeRoute(binding.route);
     if (!Buffer.isBuffer(transientSecret) || transientSecret.length === 0) {
       throw new Error("provider grant secret is invalid");
     }
@@ -74,7 +122,9 @@ export class EphemeralGrantChannel {
     }
     const retained = Buffer.from(transientSecret);
     transientSecret.fill(0);
-    this.grants.set(binding.grant_id, { binding: Object.freeze({ ...binding }), secret: retained });
+    this.grants.set(binding.grant_id, {
+      binding: Object.freeze({ ...binding, route }), secret: retained,
+    });
     return Object.freeze({
       grant_id: binding.grant_id,
       grant_digest: binding.grant_digest,
@@ -105,6 +155,11 @@ export class EphemeralGrantChannel {
     this.grants.delete(grantId);
     return Object.freeze({
       secret: entry.secret,
+      provider: Object.freeze({
+        provider_ref: entry.binding.provider_ref,
+        model: entry.binding.model,
+        route: entry.binding.route,
+      }),
       acknowledgement: Object.freeze({
         grant_id: entry.binding.grant_id,
         grant_digest: entry.binding.grant_digest,
@@ -141,6 +196,7 @@ function validateFormalGrant(document, targetIdentity, clock) {
   }
   const binding = document.binding;
   const target = binding.target;
+  normalizeRoute(binding.route);
   if (target.runtime_id !== targetIdentity.runtimeId
       || target.build_id !== targetIdentity.buildId
       || !DIGEST.test(target.instance_id_digest)
@@ -273,6 +329,7 @@ export function startPreopenedGrantReceiver(
           step_id: binding.step_id,
           provider_ref: `provider-profile:${binding.provider_id}`,
           model: binding.model,
+          route: binding.route,
           expires_at: binding.expires_at,
         }, secret);
         const frame = ackFrame(binding, acknowledgement.grant_digest);

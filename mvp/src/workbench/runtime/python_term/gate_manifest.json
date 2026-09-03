@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "58faec5f3f873f17bb854e4133da6170d4f75bdfc01a16a02ec6f6e413ca10a7",
-      "size": 1931385
+      "sha256": "e29f79101f92c82173580edc8782e616320f11b747ab0e2b3104161b56ee6b2d",
+      "size": 1933447
     },
     {
       "path": "uv.lock",
@@ -489,7 +489,7 @@
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "d327f57bfc11e306ee7b865cc738f06ccf7a58458db4701565d601e787eb42fa",
+      "sha256": "a1cba3a01c600a4bf3d408df7778628060dde5aecc90d23982d3a5a2f4cc2d33",
       "size": 6585
     },
     {
@@ -599,28 +599,28 @@
     },
     {
       "path": "runtime/goose/source_gate.py",
-      "sha256": "141cf6e3ad26f1ced9373667688bdbeb3e1c9370d33c640e34b6f03579396e5e",
-      "size": 37437
+      "sha256": "88c1f30a06f57460d6975ac3e2440f006dffe8fd2bc3f72496868ec34e4a3ad4",
+      "size": 37669
     },
     {
       "path": "runtime/goose/source_manifest.json",
-      "sha256": "0f84ded65fdc64215db8a0d1d0f9ce0b5af8d62f71e4dc740de128918fe65553",
+      "sha256": "82b95645b85a53d558d5c5dec0a66f91e917921fc8db95f24f0226fbba7bcbdb",
       "size": 4779
     },
     {
       "path": "runtime/provider_grants/__init__.py",
-      "sha256": "51aa0e95d1689cf5c38c2f47eb7aa7a376194eb7663d19981ab1f45605dffd7b",
-      "size": 1453
+      "sha256": "edafb6b2137613f6418a555a291374cfd3ace4284d3f560ae74076d8c4cd26dc",
+      "size": 1507
     },
     {
       "path": "runtime/provider_grants/broker.py",
-      "sha256": "cd62e749e89a811e280281a3db2216830a02c8f842ef254c4598c2617cf020d8",
-      "size": 13043
+      "sha256": "f0dc85562fb7ef2c837ce20a4bbc422eaec8d25e9046a01278e0b8189d206745",
+      "size": 13393
     },
     {
       "path": "runtime/provider_grants/contracts.py",
-      "sha256": "b8245acadccbc957e416dcf67c2245863e5deb93dd87a03858c89e3c8a9826f1",
-      "size": 6450
+      "sha256": "0a0c7aa93cf06cd52c664c2aa75d5775bd3a6413f70614f46445373802464afe",
+      "size": 8984
     },
     {
       "path": "runtime/provider_grants/coordinator.py",

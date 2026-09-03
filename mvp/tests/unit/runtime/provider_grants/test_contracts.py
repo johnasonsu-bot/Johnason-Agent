@@ -7,6 +7,7 @@ from workbench.runtime.provider_grants.contracts import (
     ProviderGrantAck,
     ProviderGrantBinding,
     ProviderGrantOffer,
+    ProviderGrantRouteV1,
     ProviderGrantTarget,
     canonical_grant_digest,
 )
@@ -38,6 +39,13 @@ def _binding(**updates: object) -> ProviderGrantBinding:
         "step_id": "step-001",
         "provider_id": "deepseek-primary",
         "provider_profile_digest": "4" * 64,
+        "route": ProviderGrantRouteV1(
+            protocol="deepseek",
+            base_url="https://api.deepseek.com",
+            metadata_headers=(("X-Title", "Johnason Agent"),),
+            thinking_enabled=True,
+            reasoning_effort="high",
+        ),
         "model": "deepseek-chat",
         "scopes": ("inference",),
         "issued_at": 100.0,
@@ -48,11 +56,35 @@ def _binding(**updates: object) -> ProviderGrantBinding:
     return ProviderGrantBinding.model_validate(values)
 
 
+def test_route_is_frozen_secret_free_and_canonical() -> None:
+    route = ProviderGrantRouteV1(
+        protocol="openai_compatible",
+        base_url="https://models.example.test/v1",
+        metadata_headers=(
+            ("X-Title", "Workbench"),
+            ("Accept", "application/json"),
+        ),
+        thinking_enabled=False,
+        reasoning_effort="high",
+    )
+
+    assert route.metadata_headers == (
+        ("Accept", "application/json"),
+        ("X-Title", "Workbench"),
+    )
+    with pytest.raises(ValidationError, match="metadata header"):
+        route.model_copy(
+            update={"metadata_headers": (("Authorization", "Bearer forbidden"),)}
+        )
+    with pytest.raises(ValidationError, match="base URL"):
+        route.model_copy(update={"base_url": "https://user:password@example.test"})
+
+
 def test_grant_digest_is_stable_and_secret_free() -> None:
     binding = _binding()
 
     assert canonical_grant_digest(binding) == (
-        "cf2757a12eb05aa214db778f3d40263df40fa7043266e3f1516250c39eda63c1"
+        "ffcef05b1f5c3dc7c31d29098c8e27977c8de9efdcfdf8709df2164bc23a4c27"
     )
     serialized = binding.model_dump_json()
     assert "instance-nonce-plaintext" not in serialized

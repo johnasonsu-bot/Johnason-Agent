@@ -79,6 +79,13 @@ function privateGrant(
     step_id: envelope.step_id,
     provider_id: providerRef.replace("provider-profile:", ""),
     provider_profile_digest: "d".repeat(64),
+    route: {
+      protocol: "deepseek",
+      base_url: "https://api.deepseek.com",
+      metadata_headers: [],
+      thinking_enabled: true,
+      reasoning_effort: "high",
+    },
     model: "fixture-model-resolved",
     scopes: ["inference"],
     issued_at: issuedAt,
@@ -90,6 +97,17 @@ function privateGrant(
     binding,
     grant_digest: digest(binding),
     secret: Buffer.from([1, 2, 3, 4]),
+  };
+}
+
+
+function providerRoute() {
+  return {
+    protocol: "deepseek",
+    base_url: "https://api.deepseek.com",
+    metadata_headers: [],
+    thinking_enabled: true,
+    reasoning_effort: "high",
   };
 }
 
@@ -273,6 +291,7 @@ test("grant channel consumes once and wipes the transient secret", () => {
     term_id: "term-1",
     step_id: "step-1",
     provider_ref: "provider-1",
+    route: providerRoute(),
     model: "model-1",
     expires_at: 110,
   }, secret);
@@ -286,6 +305,7 @@ test("grant channel consumes once and wipes the transient secret", () => {
   assert.equal(consumed.secret.toString("utf8"), "fixture-secret");
   assert.equal(consumed.acknowledgement.grant_id, "grant-1");
   assert.equal(consumed.acknowledgement.resolved_model, "model-1");
+  assert.equal(consumed.provider.route.base_url, "https://api.deepseek.com");
   consumed.secret.fill(0);
   assert.throws(() => grants.consumeForEnvelope(envelope), /unavailable/);
   assert.ok(secret.every(byte => byte === 0));
@@ -303,6 +323,7 @@ test("grant channel accepts a Broker-resolved model instead of the envelope alia
     term_id: "term-1",
     step_id: "step-1",
     provider_ref: "provider-profile:deepseek-primary",
+    route: providerRoute(),
     model: "deepseek-reasoner",
     expires_at: 110,
   }, Buffer.from("fixture-secret", "utf8"));
@@ -331,6 +352,7 @@ test("query consumes the shared Host v2 input and returns identity-bound seal ac
     term_id: "term-wire",
     step_id: "step-wire",
     provider_ref: "provider-profile:fixture-completed",
+    route: providerRoute(),
     model: "fixture-model",
     expires_at: 110,
   }, Buffer.from("fixture-secret", "utf8"));

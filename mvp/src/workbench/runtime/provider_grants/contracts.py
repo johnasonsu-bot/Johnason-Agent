@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Annotated, Any, Literal, Protocol, Self, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
     BaseModel,
@@ -122,6 +123,66 @@ class ProviderGrantAuthority(Protocol):
     ) -> None: ...
 
 
+class ProviderGrantRouteV1(FrozenGrantModel):
+    """Secret-free, immutable Provider request route consumed by a sidecar."""
+
+    protocol: OpaqueIdentifier
+    base_url: str = Field(min_length=1, max_length=2048)
+    metadata_headers: tuple[tuple[str, str], ...] = ()
+    thinking_enabled: bool
+    reasoning_effort: Literal["high", "max"]
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        try:
+            parsed = urlsplit(value)
+            host = parsed.hostname
+            port = parsed.port
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("Provider route base URL is invalid") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not host
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Provider route base URL is invalid")
+        normalized_host = f"[{host.lower()}]" if ":" in host else host.lower()
+        netloc = normalized_host if port is None else f"{normalized_host}:{port}"
+        return urlunsplit(
+            (parsed.scheme.lower(), netloc, parsed.path.rstrip("/"), "", "")
+        )
+
+    @field_validator("metadata_headers")
+    @classmethod
+    def validate_metadata_headers(
+        cls, value: tuple[tuple[str, str], ...]
+    ) -> tuple[tuple[str, str], ...]:
+        from workbench.models.profiles import validate_provider_headers
+
+        headers: dict[str, str] = {}
+        normalized_names: set[str] = set()
+        for item in value:
+            if not isinstance(item, tuple) or len(item) != 2:
+                raise ValueError("Provider route metadata header is invalid")
+            name, header_value = item
+            normalized = "".join(
+                character for character in name.casefold() if character.isalnum()
+            )
+            if normalized in normalized_names:
+                raise ValueError("Provider route metadata header is duplicated")
+            normalized_names.add(normalized)
+            headers[name] = header_value
+        try:
+            validate_provider_headers(headers)
+        except ValueError as exc:
+            raise ValueError("Provider route metadata header is invalid") from exc
+        return tuple(sorted(headers.items(), key=lambda item: (item[0].casefold(), item[0])))
+
+
 class ProviderGrantBinding(FrozenGrantModel):
     """Complete durable authority for one exact model request."""
 
@@ -134,6 +195,7 @@ class ProviderGrantBinding(FrozenGrantModel):
     step_id: OpaqueIdentifier
     provider_id: OpaqueIdentifier
     provider_profile_digest: Digest
+    route: ProviderGrantRouteV1
     model: OpaqueIdentifier
     scopes: tuple[OpaqueIdentifier, ...]
     issued_at: float
@@ -214,6 +276,7 @@ __all__ = [
     "ProviderGrantBinding",
     "ProviderGrantContainmentReceipt",
     "ProviderGrantOffer",
+    "ProviderGrantRouteV1",
     "ProviderGrantRevocationReason",
     "ProviderGrantTarget",
     "canonical_grant_digest",

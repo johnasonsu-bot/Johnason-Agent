@@ -496,6 +496,13 @@ def _run_protocol_path(binary: Path, *, scenario: str) -> list[dict[str, Any]]:
         "step_id": step_id,
         "provider_id": provider_id,
         "provider_profile_digest": "3" * 64,
+        "route": {
+            "protocol": "deepseek",
+            "base_url": "https://api.deepseek.com",
+            "metadata_headers": [],
+            "thinking_enabled": True,
+            "reasoning_effort": "high",
+        },
         "model": "fixture-model-resolved",
         "scopes": ["inference"],
         "issued_at": now,
