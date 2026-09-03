@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -106,13 +108,19 @@ def _run_process(
     commands: list[dict[str, object]],
     *,
     private_record: dict[str, object] | None = None,
+    private_frame: bytes | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
+    if private_record is not None and private_frame is not None:
+        raise ValueError("only one private Grant fixture transport may be selected")
     stdin = "".join(
         json.dumps(command, sort_keys=True, separators=(",", ":")) + "\n"
         for command in commands
     )
     launched_argv = argv
     read_fd: int | None = None
+    private_parent: socket.socket | None = None
+    private_child: socket.socket | None = None
+    child_environment = dict(_SAFE_ENVIRONMENT)
     if private_record is not None:
         read_fd, write_fd = os.pipe()
         os.write(
@@ -129,6 +137,13 @@ def _run_process(
             "os.execve(sys.argv[2],sys.argv[2:],dict(os.environ))"
         )
         launched_argv = (sys.executable, "-c", launcher, str(read_fd), *argv)
+    elif private_frame is not None:
+        private_parent, private_child = socket.socketpair(
+            socket.AF_UNIX, socket.SOCK_STREAM
+        )
+        private_parent.sendall(private_frame)
+        read_fd = private_child.fileno()
+        child_environment["WORKBENCH_PROVIDER_GRANT_FD"] = str(read_fd)
     try:
         completed = subprocess.run(
             launched_argv,
@@ -137,12 +152,19 @@ def _run_process(
             capture_output=True,
             check=False,
             timeout=30,
-            env=_SAFE_ENVIRONMENT,
+            env=child_environment,
             pass_fds=() if read_fd is None else (read_fd,),
         )
     finally:
-        if read_fd is not None:
+        if private_child is not None:
+            private_child.close()
+        elif read_fd is not None:
             os.close(read_fd)
+    if private_parent is not None:
+        acknowledgement = private_parent.recv(8_192)
+        private_parent.close()
+        assert acknowledgement.startswith(b"JAGTACK1\x01")
+        assert TEST_SECRET_VALUE.encode() not in acknowledgement
     assert completed.returncode == 0, completed.stderr
     frames = [json.loads(line) for line in completed.stdout.splitlines()]
     public_surfaces = {
@@ -222,22 +244,56 @@ def _dsh_built_lane(runtime_input: dict[str, object]) -> FixedSmokeVerdict:
         runtime_input=runtime_input,
     )
     commands = _wire_commands(start, envelope, terminal_cursor=3)
-    private_record = {
-        "schema": "workbench.runtime.provider_grant_private.v1",
-        "binding": {
-            "grant_id": "grant-dsh-convergence",
-            "grant_digest": "a" * 64,
-            "target_instance_digest": "b" * 64,
-            "command_id": envelope["command_id"],
-            "run_id": envelope["run_id"],
-            "term_id": envelope["term_id"],
-            "step_id": envelope["step_id"],
-            "provider_ref": envelope["provider_ref"],
-            "model": envelope["model"],
-            "expires_at": time.time() + 60,
+    now = time.time()
+    binding = {
+        "grant_id": "grant-dsh-convergence",
+        "target": {
+            "runtime_id": "dsh",
+            "build_id": "dsh:fixed-host-v2-smoke",
+            "lease_id": "lease-dsh-convergence",
+            "instance_id_digest": "b" * 64,
+            "instance_nonce_digest": "c" * 64,
+            "host_generation": "host-a",
+            "lease_generation_seq": 1,
+            "expires_at": now + 60,
         },
-        "secret_base64": PRIVATE_SECRET_BASE64,
+        "session_id": envelope["session_id"],
+        "command_id": envelope["command_id"],
+        "run_id": envelope["run_id"],
+        "term_id": envelope["term_id"],
+        "step_id": envelope["step_id"],
+        "provider_id": "fixture-completed",
+        "provider_profile_digest": "d" * 64,
+        "model": "fixture-model-resolved",
+        "scopes": ["inference"],
+        "issued_at": now,
+        "expires_at": now + 30,
+        "grant_nonce_digest": "e" * 64,
     }
+    grant_digest = hashlib.sha256(
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    header = json.dumps(
+        {
+            "schema": "workbench.runtime.provider_grant_private.v1",
+            "binding": binding,
+            "grant_digest": grant_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    secret = TEST_SECRET_VALUE.encode("utf-8")
+    private_frame = (
+        struct.pack("!8sBII", b"JAGTGRN1", 1, len(header), len(secret))
+        + header
+        + secret
+    )
     node = shutil.which("node")
     assert node is not None
     frames, surfaces = _run_process(
@@ -249,7 +305,7 @@ def _dsh_built_lane(runtime_input: dict[str, object]) -> FixedSmokeVerdict:
             ),
         ),
         commands,
-        private_record=private_record,
+        private_frame=private_frame,
     )
     return assert_fixed_smoke_transcript(
         lane="dsh_built_smoke",

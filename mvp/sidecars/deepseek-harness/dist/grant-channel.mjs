@@ -1,16 +1,47 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { Socket } from "node:net";
 
 
 const DIGEST = /^[0-9a-f]{64}$/;
 const BINDING_IDENTITY_FIELDS = Object.freeze([
-  "command_id", "run_id", "term_id", "step_id", "provider_ref", "model",
+  "command_id", "run_id", "term_id", "step_id", "provider_ref",
 ]);
+const GRANT_HEADER_FIELDS = Object.freeze(["schema", "binding", "grant_digest"]);
+const GRANT_BINDING_FIELDS = Object.freeze([
+  "grant_id", "target", "session_id", "command_id", "run_id", "term_id", "step_id",
+  "provider_id", "provider_profile_digest", "model", "scopes", "issued_at", "expires_at",
+  "grant_nonce_digest",
+]);
+const GRANT_TARGET_FIELDS = Object.freeze([
+  "runtime_id", "build_id", "lease_id", "instance_id_digest", "instance_nonce_digest",
+  "host_generation", "lease_generation_seq", "expires_at",
+]);
+const GRANT_MAGIC = Buffer.from("JAGTGRN1", "ascii");
+const ACK_MAGIC = Buffer.from("JAGTACK1", "ascii");
+const WIRE_VERSION = 1;
+const GRANT_PREFIX_BYTES = 17;
+const MAX_HEADER_BYTES = 65_536;
+const MAX_SECRET_BYTES = 65_536;
+const MAX_ACK_BYTES = 8_192;
 
 
 function exactKeys(value, expected) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).sort().join(",") === [...expected].sort().join(",");
+}
+
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+  }
+  return value;
+}
+
+
+function canonicalDigest(value) {
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 }
 
 
@@ -82,6 +113,7 @@ export class EphemeralGrantChannel {
         run_id: entry.binding.run_id,
         term_id: entry.binding.term_id,
         step_id: entry.binding.step_id,
+        resolved_model: entry.binding.model,
         acknowledged_at: this.clock(),
       }),
     });
@@ -93,12 +125,69 @@ export class EphemeralGrantChannel {
   }
 
   static digest(binding) {
-    return createHash("sha256").update(JSON.stringify(binding)).digest("hex");
+    return canonicalDigest(binding);
   }
 }
 
 
-export function readPreopenedGrantChannel(
+function validateFormalGrant(document, targetInstanceDigest, clock) {
+  if (!exactKeys(document, GRANT_HEADER_FIELDS)
+      || document.schema !== "workbench.runtime.provider_grant_private.v1"
+      || !DIGEST.test(document.grant_digest)
+      || !exactKeys(document.binding, GRANT_BINDING_FIELDS)
+      || !exactKeys(document.binding.target, GRANT_TARGET_FIELDS)
+      || canonicalDigest(document.binding) !== document.grant_digest) {
+    throw new Error("private provider grant header is invalid");
+  }
+  const binding = document.binding;
+  const target = binding.target;
+  if (target.runtime_id !== "dsh"
+      || target.instance_id_digest !== targetInstanceDigest
+      || !DIGEST.test(target.instance_nonce_digest)
+      || !Number.isSafeInteger(target.lease_generation_seq)
+      || target.lease_generation_seq < 1
+      || !Number.isFinite(target.expires_at)
+      || typeof binding.grant_id !== "string" || binding.grant_id.length === 0
+      || typeof binding.provider_id !== "string" || binding.provider_id.length === 0
+      || binding.provider_id.includes(":") || binding.provider_id.includes("/")
+      || !DIGEST.test(binding.provider_profile_digest)
+      || !DIGEST.test(binding.grant_nonce_digest)
+      || typeof binding.model !== "string" || binding.model.length === 0
+      || !Array.isArray(binding.scopes) || binding.scopes.length === 0
+      || binding.scopes.some(scope => typeof scope !== "string" || scope.length === 0)
+      || new Set(binding.scopes).size !== binding.scopes.length
+      || !Number.isFinite(binding.issued_at)
+      || !Number.isFinite(binding.expires_at)
+      || binding.expires_at <= clock()
+      || binding.expires_at > target.expires_at
+      || ["session_id", "command_id", "run_id", "term_id", "step_id"].some(
+        field => typeof binding[field] !== "string" || binding[field].length === 0,
+      )) {
+    throw new Error("private provider grant binding is invalid or expired");
+  }
+  return binding;
+}
+
+
+function ackFrame(binding, grantDigest) {
+  const payload = Buffer.from(JSON.stringify({
+    schema: "workbench.runtime.provider_grant_ack.v1",
+    grant_id: binding.grant_id,
+    grant_digest: grantDigest,
+    target_instance_digest: binding.target.instance_id_digest,
+  }), "utf8");
+  if (payload.length > MAX_ACK_BYTES) {
+    throw new Error("private provider grant acknowledgement is too large");
+  }
+  const prefix = Buffer.alloc(13);
+  ACK_MAGIC.copy(prefix, 0);
+  prefix.writeUInt8(WIRE_VERSION, 8);
+  prefix.writeUInt32BE(payload.length, 9);
+  return Buffer.concat([prefix, payload]);
+}
+
+
+export function startPreopenedGrantReceiver(
   fd,
   targetInstanceDigest,
   clock = () => Date.now() / 1000,
@@ -106,41 +195,102 @@ export function readPreopenedGrantChannel(
   if (!Number.isSafeInteger(fd) || fd <= 2 || !DIGEST.test(targetInstanceDigest)) {
     throw new Error("private provider grant descriptor is invalid");
   }
-  let payload;
+  const channel = new EphemeralGrantChannel(clock, targetInstanceDigest);
+  let endpoint;
   try {
-    payload = readFileSync(fd, "utf8");
+    endpoint = new Socket({ fd, readable: true, writable: true });
   } catch {
     throw new Error("private provider grant descriptor is unavailable");
   }
-  const channel = new EphemeralGrantChannel(clock, targetInstanceDigest);
-  const records = payload.split("\n").filter(line => line.length > 0);
-  if (records.length === 0) throw new Error("private provider grant payload is empty");
-  for (const line of records) {
-    let document;
-    try {
-      document = JSON.parse(line);
-    } catch {
+  let buffered = Buffer.alloc(0);
+  let expectedBytes = null;
+  const ready = new Promise((resolve, reject) => {
+    const fail = message => {
       channel.clear();
-      throw new Error("private provider grant payload is invalid");
-    }
-    if (!exactKeys(document, ["schema", "binding", "secret_base64"])
-        || document.schema !== "workbench.runtime.provider_grant_private.v1"
-        || !exactKeys(document.binding, [
-          "command_id", "expires_at", "grant_digest", "grant_id", "model",
-          "provider_ref", "run_id", "step_id", "target_instance_digest", "term_id",
-        ])
-        || typeof document.secret_base64 !== "string"
-        || document.secret_base64.length === 0
-        || !/^[A-Za-z0-9+/]+={0,2}$/.test(document.secret_base64)) {
-      channel.clear();
-      throw new Error("private provider grant payload is invalid");
-    }
-    const secret = Buffer.from(document.secret_base64, "base64");
-    try {
-      channel.accept(document.binding, secret);
-    } finally {
-      secret.fill(0);
-    }
-  }
-  return channel;
+      buffered.fill(0);
+      endpoint.destroy();
+      reject(new Error(message));
+    };
+    endpoint.on("error", () => fail("private provider grant descriptor is unavailable"));
+    endpoint.on("end", () => {
+      if (expectedBytes === null || buffered.length !== expectedBytes) {
+        fail("private provider grant payload is incomplete");
+      }
+    });
+    endpoint.on("data", chunk => {
+      buffered = Buffer.concat([buffered, chunk]);
+      if (buffered.length >= GRANT_PREFIX_BYTES && expectedBytes === null) {
+        if (!buffered.subarray(0, 8).equals(GRANT_MAGIC)
+            || buffered.readUInt8(8) !== WIRE_VERSION) {
+          fail("private provider grant framing is invalid");
+          return;
+        }
+        const headerBytes = buffered.readUInt32BE(9);
+        const secretBytes = buffered.readUInt32BE(13);
+        if (headerBytes === 0 || headerBytes > MAX_HEADER_BYTES
+            || secretBytes === 0 || secretBytes > MAX_SECRET_BYTES) {
+          fail("private provider grant framing is invalid");
+          return;
+        }
+        expectedBytes = GRANT_PREFIX_BYTES + headerBytes + secretBytes;
+      }
+      if (expectedBytes === null || buffered.length < expectedBytes) return;
+      if (buffered.length !== expectedBytes) {
+        fail("private provider grant contains trailing bytes");
+        return;
+      }
+      const headerBytes = buffered.readUInt32BE(9);
+      let document;
+      try {
+        document = JSON.parse(
+          buffered.subarray(GRANT_PREFIX_BYTES, GRANT_PREFIX_BYTES + headerBytes).toString("utf8"),
+        );
+      } catch {
+        fail("private provider grant header is invalid");
+        return;
+      }
+      let binding;
+      try {
+        binding = validateFormalGrant(document, targetInstanceDigest, clock);
+      } catch (error) {
+        fail(error instanceof Error ? error.message : "private provider grant is invalid");
+        return;
+      }
+      const secret = buffered.subarray(GRANT_PREFIX_BYTES + headerBytes);
+      let acknowledgement;
+      try {
+        acknowledgement = channel.accept({
+          grant_id: binding.grant_id,
+          grant_digest: document.grant_digest,
+          target_instance_digest: binding.target.instance_id_digest,
+          command_id: binding.command_id,
+          run_id: binding.run_id,
+          term_id: binding.term_id,
+          step_id: binding.step_id,
+          provider_ref: `provider-profile:${binding.provider_id}`,
+          model: binding.model,
+          expires_at: binding.expires_at,
+        }, secret);
+        const frame = ackFrame(binding, acknowledgement.grant_digest);
+        buffered.fill(0);
+        endpoint.end(frame, () => {
+          endpoint.destroy();
+          resolve(channel);
+        });
+      } catch {
+        secret.fill(0);
+        fail("private provider grant payload is invalid");
+      }
+    });
+  });
+  // Mark the background failure as observed; query.start still awaits the same
+  // promise and reports the closed failure through Host v2.
+  ready.catch(() => {});
+  return Object.freeze({ channel, ready });
+}
+
+
+export function readPreopenedGrantChannel(fd, targetInstanceDigest, clock) {
+  const receiver = startPreopenedGrantReceiver(fd, targetInstanceDigest, clock);
+  return receiver;
 }

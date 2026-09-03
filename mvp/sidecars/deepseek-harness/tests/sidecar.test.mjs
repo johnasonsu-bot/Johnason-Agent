@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
@@ -31,6 +32,20 @@ const QUERY_FIXTURE = JSON.parse(readFileSync(
 ));
 
 
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
+  }
+  return value;
+}
+
+
+function digest(value) {
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
+}
+
+
 function queryCommand(providerRef = "provider-profile:fixture-completed") {
   const command = structuredClone(QUERY_FIXTURE);
   command.payload.envelope.provider_ref = providerRef;
@@ -40,32 +55,89 @@ function queryCommand(providerRef = "provider-profile:fixture-completed") {
 
 function privateGrant(providerRef = "provider-profile:fixture-completed", grantId = "grant-wire") {
   const { envelope } = queryCommand(providerRef).payload;
+  const issuedAt = Date.now() / 1000;
+  const binding = {
+    grant_id: grantId,
+    target: {
+      runtime_id: "dsh",
+      build_id: "dsh:fixed-host-v2-smoke",
+      lease_id: "lease-wire",
+      instance_id_digest: INSTANCE_DIGEST,
+      instance_nonce_digest: "c".repeat(64),
+      host_generation: "host-a",
+      lease_generation_seq: 1,
+      expires_at: issuedAt + 60,
+    },
+    session_id: envelope.session_id,
+    command_id: envelope.command_id,
+    run_id: envelope.run_id,
+    term_id: envelope.term_id,
+    step_id: envelope.step_id,
+    provider_id: providerRef.replace("provider-profile:", ""),
+    provider_profile_digest: "d".repeat(64),
+    model: "fixture-model-resolved",
+    scopes: ["inference"],
+    issued_at: issuedAt,
+    expires_at: issuedAt + 30,
+    grant_nonce_digest: "e".repeat(64),
+  };
   return {
     schema: "workbench.runtime.provider_grant_private.v1",
-    binding: {
-      grant_id: grantId,
-      grant_digest: "a".repeat(64),
-      target_instance_digest: INSTANCE_DIGEST,
-      command_id: envelope.command_id,
-      run_id: envelope.run_id,
-      term_id: envelope.term_id,
-      step_id: envelope.step_id,
-      provider_ref: envelope.provider_ref,
-      model: envelope.model,
-      expires_at: Date.now() / 1000 + 60,
-    },
-    secret_base64: Buffer.from([1, 2, 3, 4]).toString("base64"),
+    binding,
+    grant_digest: digest(binding),
+    secret: Buffer.from([1, 2, 3, 4]),
   };
+}
+
+
+function encodePrivateGrant(grant) {
+  const header = Buffer.from(JSON.stringify({
+    schema: grant.schema,
+    binding: grant.binding,
+    grant_digest: grant.grant_digest,
+  }), "utf8");
+  const prefix = Buffer.alloc(17);
+  prefix.write("JAGTGRN1", 0, "ascii");
+  prefix.writeUInt8(1, 8);
+  prefix.writeUInt32BE(header.length, 9);
+  prefix.writeUInt32BE(grant.secret.length, 13);
+  return Buffer.concat([prefix, header, grant.secret]);
+}
+
+
+async function readPrivateAck(stream) {
+  let buffered = Buffer.alloc(0);
+  for await (const chunk of stream) {
+    buffered = Buffer.concat([buffered, chunk]);
+    if (buffered.length < 13) continue;
+    assert.equal(buffered.subarray(0, 8).toString("ascii"), "JAGTACK1");
+    assert.equal(buffered.readUInt8(8), 1);
+    const size = buffered.readUInt32BE(9);
+    if (buffered.length < 13 + size) continue;
+    return JSON.parse(buffered.subarray(13, 13 + size).toString("utf8"));
+  }
+  throw new Error("private grant acknowledgement was not received");
 }
 
 
 async function launchPublishedSidecar(grant = privateGrant()) {
   const child = spawn(process.execPath, [ENTRYPOINT], {
     cwd: ROOT,
-    env: { PATH: process.env.PATH ?? "" },
+    env: {
+      PATH: process.env.PATH ?? "",
+      WORKBENCH_PROVIDER_GRANT_FD: "3",
+    },
     stdio: ["pipe", "pipe", "pipe", "pipe"],
   });
-  child.stdio[3].end(`${JSON.stringify(grant)}\n`);
+  const ackPromise = readPrivateAck(child.stdio[3]);
+  child.stdio[3].write(encodePrivateGrant(grant));
+  const ack = await ackPromise;
+  assert.deepEqual(ack, {
+    schema: "workbench.runtime.provider_grant_ack.v1",
+    grant_id: grant.binding.grant_id,
+    grant_digest: grant.grant_digest,
+    target_instance_digest: INSTANCE_DIGEST,
+  });
   const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
   const iterator = lines[Symbol.asyncIterator]();
   const stderr = [];
@@ -209,9 +281,38 @@ test("grant channel consumes once and wipes the transient secret", () => {
   const consumed = grants.consumeForEnvelope(envelope);
   assert.equal(consumed.secret.toString("utf8"), "fixture-secret");
   assert.equal(consumed.acknowledgement.grant_id, "grant-1");
+  assert.equal(consumed.acknowledgement.resolved_model, "model-1");
   consumed.secret.fill(0);
   assert.throws(() => grants.consumeForEnvelope(envelope), /unavailable/);
   assert.ok(secret.every(byte => byte === 0));
+});
+
+
+test("grant channel accepts a Broker-resolved model instead of the envelope alias", () => {
+  const grants = new EphemeralGrantChannel(() => 100);
+  grants.accept({
+    grant_id: "grant-alias",
+    grant_digest: "a".repeat(64),
+    target_instance_digest: "b".repeat(64),
+    command_id: "command-1",
+    run_id: "run-1",
+    term_id: "term-1",
+    step_id: "step-1",
+    provider_ref: "provider-profile:deepseek-primary",
+    model: "deepseek-reasoner",
+    expires_at: 110,
+  }, Buffer.from("fixture-secret", "utf8"));
+
+  const consumed = grants.consumeForEnvelope({
+    command_id: "command-1",
+    run_id: "run-1",
+    term_id: "term-1",
+    step_id: "step-1",
+    provider_ref: "provider-profile:deepseek-primary",
+    model: "default",
+  });
+  assert.equal(consumed.acknowledgement.resolved_model, "deepseek-reasoner");
+  consumed.secret.fill(0);
 });
 
 

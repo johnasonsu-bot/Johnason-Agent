@@ -227,9 +227,15 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
 }
 
 
-export function serveNdjson(sidecar, input = process.stdin, output = process.stdout) {
+export function serveNdjson(
+  sidecar,
+  input = process.stdin,
+  output = process.stdout,
+  grantReady = Promise.resolve(),
+) {
   const lines = createInterface({ input, crlfDelay: Infinity });
-  lines.on("line", line => {
+  let commands = Promise.resolve();
+  const handleLine = async line => {
     let command;
     try {
       command = JSON.parse(line);
@@ -240,6 +246,7 @@ export function serveNdjson(sidecar, input = process.stdin, output = process.std
       if (command.type === "runtime.capabilities") {
         payload = sidecar.capabilities();
       } else if (command.type === "query.start") {
+        await grantReady;
         const started = sidecar.startQuery(command.payload);
         output.write(`${JSON.stringify({
           kind: "response",
@@ -280,7 +287,12 @@ export function serveNdjson(sidecar, input = process.stdin, output = process.std
         payload: { error: error instanceof Error ? error.message : "sidecar failure" },
       })}\n`);
     }
+  };
+  lines.on("line", line => {
+    commands = commands.then(() => handleLine(line));
   });
-  lines.on("close", () => sidecar.shutdown());
+  lines.on("close", () => {
+    void commands.finally(() => sidecar.shutdown());
+  });
   return lines;
 }
