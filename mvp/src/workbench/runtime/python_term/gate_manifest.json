@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "4b4a3f22b5ba5fae0df239a2a33353df7d4feb248141be8251947c02cd4adf27",
-      "size": 1901352
+      "sha256": "cfade8e84a6d16ed3f6ec7763b7d9702bae3f96cd56e97b453dbf19dddc3e043",
+      "size": 1907916
     },
     {
       "path": "uv.lock",
@@ -626,6 +626,11 @@
       "path": "runtime/provider_grants/delivery.py",
       "sha256": "641cfa99f5d8810f4fb00cacb264ba36575ae6246144006775b45e323f2d9cc2",
       "size": 625
+    },
+    {
+      "path": "runtime/provider_grants/private_transport.py",
+      "sha256": "25e6897dbbd8bca8001b01ca57f6162fcf07816b7d0944b7d8d863e4d8f8f572",
+      "size": 8491
     },
     {
       "path": "runtime/provider_grants/repository.py",
