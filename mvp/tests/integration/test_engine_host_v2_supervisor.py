@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+import socket
 import sys
 
 import pytest
@@ -234,3 +235,80 @@ async def test_parent_control_eof_reaps_child_and_releases_generation_lock(
         stderr=asyncio.subprocess.DEVNULL,
     )
     assert await asyncio.wait_for(replacement.wait(), timeout=3.0) == 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private descriptor is POSIX-only")
+@pytest.mark.asyncio
+async def test_process_guard_passes_only_explicit_provider_grant_descriptor(
+    tmp_path: Path,
+) -> None:
+    """Proves the guard forwards the private socket without credential argv/env."""
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    child_code = (
+        "import os,socket;"
+        "value=os.environ.get('WORKBENCH_PROVIDER_GRANT_FD','');"
+        "assert value.isdecimal();"
+        "endpoint=socket.socket(fileno=int(value));"
+        "endpoint.sendall(b'private-descriptor-ready');"
+        "endpoint.close()"
+    )
+    guard = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(Path(process_guard.__file__)),
+        "--lock",
+        str(tmp_path / "provider-grant.lock"),
+        "--generation",
+        "1",
+        "--provider-grant-fd",
+        str(child.fileno()),
+        "--",
+        sys.executable,
+        "-c",
+        child_code,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        pass_fds=(child.fileno(),),
+    )
+    child.close()
+    try:
+        observed = await asyncio.wait_for(
+            asyncio.to_thread(parent.recv, 64), timeout=2.0
+        )
+        assert observed == b"private-descriptor-ready"
+        assert await asyncio.wait_for(guard.wait(), timeout=3.0) == 0
+    finally:
+        parent.close()
+        if guard.returncode is None:
+            guard.kill()
+            await guard.wait()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private descriptor is POSIX-only")
+@pytest.mark.asyncio
+async def test_client_enables_private_grant_transport_only_for_guarded_sidecar(
+    tmp_path: Path,
+) -> None:
+    client = EngineHostV2Client(
+        fake_v2_command("provider_grant_descriptor"),
+        containment_lock=tmp_path / "private-client.lock",
+        containment_generation="1",
+        provider_grant_transport=True,
+        request_timeout=0.5,
+        shutdown_timeout=0.5,
+    )
+    await client.start()
+    try:
+        assert client.provider_grant_delivery is not None
+        assert client.capabilities is not None
+        assert client.capabilities.runtime_id == "fake-v2"
+    finally:
+        await client.aclose()
+
+
+def test_client_rejects_private_grant_transport_without_process_guard() -> None:
+    with pytest.raises(ValueError, match="containment"):
+        EngineHostV2Client(
+            fake_v2_command("normal"),
+            provider_grant_transport=True,
+        )

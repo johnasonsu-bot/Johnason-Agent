@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import signal
+import stat
 import subprocess
 import sys
 from threading import Lock, Thread
@@ -988,6 +989,14 @@ def main_v2(mode: str, checkpoint_store: str | None = None) -> int:
         "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
     ):
         return 3
+    if mode == "provider_grant_descriptor":
+        descriptor = os.environ.get("WORKBENCH_PROVIDER_GRANT_FD", "")
+        try:
+            metadata = os.fstat(int(descriptor))
+        except (OSError, TypeError, ValueError):
+            return 3
+        if not descriptor.isdecimal() or not stat.S_ISSOCK(metadata.st_mode):
+            return 3
     if mode in {
         "cancel_timeout_delayed_unknown_write",
         "cancel_timeout_delayed_unknown_write_tool_2",

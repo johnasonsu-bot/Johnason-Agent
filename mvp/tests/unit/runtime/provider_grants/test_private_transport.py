@@ -177,6 +177,33 @@ async def test_cancelled_delivery_closes_ambiguous_transport() -> None:
 
 @pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair unavailable")
 @pytest.mark.asyncio
+async def test_close_interrupts_delivery_waiting_for_ack() -> None:
+    delivery, peer = open_provider_grant_socketpair(clock=lambda: 120.0)
+    binding = _binding()
+    secret = bytearray(b"private-provider-value")
+    prefix_received = asyncio.Event()
+
+    async def receive_prefix_without_ack() -> None:
+        await asyncio.to_thread(_read_exact, peer, _GRANT_PREFIX.size)
+        prefix_received.set()
+        await asyncio.sleep(10)
+
+    receiver = asyncio.create_task(receive_prefix_without_ack())
+    sending = asyncio.create_task(delivery.deliver(binding, memoryview(secret)))
+    try:
+        await asyncio.wait_for(prefix_received.wait(), timeout=1.0)
+        await asyncio.wait_for(delivery.aclose(), timeout=1.0)
+        with pytest.raises(ProviderGrantTransportError, match="transport failed"):
+            await asyncio.wait_for(sending, timeout=1.0)
+    finally:
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
+        peer.close()
+        await delivery.aclose()
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair unavailable")
+@pytest.mark.asyncio
 async def test_oversized_secret_is_rejected_before_any_wire_write() -> None:
     delivery, peer = open_provider_grant_socketpair(
         clock=lambda: 120.0,

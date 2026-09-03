@@ -67,6 +67,7 @@ class SocketProviderGrantDelivery:
         self._lock = asyncio.Lock()
         self._attempted = False
         self._closed = False
+        self._delivery_task: asyncio.Task[ProviderGrantAck] | None = None
 
     async def deliver(
         self,
@@ -91,10 +92,21 @@ class SocketProviderGrantDelivery:
                     "provider grant delivery was already attempted"
                 )
             self._attempted = True
+            current = asyncio.current_task()
+            if current is None:
+                raise ProviderGrantTransportError(
+                    "provider grant delivery has no active task"
+                )
+            self._delivery_task = current
             try:
                 return await self._deliver_once(binding, secret_bytes)
             except asyncio.CancelledError:
+                interrupted_by_close = self._closed
                 self._close()
+                if interrupted_by_close:
+                    raise ProviderGrantTransportError(
+                        "provider grant transport failed"
+                    ) from None
                 raise
             except ProviderGrantTransportError:
                 self._close()
@@ -104,6 +116,9 @@ class SocketProviderGrantDelivery:
                 raise ProviderGrantTransportError(
                     "provider grant transport failed"
                 ) from error
+            finally:
+                if self._delivery_task is current:
+                    self._delivery_task = None
 
     async def _deliver_once(
         self,
@@ -185,13 +200,23 @@ class SocketProviderGrantDelivery:
         )
 
     async def aclose(self) -> None:
-        async with self._lock:
-            self._close()
+        # Closing the endpoint must interrupt a delivery that is blocked waiting
+        # for an acknowledgement.  Waiting for ``_lock`` first would deadlock
+        # shutdown because ``deliver`` owns it for the whole one-shot exchange.
+        self._close()
+        task = self._delivery_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def _close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        try:
+            self._endpoint.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self._endpoint.close()
 
 

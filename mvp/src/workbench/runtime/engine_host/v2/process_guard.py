@@ -12,6 +12,9 @@ import threading
 from typing import BinaryIO
 
 
+PROVIDER_GRANT_FD_ENV = "WORKBENCH_PROVIDER_GRANT_FD"
+
+
 class _ContainmentLock:
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -130,14 +133,32 @@ def _terminate_child(child: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _run(lock_path: Path, command: tuple[str, ...]) -> int:
+def _run(
+    lock_path: Path,
+    command: tuple[str, ...],
+    *,
+    provider_grant_fd: int | None = None,
+) -> int:
     containment = _ContainmentLock(lock_path)
     if not containment.acquire():
         return 73
     stopping = threading.Event()
     child: subprocess.Popen[bytes] | None = None
+    owned_provider_grant_fd: int | None = None
     try:
         options: dict[str, object] = {}
+        child_environment = dict(os.environ)
+        child_environment.pop(PROVIDER_GRANT_FD_ENV, None)
+        if provider_grant_fd is not None:
+            if os.name != "posix" or provider_grant_fd <= 2:
+                return 64
+            try:
+                os.fstat(provider_grant_fd)
+            except OSError:
+                return 64
+            owned_provider_grant_fd = provider_grant_fd
+            options["pass_fds"] = (provider_grant_fd,)
+            child_environment[PROVIDER_GRANT_FD_ENV] = str(provider_grant_fd)
         if os.name == "posix":
             options["start_new_session"] = True
         elif os.name == "nt":
@@ -150,8 +171,12 @@ def _run(lock_path: Path, command: tuple[str, ...]) -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
+            env=child_environment,
             **options,
         )
+        if owned_provider_grant_fd is not None:
+            os.close(owned_provider_grant_fd)
+            owned_provider_grant_fd = None
         assert child.stdin is not None
         assert child.stdout is not None
         assert child.stderr is not None
@@ -188,6 +213,11 @@ def _run(lock_path: Path, command: tuple[str, ...]) -> int:
     except OSError:
         return 74
     finally:
+        if owned_provider_grant_fd is not None:
+            try:
+                os.close(owned_provider_grant_fd)
+            except OSError:
+                pass
         if child is not None and child.poll() is None:
             _terminate_child(child)
         containment.release()
@@ -197,6 +227,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--lock", required=True)
     parser.add_argument("--generation", required=True)
+    parser.add_argument("--provider-grant-fd", type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     arguments = parser.parse_args()
     command = tuple(arguments.command)
@@ -204,7 +235,11 @@ def main() -> int:
         command = command[1:]
     if not command or not arguments.generation:
         return 64
-    return _run(Path(arguments.lock), command)
+    return _run(
+        Path(arguments.lock),
+        command,
+        provider_grant_fd=arguments.provider_grant_fd,
+    )
 
 
 if __name__ == "__main__":

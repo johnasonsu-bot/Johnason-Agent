@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
@@ -25,6 +26,12 @@ from .contracts import (
     RuntimeQueryInputV2,
 )
 from .security import validate_runtime_argv
+from workbench.runtime.provider_grants.delivery import ProviderGrantDelivery
+from workbench.runtime.provider_grants.private_transport import (
+    ProviderGrantTransportError,
+    SocketProviderGrantDelivery,
+    open_provider_grant_socketpair,
+)
 
 
 MAX_FRAME_BYTES = 1_048_576
@@ -186,6 +193,8 @@ class EngineHostV2Client:
         *,
         containment_lock: Path | None = None,
         containment_generation: str | None = None,
+        provider_grant_transport: bool = False,
+        provider_grant_clock: Callable[[], float] = time.time,
     ) -> None:
         command = validate_runtime_argv(command)
         if request_timeout <= 0 or shutdown_timeout <= 0:
@@ -198,9 +207,20 @@ class EngineHostV2Client:
             not isinstance(containment_generation, str) or not containment_generation
         ):
             raise ValueError("containment_generation must be non-empty")
+        if not isinstance(provider_grant_transport, bool):
+            raise TypeError("provider_grant_transport must be a bool")
+        if provider_grant_transport and containment_lock is None:
+            raise ValueError(
+                "provider grant transport requires containment configuration"
+            )
+        if not callable(provider_grant_clock):
+            raise TypeError("provider_grant_clock must be callable")
         self.command = command
         self._containment_lock = containment_lock
         self._containment_generation = containment_generation
+        self._provider_grant_transport_enabled = provider_grant_transport
+        self._provider_grant_clock = provider_grant_clock
+        self._provider_grant_delivery: SocketProviderGrantDelivery | None = None
         self.request_timeout = request_timeout
         self.shutdown_timeout = shutdown_timeout
         self._state = "created"
@@ -264,6 +284,11 @@ class EngineHostV2Client:
         return self._cleanup_confirmed
 
     @property
+    def provider_grant_delivery(self) -> ProviderGrantDelivery | None:
+        """Return the private delivery endpoint, never the child descriptor."""
+        return self._provider_grant_delivery
+
+    @property
     def reader_tasks_done(self) -> bool:
         return all(
             task is None or task.done()
@@ -318,17 +343,37 @@ class EngineHostV2Client:
         try:
             if self._closed:
                 raise asyncio.CancelledError
-            spawn_task = asyncio.create_task(
-                asyncio.create_subprocess_exec(
-                    *self._spawn_command(),
+            provider_grant_fd: int | None = None
+            provider_grant_child = None
+            spawn_options = self._process_group_options()
+            if self._provider_grant_transport_enabled:
+                delivery, provider_grant_child = open_provider_grant_socketpair(
+                    clock=self._provider_grant_clock
+                )
+                self._provider_grant_delivery = delivery
+                provider_grant_fd = provider_grant_child.fileno()
+                spawn_options["pass_fds"] = (provider_grant_fd,)
+            try:
+                spawn_task = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                    *self._spawn_command(provider_grant_fd),
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     limit=MAX_FRAME_BYTES + 1,
                     env=self._safe_environment(),
-                    **self._process_group_options(),
+                    **spawn_options,
+                    )
                 )
-            )
+            except BaseException:
+                if provider_grant_child is not None:
+                    provider_grant_child.close()
+                raise
+            if provider_grant_child is not None:
+                provider_grant_child_endpoint = provider_grant_child
+                spawn_task.add_done_callback(
+                    lambda _: provider_grant_child_endpoint.close()
+                )
             self._spawn_task = spawn_task
             try:
                 process = await asyncio.shield(spawn_task)
@@ -361,7 +406,7 @@ class EngineHostV2Client:
             if self._closed:
                 raise asyncio.CancelledError
             self._transition("ready", expected={"starting"})
-        except OSError as error:
+        except (OSError, ProviderGrantTransportError) as error:
             failure = RuntimeUnavailableError("engine-host v2 failed to start")
             self._start_failure = failure
             self._transition("unavailable", expected={"created", "starting"})
@@ -1617,6 +1662,10 @@ class EngineHostV2Client:
 
     async def _close_process(self) -> None:
         async with self._process_close_lock:
+            delivery = self._provider_grant_delivery
+            self._provider_grant_delivery = None
+            if delivery is not None:
+                await delivery.aclose()
             stream = self._active
             if (
                 stream is not None
@@ -1708,20 +1757,27 @@ class EngineHostV2Client:
         """Wait for process/transport termination without exposing raw process state."""
         await self._terminated.wait()
 
-    def _spawn_command(self) -> tuple[str, ...]:
+    def _spawn_command(
+        self, provider_grant_fd: int | None = None
+    ) -> tuple[str, ...]:
         if self._containment_lock is None:
+            if provider_grant_fd is not None:
+                raise RuntimeUnavailableError(
+                    "private provider grant descriptor requires process guard"
+                )
             return self.command
         guard = Path(__file__).with_name("process_guard.py")
-        return (
+        command = (
             sys.executable,
             str(guard),
             "--lock",
             str(self._containment_lock),
             "--generation",
             self._containment_generation or "",
-            "--",
-            *self.command,
         )
+        if provider_grant_fd is not None:
+            command += ("--provider-grant-fd", str(provider_grant_fd))
+        return (*command, "--", *self.command)
 
     async def _terminate_process_tree(
         self,

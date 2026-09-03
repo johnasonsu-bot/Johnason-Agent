@@ -234,6 +234,7 @@ class SidecarSupervisor:
             config.argv,
             containment_lock=containment_lock,
             containment_generation=str(generation),
+            provider_grant_transport=True,
         )
 
     @staticmethod
