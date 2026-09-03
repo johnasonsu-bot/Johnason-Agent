@@ -18,6 +18,12 @@ from workbench.runtime.engine_host.v2.client import (
     RuntimeClientObservation,
     RuntimeUnavailableError,
 )
+from workbench.runtime.engine_host.v2.contracts import (
+    RuntimeMessageInputV2,
+    RuntimePromptSectionInputV2,
+    RuntimeQueryInputV2,
+    canonical_runtime_input_digest,
+)
 from workbench.runtime.engine_host.v2.registry import (
     RuntimeRegistryIntegrityError,
     RuntimeRegistryV2,
@@ -48,6 +54,7 @@ class _Client:
         self.pause_count = 0
         self.resume_count = 0
         self.queries = []
+        self.runtime_inputs = []
         self.query_started = asyncio.Event()
         self.release_query = asyncio.Event()
         self.terminated = asyncio.Event()
@@ -66,8 +73,9 @@ class _Client:
     async def wait_terminated(self) -> None:
         await self.terminated.wait()
 
-    async def run_query(self, envelope, *, observer=None):
+    async def run_query(self, envelope, *, runtime_input=None, observer=None):
         self.queries.append(envelope)
+        self.runtime_inputs.append(runtime_input)
         if observer is not None:
             observer(
                 RuntimeClientObservation(
@@ -97,6 +105,27 @@ class _Client:
         del run_id, reason
         self.cancel_count += 1
         self.release_query.set()
+
+
+def _materialized_runtime_input() -> RuntimeQueryInputV2:
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1", role="user", content="materialized request"
+        ),
+    )
+    prompt_sections = (
+        RuntimePromptSectionInputV2(
+            section_id="section-1", order=0, content="pinned instructions"
+        ),
+    )
+    return RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=prompt_sections,
+        prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
+    )
 
 
 def _supervisor(
@@ -1068,6 +1097,132 @@ async def test_run_query_persists_acceptance_and_fences_every_control_operation(
     with pytest.raises(LeaseConflict):
         await handle.cancel(reason="stale")
     assert clients[1].cancel_count == 0
+
+
+@pytest.mark.asyncio
+async def test_supervised_query_forwards_the_exact_materialized_runtime_input(
+    tmp_path: Path,
+) -> None:
+    """Catches the Supervisor dropping or rebuilding the query input snapshot."""
+    database = tmp_path / "materialized-input.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    runtime_input = _materialized_runtime_input()
+    envelope = run_envelope(
+        runtime_id="goose",
+        command_id="command-materialized-input",
+        host_generation="1",
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        },
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    query = asyncio.create_task(
+        _collect_supervised(
+            handle.run_query(envelope, runtime_input=runtime_input)
+        )
+    )
+    await asyncio.wait_for(client.query_started.wait(), timeout=1.0)
+    await handle.cancel(reason="test")
+    await asyncio.wait_for(query, timeout=1.0)
+
+    assert client.runtime_inputs == [runtime_input]
+    assert client.runtime_inputs[0] is runtime_input
+
+
+@pytest.mark.asyncio
+async def test_supervised_retry_preserves_materialized_input_identity_pins(
+    tmp_path: Path,
+) -> None:
+    """Catches retry-local lease identity changes drifting input snapshot pins."""
+    database = tmp_path / "materialized-input-retry.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    runtime_input = _materialized_runtime_input()
+    envelope = run_envelope(
+        runtime_id="goose",
+        command_id="command-materialized-input-retry",
+        host_generation="1",
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        },
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: list[_Client] = []
+
+    def factory(config, generation, containment_lock):
+        del config, containment_lock
+        client = _Client("goose", fail_query=generation == 1)
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        client_factory=factory,
+        clock=lambda: 10.0,
+        sleep=lambda delay: asyncio.sleep(0),
+    )
+    await supervisor.start()
+    old = await supervisor.acquire_initial(assignment)
+
+    with pytest.raises(RuntimeUnavailableError, match="fixture query crash"):
+        _ = [
+            event
+            async for event in old.run_query(
+                envelope, runtime_input=runtime_input
+            )
+        ]
+    recovery = await asyncio.wait_for(old.wait_recovery(), timeout=1.0)
+    assert recovery.retry_handle is not None
+
+    equivalent_input = RuntimeQueryInputV2.model_validate(
+        runtime_input.model_dump(mode="json")
+    )
+    retry_query = asyncio.create_task(
+        _collect_supervised(
+            recovery.retry_handle.run_query(
+                envelope, runtime_input=equivalent_input
+            )
+        )
+    )
+    await asyncio.wait_for(clients[1].query_started.wait(), timeout=1.0)
+    await recovery.retry_handle.cancel(reason="test")
+    await asyncio.wait_for(retry_query, timeout=1.0)
+
+    assert clients[0].runtime_inputs == [runtime_input]
+    assert clients[1].runtime_inputs == [equivalent_input]
+    assert clients[0].queries[0].attempt == 0
+    assert clients[1].queries[0].attempt == 1
+    assert clients[0].queries[0].message_snapshot_digest == (
+        clients[1].queries[0].message_snapshot_digest
+    )
+    assert clients[0].queries[0].context.snapshot_digest == (
+        clients[1].queries[0].context.snapshot_digest
+    )
+    assert clients[0].queries[0].prompt_manifest_digest == (
+        clients[1].queries[0].prompt_manifest_digest
+    )
 
 
 @pytest.mark.asyncio

@@ -33,6 +33,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     CheckpointHintV2,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
+    RuntimeQueryInputV2,
 )
 from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
@@ -1283,7 +1284,11 @@ class SidecarSupervisor:
             )
 
     async def _run_handle_query(
-        self, handle: "SupervisedRuntimeLease", envelope: RunEnvelopeV2
+        self,
+        handle: "SupervisedRuntimeLease",
+        envelope: RunEnvelopeV2,
+        *,
+        runtime_input: RuntimeQueryInputV2 | None = None,
     ):
         slot, lease, client = self._validate_envelope(handle, envelope)
         try:
@@ -1310,12 +1315,16 @@ class SidecarSupervisor:
 
         terminal = False
         try:
-            async for event in client.run_query(
-                envelope,
-                observer=lambda observation: self._observe_handle(
-                    handle, observation
-                ),
-            ):
+            observer = lambda observation: self._observe_handle(handle, observation)
+            if runtime_input is None:
+                stream = client.run_query(envelope, observer=observer)
+            else:
+                stream = client.run_query(
+                    envelope,
+                    runtime_input=runtime_input,
+                    observer=observer,
+                )
+            async for event in stream:
                 terminal = (
                     event.type == "runtime.status"
                     and event.payload.get("status")
@@ -1979,13 +1988,26 @@ class SupervisedRuntimeLease:
         )
         self.__requires_reconcile = False
 
-    async def run_query(self, envelope: RunEnvelopeV2):
+    async def run_query(
+        self,
+        envelope: RunEnvelopeV2,
+        *,
+        runtime_input: RuntimeQueryInputV2 | None = None,
+    ):
+        if runtime_input is not None and not isinstance(
+            runtime_input, RuntimeQueryInputV2
+        ):
+            raise TypeError("runtime_input must be a RuntimeQueryInputV2")
         if self.__run_identity is not None:
             raise LeaseConflict("supervised runtime handle already ran a query")
         controlled = self.__supervisor._controlled_envelope(self, envelope)
         self.__run_identity = controlled.run_id
         try:
-            async for event in self.__supervisor._run_handle_query(self, controlled):
+            async for event in self.__supervisor._run_handle_query(
+                self,
+                controlled,
+                runtime_input=runtime_input,
+            ):
                 yield event
         finally:
             if not self.__closed and not self.__retiring:

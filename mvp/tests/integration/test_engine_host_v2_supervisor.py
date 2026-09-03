@@ -7,12 +7,107 @@ import sys
 
 import pytest
 
+from tests.fixtures.assignment_v2 import admitted_assignment
 from tests.fixtures.host_v2 import fake_v2_command
+from tests.fixtures.host_v2 import run_envelope, runtime_capabilities
 from workbench.runtime.engine_host.v2.client import (
     EngineHostV2Client,
     RuntimeUnavailableError,
 )
+from workbench.runtime.engine_host.v2.contracts import (
+    RuntimeMessageInputV2,
+    RuntimePromptSectionInputV2,
+    RuntimeQueryInputV2,
+    canonical_runtime_input_digest,
+)
 from workbench.runtime.engine_host.v2 import process_guard
+from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
+from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
+from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
+from workbench.settings import RuntimeProcessConfig
+
+
+@pytest.mark.asyncio
+async def test_supervisor_sends_materialized_input_through_real_client(
+    tmp_path: Path,
+) -> None:
+    """Catches either Supervisor layer dropping runtime_input before query.start."""
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1", role="user", content="materialized hello"
+        ),
+    )
+    prompt_sections = (
+        RuntimePromptSectionInputV2(
+            section_id="section-1", order=0, content="pinned instructions"
+        ),
+    )
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=prompt_sections,
+        prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
+    )
+    envelope = run_envelope(
+        command_id="command-supervised-input",
+        host_generation="1",
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        },
+    )
+    capabilities = runtime_capabilities(
+        "fake-v2",
+        build_id="python:test-build",
+        query=True,
+        model=True,
+        tools=True,
+        skills=True,
+        plugins=True,
+        workspace=True,
+        interventions=True,
+        pause_resume=True,
+        compaction=True,
+        checkpoints=True,
+        streaming=True,
+        plan=True,
+        todo=True,
+        prompt_sections=True,
+        tool_interceptors=True,
+        event_cursor=True,
+    )
+    database = tmp_path / "supervised-materialized-input.sqlite"
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    supervisor = SidecarSupervisor(
+        runtimes=(
+            RuntimeProcessConfig(
+                runtime_id="fake-v2",
+                argv=fake_v2_command("require_runtime_input"),
+            ),
+        ),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-1",
+        lease_seconds=30.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_initial(assignment)
+
+    try:
+        events = [
+            event
+            async for event in handle.run_query(
+                envelope, runtime_input=runtime_input
+            )
+        ]
+    finally:
+        await supervisor.aclose()
+
+    assert events[-1].payload == {"status": "completed"}
 
 
 @pytest.mark.asyncio
