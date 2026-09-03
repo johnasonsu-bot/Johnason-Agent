@@ -25,6 +25,9 @@ const ALLOWED_PROCESS_ENVIRONMENT_NAMES: &[&str] = &[
     "PYTHONUTF8",
     "TMPDIR",
     "TZ",
+    // macOS injects this locale descriptor while loading the system trust
+    // provider used by Goose's rustls stack. It is not application config.
+    "__CF_USER_TEXT_ENCODING",
 ];
 
 fn validate_argv(arguments: &[String]) -> Result<(), String> {
@@ -255,6 +258,10 @@ mod tests {
             ("HOME".to_owned(), "/tmp/home".to_owned()),
             ("TMPDIR".to_owned(), "/tmp".to_owned()),
             ("LANG".to_owned(), "C.UTF-8".to_owned()),
+            (
+                "__CF_USER_TEXT_ENCODING".to_owned(),
+                "0x1F5:0x0:0x0".to_owned(),
+            ),
         ];
         assert!(validate_process_environment(safe).is_ok());
 

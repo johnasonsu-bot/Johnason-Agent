@@ -66,6 +66,16 @@ pub struct GrantMaterial {
     bytes: Vec<u8>,
 }
 
+pub(crate) struct ProviderMaterial {
+    protocol: String,
+    base_url: String,
+    metadata_headers: Vec<(String, String)>,
+    thinking_enabled: bool,
+    reasoning_effort: String,
+    model: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureDisposition {
     Complete,
@@ -148,9 +158,99 @@ impl GrantMaterial {
             _ => Err("fixed Goose provider is unsupported".into()),
         }
     }
+
+    // Consumed by the real-query state-machine slice; kept here so the private
+    // Grant remains the only ownership-transfer boundary into upstream Goose.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn into_provider_material(
+        mut self,
+        command_id: &str,
+        run_id: &str,
+        term_id: &str,
+        step_id: &str,
+        provider_ref: &str,
+    ) -> Result<ProviderMaterial, String> {
+        let expected_provider_ref = format!("provider-profile:{}", self.binding.provider_id);
+        if self.binding.command_id != command_id
+            || self.binding.run_id != run_id
+            || self.binding.term_id != term_id
+            || self.binding.step_id != step_id
+            || expected_provider_ref != provider_ref
+            || self.binding.model.is_empty()
+            || self.bytes.is_empty()
+        {
+            return Err("provider Grant binding identity mismatch".into());
+        }
+        Ok(ProviderMaterial {
+            protocol: std::mem::take(&mut self.binding.route.protocol),
+            base_url: std::mem::take(&mut self.binding.route.base_url),
+            metadata_headers: std::mem::take(&mut self.binding.route.metadata_headers),
+            thinking_enabled: self.binding.route.thinking_enabled,
+            reasoning_effort: std::mem::take(&mut self.binding.route.reasoning_effort),
+            model: std::mem::take(&mut self.binding.model),
+            bytes: std::mem::take(&mut self.bytes),
+        })
+    }
+}
+
+impl ProviderMaterial {
+    pub(crate) fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub(crate) fn metadata_headers(&self) -> &[(String, String)] {
+        &self.metadata_headers
+    }
+
+    pub(crate) fn thinking_enabled(&self) -> bool {
+        self.thinking_enabled
+    }
+
+    pub(crate) fn reasoning_effort(&self) -> &str {
+        &self.reasoning_effort
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(crate) fn take_secret(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        protocol: &str,
+        base_url: String,
+        metadata_headers: Vec<(String, String)>,
+        thinking_enabled: bool,
+        reasoning_effort: &str,
+        model: &str,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            protocol: protocol.into(),
+            base_url,
+            metadata_headers,
+            thinking_enabled,
+            reasoning_effort: reasoning_effort.into(),
+            model: model.into(),
+            bytes,
+        }
+    }
 }
 
 impl Drop for GrantMaterial {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
+impl Drop for ProviderMaterial {
     fn drop(&mut self) {
         self.bytes.fill(0);
     }

@@ -2,13 +2,16 @@
 name = "goose-host-v2"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.94.1"
 publish = false
 
 [dependencies]
+futures = { version = "0.3.32", default-features = false, features = ["std"] }
+goose-providers = { path = "../../../third_party/goose/crates/goose-providers", default-features = false, features = ["rustls-tls"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
+tokio = { version = "1.48", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 
 [workspace]

@@ -16,6 +16,7 @@
 
 ## Task 2：Goose pinned upstream 最小真实 Query
 
+- [x] Slice 2.1：Host 使用锁定的 Rust 1.96.1 与 pinned `goose-providers`，由一次性 Grant 驱动真实 OpenAI-compatible 流；本地 mock 已验证路由、模型、思考参数、元数据头、内存凭据、文本与 usage-only 事件。
 - [ ] 通过 pinned Goose 的公开库接口创建单轮 Provider/Session，不读取运行时专属配置文件或 API Key 环境变量。
 - [ ] 用 `RuntimeQueryInputV2` 生成有序输入，将 upstream assistant text / tool / terminal 事件映射为 Host v2 唯一有序事件。
 - [ ] 固定冒烟与真实 provider 分支明确分离；真实分支失败不得回落 fixture 或其他 Provider。
