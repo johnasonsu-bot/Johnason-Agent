@@ -7,6 +7,7 @@ from tests.fixtures.host_v2 import run_envelope, runtime_capabilities, runtime_e
 from workbench.runtime.engine_host import v2
 from workbench.runtime.engine_host.v2.contracts import (
     CheckpointHintV2,
+    HostQueryCommandV2,
     QueryCommandV2,
     RunEnvelopeV2,
     RuntimeContextItemV2,
@@ -15,6 +16,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimePromptSectionInputV2,
     RuntimeQueryInputV2,
     canonical_runtime_input_digest,
+    validate_host_v2_command_payload,
 )
 
 
@@ -96,7 +98,7 @@ def test_query_start_allows_credential_shaped_business_text_only_in_runtime_inpu
         }
     )
 
-    command = QueryCommandV2.model_validate(
+    command = HostQueryCommandV2.model_validate(
         {
             "type": "query.start",
             "command_id": envelope.command_id,
@@ -114,7 +116,7 @@ def test_query_start_allows_credential_shaped_business_text_only_in_runtime_inpu
 
 def test_legacy_query_start_rejects_unknown_safe_payload_fields() -> None:
     with pytest.raises(ValueError, match="unknown or missing"):
-        QueryCommandV2.model_validate(
+        HostQueryCommandV2.model_validate(
             {
                 "type": "query.start",
                 "command_id": "command-1",
@@ -124,6 +126,38 @@ def test_legacy_query_start_rejects_unknown_safe_payload_fields() -> None:
                 },
             }
         )
+
+
+def test_internal_query_start_is_not_misclassified_as_a_host_transport_frame() -> None:
+    """Python Term command payloads are not Engine Host NDJSON request payloads."""
+    empty = QueryCommandV2(type="query.start", command_id="command-1")
+    stepped = QueryCommandV2(
+        type="query.start",
+        command_id="command-2",
+        payload={
+            "steps": [
+                {"step_id": "step-1", "command_id": "command-2"},
+            ]
+        },
+    )
+
+    assert empty.payload == {}
+    assert stepped.payload["steps"][0]["step_id"] == "step-1"
+
+
+def test_internal_query_start_can_use_names_reserved_by_the_host_transport() -> None:
+    command = QueryCommandV2(
+        type="query.start",
+        command_id="command-1",
+        payload={"runtime_input": {"mode": "internal"}, "steps": []},
+    )
+
+    assert command.payload["runtime_input"]["mode"] == "internal"
+
+
+def test_host_query_start_rejects_an_unvalidated_envelope() -> None:
+    with pytest.raises(ValueError):
+        validate_host_v2_command_payload("query.start", {"envelope": {}})
 
 
 def test_run_envelope_freezes_every_resume_identity() -> None:

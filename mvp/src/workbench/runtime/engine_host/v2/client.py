@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from .contracts import (
     CheckpointHintV2,
-    QueryCommandV2,
+    HostQueryCommandV2,
     RunEnvelopeV2,
     RuntimeCapabilitiesV2,
     RuntimeEventV2,
@@ -1013,7 +1013,7 @@ class EngineHostV2Client:
             raise RuntimeUnavailableError("engine-host v2 is not running")
         resolved_command_id = command_id or f"control-{uuid4()}"
         try:
-            command = QueryCommandV2.model_validate(
+            command = HostQueryCommandV2.model_validate(
                 {
                     "type": command_type,
                     "command_id": resolved_command_id,

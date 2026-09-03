@@ -419,27 +419,57 @@ class QueryCommandV2(FrozenModel):
     command_id: OpaqueIdentifier
     payload: Mapping[str, JsonValue] = Field(default_factory=dict)
 
+    @field_validator("payload", mode="before")
+    @classmethod
+    def validate_payload(cls, value: Any) -> Any:
+        _validate_json_value(value)
+        return value
+
+    @field_validator("payload")
+    @classmethod
+    def freeze_payload(cls, value: Mapping[str, JsonValue]) -> FrozenJsonMapping:
+        return _freeze_json_value(value)  # type: ignore[return-value]
+
+    @field_serializer("payload")
+    def serialize_payload(self, value: Mapping[str, JsonValue]) -> JsonValue:
+        return _serialize_json_value(value)
+
+
+def validate_host_v2_command_payload(
+    command_type: QueryCommandTypeV2, payload: Mapping[str, Any]
+) -> None:
+    """Validate the stricter payload shape used only on Host v2 NDJSON."""
+    if command_type != "query.start":
+        _validate_json_value(payload)
+        return
+    expected_fields = (
+        {"envelope", "runtime_input"}
+        if "runtime_input" in payload
+        else {"envelope"}
+    )
+    if set(payload) != expected_fields:
+        raise ValueError("query.start payload has unknown or missing fields")
+    RunEnvelopeV2.model_validate(payload["envelope"])
+    if "runtime_input" in payload:
+        RuntimeQueryInputV2.model_validate(payload["runtime_input"])
+
+
+class HostQueryCommandV2(FrozenModel):
+    """Strict command record used only for the Engine Host v2 NDJSON wire."""
+
+    type: QueryCommandTypeV2
+    command_id: OpaqueIdentifier
+    payload: Mapping[str, JsonValue] = Field(default_factory=dict)
+
     @model_validator(mode="before")
     @classmethod
-    def validate_command_payload(cls, value: Any) -> Any:
+    def validate_transport_payload(cls, value: Any) -> Any:
         if not isinstance(value, Mapping):
             return value
         payload = value.get("payload", {})
         if not isinstance(payload, Mapping):
             raise ValueError("command payload must be an object")
-        if value.get("type") == "query.start":
-            expected_fields = (
-                {"envelope", "runtime_input"}
-                if "runtime_input" in payload
-                else {"envelope"}
-            )
-            if set(payload) != expected_fields:
-                raise ValueError("query.start payload has unknown or missing fields")
-            _validate_json_value(payload["envelope"])
-            if "runtime_input" in payload:
-                RuntimeQueryInputV2.model_validate(payload["runtime_input"])
-        else:
-            _validate_json_value(payload)
+        validate_host_v2_command_payload(value.get("type"), payload)
         return value
 
     @field_validator("payload")
