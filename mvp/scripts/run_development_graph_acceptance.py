@@ -53,6 +53,50 @@ def _git(repository: Path, *arguments: str) -> str:
     return completed.stdout.strip()
 
 
+class AcceptanceGitWorkspaceTool(GitWorkspaceTool):
+    """Prepare pinned local submodules before the full regression gate."""
+
+    def __init__(
+        self,
+        *,
+        worktree_root: Path,
+        ledger: EffectLedger,
+        submodule_sources: dict[str, Path],
+    ) -> None:
+        super().__init__(worktree_root=worktree_root, ledger=ledger)
+        self._submodule_sources = dict(submodule_sources)
+
+    def merge_to_integration(
+        self,
+        *,
+        operation_id: str,
+        repo: Path,
+        base_sha: str,
+        integration_branch: str,
+        commits: tuple[str, ...],
+    ) -> str:
+        integration_sha = super().merge_to_integration(
+            operation_id=operation_id,
+            repo=repo,
+            base_sha=base_sha,
+            integration_branch=integration_branch,
+            commits=commits,
+        )
+        workspace = self._operation_path(operation_id)
+        command = ["git", "-c", "protocol.file.allow=always"]
+        for name, source in sorted(self._submodule_sources.items()):
+            command.extend(("-c", f"submodule.{name}.url={source.resolve()}"))
+        command.extend(("submodule", "update", "--init", "--recursive"))
+        subprocess.run(
+            tuple(command),
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return integration_sha
+
+
 class DurableCalls:
     """Small acceptance-only counter proving checkpoint recovery did not replay work."""
 
@@ -434,9 +478,14 @@ async def _exercise_main_graph(
         ),
         integration_regression_policy=_integration_regression_policy(inject),
     )
-    tool = GitWorkspaceTool(
+    source = Path(__file__).resolve().parents[2]
+    tool = AcceptanceGitWorkspaceTool(
         worktree_root=runtime_dir / "main-worktrees",
         ledger=EffectLedger(runtime_dir / "main-effects.sqlite"),
+        submodule_sources={
+            "third_party/deepseek-harness": source / "third_party/deepseek-harness",
+            "third_party/goose": source / "third_party/goose",
+        },
     )
     checkpoint = runtime_dir / "main-checkpoints.sqlite"
     config = graph_config(run_id, 1)

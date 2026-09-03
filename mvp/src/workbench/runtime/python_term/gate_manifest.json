@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "f6ce0ea3c9f3450d861fbea64c3a8ae296120f36655f5c330f0f54c8f7b1196f",
-      "size": 1851914
+      "sha256": "4b4a3f22b5ba5fae0df239a2a33353df7d4feb248141be8251947c02cd4adf27",
+      "size": 1901352
     },
     {
       "path": "uv.lock",
@@ -484,13 +484,13 @@
     },
     {
       "path": "runtime/deepseek_harness/source_gate.py",
-      "sha256": "df40167a59d0ad31d17ba853cabad3536392e59867bcf707ce87c1ceaddcf42d",
-      "size": 15713
+      "sha256": "c909cb3e39148fd27767e418500daa659ab180489fe6949810f6575e4ae0a07c",
+      "size": 24137
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "272dbf90057a1938f75f7fcc760d758511be318646e4be66277c772b7872ddc7",
-      "size": 3213
+      "sha256": "7c419e460522007840285cd1e65419eb82fc322841ccbbbd613753810960f7f0",
+      "size": 6583
     },
     {
       "path": "runtime/engine_host/__init__.py",
@@ -519,8 +519,8 @@
     },
     {
       "path": "runtime/engine_host/v2/__init__.py",
-      "sha256": "65cd7e69a7508ff95b51e0e241554f8a2e0bd721fab230021844085c4850b942",
-      "size": 527
+      "sha256": "d6680e535892a00aa2955e828912e354c3a80b016ea3acd6450aff32a5e29505",
+      "size": 831
     },
     {
       "path": "runtime/engine_host/v2/assignment.py",
@@ -529,13 +529,13 @@
     },
     {
       "path": "runtime/engine_host/v2/client.py",
-      "sha256": "9d10adab6bb8cb02c15c061552afe4b8e30db9d2581cd22edf02fc14b29bb8bc",
-      "size": 72380
+      "sha256": "b22fc7487a5043395ee54db8d6ebd99071c009ca05a6cbbc22c193d78e9d6030",
+      "size": 74482
     },
     {
       "path": "runtime/engine_host/v2/contracts.py",
-      "sha256": "81363dff02ecbc3922701d03efd7a25fbb2b5730b19ac65798e5a0d7584905d6",
-      "size": 12682
+      "sha256": "acf8a4146dacab1a8d71433c290a951b1ce01f4d630cf0a996833e0f0b1e15d0",
+      "size": 18584
     },
     {
       "path": "runtime/engine_host/v2/identity.py",
@@ -579,8 +579,8 @@
     },
     {
       "path": "runtime/engine_host/v2/supervisor.py",
-      "sha256": "1229c43639a908f8222a52b949df066d10a2cd06ffa3b019b4f06f36047c3c88",
-      "size": 84126
+      "sha256": "23a19bce868082efa11ad7e744eb6e7576aaa7a214822a68dd828c57468467ab",
+      "size": 84825
     },
     {
       "path": "runtime/goose/__init__.py",
@@ -589,8 +589,8 @@
     },
     {
       "path": "runtime/goose/host_adapter.py",
-      "sha256": "38821337a35d1951625e661dbe1a8f4b1eacb48703f588eaa691776bd3ede64d",
-      "size": 10853
+      "sha256": "cb766e998d6d67bfff695fd992b91dc8bd06095d083a3c48f09c0d6cf7541ed7",
+      "size": 10852
     },
     {
       "path": "runtime/goose/message_mapper.py",
@@ -599,13 +599,13 @@
     },
     {
       "path": "runtime/goose/source_gate.py",
-      "sha256": "5d17987ed67b6e1bc0fc814f1be083ad235ce5188d3c0d02de6e3d6b29f8ddec",
-      "size": 9529
+      "sha256": "0a7a473583ecb21727b1ee99085c5359a9c03c40cbf2135c4287ec96c33ea3b7",
+      "size": 34955
     },
     {
       "path": "runtime/goose/source_manifest.json",
-      "sha256": "2cf02f33505f78df094b674b55ca563bd15fa7a3b8621984f6ad233028cdf8b7",
-      "size": 2463
+      "sha256": "e921890d1058cbefa890bcb6248db694a1ffe3a89f288970a7296d4d2b8dd18a",
+      "size": 4787
     },
     {
       "path": "runtime/provider_grants/__init__.py",

@@ -11,6 +11,8 @@ import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from copy import deepcopy
+from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -73,6 +75,99 @@ _SAFE_PUBLIC_SUMMARIES = (
     "This provider offers a public service.",
     "The workspace supports ordinary team planning.",
 )
+
+
+@dataclass(frozen=True)
+class FixedSmokeVerdict:
+    """Independent evidence for one fixed smoke lane; never a federation GO."""
+
+    lane: str
+    scope: str
+    runtime_input_digest: str
+    terminal_status: str
+    terminal_cursor: int
+    sealed: bool
+
+
+def assert_fixed_smoke_transcript(
+    *,
+    lane: str,
+    frames: list[dict[str, object]],
+    runtime_input: Mapping[str, object],
+    public_surfaces: Mapping[str, object],
+    forbidden_values: tuple[str, ...],
+) -> FixedSmokeVerdict:
+    """Validate one closed fixed-smoke transcript and its public boundary."""
+
+    accepted_indexes = [
+        index
+        for index, frame in enumerate(frames)
+        if frame.get("kind") == "response"
+        and frame.get("type") == "query.start"
+        and frame.get("payload") == {"accepted": True}
+    ]
+    event_indexes = [
+        index for index, frame in enumerate(frames) if frame.get("kind") == "event"
+    ]
+    assert len(accepted_indexes) == 1
+    assert event_indexes
+    assert accepted_indexes[0] < min(event_indexes)
+
+    events = [frames[index]["payload"] for index in event_indexes]
+    assert all(isinstance(event, dict) for event in events)
+    cursors = [event["cursor"] for event in events]
+    assert cursors == list(range(1, len(events) + 1))
+    identities = {
+        (event.get("run_id"), event.get("term_id"), event.get("step_id"))
+        for event in events
+    }
+    assert len(identities) == 1
+    assert all(all(identity) for identity in identities)
+    terminal_events = [
+        event
+        for event in events
+        if event.get("type") == "runtime.status"
+        and isinstance(event.get("payload"), dict)
+        and event["payload"].get("status")
+        in {"completed", "failed", "cancelled"}
+    ]
+    assert len(terminal_events) == 1
+    terminal = terminal_events[0]
+    terminal_index = event_indexes[events.index(terminal)]
+
+    seals = [
+        (index, frame)
+        for index, frame in enumerate(frames)
+        if frame.get("kind") == "response" and frame.get("type") == "query.status"
+    ]
+    assert len(seals) == 1
+    seal_index, seal = seals[0]
+    assert terminal_index < seal_index
+    seal_payload = seal.get("payload")
+    assert isinstance(seal_payload, dict)
+    assert seal_payload.get("sealed") is True
+    assert seal_payload.get("terminal_cursor") == terminal["cursor"]
+    assert all(
+        seal_payload.get(name) == terminal.get(name)
+        for name in ("run_id", "term_id", "step_id")
+    )
+
+    public_document = {"frames": frames, **dict(public_surfaces)}
+    public_text = json.dumps(
+        public_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    assert all(value not in public_text for value in forbidden_values)
+    input_text = json.dumps(
+        runtime_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return FixedSmokeVerdict(
+        lane=lane,
+        scope="fixed_smoke_convergence",
+        runtime_input_digest=hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+        terminal_status=terminal["payload"]["status"],
+        terminal_cursor=terminal["cursor"],
+        sealed=True,
+    )
 
 
 class HostV2Runtime(Protocol):
