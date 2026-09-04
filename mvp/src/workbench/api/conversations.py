@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import sqlite3
+import time
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Header, HTTPException
@@ -241,6 +242,9 @@ _FEDERATED_TERMINAL_OUTCOMES = frozenset(
         "reconciliation_required",
     }
 )
+_FEDERATED_RETRY_BASE_SECONDS = 0.1
+_FEDERATED_RETRY_MAX_SECONDS = 5.0
+_FEDERATED_RETRY_MAX_COUNT = 8
 
 
 @dataclass(frozen=True)
@@ -1396,6 +1400,7 @@ class ConversationAPI:
                         "runtime_projected_event_digests": projected_digests,
                     }
                 )
+                self._apply_federated_retry_backoff(retry_state)
                 self.conversations.mark_retryable(
                     turn.session_id,
                     turn.command_id,
@@ -1938,6 +1943,26 @@ class ConversationAPI:
         state["failed_host_generation"] = generation
         state.pop("retry_not_before", None)
         state.pop("host_retry_count", None)
+
+    @staticmethod
+    def _apply_federated_retry_backoff(state: dict[str, Any]) -> None:
+        retry_count = state.get("federated_retry_count", 0)
+        if (
+            isinstance(retry_count, bool)
+            or not isinstance(retry_count, int)
+            or retry_count < 0
+        ):
+            raise TurnSnapshotCorruption(
+                "federated retry metadata is invalid"
+            )
+        retry_count = min(retry_count + 1, _FEDERATED_RETRY_MAX_COUNT)
+        delay = min(
+            _FEDERATED_RETRY_BASE_SECONDS * (2 ** (retry_count - 1)),
+            _FEDERATED_RETRY_MAX_SECONDS,
+        )
+        state["federated_retry_count"] = retry_count
+        state["retry_not_before"] = time.time() + delay
+        state.pop("failed_host_generation", None)
 
     async def run_message(
         self,

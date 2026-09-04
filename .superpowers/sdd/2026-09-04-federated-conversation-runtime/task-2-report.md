@@ -237,3 +237,119 @@
   文件拆分并对每次运行施加 60 秒硬上限，两个原疑似文件分别在 0.12 秒和 1.50 秒通过，
   未复现确定性死锁。
 - 仓库环境未安装 `ruff`；已用 `compileall`、`git diff --check` 及相关 pytest 回归替代。
+
+---
+
+## Fix round 2/5：审查修复
+
+### 交付变更
+
+1. **初始/恢复 lease 一次性执行认领**
+   - `SupervisedRuntimeLease` 新增进程内一次性 `execution_claimed` 状态；初始 handle 在
+     `acquire_initial()` 返回前、`slot.lock` 内即完成认领。
+   - `release_retry` 产生的 Supervisor-approved handle 由下一次
+     `acquire_for_execution()` 在 `slot.lock` 内原子消费；当前调用栈专属的
+     `read_only_retry` handle 在恢复创建时即认领，不能被另一个 Worker 并发取得。
+   - 对已经认领的同 assignment handle 增加锁外快速拒绝，避免 Grant delivery 持有
+     `slot.lock` 时第二个执行者等待到超时；锁内仍保留 authority/assignment 二次校验与
+     原子认领。
+
+2. **Grant delivery 阶段取消**
+   - active durable command 在 Host query 尚未建立 run identity 时，`cancel()` 设置
+     pre-query cancellation signal，不再调用要求 active run 的 Host cancel。
+   - Coordinator 同时等待私有 Grant delivery 与 cancellation signal；取消先到时中止
+     delivery，等待 transport 完成 cancellation-safe 收尾，再由 Supervisor 关闭精确
+     sidecar、生成 containment receipt，最后以 `query_cancelled` 撤销该 Grant。
+   - pre-query 取消映射为稳定 `runtime_cancelled`；真实 Worker 集成覆盖 Grant 已进入
+     `delivering` 但尚未 ACK 的窗口，以及 ACK 后 Host `query.cancel` 窗口，两个分支都只
+     产生一个 cancelled terminal。
+
+3. **Goose/DSH Provider compatibility 对齐**
+   - Goose allowlist 为 `deepseek`、`lmstudio`、`openai`、`openai_chat`、
+     `openai_compatible`。
+   - DSH 仍只接受 `deepseek`，并拒绝任何自定义 metadata headers。
+   - unsupported Goose protocol、DSH 非 DeepSeek 与 DSH metadata headers 均在 Grant
+     issue 前以 `provider_incompatible` fail closed；新增 `lmstudio`、`openai` 可 issue
+     回归。
+
+4. **provider_unavailable 持久化退避**
+   - pre-acceptance retry state 持久化 `federated_retry_count` 与
+     `retry_not_before`；采用 100ms 起步、指数增长、最大 5 秒、计数最大 8 的有界退避。
+   - 继续复用 Conversation repository 对 `retry_not_before` 的 durable claim gate；进程
+     重启后不会丢失退避，持续 provider_unavailable 的后台 Worker 不会高频 claim。
+   - 该路径仍只适用于 `accepted=False, retryable=True`；已接受请求、reconcile 与未知
+     write 不会进入安全重放。
+
+### Fix round 2 RED
+
+1. 初始与 recovery handle 一次性认领测试首次运行：`2 failed`；同一 handle 可被
+   `acquire_for_execution()` 第二次返回。补充 read-only inline recovery 断言后亦失败，
+   证明恢复 handle 尚未区分当前执行者与下一 Worker。
+2. Goose 新增 `lmstudio`/`openai` route 测试首次运行：`2 failed`；旧 validator 把两者
+   都判为 `ProviderGrantIncompatible`。同时把旧 Goose incompatible fixture 改为真正的
+   `unsupported` protocol，保留 DSH 非 DeepSeek/metadata headers 断言。
+3. provider backoff 精确测试：
+   - 首次后台 Worker 测试复现生产忙循环并使测试事件循环饥饿，已中断该无界运行；给
+     fake executor 增加一次调度让出后，确定性 RED 为 `2 failed in 0.61s`：state 缺少
+     `federated_retry_count`，且 30ms 内执行次数已达到 3。
+4. Grant-stage cancel 首次真实集成：取消在 run identity 建立前进入既有 Host cancel，
+   抛 `LeaseConflict` 并把 turn 错封为 `runtime_failed`。
+5. 将阻塞点推进到 Grant repository 已 claim、transport ACK 尚未返回后，测试曾等待约
+   30 秒；用单例、`faulthandler_timeout` 与硬超时定位为第二个
+   `acquire_for_execution()` 等待 Grant delivery 所持的 `slot.lock`。中断残留进程后加入
+   已认领 handle 快速拒绝，未继续无界等待。
+6. 新退避引入后的 federated integration 首次回归：`1 failed, 2 passed in 3.94s`；旧测试
+   在 `retry_not_before` 前立即 claim。测试改为等待持久 deadline 后再验证成功重试。
+
+### Fix round 2 GREEN
+
+1. 初始、release-retry 与 read-only-retry execution claim 精确回归：
+   `3 passed in 0.52s`；最终新鲜复跑 `3 passed in 0.49s`。
+2. Goose 新增可用协议及三类 incompatible route：`5 passed in 4.10s`。
+3. provider_unavailable 单次状态与后台 Worker 退避：`2 passed in 0.68s`。
+4. Grant-stage cancel 单例：`1 passed in 1.50s`；ACK 后 Host cancel 单例：
+   `1 passed in 1.49s`。
+5. federated 真实 Worker 集成文件：`3 passed in 4.16s`。
+6. Supervisor 完整单元文件：`69 passed in 3.48s`。
+7. Broker、Coordinator 与 federated executor：`49 passed in 23.38s`。
+8. Conversation Worker 完整单元文件：`21 passed in 1.74s`。
+9. Engine Host v2 Supervisor 集成：`8 passed in 2.04s`。
+
+### Fix round 2 最终新鲜验证
+
+1. brief 指定 executor、Conversation Worker、真实 federated Worker、Supervisor 集成与
+   Coordinator 组合：`54 passed in 9.97s`。
+2. main、Admission、Conversation execution/repository/reconciliation/API、Python Term
+   compatibility 与 Provider Grant acceptance 相邻回归：`147 passed in 18.87s`。
+3. `compileall` 与 `git diff --check`：退出码 0。
+
+### Fix round 2 相邻文件说明
+
+- `mvp/src/workbench/runtime/engine_host/v2/supervisor.py` 及其单元测试：审查明确要求
+  initial/recovery handle 原子认领与 Grant 前取消，这是 Supervisor lease/control 合同，
+  不能只在 Conversation executor 内模拟。
+- `mvp/src/workbench/runtime/provider_grants/coordinator.py`、`__init__.py`、`broker.py` 及
+  Broker 测试：审查明确允许修订相邻 Grant/Supervisor 合同；这里实现 cancellation-safe
+  Grant containment 与正式 runtime compatibility validator，未扩展 Gate 签发。
+- 未修改 Task 3 Gate Receipt/capability 发布或 Task 4 UI。
+
+### Fix round 2 自审
+
+- execution claim 的创建/消费仍在 `slot.lock` 内完成；锁外分支仅对已认领的精确同
+  assignment handle 做快速 fail-closed，不能取得或变更 lease。
+- Grant-stage cancellation 只有在 delivery task 完成 cancellation-safe 收尾后才使用
+  Supervisor containment receipt 撤销 Grant；不会直接伪造 ACK 或绕过 Broker。
+- Grant ACK 前不投影公共 Runtime event；取消只由 Conversation 层写唯一 terminal。
+- `provider_unavailable` 只保留 pre-acceptance retry；Supervisor 批准的 read-only retry
+  仍重放同一冻结 Envelope/Input，release retry 留给 durable Worker，reconcile/未知 write
+  仍禁止重放。
+- Python Term 继续使用既有 Tool/Effect/Checkpoint executor；Provider/model 冻结、cursor
+  digest、terminal outcome 原子恢复与唯一 terminal 合同均未弱化。
+
+### Fix round 2 Concerns
+
+- 首轮 busy-loop 与 Grant-lock 测试各出现过一次无界等待；均已中断，之后所有并发测试
+  使用单例和硬超时，问题已分别转化为可重复 RED 并修复。
+- 仓库环境仍未安装 `ruff`；使用 `compileall`、`git diff --check` 和相关 pytest 回归替代。
+- 未执行仓库全量测试；执行了 Task 2 指定组合、所有本轮修改模块的完整单元/集成文件，
+  以及 147 个相邻 main/Admission/Conversation/Python Term/Grant acceptance 回归。

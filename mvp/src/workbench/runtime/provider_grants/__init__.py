@@ -21,7 +21,11 @@ from .broker import (
     canonical_provider_profile_digest,
 )
 from .delivery import ProviderGrantDelivery
-from .coordinator import FederatedRuntimeCoordinator, FederatedRuntimeLease
+from .coordinator import (
+    FederatedRuntimeCancelled,
+    FederatedRuntimeCoordinator,
+    FederatedRuntimeLease,
+)
 from .repository import (
     ProviderGrantConflict,
     ProviderGrantContainmentRequired,
@@ -51,6 +55,7 @@ __all__ = [
     "ProviderGrantRecord",
     "ProviderGrantReceipt",
     "ProviderGrantUnavailable",
+    "FederatedRuntimeCancelled",
     "FederatedRuntimeCoordinator",
     "FederatedRuntimeLease",
     "canonical_grant_digest",

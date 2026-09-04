@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 import time
 from typing import Protocol
@@ -19,10 +20,15 @@ from .broker import (
 )
 from .contracts import (
     ProviderGrantContainmentReceipt,
+    ProviderGrantOffer,
     ProviderGrantRevocationReason,
     ProviderGrantTarget,
 )
 from .delivery import ProviderGrantDelivery
+
+
+class FederatedRuntimeCancelled(RuntimeError):
+    """A supervised query was cancelled before Host query acceptance."""
 
 
 class FederatedRuntimeLease(Protocol):
@@ -49,6 +55,10 @@ class FederatedRuntimeLease(Protocol):
     async def aclose(self) -> None: ...
 
     async def release_for_retry(self) -> None: ...
+
+    async def wait_pre_query_cancel(self) -> None: ...
+
+    def pre_query_cancel_requested(self) -> bool: ...
 
     def run_query(
         self,
@@ -86,6 +96,9 @@ class FederatedRuntimeCoordinator:
         if not isinstance(runtime_input, RuntimeQueryInputV2):
             raise TypeError("runtime_input must be a RuntimeQueryInputV2")
 
+        if _pre_query_cancel_requested(lease):
+            await lease.aclose()
+            raise FederatedRuntimeCancelled()
         target = lease.provider_grant_target(envelope)
         try:
             delivery = lease.provider_grant_delivery(envelope, target=target)
@@ -97,11 +110,11 @@ class FederatedRuntimeCoordinator:
             await lease.aclose()
             raise
         try:
-            await self._broker.deliver(
-                offer,
-                target=target,
-                delivery=delivery,
+            await self._deliver_or_cancel(
+                lease, offer=offer, target=target, delivery=delivery
             )
+        except FederatedRuntimeCancelled:
+            raise
         except ProviderGrantDeliveryFailed:
             receipt = await lease.contain_provider_grant(
                 target,
@@ -122,5 +135,65 @@ class FederatedRuntimeCoordinator:
         ):
             yield event
 
+    async def _deliver_or_cancel(
+        self,
+        lease: FederatedRuntimeLease,
+        *,
+        offer: ProviderGrantOffer,
+        target: ProviderGrantTarget,
+        delivery: ProviderGrantDelivery,
+    ) -> None:
+        wait_cancel = getattr(lease, "wait_pre_query_cancel", None)
+        if not callable(wait_cancel):
+            await self._broker.deliver(offer, target=target, delivery=delivery)
+            return
+        delivery_task = asyncio.create_task(
+            self._broker.deliver(offer, target=target, delivery=delivery)
+        )
+        cancel_task = asyncio.create_task(wait_cancel())
+        try:
+            done, _ = await asyncio.wait(
+                {delivery_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done:
+                delivery_task.cancel()
+                await asyncio.gather(delivery_task, return_exceptions=True)
+                await self._contain_cancelled_grant(
+                    lease, offer=offer, target=target
+                )
+                raise FederatedRuntimeCancelled()
+            await delivery_task
+        finally:
+            if not cancel_task.done():
+                cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+        if _pre_query_cancel_requested(lease):
+            await self._contain_cancelled_grant(
+                lease, offer=offer, target=target
+            )
+            raise FederatedRuntimeCancelled()
 
-__all__ = ["FederatedRuntimeCoordinator", "FederatedRuntimeLease"]
+    async def _contain_cancelled_grant(
+        self,
+        lease: FederatedRuntimeLease,
+        *,
+        offer: ProviderGrantOffer,
+        target: ProviderGrantTarget,
+    ) -> None:
+        receipt = await lease.contain_provider_grant(
+            target, reason="query_cancelled"
+        )
+        self._broker.revoke(offer, receipt, self._clock())
+
+
+def _pre_query_cancel_requested(lease: FederatedRuntimeLease) -> bool:
+    requested = getattr(lease, "pre_query_cancel_requested", None)
+    return bool(callable(requested) and requested())
+
+
+__all__ = [
+    "FederatedRuntimeCancelled",
+    "FederatedRuntimeCoordinator",
+    "FederatedRuntimeLease",
+]

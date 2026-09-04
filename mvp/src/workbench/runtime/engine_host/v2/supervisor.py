@@ -598,6 +598,13 @@ class SidecarSupervisor:
         slot = self._slots.get(assignment.runtime_id)
         if slot is None:
             raise LeaseConflict("assignment runtime is not configured")
+        active = slot.handle
+        if (
+            active is not None
+            and active._assignment() == assignment
+            and active._execution_is_claimed()
+        ):
+            raise LeaseConflict("runtime lease execution is already claimed")
         async with slot.lock:
             durable = self._assignments.get_assignment(
                 assignment.session_id, assignment.command_id
@@ -636,6 +643,8 @@ class SidecarSupervisor:
             handle = SupervisedRuntimeLease(
                 self, slot.config.runtime_id, assignment, lease, fence_token
             )
+            if not handle._claim_execution():
+                raise LeaseConflict("runtime lease execution is already claimed")
             slot.handle = handle
             slot.active = True
             self._transition(slot, "leased")
@@ -651,11 +660,22 @@ class SidecarSupervisor:
         slot = self._slots.get(assignment.runtime_id)
         if slot is None:
             raise LeaseConflict("assignment runtime is not configured")
+        active = slot.handle
+        if (
+            active is not None
+            and active._assignment() == assignment
+            and active._execution_is_claimed()
+        ):
+            raise LeaseConflict("runtime lease execution is already claimed")
         async with slot.lock:
             handle = slot.handle
             if handle is not None:
-                if handle._assignment() != assignment or handle._has_run():
+                if handle._assignment() != assignment:
                     raise LeaseConflict("runtime lease is not resumable")
+                if not handle._claim_execution():
+                    raise LeaseConflict(
+                        "runtime lease execution is already claimed"
+                    )
                 return handle
         return await self.acquire_initial(assignment)
 
@@ -1555,6 +1575,14 @@ class SidecarSupervisor:
             retry_handle = self._handle_from_recovery(
                 slot, handle._assignment(), outcome, next_fence
             )
+            if (
+                outcome.decision == "read_only_retry"
+                and retry_handle is not None
+                and not retry_handle._claim_execution()
+            ):
+                raise LeaseConflict(
+                    "runtime retry lease execution is already claimed"
+                )
         handle._set_recovery(
             SupervisedRecoveryResult(outcome.decision, retry_handle)
         )
@@ -1755,6 +1783,9 @@ class SidecarSupervisor:
         self, handle: "SupervisedRuntimeLease", reason: str
     ) -> None:
         slot, _ = self._require_current_handle(handle)
+        if not handle._has_run():
+            handle._request_pre_query_cancel()
+            return
         await slot.client.cancel(handle._run_id(), reason=reason)
 
     async def _intervene_handle(
@@ -2009,6 +2040,8 @@ class SupervisedRuntimeLease:
         "__closed",
         "__retiring",
         "__terminal_proof",
+        "__execution_claimed",
+        "__pre_query_cancel",
         "__run_identity",
         "__recovery",
         "__requires_reconcile",
@@ -2030,6 +2063,8 @@ class SupervisedRuntimeLease:
         self.__closed = False
         self.__retiring = False
         self.__terminal_proof = False
+        self.__execution_claimed = False
+        self.__pre_query_cancel = asyncio.Event()
         self.__run_identity: str | None = None
         self.__recovery: asyncio.Future[SupervisedRecoveryResult] = (
             asyncio.get_running_loop().create_future()
@@ -2118,6 +2153,12 @@ class SupervisedRuntimeLease:
     async def wait_recovery(self) -> SupervisedRecoveryResult:
         return await asyncio.shield(self.__recovery)
 
+    async def wait_pre_query_cancel(self) -> None:
+        await self.__pre_query_cancel.wait()
+
+    def pre_query_cancel_requested(self) -> bool:
+        return self.__pre_query_cancel.is_set()
+
     async def renew(self) -> None:
         await self.__supervisor._renew_handle(self)
 
@@ -2156,6 +2197,18 @@ class SupervisedRuntimeLease:
 
     def _assignment(self) -> RuntimeAssignment:
         return self.__assignment
+
+    def _claim_execution(self) -> bool:
+        if self.__execution_claimed:
+            return False
+        self.__execution_claimed = True
+        return True
+
+    def _execution_is_claimed(self) -> bool:
+        return self.__execution_claimed
+
+    def _request_pre_query_cancel(self) -> None:
+        self.__pre_query_cancel.set()
 
     def _run_id(self) -> str:
         if self.__run_identity is None:

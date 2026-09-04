@@ -367,6 +367,8 @@ def _validate_runtime_provider_compatibility(
         )
     if runtime_id == "goose" and profile.protocol not in {
         "deepseek",
+        "lmstudio",
+        "openai",
         "openai_chat",
         "openai_compatible",
     }:

@@ -343,8 +343,11 @@ class _FederatedExecutor:
         self.failure = failure
         self.accepted = accepted
         self.retryable = retryable
+        self.calls = 0
 
     async def execute(self, snapshot):
+        self.calls += 1
+        await asyncio.sleep(0)
         if self.failure is not None:
             raise FederatedConversationExecutionError(
                 self.failure,
@@ -578,18 +581,63 @@ async def test_pre_acceptance_provider_failure_keeps_turn_retryable(
     retryable = repository.load_turn_status("session-1", "turn-1")
     assert retryable is not None and retryable.status == "retryable"
     assert retryable.state["reason"] == "provider_unavailable"
+    assert retryable.state["federated_retry_count"] == 1
+    assert retryable.state["retry_not_before"] > time.time()
     assert not any(
         event.event_type.startswith("runtime.")
         or event.event_type == "conversation.turn.failed"
         for event in api.events.read_stream("run:session-1")
     )
     executor.failure = None
+    await asyncio.sleep(
+        max(0.0, retryable.state["retry_not_before"] - time.time()) + 0.01
+    )
     assert repository.claim_next_turn(owner_id="worker-2", lease_seconds=30)
 
     await api.process_queued_turn("session-1", "turn-1")
 
     completed = repository.load_turn_status("session-1", "turn-1")
     assert completed is not None and completed.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_background_worker_backs_off_persistent_provider_unavailable(
+    tmp_path: Path,
+) -> None:
+    executor = _FederatedExecutor(
+        failure="provider_unavailable", retryable=True
+    )
+    api, repository = _federated_api(
+        tmp_path / "persistent-provider-unavailable.sqlite", executor
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    worker = ConversationTaskWorker(
+        repository, api, poll_interval=0.001, lease_seconds=1.0
+    )
+
+    await worker.start()
+    try:
+        for _ in range(100):
+            if executor.calls:
+                break
+            await asyncio.sleep(0.001)
+        assert executor.calls == 1
+        await asyncio.sleep(0.03)
+        assert executor.calls == 1
+    finally:
+        await worker.stop()
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None and turn.status == "retryable"
+    assert turn.state["federated_retry_count"] == 1
+    assert turn.state["retry_not_before"] > time.time()
 
 
 @pytest.mark.parametrize(

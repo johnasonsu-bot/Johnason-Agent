@@ -452,6 +452,85 @@ async def test_current_handle_projects_a_secret_free_provider_grant_target(
 
 
 @pytest.mark.asyncio
+async def test_acquire_for_execution_claims_initial_handle_once_before_query(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "initial-execution-claim.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-initial-claim", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    client = _Client("goose")
+    client.capabilities = capabilities
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-initial-claim",
+        client_factory=lambda config, generation, containment_lock: client,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    try:
+        first = await supervisor.acquire_for_execution(assignment)
+
+        with pytest.raises(LeaseConflict, match="claimed"):
+            await supervisor.acquire_for_execution(assignment)
+
+        await first.aclose()
+    finally:
+        await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acquire_for_execution_claims_recovery_handle_once(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "recovery-execution-claim.sqlite"
+    capabilities = runtime_capabilities("goose", query=True)
+    envelope = run_envelope(
+        runtime_id="goose", command_id="command-recovery-claim", host_generation="1"
+    )
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    clients: list[_Client] = []
+
+    def factory(config, generation, containment_lock):
+        del config, generation, containment_lock
+        client = _Client("goose")
+        client.capabilities = capabilities
+        clients.append(client)
+        return client
+
+    supervisor = SidecarSupervisor(
+        runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=("goose",)),),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="app-instance-recovery-claim",
+        client_factory=factory,
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    try:
+        source = await supervisor.acquire_initial(assignment)
+        await source.release_for_retry()
+        recovery = await source.wait_recovery()
+        assert recovery.decision == "release_retry"
+        assert recovery.retry_handle is not None
+
+        claimed = await supervisor.acquire_for_execution(assignment)
+        assert claimed is recovery.retry_handle
+        with pytest.raises(LeaseConflict, match="claimed"):
+            await supervisor.acquire_for_execution(assignment)
+
+        await claimed.aclose()
+    finally:
+        await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_current_handle_exposes_only_its_private_provider_delivery(
     tmp_path: Path,
 ) -> None:
@@ -2933,6 +3012,8 @@ async def test_immediate_query_crash_recovers_without_replaying_envelope(
 
     assert recovery.decision == "read_only_retry"
     assert recovery.retry_handle is not None
+    with pytest.raises(LeaseConflict, match="claimed"):
+        await supervisor.acquire_for_execution(assignment)
     assert clients[0].closed is True
     assert len(clients) == 2
     assert assignments.active_leases(runtime_ids=("goose",))[0].attempt == 1

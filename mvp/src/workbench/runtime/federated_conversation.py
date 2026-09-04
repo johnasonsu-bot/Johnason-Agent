@@ -37,6 +37,7 @@ from workbench.runtime.engine_host.v2.supervisor import (
     SupervisorShutdownError,
 )
 from workbench.runtime.provider_grants import (
+    FederatedRuntimeCancelled,
     ProviderGrantDeliveryFailed,
     ProviderGrantIncompatible,
     ProviderGrantUnavailable,
@@ -258,6 +259,10 @@ class FederatedConversationExecutor:
             raise
         except FederatedConversationExecutionError:
             raise
+        except FederatedRuntimeCancelled:
+            raise FederatedConversationExecutionError(
+                "runtime_cancelled"
+            ) from None
         except ProviderGrantIncompatible:
             raise FederatedConversationExecutionError(
                 "provider_incompatible"

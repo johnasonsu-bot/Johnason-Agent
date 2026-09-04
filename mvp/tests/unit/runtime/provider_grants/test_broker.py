@@ -695,7 +695,7 @@ def test_provider_profile_digest_binds_credential_reference() -> None:
             ProviderProfileRecord(
                 id="provider",
                 name="Provider",
-                protocol="lmstudio",
+                protocol="unsupported",
                 base_url="http://127.0.0.1:1234",
                 secret_id="secret",
                 model_aliases={"default": "model"},
@@ -739,6 +739,53 @@ def test_issue_rejects_runtime_incompatible_provider_route(
 
     with pytest.raises(ProviderGrantIncompatible):
         broker.issue(envelope, target=target)
+
+
+@pytest.mark.parametrize("protocol", ["lmstudio", "openai"])
+def test_issue_accepts_supported_goose_provider_routes(
+    tmp_path: Path, protocol: str
+) -> None:
+    database = tmp_path / f"goose-{protocol}.sqlite"
+    providers = ProviderRepository(database)
+    providers.save(
+        ProviderProfileRecord(
+            id="provider",
+            name="Provider",
+            protocol=protocol,
+            base_url="http://127.0.0.1:1234",
+            model_aliases={"default": "model"},
+        )
+    )
+    profile = providers.get("provider")
+    vault = VaultService(tmp_path / f"goose-{protocol}.vault")
+    vault.create("test-vault-password")
+    assert profile.secret_id is not None
+    vault.put(profile.secret_id, PROVIDER_VALUE)
+    target = _target(runtime_id="goose")
+    broker = ProviderGrantBroker(
+        database=database,
+        providers=providers,
+        vault=vault,
+        authority=_Authority(target),
+        clock=lambda: 100.0,
+    )
+    envelope = run_envelope(
+        runtime_id="goose",
+        host_generation="7",
+        overrides={
+            "runtime.build_id": "goose-build-001",
+            "provider_ref": "provider-profile:provider",
+            "model": "model",
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(profile),
+                "resolved_model": "model",
+            },
+        },
+    )
+
+    offer = broker.issue(envelope, target=target)
+
+    assert ProviderGrantRepository(database).get(offer.grant_id).state == "issued"
 
 
 @pytest.mark.asyncio
