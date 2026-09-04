@@ -53,6 +53,7 @@ class WorkbenchSettings(BaseModel):
     engine_host_v2_runtimes: tuple[RuntimeProcessConfig, ...] = ()
     python_term_runtime_enabled: StrictBool = False
     python_term_development_trust: StrictBool = False
+    federated_runtime_development_trust: StrictBool = False
 
     @model_validator(mode="after")
     def validate_unique_v2_runtime_ids(self) -> "WorkbenchSettings":

@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 import re
 import sqlite3
-from typing import Callable, Literal
+from typing import Callable, Literal, Mapping
 
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentConflict,
@@ -232,14 +232,14 @@ class RuntimeAdmissionProbe:
         self,
         *,
         coordinator: "RuntimeAdmissionCoordinator",
-        provider_available: bool,
-        executor_available: bool,
-        runtime_enabled: bool,
+        provider_available: bool | Mapping[str, bool],
+        executor_available: bool | Mapping[str, bool],
+        runtime_enabled: bool | Mapping[str, bool],
     ) -> None:
         self.coordinator = coordinator
-        self.provider_available = bool(provider_available)
-        self.executor_available = bool(executor_available)
-        self.runtime_enabled = bool(runtime_enabled)
+        self.provider_available = _availability_source(provider_available)
+        self.executor_available = _availability_source(executor_available)
+        self.runtime_enabled = _availability_source(runtime_enabled)
 
     def selector(self, selector: str) -> RuntimeSelectorAdmissionDiagnostic:
         entry = next(
@@ -271,15 +271,15 @@ class RuntimeAdmissionProbe:
                 trust_status=trust_status,
                 admission_reason=proof_reason,
             )
-        if not self.executor_available:
+        if not _runtime_available(self.executor_available, selector):
             return self._unavailable(
                 selector, "executor_unavailable", trust_status=trust_status
             )
-        if not self.provider_available:
+        if not _runtime_available(self.provider_available, selector):
             return self._unavailable(
                 selector, "provider_unavailable", trust_status=trust_status
             )
-        if not self.runtime_enabled or not entry.enabled:
+        if not _runtime_available(self.runtime_enabled, selector) or not entry.enabled:
             return self._unavailable(
                 selector, "runtime_disabled", trust_status=trust_status
             )
@@ -304,6 +304,10 @@ class RuntimeAdmissionProbe:
                 selector, "runtime_disabled", trust_status=trust_status
             )
         if snapshot.state != "ready":
+            return self._unavailable(
+                selector, "runtime_unavailable", trust_status=trust_status
+            )
+        if tuple(snapshot.capabilities) != entry.required_capabilities:
             return self._unavailable(
                 selector, "runtime_unavailable", trust_status=trust_status
             )
@@ -426,6 +430,29 @@ class RuntimeAdmissionProbe:
             trust_status=trust_status,
             admission_reason=reason,
         )
+
+
+def _availability_source(
+    value: bool | Mapping[str, bool],
+) -> bool | dict[str, bool]:
+    if type(value) is bool:
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("runtime availability must be boolean or a mapping")
+    if any(
+        not isinstance(key, str) or not key or type(available) is not bool
+        for key, available in value.items()
+    ):
+        raise ValueError("runtime availability mapping is invalid")
+    return dict(value)
+
+
+def _runtime_available(
+    value: bool | Mapping[str, bool], selector: str
+) -> bool:
+    if type(value) is bool:
+        return value
+    return value.get(selector) is True
 
 
 class RuntimeAdmissionRepository:

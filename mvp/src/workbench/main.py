@@ -78,6 +78,7 @@ from workbench.runtime.conversation_execution import (
     build_runtime_query_input,
 )
 from workbench.runtime.federated_conversation import FederatedConversationExecutor
+from workbench.runtime.development_admission import load_development_admission
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
     PythonTermDevelopmentTrust,
@@ -532,6 +533,26 @@ def _runtime_admission_coordinator(
 ) -> RuntimeAdmissionCoordinator:
     """Construct the formal admission path, empty when no RF-1 proof exists."""
     assignments = AssignmentRepository.production(settings.database)
+    catalog_entries: tuple[RuntimeCatalogEntry, ...] = ()
+    if settings.federated_runtime_development_trust:
+        imported = load_development_admission(
+            database=settings.database,
+            output_dir=settings.runtime_dir,
+            registry=registry,
+            configured_runtime_ids=tuple(
+                item.runtime_id for item in settings.engine_host_v2_runtimes
+            ),
+        )
+        if imported is not None:
+            assignments = imported.assignments
+            catalog_entries = imported.catalog_entries
+        return RuntimeAdmissionCoordinator(
+            catalog=RuntimeCatalog(catalog_entries),
+            registry=registry,
+            assignments=assignments,
+            intents=RuntimeAdmissionRepository(settings.database),
+            trusted_time=time.time,
+        )
     proof_digest: str | None = None
     if development_trust:
         development = _development_assignment_proof(
@@ -539,7 +560,6 @@ def _runtime_admission_coordinator(
         )
         if development is not None:
             assignments, proof_digest = development
-    catalog_entries: tuple[RuntimeCatalogEntry, ...] = ()
     if proof_digest is not None:
         selection = next(
             (
@@ -644,13 +664,17 @@ def build_app(
     python_term_executor = None
     python_term_gate_proof = None
     python_term_trust_status = None
+    development_trust_enabled = (
+        resolved.python_term_development_trust
+        or resolved.federated_runtime_development_trust
+    )
     if runtime_registry_v2 is not None and resolved.python_term_runtime_enabled:
         repository = PythonTermRepository(resolved.database)
         # Production keeps the existing minimal diagnostic contract.  The
         # additive marker exists only to make development trust impossible to
         # mistake for a production-admitted runtime.
         python_term_trust_status = (
-            "DEV_UNTRUSTED" if resolved.python_term_development_trust else None
+            "DEV_UNTRUSTED" if development_trust_enabled else None
         )
         try:
             trust = (
@@ -663,7 +687,7 @@ def build_app(
                         resolved.runtime_dir / "python-term-dev-signed-proof.json"
                     ),
                 )
-                if resolved.python_term_development_trust
+                if development_trust_enabled
                 else None
             )
             composition_arguments = {
@@ -694,19 +718,9 @@ def build_app(
         _runtime_admission_coordinator(
             settings=resolved,
             registry=runtime_registry_v2,
-            development_trust=resolved.python_term_development_trust,
+            development_trust=development_trust_enabled,
         )
         if runtime_registry_v2 is not None
-        else None
-    )
-    runtime_admission_probe = (
-        RuntimeAdmissionProbe(
-            coordinator=runtime_admission_coordinator,
-            provider_available=any(profile.enabled for profile in providers.list()),
-            executor_available=python_term_executor is not None,
-            runtime_enabled=resolved.python_term_runtime_enabled,
-        )
-        if runtime_admission_coordinator is not None
         else None
     )
     runtime_assignments = (
@@ -738,6 +752,53 @@ def build_app(
             coordinator=FederatedRuntimeCoordinator(provider_grant_broker),
         )
         if sidecar_supervisor is not None
+        else None
+    )
+    configured_runtime_ids = {
+        item.runtime_id for item in resolved.engine_host_v2_runtimes
+    }
+    enabled_profiles = tuple(
+        profile for profile in providers.list() if profile.enabled
+    )
+    provider_available = {
+        "python-term": bool(enabled_profiles),
+        "goose": any(
+            profile.secret_id is not None
+            and profile.protocol
+            in {
+                "deepseek",
+                "lmstudio",
+                "openai",
+                "openai_chat",
+                "openai_compatible",
+            }
+            for profile in enabled_profiles
+        ),
+        "dsh": any(
+            profile.secret_id is not None
+            and profile.protocol == "deepseek"
+            and not profile.headers
+            for profile in enabled_profiles
+        ),
+    }
+    executor_available = {
+        "python-term": python_term_executor is not None,
+        "goose": federated_executor is not None and "goose" in configured_runtime_ids,
+        "dsh": federated_executor is not None and "dsh" in configured_runtime_ids,
+    }
+    runtime_enabled = {
+        "python-term": resolved.python_term_runtime_enabled,
+        "goose": "goose" in configured_runtime_ids,
+        "dsh": "dsh" in configured_runtime_ids,
+    }
+    runtime_admission_probe = (
+        RuntimeAdmissionProbe(
+            coordinator=runtime_admission_coordinator,
+            provider_available=provider_available,
+            executor_available=executor_available,
+            runtime_enabled=runtime_enabled,
+        )
+        if runtime_admission_coordinator is not None
         else None
     )
     runtime_query_router = RuntimeQueryRouter(
@@ -787,6 +848,7 @@ def build_app(
     app.state.runtime_admission_coordinator = runtime_admission_coordinator
     app.state.python_term_runtime = python_term_runtime
     app.state.provider_grant_broker = provider_grant_broker
+    app.state.federated_executor = federated_executor
     return app
 
 
@@ -959,6 +1021,17 @@ def _settings_from_environment(settings: WorkbenchSettings) -> WorkbenchSettings
         if development_trust not in {"true", "false"}:
             raise ValueError("python term development trust must be true or false")
         updates["python_term_development_trust"] = development_trust == "true"
+    federated_development_trust = os.environ.get(
+        "WORKBENCH_FEDERATED_RUNTIME_DEVELOPMENT_TRUST"
+    )
+    if federated_development_trust is not None:
+        if federated_development_trust not in {"true", "false"}:
+            raise ValueError(
+                "federated runtime development trust must be true or false"
+            )
+        updates["federated_runtime_development_trust"] = (
+            federated_development_trust == "true"
+        )
     command = os.environ.get("WORKBENCH_ENGINE_HOST_COMMAND_JSON")
     if command is not None:
         updates["engine_host_command"] = _json_string_array("command", command)

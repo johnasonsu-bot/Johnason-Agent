@@ -21,6 +21,7 @@ DSH_SUBMODULE_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
 DSH_PINNED_REVISION = "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
 DSH_SOURCE_MANIFEST_SCHEMA = "workbench.runtime.dsh.source_manifest.v1"
 DSH_HOST_V2_BUILD_SCHEMA = "workbench.runtime.dsh.host_v2_build.v1"
+DSH_HOST_V2_BUILD_ID = "dsh:fixed-host-v2-smoke"
 
 _DEPENDENCY_PREPARATION_COMMAND = (
     "corepack pnpm@11.7.0 install --frozen-lockfile"
@@ -621,3 +622,37 @@ class DeepSeekSourceVerifier:
             "artifact_digest": build["artifact_digest"],
             "preset_digest": host_v2["preset"]["sha256"],
         }
+
+
+def deepseek_harness_runtime_build_identity(
+    repository_root: Path, *, manifest_path: Path | None = None
+) -> dict[str, str]:
+    """Return exact fixed-sidecar identity without granting model capability."""
+    root = Path(repository_root).resolve()
+    manifest_file = (
+        Path(__file__).with_name("source_manifest.json")
+        if manifest_path is None
+        else Path(manifest_path)
+    )
+    verdict = DeepSeekSourceVerifier().verify_plugin_smoke(root, manifest_file)
+    receipt_candidate = root / _HOST_V2_BUILD_RECEIPT
+    try:
+        if receipt_candidate.is_symlink():
+            raise ValueError
+        receipt_path = receipt_candidate.resolve(strict=True)
+        if (
+            not receipt_path.is_relative_to(root)
+            or not receipt_path.is_file()
+        ):
+            raise ValueError
+        receipt_bytes = receipt_path.read_bytes()
+    except (OSError, ValueError) as error:
+        raise SourceReadinessError(
+            "DeepSeek Harness verified build identity is unavailable"
+        ) from error
+    return {
+        "runtime_id": "dsh",
+        "build_id": DSH_HOST_V2_BUILD_ID,
+        "source_manifest_digest": verdict["manifest_digest"],
+        "build_manifest_digest": _sha256_bytes(receipt_bytes),
+    }

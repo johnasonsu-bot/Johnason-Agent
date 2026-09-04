@@ -23,6 +23,7 @@ from workbench.runtime.engine_host.v2.contracts import (
 
 GO_GOOSE_SOURCE_READY = "GO_GOOSE_SOURCE_READY"
 GO_GOOSE_QUERY_SMOKE = "GO_GOOSE_QUERY_SMOKE"
+GOOSE_HOST_V2_BUILD_ID = "goose-host-v2:fixture-wrapper-r2"
 PINNED_REVISION = "d9d08f0e051531e921f561fcb77aa0ed589e9de9"
 PINNED_SOURCE_PATH = "third_party/goose"
 PINNED_SOURCE_URL = "git@github.com:johnasonsu-bot/goose.git"
@@ -72,7 +73,7 @@ _QUERY_SMOKE_EVIDENCE_PATH = (
 _QUERY_SMOKE_BINARY_PATH = f"{_WRAPPER_ROOT}/target/release/goose-host-v2"
 _QUERY_SMOKE_SCHEMA = "workbench.runtime.goose.fixture-build-evidence.v1"
 _QUERY_SMOKE_BUILDER = "johnason.goose.fixture-wrapper.local-release.v1"
-_QUERY_SMOKE_BUILD_ID = "goose-host-v2:fixture-wrapper-r2"
+_QUERY_SMOKE_BUILD_ID = GOOSE_HOST_V2_BUILD_ID
 _QUERY_SMOKE_PROTOCOL = (
     "host-v2-private-framed-grant-completed-failed-cancelled.v4"
 )
@@ -226,6 +227,46 @@ def verify_goose_query_smoke_readiness(
         build_plans=receipt.build_plans,
         claims=receipt.claims,
     )
+
+
+def goose_runtime_build_identity(
+    repository_root: Path, *, manifest_path: Path | None = None
+) -> dict[str, str]:
+    """Return build identity only after the existing source/build smoke passes.
+
+    This intentionally publishes no capability or Gate decision.  Model
+    capability remains owned by external live endpoint admission.
+    """
+    root = Path(repository_root).resolve()
+    manifest_file = default_manifest_path() if manifest_path is None else Path(manifest_path)
+    receipt = verify_goose_query_smoke_readiness(
+        root, manifest_path=manifest_file
+    )
+    try:
+        manifest = json.loads(manifest_file.read_bytes())
+        evidence_relative = manifest["query_smoke"]["evidence_path"]
+        if not isinstance(evidence_relative, str):
+            raise ValueError
+        evidence_candidate = root / evidence_relative
+        if evidence_candidate.is_symlink():
+            raise ValueError
+        evidence_path = evidence_candidate.resolve(strict=True)
+        if (
+            not evidence_path.is_relative_to(root)
+            or not evidence_path.is_file()
+        ):
+            raise ValueError
+        evidence_bytes = evidence_path.read_bytes()
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise GooseSourceReadinessError(
+            "Goose verified build identity is unavailable"
+        ) from error
+    return {
+        "runtime_id": "goose",
+        "build_id": GOOSE_HOST_V2_BUILD_ID,
+        "source_manifest_digest": receipt.manifest_digest,
+        "build_manifest_digest": _sha256(evidence_bytes),
+    }
 
 
 def build_and_attest_goose_query_smoke(
