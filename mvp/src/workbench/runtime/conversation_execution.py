@@ -92,7 +92,10 @@ def build_runtime_query_input(admission: Any) -> RuntimeQueryInputV2:
 
 
 def build_runtime_execution_snapshot(
-    admission: Any, command: QueryCommandV2, envelope: RunEnvelopeV2
+    admission: Any,
+    command: QueryCommandV2,
+    envelope: RunEnvelopeV2,
+    runtime_input: RuntimeQueryInputV2,
 ) -> dict[str, object]:
     """Persist the complete, runtime-neutral execution evidence for one command."""
     profiles = admission.agent_profiles
@@ -131,7 +134,8 @@ def build_runtime_execution_snapshot(
         if development_smoke
         else {"tool_policy": "deny", "filesystem_policy": "deny"}
     )
-    runtime_input = build_runtime_query_input(admission)
+    if not isinstance(runtime_input, RuntimeQueryInputV2):
+        raise TypeError("runtime_input must be a RuntimeQueryInputV2")
     if runtime_input.message_snapshot_digest != envelope.message_snapshot_digest:
         raise ValueError("runtime input message snapshot digest does not match envelope")
     if runtime_input.context_snapshot_digest != envelope.context.snapshot_digest:

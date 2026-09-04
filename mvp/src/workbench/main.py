@@ -71,13 +71,11 @@ from workbench.runtime.engine_host.v2.contracts import (
     QueryCommandV2,
     RunEnvelopeV2,
     ToolManifestEntryV2,
-    canonical_runtime_input_digest,
 )
 from workbench.runtime.conversation_execution import (
     RuntimeConversationRoute,
     build_runtime_execution_snapshot,
-    runtime_input_context_items,
-    runtime_input_messages,
+    build_runtime_query_input,
 )
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
@@ -153,7 +151,7 @@ class RuntimeQueryRouter:
             raise RuntimeAdmissionUnavailable()
         try:
             selected = self._runtime_identity(selector, admission)
-            command, envelope = self._conversation_query(
+            command, envelope, runtime_input = self._conversation_query(
                 admission=admission,
                 runtime_id=selected.runtime_id,
                 build_id=selected.build_id,
@@ -199,7 +197,7 @@ class RuntimeQueryRouter:
             build_id=selected.build_id,
             runtime_command_id=admission.runtime_command_id,
             execution_snapshot=build_runtime_execution_snapshot(
-                admission, command, envelope
+                admission, command, envelope, runtime_input
             ),
         )
 
@@ -269,7 +267,7 @@ class RuntimeQueryRouter:
         admission: PythonTermConversationAdmission,
         runtime_id: str,
         build_id: str,
-    ) -> tuple[QueryCommandV2, RunEnvelopeV2]:
+    ) -> tuple[QueryCommandV2, RunEnvelopeV2, RuntimeQueryInputV2]:
         """Build an envelope solely from snapshots resolved by repository authority."""
         provider_snapshot = admission.provider.model_dump(
             mode="json", exclude={"secret_id"}
@@ -290,8 +288,7 @@ class RuntimeQueryRouter:
             }
             for message in admission.messages
         ]
-        runtime_messages = runtime_input_messages(admission)
-        runtime_context_items = runtime_input_context_items(admission)
+        runtime_input = build_runtime_query_input(admission)
         project_snapshot = (
             admission.project_context.model_dump(mode="json")
             if admission.project_context is not None
@@ -404,14 +401,10 @@ class RuntimeQueryRouter:
                 "model_options_digest": self._digest(
                     {"provider": provider_snapshot, "model": admission.model}
                 ),
-                "message_snapshot_digest": canonical_runtime_input_digest(
-                    runtime_messages
-                ),
+                "message_snapshot_digest": runtime_input.message_snapshot_digest,
                 "context": {
                     "snapshot_ref": session_ref,
-                    "snapshot_digest": canonical_runtime_input_digest(
-                        runtime_context_items
-                    ),
+                    "snapshot_digest": runtime_input.context_snapshot_digest,
                     "version": (
                         admission.project_context.version
                         if admission.project_context is not None
@@ -453,6 +446,7 @@ class RuntimeQueryRouter:
                 type="query.start", command_id=admission.runtime_command_id
             ),
             envelope,
+            runtime_input,
         )
 
     def _development_smoke(

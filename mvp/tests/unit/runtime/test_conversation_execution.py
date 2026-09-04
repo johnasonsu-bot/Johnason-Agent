@@ -7,6 +7,7 @@ from workbench.conversations.models import ConversationMessage
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.runtime.conversation_execution import (
     build_runtime_execution_snapshot,
+    build_runtime_query_input,
     read_runtime_execution,
     runtime_input_context_items,
 )
@@ -112,8 +113,12 @@ def _envelope() -> RunEnvelopeV2:
 
 
 def test_runtime_execution_snapshot_materializes_query_input() -> None:
+    admission = _admission()
     snapshot = build_runtime_execution_snapshot(
-        _admission(), QueryCommandV2(type="query.start", command_id="runtime-command-1"), _envelope()
+        admission,
+        QueryCommandV2(type="query.start", command_id="runtime-command-1"),
+        _envelope(),
+        build_runtime_query_input(admission),
     )
 
     runtime_input = RuntimeQueryInputV2.model_validate(snapshot["runtime_input"])
@@ -124,6 +129,20 @@ def test_runtime_execution_snapshot_materializes_query_input() -> None:
     assert runtime_input.context_snapshot_digest == envelope.context.snapshot_digest
     assert runtime_input.prompt_manifest_digest == envelope.prompt_manifest_digest
     assert snapshot["selector"] == "goose"
+
+
+def test_runtime_execution_snapshot_persists_the_caller_materialized_input() -> None:
+    admission = _admission()
+    runtime_input = build_runtime_query_input(admission)
+
+    snapshot = build_runtime_execution_snapshot(
+        admission,
+        QueryCommandV2(type="query.start", command_id="runtime-command-1"),
+        _envelope(),
+        runtime_input,
+    )
+
+    assert snapshot["runtime_input"] == runtime_input.model_dump(mode="json")
 
 
 def test_old_python_term_execution_is_read_only_compatible() -> None:
@@ -145,10 +164,12 @@ def test_runtime_execution_snapshot_rejects_an_unbound_input_digest(
     envelope = _envelope().model_copy(update={field: value})
 
     with pytest.raises(ValueError, match=match):
+        admission = _admission()
         build_runtime_execution_snapshot(
-            _admission(),
+            admission,
             QueryCommandV2(type="query.start", command_id="runtime-command-1"),
             envelope,
+            build_runtime_query_input(admission),
         )
 
 
@@ -158,8 +179,10 @@ def test_runtime_execution_snapshot_rejects_an_unbound_context_digest() -> None:
     )
 
     with pytest.raises(ValueError, match="context snapshot digest"):
+        admission = _admission()
         build_runtime_execution_snapshot(
-            _admission(),
+            admission,
             QueryCommandV2(type="query.start", command_id="runtime-command-1"),
             envelope,
+            build_runtime_query_input(admission),
         )

@@ -83,3 +83,25 @@
 `mvp/.venv/bin/python -m pytest mvp/tests/unit/runtime/test_conversation_execution.py mvp/tests/unit/runtime/engine_host/v2/test_runtime_admission.py mvp/tests/unit/conversations/test_repository.py mvp/tests/unit/conversations/test_reconciliation_atomicity.py mvp/tests/unit/api/test_conversations.py mvp/tests/unit/conversations/test_worker.py mvp/tests/acceptance/test_python_term_compatibility.py -q`
 
 - `136 passed in 13.64s`。
+
+## Fix round 2/5（单次物化不变量）
+
+### 修复内容
+
+- `RuntimeQueryRouter` 现在只调用一次 `build_runtime_query_input(admission)`。
+  该同一不可变 `RuntimeQueryInputV2` 的 message/context/prompt digest 用于创建
+  `RunEnvelopeV2`，并作为参数传入 `build_runtime_execution_snapshot()`。
+- 快照构造器只验证并持久化传入的 `RuntimeQueryInputV2`，不再重新物化 messages、
+  context 或 prompt sections。
+
+### RED
+
+`mvp/.venv/bin/python -m pytest mvp/tests/unit/runtime/test_conversation_execution.py::test_runtime_execution_snapshot_persists_the_caller_materialized_input -q`
+
+- 失败：`TypeError: build_runtime_execution_snapshot() takes 3 positional arguments but 4 were given`，证明旧接口无法接收调用方已物化的同一输入实例。
+
+### GREEN
+
+`mvp/.venv/bin/python -m pytest mvp/tests/unit/runtime/test_conversation_execution.py mvp/tests/unit/runtime/engine_host/v2/test_runtime_admission.py mvp/tests/unit/conversations/test_repository.py mvp/tests/unit/conversations/test_reconciliation_atomicity.py mvp/tests/unit/api/test_conversations.py mvp/tests/unit/conversations/test_worker.py mvp/tests/acceptance/test_python_term_compatibility.py -q`
+
+- `137 passed in 13.45s`。
