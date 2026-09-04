@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "74e43eaeb7e45f796b574b2243d9156c58719ad2abd15f377861ca7c604df064",
-      "size": 1937555
+      "sha256": "0545da7a3ca192bb6887775a34dd6a2219328a82b46c70337fd1ec8430ad5f26",
+      "size": 1942020
     },
     {
       "path": "uv.lock",

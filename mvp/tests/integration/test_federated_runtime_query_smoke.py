@@ -466,3 +466,118 @@ def test_goose_release_binary_streams_a_real_mock_provider_without_fixture_fallb
     assert event_payloads[-1]["payload"] == {"status": "completed"}
     assert TEST_SECRET_VALUE not in json.dumps(frames)
     assert TEST_SECRET_VALUE not in json.dumps(surfaces)
+
+
+def test_goose_release_binary_cancels_an_inflight_real_provider_request() -> None:
+    build_and_attest_goose_query_smoke(REPOSITORY_ROOT)
+    request_started = threading.Event()
+    release_response = threading.Event()
+
+    class BlockingProviderHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            request_started.set()
+            release_response.wait(timeout=10)
+            body = b"data: [DONE]\n\n"
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), BlockingProviderHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    process: subprocess.Popen[str] | None = None
+    try:
+        runtime_input = canonical_runtime_query_input_v2().model_dump(mode="json")
+        start, envelope = _command(
+            "goose",
+            command_id="start-goose-real-cancel",
+            provider_ref="provider-profile:deepseek",
+            runtime_input=runtime_input,
+        )
+        parent.sendall(
+            _formal_private_frame(
+                envelope,
+                grant_id="grant-goose-real-cancel",
+                runtime_id="goose",
+                build_id="goose-host-v2:fixture-wrapper-r2",
+                provider_id="deepseek",
+                instance_id_digest="1" * 64,
+                base_url=f"http://127.0.0.1:{server.server_port}",
+                resolved_model="deepseek-chat",
+            )
+        )
+        environment = dict(_SAFE_ENVIRONMENT)
+        environment["WORKBENCH_PROVIDER_GRANT_FD"] = str(child.fileno())
+        process = subprocess.Popen(
+            [str(MVP_ROOT / "runtime-hosts/goose-host-v2/target/release/goose-host-v2")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=environment,
+            pass_fds=(child.fileno(),),
+        )
+        child.close()
+        assert process.stdin is not None
+        process.stdin.write(
+            json.dumps({"kind": "command", **start}, separators=(",", ":")) + "\n"
+        )
+        process.stdin.flush()
+        assert request_started.wait(timeout=10), "Goose request did not reach provider"
+        process.stdin.write(
+            json.dumps(
+                {
+                    "kind": "command",
+                    "type": "query.cancel",
+                    "command_id": "cancel-goose-real",
+                    "payload": {"run_id": envelope["run_id"]},
+                },
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        process.stdin.close()
+        process.stdin = None
+        release_response.set()
+        stdout, stderr = process.communicate(timeout=15)
+        acknowledgement = parent.recv(8_192)
+    finally:
+        release_response.set()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        child.close()
+        parent.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert process.returncode == 0, stderr
+    assert acknowledgement.startswith(b"JAGTACK1\x01")
+    frames = [json.loads(line) for line in stdout.splitlines()]
+    assert [frame["kind"] for frame in frames] == [
+        "response",
+        "event",
+        "response",
+        "event",
+    ]
+    assert frames[0]["type"] == "query.start"
+    assert frames[0]["payload"] == {"accepted": True}
+    assert frames[1]["payload"]["payload"] == {"status": "running"}
+    assert frames[2]["type"] == "query.cancel"
+    assert frames[2]["payload"] == {"accepted": True}
+    assert frames[3]["payload"]["payload"] == {"status": "cancelled"}
+    assert frames[3]["payload"]["cursor"] == 2
+    assert TEST_SECRET_VALUE not in stdout
+    assert TEST_SECRET_VALUE not in stderr
