@@ -327,6 +327,8 @@ def test_client_rejects_private_grant_transport_without_process_guard() -> None:
 async def test_coordinator_delivers_private_grant_before_real_supervised_query(
     tmp_path: Path,
 ) -> None:
+    from workbench.runtime.provider_grants import canonical_provider_profile_digest
+
     messages = (
         RuntimeMessageInputV2(
             message_id="message-1", role="user", content="coordinated query"
@@ -345,15 +347,25 @@ async def test_coordinator_delivers_private_grant_before_real_supervised_query(
         prompt_sections=prompt_sections,
         prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
     )
+    provider_profile = ProviderProfileRecord.deepseek(id="deepseek-primary")
+    database = tmp_path / "coordinator.sqlite"
+    providers = ProviderRepository(database)
+    _, profile = providers.upsert(provider_profile)
     envelope = run_envelope(
         command_id="command-coordinated-query",
         host_generation="1",
         overrides={
             "provider_ref": "provider-profile:deepseek-primary",
-            "model": "default",
+            "model": "deepseek-v4-flash",
             "message_snapshot_digest": runtime_input.message_snapshot_digest,
             "context.snapshot_digest": runtime_input.context_snapshot_digest,
             "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+                "extensions": {
+                    "provider_profile_digest": canonical_provider_profile_digest(
+                        profile
+                    ),
+                "resolved_model": "deepseek-v4-flash",
+            },
         },
     )
     capabilities = runtime_capabilities(
@@ -376,7 +388,6 @@ async def test_coordinator_delivers_private_grant_before_real_supervised_query(
         tool_interceptors=True,
         event_cursor=True,
     )
-    database = tmp_path / "coordinator.sqlite"
     assignments, assignment = admitted_assignment(database, envelope, capabilities)
     supervisor = SidecarSupervisor(
         runtimes=(
@@ -389,10 +400,6 @@ async def test_coordinator_delivers_private_grant_before_real_supervised_query(
         assignments=assignments,
         runtime_dir=tmp_path,
         app_instance_id="app-instance-coordinator",
-    )
-    providers = ProviderRepository(database)
-    _, profile = providers.upsert(
-        ProviderProfileRecord.deepseek(id="deepseek-primary")
     )
     vault = VaultService(tmp_path / "coordinator.vault")
     vault.create(token_urlsafe(24))

@@ -16,7 +16,9 @@ from workbench.providers.repository import ProviderRepository
 from workbench.runtime.provider_grants.broker import (
     ProviderGrantBroker,
     ProviderGrantDeliveryFailed,
+    ProviderGrantIncompatible,
     ProviderGrantUnavailable,
+    canonical_provider_profile_digest,
 )
 from workbench.runtime.provider_grants.contracts import (
     ProviderGrantAck,
@@ -136,7 +138,11 @@ def _services(tmp_path: Path, *, target: ProviderGrantTarget | None = None):
                 "host_generation": "7",
             },
             "provider_ref": "provider-profile:deepseek-primary",
-            "model": "default",
+            "model": "deepseek-v4-flash",
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(profile),
+                "resolved_model": "deepseek-v4-flash",
+            },
         }
     )
     return broker, providers, vault, authority, clock, envelope, database
@@ -216,6 +222,39 @@ async def test_broker_delivers_only_for_live_target_and_keeps_repository_private
     )
     assert PROVIDER_VALUE.encode("utf-8") not in database_bytes
     assert not hasattr(broker, "grants")
+
+
+def test_issue_uses_already_resolved_envelope_model_without_alias_lookup(
+    tmp_path: Path,
+) -> None:
+    target = _target()
+    broker, providers, _, _, _, envelope, database = _services(
+        tmp_path, target=target
+    )
+    profile = providers.get("deepseek-primary").model_copy(
+        update={
+            "model_aliases": {
+                "default": "deepseek-v4-flash",
+                "deepseek-v4-flash": "must-not-be-selected",
+            }
+        }
+    )
+    providers.upsert(profile)
+    envelope = envelope.model_copy(
+        update={
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(
+                    providers.get("deepseek-primary")
+                ),
+                "resolved_model": "deepseek-v4-flash",
+            }
+        }
+    )
+
+    offer = broker.issue(envelope, target=target)
+
+    record = ProviderGrantRepository(database).get(offer.grant_id)
+    assert record.binding.model == "deepseek-v4-flash"
 
 
 def test_issue_rejects_a_target_that_is_not_current_and_live(tmp_path: Path) -> None:
@@ -595,6 +634,111 @@ async def test_profile_drift_is_rejected_before_secret_delivery(
         await broker.deliver(offer, target=target, delivery=delivery)
 
     assert delivery.view is None
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"base_url": "https://api.deepseek.com/v2"},
+        {"protocol": "openai", "thinking_enabled": False},
+        {"headers": {"X-Title": "changed"}},
+        {"model_aliases": {"default": "model-b"}},
+    ],
+)
+def test_issue_rejects_provider_profile_drift_from_admission(
+    tmp_path: Path, update: dict[str, object]
+) -> None:
+    target = _target()
+    broker, providers, _, _, _, envelope, _ = _services(tmp_path, target=target)
+    providers.upsert(providers.get("deepseek-primary").model_copy(update=update))
+
+    with pytest.raises(ProviderGrantUnavailable, match="profile changed"):
+        broker.issue(envelope, target=target)
+
+
+def test_provider_profile_digest_binds_credential_reference() -> None:
+    profile = ProviderProfileRecord.deepseek(
+        id="provider", secret_id="provider/" + "1" * 32
+    )
+
+    assert canonical_provider_profile_digest(profile) != (
+        canonical_provider_profile_digest(
+            profile.model_copy(update={"secret_id": "provider/" + "2" * 32})
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("runtime_id", "profile"),
+    [
+        (
+            "dsh",
+            ProviderProfileRecord(
+                id="provider",
+                name="Provider",
+                protocol="lmstudio",
+                base_url="http://127.0.0.1:1234",
+                secret_id="secret",
+                model_aliases={"default": "model"},
+            ),
+        ),
+        (
+            "dsh",
+            ProviderProfileRecord.deepseek(
+                id="provider",
+                secret_id="secret",
+                headers={"X-Title": "custom"},
+            ),
+        ),
+        (
+            "goose",
+            ProviderProfileRecord(
+                id="provider",
+                name="Provider",
+                protocol="lmstudio",
+                base_url="http://127.0.0.1:1234",
+                secret_id="secret",
+                model_aliases={"default": "model"},
+            ),
+        ),
+    ],
+)
+def test_issue_rejects_runtime_incompatible_provider_route(
+    tmp_path: Path, runtime_id: str, profile: ProviderProfileRecord
+) -> None:
+    database = tmp_path / "incompatible.sqlite"
+    providers = ProviderRepository(database)
+    providers.save(profile)
+    profile = providers.get(profile.id)
+    vault = VaultService(tmp_path / "incompatible.vault")
+    vault.create("test-vault-password")
+    assert profile.secret_id is not None
+    vault.put(profile.secret_id, PROVIDER_VALUE)
+    target = _target(runtime_id=runtime_id)
+    broker = ProviderGrantBroker(
+        database=database,
+        providers=providers,
+        vault=vault,
+        authority=_Authority(target),
+        clock=lambda: 100.0,
+    )
+    resolved_model = profile.model_aliases["default"]
+    envelope = run_envelope(
+        runtime_id=runtime_id,
+        host_generation="7",
+        overrides={
+            "runtime.build_id": "goose-build-001",
+            "provider_ref": "provider-profile:provider",
+            "model": resolved_model,
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(profile),
+                "resolved_model": resolved_model,
+            },
+        },
+    )
+
+    with pytest.raises(ProviderGrantIncompatible):
+        broker.issue(envelope, target=target)
 
 
 @pytest.mark.asyncio

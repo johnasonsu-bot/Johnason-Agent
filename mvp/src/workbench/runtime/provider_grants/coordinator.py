@@ -12,7 +12,11 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimeQueryInputV2,
 )
 
-from .broker import ProviderGrantBroker, ProviderGrantDeliveryFailed
+from .broker import (
+    ProviderGrantBroker,
+    ProviderGrantDeliveryFailed,
+    ProviderGrantUnavailable,
+)
 from .contracts import (
     ProviderGrantContainmentReceipt,
     ProviderGrantRevocationReason,
@@ -43,6 +47,8 @@ class FederatedRuntimeLease(Protocol):
     ) -> ProviderGrantContainmentReceipt: ...
 
     async def aclose(self) -> None: ...
+
+    async def release_for_retry(self) -> None: ...
 
     def run_query(
         self,
@@ -84,6 +90,9 @@ class FederatedRuntimeCoordinator:
         try:
             delivery = lease.provider_grant_delivery(envelope, target=target)
             offer = self._broker.issue(envelope, target=target)
+        except ProviderGrantUnavailable:
+            await lease.release_for_retry()
+            raise
         except BaseException:
             await lease.aclose()
             raise
@@ -99,6 +108,9 @@ class FederatedRuntimeCoordinator:
                 reason="delivery_failed",
             )
             self._broker.revoke(offer, receipt, self._clock())
+            raise
+        except ProviderGrantUnavailable:
+            await lease.release_for_retry()
             raise
         except BaseException:
             await lease.aclose()

@@ -40,6 +40,10 @@ class ProviderGrantUnavailable(RuntimeError):
     """The exact configured Provider authority is not currently available."""
 
 
+class ProviderGrantIncompatible(RuntimeError):
+    """The selected runtime cannot consume the frozen Provider route."""
+
+
 class ProviderGrantDeliveryFailed(RuntimeError):
     """The private sidecar delivery did not produce a trustworthy ACK."""
 
@@ -85,7 +89,6 @@ class ProviderGrantBroker:
         if (
             envelope.runtime.runtime_id != target.runtime_id
             or envelope.runtime.build_id != target.build_id
-            or envelope.runtime.host_generation != target.host_generation
         ):
             raise ProviderGrantUnavailable("runtime target does not match envelope")
         self._validate_target(target)
@@ -96,7 +99,21 @@ class ProviderGrantBroker:
             raise ProviderGrantUnavailable("runtime target has expired")
         provider_id = _provider_id(envelope.provider_ref)
         profile = self._profile(provider_id)
-        resolved_model = profile.model_aliases.get(envelope.model, envelope.model)
+        expected_profile_digest = envelope.extensions.get(
+            "provider_profile_digest"
+        )
+        expected_model = envelope.extensions.get("resolved_model")
+        if (
+            not isinstance(expected_profile_digest, str)
+            or len(expected_profile_digest) != 64
+            or expected_model != envelope.model
+        ):
+            raise ProviderGrantUnavailable(
+                "provider admission authority is unavailable"
+            )
+        if canonical_provider_profile_digest(profile) != expected_profile_digest:
+            raise ProviderGrantUnavailable("provider profile changed")
+        _validate_runtime_provider_compatibility(target.runtime_id, profile)
         nonce = token_urlsafe(32)
         challenge = token_urlsafe(32)
         binding = ProviderGrantBinding(
@@ -108,7 +125,7 @@ class ProviderGrantBroker:
             term_id=envelope.term_id,
             step_id=envelope.step_id,
             provider_id=provider_id,
-            provider_profile_digest=_profile_digest(profile),
+            provider_profile_digest=expected_profile_digest,
             route=ProviderGrantRouteV1(
                 protocol=profile.protocol,
                 base_url=profile.base_url,
@@ -116,7 +133,7 @@ class ProviderGrantBroker:
                 thinking_enabled=profile.thinking_enabled,
                 reasoning_effort=profile.reasoning_effort,
             ),
-            model=resolved_model,
+            model=envelope.model,
             scopes=scopes,
             issued_at=now,
             expires_at=expires_at,
@@ -148,7 +165,10 @@ class ProviderGrantBroker:
         ):
             raise ProviderGrantUnavailable("grant offer binding changed")
         profile = self._profile(record.binding.provider_id)
-        if _profile_digest(profile) != record.binding.provider_profile_digest:
+        if (
+            canonical_provider_profile_digest(profile)
+            != record.binding.provider_profile_digest
+        ):
             raise ProviderGrantUnavailable("provider profile changed")
         assert profile.secret_id is not None
         try:
@@ -314,7 +334,10 @@ class _UnavailableProviderGrantAuthority:
         raise ProviderGrantAuthorityError("containment receipt is invalid")
 
 
-def _profile_digest(profile: ProviderProfileRecord) -> str:
+def canonical_provider_profile_digest(profile: ProviderProfileRecord) -> str:
+    """Bind the full durable Profile without persisting credential material."""
+    if not isinstance(profile, ProviderProfileRecord):
+        raise TypeError("profile must be a ProviderProfileRecord")
     document = {
         "id": profile.id,
         "protocol": profile.protocol,
@@ -331,6 +354,25 @@ def _profile_digest(profile: ProviderProfileRecord) -> str:
         document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_runtime_provider_compatibility(
+    runtime_id: str, profile: ProviderProfileRecord
+) -> None:
+    if runtime_id == "dsh" and (
+        profile.protocol != "deepseek" or bool(profile.headers)
+    ):
+        raise ProviderGrantIncompatible(
+            "runtime cannot consume the selected provider route"
+        )
+    if runtime_id == "goose" and profile.protocol not in {
+        "deepseek",
+        "openai_chat",
+        "openai_compatible",
+    }:
+        raise ProviderGrantIncompatible(
+            "runtime cannot consume the selected provider route"
+        )
 
 
 def _ttl(value: float) -> float:
@@ -354,6 +396,8 @@ def _time(value: float) -> float:
 __all__ = [
     "ProviderGrantBroker",
     "ProviderGrantDeliveryFailed",
+    "ProviderGrantIncompatible",
     "ProviderGrantReceipt",
     "ProviderGrantUnavailable",
+    "canonical_provider_profile_digest",
 ]

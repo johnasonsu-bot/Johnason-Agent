@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from secrets import token_urlsafe
 
@@ -9,6 +10,7 @@ from tests.fixtures.assignment_v2 import admitted_assignment
 from tests.fixtures.host_v2 import fake_v2_command, run_envelope, runtime_capabilities
 from workbench.api.conversations import (
     ConversationAPI,
+    ConversationInterventionRequest,
     RuntimeConversationRoute,
     python_term_command_id,
 )
@@ -29,6 +31,7 @@ from workbench.runtime.federated_conversation import FederatedConversationExecut
 from workbench.runtime.provider_grants import (
     FederatedRuntimeCoordinator,
     ProviderGrantBroker,
+    canonical_provider_profile_digest,
 )
 from workbench.runtime.provider_grants.repository import ProviderGrantRepository
 from workbench.settings import RuntimeProcessConfig
@@ -83,15 +86,24 @@ async def test_worker_runs_supervisor_grant_host_v2_into_conversation_store(
     public_command_id = "turn-1"
     runtime_command_id = python_term_command_id(session_id, public_command_id)
     runtime_input = _runtime_input()
+    providers = ProviderRepository(database)
+    _, profile = providers.upsert(
+        ProviderProfileRecord.deepseek(id="deepseek-primary")
+    )
     envelope = run_envelope(
         command_id=runtime_command_id,
         host_generation="1",
         overrides={
             "provider_ref": "provider-profile:deepseek-primary",
             "model": "deepseek-v4-flash",
+            "deadline_ms": 60_000,
             "message_snapshot_digest": runtime_input.message_snapshot_digest,
             "context.snapshot_digest": runtime_input.context_snapshot_digest,
             "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(profile),
+                "resolved_model": "deepseek-v4-flash",
+            },
         },
     )
     capabilities = runtime_capabilities(
@@ -127,10 +139,6 @@ async def test_worker_runs_supervisor_grant_host_v2_into_conversation_store(
         runtime_dir=tmp_path,
         app_instance_id="federated-conversation-test",
     )
-    providers = ProviderRepository(database)
-    _, profile = providers.upsert(
-        ProviderProfileRecord.deepseek(id="deepseek-primary")
-    )
     vault = VaultService(tmp_path / "federated-conversation.vault")
     vault.create(token_urlsafe(24))
     assert profile.secret_id is not None
@@ -154,6 +162,8 @@ async def test_worker_runs_supervisor_grant_host_v2_into_conversation_store(
             "selector": "fake-v2",
             "runtime_id": "fake-v2",
             "build_id": "python:test-build",
+            "provider_profile_digest": canonical_provider_profile_digest(profile),
+            "resolved_model": "deepseek-v4-flash",
             "envelope": envelope.model_dump(mode="json"),
             "runtime_input": runtime_input.model_dump(mode="json"),
         },
@@ -183,13 +193,34 @@ async def test_worker_runs_supervisor_grant_host_v2_into_conversation_store(
             repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
             is not None
         )
+        providers.upsert(
+            profile.model_copy(
+                update={"base_url": "https://api.deepseek.com/v2"}
+            )
+        )
+        await api.process_queued_turn(session_id, public_command_id)
+        retryable = repository.load_turn_status(session_id, public_command_id)
+        assert retryable is not None and retryable.status == "retryable"
+        assert retryable.state["reason"] == "provider_unavailable"
+        assert not any(
+            event.event_type.startswith("runtime.")
+            for event in api.events.read_stream(f"run:{session_id}")
+        )
+        providers.upsert(profile)
+        assert canonical_provider_profile_digest(
+            providers.get("deepseek-primary")
+        ) == envelope.extensions["provider_profile_digest"]
+        assert (
+            repository.claim_next_turn(owner_id="worker-2", lease_seconds=30)
+            is not None
+        )
         await api.process_queued_turn(session_id, public_command_id)
     finally:
         await supervisor.aclose()
 
     turn = repository.load_turn_status(session_id, public_command_id)
     assert turn is not None
-    assert turn.status == "completed"
+    assert turn.status == "completed", turn.state
     assert turn.state["runtime_projected_cursor"] == 2
     event_types = [
         event.event_type for event in api.events.read_stream(f"run:{session_id}")
@@ -206,3 +237,160 @@ async def test_worker_runs_supervisor_grant_host_v2_into_conversation_store(
         ).fetchall()
     assert len(rows) == 1
     assert grant_repository.get(rows[0]["grant_id"]).state == "consumed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_intervention_reaches_host_v2_and_seals_once(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "federated-cancel.sqlite"
+    session_id = "session-cancel"
+    public_command_id = "turn-cancel"
+    runtime_command_id = python_term_command_id(session_id, public_command_id)
+    runtime_input = _runtime_input()
+    providers = ProviderRepository(database)
+    _, profile = providers.upsert(
+        ProviderProfileRecord.deepseek(id="deepseek-primary")
+    )
+    profile_digest = canonical_provider_profile_digest(profile)
+    envelope = run_envelope(
+        command_id=runtime_command_id,
+        host_generation="1",
+        overrides={
+            "session_id": f"conversation-session:{session_id}",
+            "deadline_ms": 60_000,
+            "provider_ref": "provider-profile:deepseek-primary",
+            "model": "deepseek-v4-flash",
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+            "extensions": {
+                "provider_profile_digest": profile_digest,
+                "resolved_model": "deepseek-v4-flash",
+            },
+        },
+    )
+    capabilities = runtime_capabilities(
+        "fake-v2",
+        build_id="python:test-build",
+        query=True,
+        model=True,
+        tools=True,
+        skills=True,
+        plugins=True,
+        workspace=True,
+        interventions=True,
+        pause_resume=True,
+        compaction=True,
+        checkpoints=True,
+        streaming=True,
+        plan=True,
+        todo=True,
+        prompt_sections=True,
+        tool_interceptors=True,
+        event_cursor=True,
+    )
+    assignments, _ = admitted_assignment(database, envelope, capabilities)
+    supervisor = SidecarSupervisor(
+        runtimes=(
+            RuntimeProcessConfig(
+                runtime_id="fake-v2",
+                argv=fake_v2_command("provider_grant_blocking_query"),
+            ),
+        ),
+        registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="federated-cancel-test",
+    )
+    vault = VaultService(tmp_path / "federated-cancel.vault")
+    vault.create(token_urlsafe(24))
+    assert profile.secret_id is not None
+    vault.put(profile.secret_id, token_urlsafe(32))
+    executor = FederatedConversationExecutor(
+        assignments=assignments,
+        supervisor=supervisor,
+        coordinator=FederatedRuntimeCoordinator(
+            ProviderGrantBroker(
+                database=database,
+                providers=providers,
+                vault=vault,
+                authority=supervisor,
+            )
+        ),
+    )
+    route = RuntimeConversationRoute(
+        runtime_id="fake-v2",
+        build_id="python:test-build",
+        runtime_command_id=runtime_command_id,
+        execution_snapshot={
+            "selector": "fake-v2",
+            "runtime_id": "fake-v2",
+            "build_id": "python:test-build",
+            "provider_profile_digest": profile_digest,
+            "resolved_model": "deepseek-v4-flash",
+            "envelope": envelope.model_dump(mode="json"),
+            "runtime_input": runtime_input.model_dump(mode="json"),
+        },
+    )
+    repository = ConversationRepository(database)
+    api = ConversationAPI(
+        conversations=repository,
+        events=EventStore(database),
+        runner=_NoopRunner(),
+        providers=providers,
+        runtime_router=_PinnedRoute(route),
+        federated_executor=executor,
+    )
+    api.create_session(session_id)
+
+    await supervisor.start()
+    try:
+        await api.enqueue_message(
+            session_id=session_id,
+            command_id=public_command_id,
+            content="cancel the federated worker",
+            model="default",
+            provider_id="deepseek-primary",
+            runtime="fake-v2",
+        )
+        assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+        processing = asyncio.create_task(
+            api.process_queued_turn(session_id, public_command_id)
+        )
+        for _ in range(500):
+            if any(
+                event.event_type == "runtime.status.changed"
+                and event.payload.get("status") == "running"
+                for event in api.events.read_stream(f"run:{session_id}")
+            ):
+                break
+            if processing.done():
+                await processing
+                current = repository.load_turn_status(session_id, public_command_id)
+                raise AssertionError(
+                    f"Host v2 query ended before acceptance: {current}"
+                )
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("Host v2 did not accept the query")
+        await api.queue_intervention(
+            session_id=session_id,
+            command_id="cancel-command",
+            payload=ConversationInterventionRequest(
+                kind="cancel", content="stop", context_version=0
+            ),
+        )
+        await asyncio.wait_for(processing, timeout=2.0)
+    finally:
+        await supervisor.aclose()
+
+    turn = repository.load_turn_status(session_id, public_command_id)
+    assert turn is not None and turn.state["reason"] == "runtime_cancelled"
+    terminals = [
+        event
+        for event in api.events.read_stream(f"run:{session_id}")
+        if event.event_type == "conversation.turn.failed"
+    ]
+    assert len(terminals) == 1
+    assert terminals[0].payload["response_status"] == "cancelled"

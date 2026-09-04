@@ -17,6 +17,9 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimeQueryInputV2,
     canonical_runtime_input_digest,
 )
+from workbench.runtime.provider_grants.broker import (
+    canonical_provider_profile_digest,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +101,16 @@ def build_runtime_execution_snapshot(
     runtime_input: RuntimeQueryInputV2,
 ) -> dict[str, object]:
     """Persist the complete, runtime-neutral execution evidence for one command."""
+    provider_profile_digest = canonical_provider_profile_digest(
+        admission.provider
+    )
+    if (
+        envelope.extensions.get("provider_profile_digest")
+        != provider_profile_digest
+        or envelope.extensions.get("resolved_model") != admission.model
+        or envelope.model != admission.model
+    ):
+        raise ValueError("runtime provider authority does not match envelope")
     profiles = admission.agent_profiles
     if len(profiles) == 1:
         profile = profiles[0]
@@ -146,6 +159,8 @@ def build_runtime_execution_snapshot(
         "selector": envelope.runtime.runtime_id,
         "runtime_id": envelope.runtime.runtime_id,
         "build_id": envelope.runtime.build_id,
+        "provider_profile_digest": provider_profile_digest,
+        "resolved_model": admission.model,
         "command": command.model_dump(mode="json"),
         "envelope": envelope.model_dump(mode="json"),
         "runtime_input": runtime_input.model_dump(mode="json"),

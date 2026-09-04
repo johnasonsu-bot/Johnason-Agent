@@ -56,6 +56,7 @@ from workbench.runtime.conversation_execution import (
     read_runtime_execution,
 )
 from workbench.runtime.federated_conversation import (
+    canonical_runtime_event_digest,
     FederatedConversationExecutionError,
     FederatedConversationExecutor,
     FederatedConversationProtocolError,
@@ -1225,6 +1226,7 @@ class ConversationAPI:
 
         projected_cursor = turn.state.get("runtime_projected_cursor", 0)
         accumulated = turn.state.get("runtime_projected_result", [])
+        projected_digests = turn.state.get("runtime_projected_event_digests", {})
         assistant_message = turn.state.get("runtime_assistant_message")
         terminal_outcome = turn.state.get("runtime_terminal_outcome")
         if (
@@ -1233,6 +1235,14 @@ class ConversationAPI:
             or projected_cursor < 0
             or not isinstance(accumulated, list)
             or not all(isinstance(item, dict) for item in accumulated)
+            or not isinstance(projected_digests, dict)
+            or any(
+                not isinstance(cursor, str)
+                or not cursor.isdecimal()
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                for cursor, digest in projected_digests.items()
+            )
             or (
                 assistant_message is not None
                 and (not isinstance(assistant_message, str) or not assistant_message)
@@ -1244,21 +1254,59 @@ class ConversationAPI:
         ):
             raise TurnSnapshotCorruption("invalid federated runtime projection state")
         accumulated = [dict(item) for item in accumulated]
+        projected_digests = dict(projected_digests)
+        if terminal_outcome is None:
+            recovered_terminal = self._recover_federated_terminal_projection(
+                turn.session_id, reservation_id=reservation_id
+            )
+            if recovered_terminal is not None:
+                terminal_outcome, terminal_cursor, terminal_digest = recovered_terminal
+                if terminal_cursor < projected_cursor:
+                    raise TurnSnapshotCorruption(
+                        "durable runtime terminal cursor regressed"
+                    )
+                persisted_terminal_digest = projected_digests.get(
+                    str(terminal_cursor)
+                )
+                if (
+                    terminal_cursor == projected_cursor
+                    and persisted_terminal_digest != terminal_digest
+                ):
+                    raise TurnSnapshotCorruption(
+                        "durable runtime terminal digest changed"
+                    )
+                projected_cursor = terminal_cursor
+                projected_digests[str(terminal_cursor)] = terminal_digest
         if terminal_outcome is not None:
             self._finish_federated_runtime_turn(
                 turn,
                 reservation_id=reservation_id,
                 projected_cursor=projected_cursor,
                 accumulated=accumulated,
+                projected_digests=projected_digests,
                 assistant_message=assistant_message,
                 outcome=terminal_outcome,
             )
             return
         terminal_status: str | None = None
+        stream_cursor: int | None = None
         try:
             async for runtime_event in self.federated_executor.execute(snapshot):
+                if stream_cursor is not None:
+                    if runtime_event.cursor < stream_cursor:
+                        raise FederatedConversationProtocolError(
+                            "runtime cursor regressed"
+                        )
+                    if runtime_event.cursor > stream_cursor + 1:
+                        raise FederatedConversationProtocolError(
+                            "runtime cursor has a gap"
+                        )
+                stream_cursor = runtime_event.cursor
+                event_digest = canonical_runtime_event_digest(runtime_event)
                 projection = project_runtime_event(
-                    runtime_event, after_cursor=projected_cursor
+                    runtime_event,
+                    after_cursor=projected_cursor,
+                    projected_digests=projected_digests,
                 )
                 if projection is None:
                     continue
@@ -1273,6 +1321,7 @@ class ConversationAPI:
                         dict(domain_event.payload),
                         f"{turn.command_id}:runtime:{projection.cursor}",
                         ordinal=domain_event.sequence,
+                        correlation_id="runtime-event-digest:" + event_digest,
                         causation_id=reservation_id,
                     )
                     if appended:
@@ -1300,14 +1349,26 @@ class ConversationAPI:
                         )
                 terminal_status = projection.terminal_status or terminal_status
                 projected_cursor = projection.cursor
+                projected_digests[str(projected_cursor)] = event_digest
+                projected_outcome = (
+                    self._federated_terminal_outcome(terminal_status)
+                    if terminal_status is not None
+                    else None
+                )
                 projected_state = dict(turn.state)
                 projected_state.update(
                     {
                         "runtime_projected_cursor": projected_cursor,
                         "runtime_projected_result": accumulated,
+                        "runtime_projected_event_digests": projected_digests,
                         **(
                             {"runtime_assistant_message": assistant_message}
                             if assistant_message is not None
+                            else {}
+                        ),
+                        **(
+                            {"runtime_terminal_outcome": projected_outcome}
+                            if projected_outcome is not None
                             else {}
                         ),
                     }
@@ -1323,11 +1384,31 @@ class ConversationAPI:
         except FederatedConversationSnapshotError as error:
             raise TurnSnapshotCorruption("invalid federated runtime snapshot") from error
         except FederatedConversationExecutionError as error:
+            if error.retryable and not error.accepted:
+                retry_state = dict(turn.state)
+                retry_state.update(
+                    {
+                        "phase": "before_model",
+                        "reason": error.category,
+                        "retryable": True,
+                        "runtime_projected_cursor": projected_cursor,
+                        "runtime_projected_result": accumulated,
+                        "runtime_projected_event_digests": projected_digests,
+                    }
+                )
+                self.conversations.mark_retryable(
+                    turn.session_id,
+                    turn.command_id,
+                    owner_id=turn.owner_id or "",
+                    state=retry_state,
+                )
+                return
             self._finish_federated_runtime_turn(
                 turn,
                 reservation_id=reservation_id,
                 projected_cursor=projected_cursor,
                 accumulated=accumulated,
+                projected_digests=projected_digests,
                 assistant_message=assistant_message,
                 outcome=error.category,
             )
@@ -1338,6 +1419,7 @@ class ConversationAPI:
                 reservation_id=reservation_id,
                 projected_cursor=projected_cursor,
                 accumulated=accumulated,
+                projected_digests=projected_digests,
                 assistant_message=assistant_message,
                 outcome="runtime_failed",
             )
@@ -1357,9 +1439,58 @@ class ConversationAPI:
             reservation_id=reservation_id,
             projected_cursor=projected_cursor,
             accumulated=accumulated,
+            projected_digests=projected_digests,
             assistant_message=assistant_message,
             outcome=outcome,
         )
+
+    @staticmethod
+    def _federated_terminal_outcome(
+        terminal_status: str,
+    ) -> PublicFederatedFailure | Literal["completed"]:
+        if terminal_status == "completed":
+            return "completed"
+        if terminal_status == "failed":
+            return "runtime_failed"
+        if terminal_status == "cancelled":
+            return "runtime_cancelled"
+        raise FederatedConversationProtocolError("invalid runtime terminal status")
+
+    def _recover_federated_terminal_projection(
+        self, session_id: str, *, reservation_id: str
+    ) -> tuple[
+        PublicFederatedFailure | Literal["completed"], int, str
+    ] | None:
+        projections = [
+            (
+                self._federated_terminal_outcome(status),
+                event.payload.get("cursor"),
+                event.correlation_id,
+            )
+            for event in self.events.read_stream(f"run:{session_id}")
+            if event.causation_id == reservation_id
+            and event.event_type == "runtime.status.changed"
+            and (status := event.payload.get("status"))
+            in {"completed", "failed", "cancelled"}
+        ]
+        if len(projections) > 1:
+            raise TurnSnapshotCorruption("conflicting durable runtime terminals")
+        if not projections:
+            return None
+        outcome, cursor, correlation_id = projections[0]
+        prefix = "runtime-event-digest:"
+        if (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or cursor < 1
+            or not isinstance(correlation_id, str)
+            or not correlation_id.startswith(prefix)
+            or len(correlation_id.removeprefix(prefix)) != 64
+        ):
+            raise TurnSnapshotCorruption(
+                "durable runtime terminal projection is incomplete"
+            )
+        return outcome, cursor, correlation_id.removeprefix(prefix)
 
     def _finish_federated_runtime_turn(
         self,
@@ -1368,6 +1499,7 @@ class ConversationAPI:
         reservation_id: str,
         projected_cursor: int,
         accumulated: list[dict[str, Any]],
+        projected_digests: dict[str, str],
         assistant_message: str | None,
         outcome: PublicFederatedFailure | Literal["completed"],
     ) -> None:
@@ -1387,6 +1519,7 @@ class ConversationAPI:
             {
                 "runtime_projected_cursor": projected_cursor,
                 "runtime_projected_result": accumulated,
+                "runtime_projected_event_digests": projected_digests,
                 "runtime_terminal_outcome": outcome,
                 **(
                     {"runtime_assistant_message": assistant_message}
@@ -1440,6 +1573,7 @@ class ConversationAPI:
                 "events": [],
                 "runtime_projected_cursor": projected_cursor,
                 "runtime_projected_result": accumulated,
+                "runtime_projected_event_digests": projected_digests,
                 "runtime_terminal_outcome": outcome,
                 **(
                     {"runtime_assistant_message": assistant_message}
@@ -1895,6 +2029,13 @@ class ConversationAPI:
             "context_version": payload.context_version,
         }
         reservation_id = self._reserve(session_id, command_id, "intervention", values)
+        if payload.kind == "cancel" and self.federated_executor is not None:
+            active_command = getattr(
+                self.federated_executor, "active_command", lambda _session_id: None
+            )(session_id)
+            cancel = getattr(self.federated_executor, "cancel", None)
+            if isinstance(active_command, str) and callable(cancel):
+                await cancel(active_command)
         record = None
         if self._has_lifecycle_run(session_id):
             assert self.engine is not None

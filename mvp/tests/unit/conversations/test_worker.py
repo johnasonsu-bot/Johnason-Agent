@@ -8,6 +8,7 @@ import pytest
 from tests.fixtures.host_v2 import run_envelope, runtime_event
 from workbench.api.conversations import (
     ConversationAPI,
+    ConversationInterventionRequest,
     RuntimeConversationRoute,
     python_term_command_id,
 )
@@ -332,12 +333,24 @@ class _FederatedRouter:
 
 
 class _FederatedExecutor:
-    def __init__(self, *, failure: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        failure: str | None = None,
+        accepted: bool = False,
+        retryable: bool = False,
+    ) -> None:
         self.failure = failure
+        self.accepted = accepted
+        self.retryable = retryable
 
     async def execute(self, snapshot):
         if self.failure is not None:
-            raise FederatedConversationExecutionError(self.failure)
+            raise FederatedConversationExecutionError(
+                self.failure,
+                accepted=self.accepted,
+                retryable=self.retryable,
+            )
         yield runtime_event(
             "runtime.status", cursor=1, payload={"status": "running"}
         )
@@ -386,6 +399,56 @@ class _ForbiddenFederatedExecutor:
         self.called = True
         raise AssertionError("durable terminal projection must not rerun the runtime")
         yield
+
+
+class _ReplayFederatedExecutor:
+    def __init__(self, *, changed: bool = False) -> None:
+        self.changed = changed
+
+    async def execute(self, snapshot):
+        del snapshot
+        yield runtime_event(
+            "runtime.status", cursor=1, payload={"status": "running"}
+        )
+        yield runtime_event(
+            "assistant.delta",
+            cursor=2,
+            payload={"text": "changed" if self.changed else "stable"},
+        )
+        yield runtime_event(
+            "runtime.status", cursor=3, payload={"status": "completed"}
+        )
+
+
+class _CancellableFederatedExecutor:
+    def __init__(self) -> None:
+        import asyncio
+
+        self.started = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.command_id: str | None = None
+        self.cancelled_commands: list[str] = []
+
+    async def execute(self, snapshot):
+        self.command_id = snapshot["envelope"]["command_id"]
+        self.started.set()
+        yield runtime_event(
+            "runtime.status", cursor=1, payload={"status": "running"}
+        )
+        await self.cancelled.wait()
+        yield runtime_event(
+            "runtime.status", cursor=2, payload={"status": "cancelled"}
+        )
+
+    def active_command(self, session_id: str) -> str | None:
+        assert session_id == "session-1"
+        return self.command_id
+
+    async def cancel(self, command_id: str) -> bool:
+        assert command_id == self.command_id
+        self.cancelled_commands.append(command_id)
+        self.cancelled.set()
+        return True
 
 
 class _NoopRunner:
@@ -488,6 +551,45 @@ async def test_grant_ack_failure_has_stable_terminal_without_runtime_event(
     ]
     assert len(terminal) == 1
     assert terminal[0].payload["reason"] == "provider_grant_failed"
+
+
+@pytest.mark.asyncio
+async def test_pre_acceptance_provider_failure_keeps_turn_retryable(
+    tmp_path: Path,
+) -> None:
+    executor = _FederatedExecutor(
+        failure="provider_unavailable", retryable=True
+    )
+    api, repository = _federated_api(
+        tmp_path / "provider-retry.sqlite", executor
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    retryable = repository.load_turn_status("session-1", "turn-1")
+    assert retryable is not None and retryable.status == "retryable"
+    assert retryable.state["reason"] == "provider_unavailable"
+    assert not any(
+        event.event_type.startswith("runtime.")
+        or event.event_type == "conversation.turn.failed"
+        for event in api.events.read_stream("run:session-1")
+    )
+    executor.failure = None
+    assert repository.claim_next_turn(owner_id="worker-2", lease_seconds=30)
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    completed = repository.load_turn_status("session-1", "turn-1")
+    assert completed is not None and completed.status == "completed"
 
 
 @pytest.mark.parametrize(
@@ -596,9 +698,9 @@ async def test_failed_runtime_does_not_modify_other_runtime_or_python_turn(
 
 @pytest.mark.asyncio
 async def test_worker_recovers_durable_runtime_terminal_without_reexecution(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executor = _ForbiddenFederatedExecutor()
+    executor = _TerminalFederatedExecutor("completed")
     api, repository = _federated_api(
         tmp_path / "runtime-terminal-recovery.sqlite",
         executor,
@@ -613,27 +715,254 @@ async def test_worker_recovers_durable_runtime_terminal_without_reexecution(
     )
     claimed = repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
     assert claimed is not None
-    recovered_state = dict(claimed.state)
-    recovered_state.update(
-        {
-            "runtime_projected_cursor": 4,
-            "runtime_projected_result": [],
-            "runtime_terminal_outcome": "completed",
-        }
-    )
-    repository.save_turn_state(
-        "session-1",
-        "turn-1",
-        owner_id="worker-1",
-        state=recovered_state,
-    )
+    original_save = repository.save_turn_state
+
+    def crash_after_terminal_state(*args, **kwargs):
+        original_save(*args, **kwargs)
+        state = kwargs["state"]
+        if state.get("runtime_terminal_outcome") == "completed":
+            raise RuntimeError("injected crash after terminal state")
+
+    monkeypatch.setattr(repository, "save_turn_state", crash_after_terminal_state)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        await api.process_queued_turn("session-1", "turn-1")
+
+    interrupted = repository.load_turn_status("session-1", "turn-1")
+    assert interrupted is not None
+    assert interrupted.state["runtime_projected_cursor"] == 2
+    assert interrupted.state["runtime_terminal_outcome"] == "completed"
+
+    monkeypatch.setattr(repository, "save_turn_state", original_save)
+    forbidden = _ForbiddenFederatedExecutor()
+    api.federated_executor = forbidden
 
     await api.process_queued_turn("session-1", "turn-1")
 
     turn = repository.load_turn_status("session-1", "turn-1")
     assert turn is not None and turn.status == "completed"
-    assert executor.called is False
+    assert forbidden.called is False
     assert sum(
         event.event_type == "conversation.turn.finished"
+        for event in api.events.read_stream("run:session-1")
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_derives_terminal_from_domain_event_after_pre_state_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "runtime-terminal-domain-recovery.sqlite",
+        _TerminalFederatedExecutor("completed"),
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    original_save = repository.save_turn_state
+
+    def crash_before_terminal_state(*args, **kwargs):
+        if kwargs["state"].get("runtime_terminal_outcome") == "completed":
+            raise RuntimeError("injected crash before terminal state")
+        original_save(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "save_turn_state", crash_before_terminal_state)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        await api.process_queued_turn("session-1", "turn-1")
+
+    interrupted = repository.load_turn_status("session-1", "turn-1")
+    assert interrupted is not None
+    assert interrupted.state["runtime_projected_cursor"] == 1
+    assert "runtime_terminal_outcome" not in interrupted.state
+    durable_events = api.events.read_stream("run:session-1")
+    assert any(
+        event.event_type == "runtime.status.changed"
+        and event.payload.get("status") == "completed"
+        for event in durable_events
+    ), durable_events
+    monkeypatch.setattr(repository, "save_turn_state", original_save)
+    forbidden = _ForbiddenFederatedExecutor()
+    api.federated_executor = forbidden
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    recovered = repository.load_turn_status("session-1", "turn-1")
+    assert recovered is not None and recovered.status == "completed"
+    assert recovered.state["runtime_projected_cursor"] == 2
+    assert len(recovered.state["runtime_projected_event_digests"]) == 2
+    assert forbidden.called is False
+
+
+@pytest.mark.asyncio
+async def test_worker_recovers_terminal_when_cursor_was_saved_without_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "runtime-terminal-equal-cursor-recovery.sqlite",
+        _TerminalFederatedExecutor("completed"),
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    original_save = repository.save_turn_state
+
+    def crash_after_legacy_terminal_cursor(*args, **kwargs):
+        state = kwargs["state"]
+        if state.get("runtime_terminal_outcome") == "completed":
+            interrupted_state = dict(state)
+            interrupted_state.pop("runtime_terminal_outcome")
+            original_save(*args, **{**kwargs, "state": interrupted_state})
+            raise RuntimeError("injected legacy terminal cursor crash")
+        original_save(*args, **kwargs)
+
+    monkeypatch.setattr(
+        repository, "save_turn_state", crash_after_legacy_terminal_cursor
+    )
+    with pytest.raises(RuntimeError, match="legacy terminal cursor crash"):
+        await api.process_queued_turn("session-1", "turn-1")
+
+    interrupted = repository.load_turn_status("session-1", "turn-1")
+    assert interrupted is not None
+    assert interrupted.state["runtime_projected_cursor"] == 2
+    assert "runtime_terminal_outcome" not in interrupted.state
+
+    monkeypatch.setattr(repository, "save_turn_state", original_save)
+    forbidden = _ForbiddenFederatedExecutor()
+    api.federated_executor = forbidden
+    await api.process_queued_turn("session-1", "turn-1")
+
+    recovered = repository.load_turn_status("session-1", "turn-1")
+    assert recovered is not None and recovered.status == "completed"
+    assert recovered.state["runtime_terminal_outcome"] == "completed"
+    assert forbidden.called is False
+
+
+@pytest.mark.asyncio
+async def test_worker_accepts_identical_cursor_replay_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "runtime-cursor-replay.sqlite", _ReplayFederatedExecutor()
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    original_save = repository.save_turn_state
+    interrupted = False
+
+    def crash_after_cursor_two(*args, **kwargs):
+        nonlocal interrupted
+        original_save(*args, **kwargs)
+        if kwargs["state"].get("runtime_projected_cursor") == 2 and not interrupted:
+            interrupted = True
+            raise RuntimeError("injected cursor crash")
+
+    monkeypatch.setattr(repository, "save_turn_state", crash_after_cursor_two)
+    with pytest.raises(RuntimeError, match="cursor crash"):
+        await api.process_queued_turn("session-1", "turn-1")
+    monkeypatch.setattr(repository, "save_turn_state", original_save)
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None and turn.status == "completed"
+    deltas = [
+        event
+        for event in api.events.read_stream("run:session-1")
+        if event.event_type == "agent.message.delta"
+    ]
+    assert len(deltas) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_rejects_changed_cursor_replay_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "runtime-cursor-changed.sqlite", _ReplayFederatedExecutor()
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    original_save = repository.save_turn_state
+    interrupted = False
+
+    def crash_after_cursor_two(*args, **kwargs):
+        nonlocal interrupted
+        original_save(*args, **kwargs)
+        if kwargs["state"].get("runtime_projected_cursor") == 2 and not interrupted:
+            interrupted = True
+            raise RuntimeError("injected cursor crash")
+
+    monkeypatch.setattr(repository, "save_turn_state", crash_after_cursor_two)
+    with pytest.raises(RuntimeError, match="cursor crash"):
+        await api.process_queued_turn("session-1", "turn-1")
+    monkeypatch.setattr(repository, "save_turn_state", original_save)
+    api.federated_executor = _ReplayFederatedExecutor(changed=True)
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None and turn.status == "failed"
+    assert turn.state["reason"] == "runtime_failed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_intervention_reaches_active_federated_lease_once(
+    tmp_path: Path,
+) -> None:
+    executor = _CancellableFederatedExecutor()
+    api, repository = _federated_api(
+        tmp_path / "runtime-cancel.sqlite", executor
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    processing = asyncio.create_task(
+        api.process_queued_turn("session-1", "turn-1")
+    )
+    await executor.started.wait()
+
+    await api.queue_intervention(
+        session_id="session-1",
+        command_id="cancel-1",
+        payload=ConversationInterventionRequest(kind="cancel", content="stop"),
+    )
+    await processing
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None and turn.state["reason"] == "runtime_cancelled"
+    assert executor.cancelled_commands == [python_term_command_id("session-1", "turn-1")]
+    assert sum(
+        event.event_type == "conversation.turn.failed"
         for event in api.events.read_stream("run:session-1")
     ) == 1

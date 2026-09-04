@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from tests.fixtures.assignment_v2 import admitted_assignment
 from tests.fixtures.host_v2 import run_envelope, runtime_capabilities
 from workbench.main import build_app
+from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
 from workbench.runtime.provider_grants import (
     ProviderGrantAck,
@@ -21,6 +22,7 @@ from workbench.runtime.provider_grants import (
     ProviderGrantDeliveryFailed,
     ProviderGrantUnavailable,
     canonical_grant_digest,
+    canonical_provider_profile_digest,
 )
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 
@@ -138,6 +140,7 @@ def test_supervisor_backed_broker_contains_failure_without_public_leak(
         )
         public_responses.append(saved.text)
         assert saved.status_code == 200
+        profile = ProviderRepository(settings.database).get("deepseek-primary")
 
         envelope = run_envelope(
             runtime_id="goose",
@@ -150,7 +153,13 @@ def test_supervisor_backed_broker_contains_failure_without_public_leak(
                     "host_generation": "1",
                 },
                 "provider_ref": "provider-profile:deepseek-primary",
-                "model": "default",
+                "model": "deepseek-v4-flash",
+                "extensions": {
+                    "provider_profile_digest": canonical_provider_profile_digest(
+                        profile
+                    ),
+                    "resolved_model": "deepseek-v4-flash",
+                },
             },
         )
         assignments, assignment = admitted_assignment(

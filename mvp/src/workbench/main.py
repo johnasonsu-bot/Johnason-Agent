@@ -88,6 +88,7 @@ from workbench.runtime.python_term.repository import PythonTermRepository
 from workbench.runtime.provider_grants import (
     FederatedRuntimeCoordinator,
     ProviderGrantBroker,
+    canonical_provider_profile_digest,
 )
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
@@ -438,6 +439,10 @@ class RuntimeQueryRouter:
                 "traceparent": f"conversation-trace-{identity[:32]}",
                 "extensions": {
                     "admission_identity_digest": identity,
+                    "provider_profile_digest": canonical_provider_profile_digest(
+                        admission.provider
+                    ),
+                    "resolved_model": admission.model,
                     "agent_profile_refs": agent_refs,
                     "agent_profiles_digest": self._digest(agent_snapshots),
                     "project_context_ref": project_ref,

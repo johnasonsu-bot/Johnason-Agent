@@ -18,6 +18,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimeQueryInputV2,
     canonical_runtime_input_digest,
 )
+from workbench.runtime.provider_grants import canonical_provider_profile_digest
 
 
 def _admission() -> PythonTermConversationAdmission:
@@ -107,7 +108,12 @@ def _envelope() -> RunEnvelopeV2:
             "checkpoint_cursor": 0,
             "deadline_ms": 60_000,
             "traceparent": "conversation-trace-1",
-            "extensions": {},
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(
+                    _admission().provider
+                ),
+                "resolved_model": "configured-model",
+            },
         }
     )
 
@@ -129,6 +135,14 @@ def test_runtime_execution_snapshot_materializes_query_input() -> None:
     assert runtime_input.context_snapshot_digest == envelope.context.snapshot_digest
     assert runtime_input.prompt_manifest_digest == envelope.prompt_manifest_digest
     assert snapshot["selector"] == "goose"
+    assert snapshot["provider_profile_digest"] == (
+        canonical_provider_profile_digest(admission.provider)
+    )
+    assert snapshot["resolved_model"] == "configured-model"
+    assert envelope.extensions["provider_profile_digest"] == (
+        snapshot["provider_profile_digest"]
+    )
+    assert envelope.extensions["resolved_model"] == "configured-model"
 
 
 def test_runtime_execution_snapshot_persists_the_caller_materialized_input() -> None:

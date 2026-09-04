@@ -642,6 +642,31 @@ class SidecarSupervisor:
             self._schedule_watchdog(slot, handle)
             return handle
 
+    async def acquire_for_execution(
+        self, assignment: RuntimeAssignment
+    ) -> "SupervisedRuntimeLease":
+        """Resume one Supervisor-approved retry handle or acquire attempt zero."""
+        if not isinstance(assignment, RuntimeAssignment):
+            raise TypeError("assignment must be a RuntimeAssignment")
+        slot = self._slots.get(assignment.runtime_id)
+        if slot is None:
+            raise LeaseConflict("assignment runtime is not configured")
+        async with slot.lock:
+            handle = slot.handle
+            if handle is not None:
+                if handle._assignment() != assignment or handle._has_run():
+                    raise LeaseConflict("runtime lease is not resumable")
+                return handle
+        return await self.acquire_initial(assignment)
+
+    async def _release_handle_for_retry(
+        self, handle: "SupervisedRuntimeLease"
+    ) -> None:
+        """Release a pre-acceptance lease through durable recovery classification."""
+        if handle._has_run():
+            raise LeaseConflict("accepted runtime lease cannot use release retry")
+        await self._recover_failed_handle(handle)
+
     async def _renew_handle(self, handle: "SupervisedRuntimeLease") -> None:
         try:
             slot, lease = self._require_current_handle(handle)
@@ -2083,6 +2108,9 @@ class SupervisedRuntimeLease:
 
     async def cancel(self, *, reason: str = "user_requested") -> None:
         await self.__supervisor._cancel_handle(self, reason)
+
+    async def release_for_retry(self) -> None:
+        await self.__supervisor._release_handle_for_retry(self)
 
     async def checkpoint(self) -> CheckpointHintV2:
         return await self.__supervisor._checkpoint_handle(self)

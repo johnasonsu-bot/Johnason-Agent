@@ -426,7 +426,10 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
     if command_type == "query.start":
         if mode == "ignore_query_start":
             return False
-        if mode == "provider_grant_query" and not V2_STATE["provider_grant_ready"]:
+        if mode in {
+            "provider_grant_query",
+            "provider_grant_blocking_query",
+        } and not V2_STATE["provider_grant_ready"]:
             write_v2(v2_response(command, {"accepted": False}))
             return False
         if not V2_STATE["accepted"]:
@@ -436,7 +439,11 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             return True
         expected_payload_fields = (
             {"envelope", "runtime_input"}
-            if mode in {"require_runtime_input", "provider_grant_query"}
+            if mode in {
+                "require_runtime_input",
+                "provider_grant_query",
+                "provider_grant_blocking_query",
+            }
             else {"envelope"}
         )
         if set(payload) != expected_payload_fields:
@@ -541,6 +548,7 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
             "missing_control_capabilities",
             "pause_terminal",
             "resume_crash",
+            "provider_grant_blocking_query",
         }:
             if mode in {
                 "cancel_timeout_observed_write_exact",
@@ -1045,7 +1053,11 @@ def respond_v2(command: dict[str, object], mode: str) -> bool:
         write_v2_terminal(
             cursor,
             "cancelled",
-            cancel_count=int(V2_STATE["cancel_count"]),
+            **(
+                {}
+                if mode == "provider_grant_blocking_query"
+                else {"cancel_count": int(V2_STATE["cancel_count"])}
+            ),
         )
         return False
     return True
@@ -1058,7 +1070,11 @@ def main_v2(mode: str, checkpoint_store: str | None = None) -> int:
         "ENGINE_HOST_TEST_SECRET" in os.environ or "TEST_SECRET" in os.environ
     ):
         return 3
-    if mode in {"provider_grant_descriptor", "provider_grant_query"}:
+    if mode in {
+        "provider_grant_descriptor",
+        "provider_grant_query",
+        "provider_grant_blocking_query",
+    }:
         descriptor = os.environ.get("WORKBENCH_PROVIDER_GRANT_FD", "")
         try:
             metadata = os.fstat(int(descriptor))
@@ -1066,7 +1082,7 @@ def main_v2(mode: str, checkpoint_store: str | None = None) -> int:
             return 3
         if not descriptor.isdecimal() or not stat.S_ISSOCK(metadata.st_mode):
             return 3
-        if mode == "provider_grant_query":
+        if mode in {"provider_grant_query", "provider_grant_blocking_query"}:
             del os.environ["WORKBENCH_PROVIDER_GRANT_FD"]
             Thread(
                 target=receive_test_provider_grant,

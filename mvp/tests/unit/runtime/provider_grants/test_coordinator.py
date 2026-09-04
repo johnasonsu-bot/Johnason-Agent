@@ -23,6 +23,7 @@ from workbench.runtime.provider_grants import (
     ProviderGrantTarget,
     ProviderGrantUnavailable,
     canonical_grant_digest,
+    canonical_provider_profile_digest,
 )
 from workbench.runtime.provider_grants.coordinator import (
     FederatedRuntimeCoordinator,
@@ -117,6 +118,10 @@ class _Lease:
         self.order.append("close")
         self.closed = True
 
+    async def release_for_retry(self) -> None:
+        self.order.append("release_retry")
+        self.closed = True
+
     async def run_query(
         self, envelope, *, runtime_input: RuntimeQueryInputV2
     ) -> AsyncIterator[object]:
@@ -179,6 +184,15 @@ def _fixture(
     providers = ProviderRepository(database)
     _, profile = providers.upsert(
         ProviderProfileRecord.deepseek(id="deepseek-primary")
+    )
+    envelope = envelope.model_copy(
+        update={
+            "model": "deepseek-v4-flash",
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(profile),
+                "resolved_model": "deepseek-v4-flash",
+            },
+        }
     )
     vault = VaultService(tmp_path / "credentials.vault")
     vault.create(token_urlsafe(24))
@@ -255,5 +269,5 @@ async def test_unavailable_provider_releases_lease_without_starting_query(
         ):
             pass
 
-    assert order == ["target", "delivery", "close"]
+    assert order == ["target", "delivery", "release_retry"]
     assert lease.closed is True

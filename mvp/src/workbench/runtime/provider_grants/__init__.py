@@ -15,8 +15,10 @@ from .contracts import (
 from .broker import (
     ProviderGrantBroker,
     ProviderGrantDeliveryFailed,
+    ProviderGrantIncompatible,
     ProviderGrantReceipt,
     ProviderGrantUnavailable,
+    canonical_provider_profile_digest,
 )
 from .delivery import ProviderGrantDelivery
 from .coordinator import FederatedRuntimeCoordinator, FederatedRuntimeLease
@@ -37,6 +39,7 @@ __all__ = [
     "ProviderGrantContainmentReceipt",
     "ProviderGrantDelivery",
     "ProviderGrantDeliveryFailed",
+    "ProviderGrantIncompatible",
     "ProviderGrantOffer",
     "ProviderGrantRouteV1",
     "ProviderGrantRevocationReason",
@@ -51,4 +54,5 @@ __all__ = [
     "FederatedRuntimeCoordinator",
     "FederatedRuntimeLease",
     "canonical_grant_digest",
+    "canonical_provider_profile_digest",
 ]
