@@ -2,7 +2,7 @@
 
 **状态：** 待用户复核  
 **阶段：** P0 / RF-3A、RF-4A 用户可操作验收  
-**适用 Runtime：** Codex-compatible Python Term、Goose、DeepSeek Harness
+**适用模式：** 聊天、Agent-步进执行、Agent-寻路、Agent-事件驱动
 
 ## 1. 结论
 
@@ -40,6 +40,19 @@ Composer
 
 多 Agent 编排仍由控制面持有执行图。当前批次不允许同一个尚未拆分的 Agent 节点在执行中途更换 Runtime；未来解决方案模板可以在编译阶段为不同节点分配不同 Runtime。
 
+### 2.3 四类用户模式与内部映射
+
+前端使用面向任务方式的名称，内部仍使用稳定 Runtime selector。模式名称不等于模型供应商，四类模式均可在其兼容范围内选择本地或云端模型。
+
+| 用户模式 | 内部执行路径 | 核心机制 | 主要适用任务 | 当前 P0 边界 |
+|---|---|---|---|---|
+| 聊天模式 | 现有 Conversation AgentRuntime / 兼容路径 | 连续对话、直接模型响应、低调度开销 | 问答、写作、快速分析 | 不进入显式 Host v2 Runtime 准入；用于兼容现有会话 |
+| Agent-步进执行模式（Codex Harness） | `python-term` / Codex-compatible Python Term | Term-Step 隔离、Work State、Checkpoint、工具副作用证据与断点恢复 | 编码、文件处理、需要逐步执行和恢复的任务 | 已具备最完整的 Tool/Workspace/Checkpoint 基线；不是直接嵌入官方 Codex 产品 |
+| Agent-寻路模式（Claude Harness） | `goose` / Goose 承载的 Claude-style 查询运行时 | 单一 Query 工作台、上下文预算、动态探索路径、Plan/Todo 与原链重试 | 目标不清晰、需要边探索边调整路线的复杂任务 | P0 先开放真实模型查询；Plan/Todo/Tool/Intervention 在后续 Goose Gate 开放，并非直接嵌入 Claude Code |
+| Agent-事件驱动模式（DeepSeek Harness） | `dsh` / pinned DeepSeek Harness | PromptSection 分段、Provider Adapter、AgentLoop/Session、事件流与 Checkpoint 投影 | 长流程、异步事件、可插拔工具管道和可追踪执行 | P0 开放原生 Session 模型循环；持久化 Tool bridge 在后续 Gate 开放 |
+
+四类模式的关键差异是执行控制方式，而不是模型能力高低：聊天模式以低延迟响应为主；步进模式以隔离和可恢复为主；寻路模式以动态规划和上下文调度为主；事件驱动模式以事件溯源和插件生命周期为主。
+
 ## 3. 准入与能力发布
 
 ### 3.1 开发准入证据
@@ -47,12 +60,14 @@ Composer
 新增统一的 `DEV_UNTRUSTED` Harness 准备流程。该流程在 Workbench 启动前运行，并完成：
 
 1. 验证锁定的 upstream revision、依赖锁、Host wrapper/sidecar 源码与实际构建产物。
-2. 分别执行 Python Term、Goose、DeepSeek Harness 的机器 Smoke。
+2. 分别执行 Python Term、Goose、DeepSeek Harness 的协议回归，并对每套 Runtime 至少执行一个真实模型端点验收。
 3. 按 Runtime 当前真实 `RuntimeCapabilitiesV2` 生成独立 Gate Receipt。
 4. 使用一次性 Ed25519 私钥签名；只发布公钥和签名证据，私钥不落盘。
 5. 原子发布开发环境；文件不完整、被修改或过期时 fail closed。
 
 应用启动只导入并验证这些外部证据，不自行充当 Gate 签发者。生产信任根与开发信任根继续隔离。
+
+真实端点必须是用户实际运行的 DeepSeek 云端 API、LM Studio 或其他本地兼容 API；进程内 mock、测试 fixture 或模拟 SSE 响应不能产生 Runtime GO。真实调用由用户显式触发，不在普通 CI 中自动消耗云端额度。API Key 只由 Vault 解析，验收证据只记录 Runtime、Provider、模型、时间、延迟、终态和输出摘要，不保存凭据。
 
 ### 3.2 能力诚实发布
 
@@ -108,12 +123,12 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 
 ## 5. 前端交互
 
-会话底部 Composer 保留 Provider/Model 选择，并把 Runtime 选择扩展为：
+会话底部 Composer 保留 Provider/Model 选择，并把运行模式选择扩展为：
 
-- 默认运行路径
-- Codex-compatible Python Term
-- Goose
-- DeepSeek Harness
+- 聊天模式
+- Agent-步进执行模式（Codex Harness）
+- Agent-寻路模式（Claude Harness）
+- Agent-事件驱动模式（DeepSeek Harness）
 
 选择行为：
 
@@ -143,7 +158,7 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 
 ## 7. 机器验收
 
-所有生产改动按测试驱动完成，至少覆盖：
+所有生产改动按测试驱动完成。mock 仅用于开发期单元测试、协议边界和故障注入，不得作为下列 Runtime GO 的真实调用证据。验收至少覆盖：
 
 1. **准入：** 三个 Runtime 独立 Gate；Build/能力/Proof 任一漂移即不可选择。
 2. **精确绑定：** 前端选择的 Runtime、Provider 与模型和最终 Provider 请求一致。
@@ -154,14 +169,15 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 7. **隔离：** Goose 失败不阻塞 DSH/Python，DSH 失败不阻塞 Goose/Python。
 8. **失败关闭：** 不兼容 Provider、Grant ACK 失败、source/build drift 均不得执行模型请求。
 9. **前端：** Runtime 下拉状态、禁用原因、运行状态和历史恢复均有 Playwright 验收。
+10. **真实端点：** Python Term、Goose、DeepSeek Harness 各自通过至少一个真实 DeepSeek 云端 API 或本地 API；请求必须经过正式 Vault/Grant/Host v2 链路。
 
-测试使用随机临时凭据和本地 mock Provider。P0/P1/P2 完成前不重复执行广泛安全扫描；本批只验证功能合同明确禁止的凭据载体与失败回退。
+开发期自动测试使用随机临时凭据和本地 mock Provider；最终 Gate 使用 Vault 中用户已配置的真实凭据或无需凭据的本地 API。P0/P1/P2 完成前不重复执行广泛安全扫描；本批只验证功能合同明确禁止的凭据载体与失败回退。
 
 ## 8. Gate 决策
 
 - Python Term 维持自身现有 Gate。
-- Goose 全部独立验收通过后可授予 `GO_GOOSE_QUERY_SMOKE`。
-- DeepSeek Harness 全部独立验收通过后可授予 `GO_DSH_PLUGIN_SMOKE`。
+- Goose 全部独立验收且至少一个真实端点通过后可授予 `GO_GOOSE_QUERY_SMOKE`。
+- DeepSeek Harness 全部独立验收且至少一个真实端点通过后可授予 `GO_DSH_PLUGIN_SMOKE`。
 - 任一单通道 GO 不等于 `GO_RUNTIME_FEDERATION`。
 - 只有共享合同、三通道、重启恢复与前端验收全部通过后，才单独评估 `GO_RUNTIME_FEDERATION`。
 
