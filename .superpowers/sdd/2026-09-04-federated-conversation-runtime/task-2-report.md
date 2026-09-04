@@ -417,3 +417,72 @@
 - 未运行仓库全量测试；执行了 Task 2 指定组合及 Broker/Coordinator/private transport
   全部相关回归，所有并发测试均有硬超时。
 - 仓库环境未安装 `ruff`；使用 `compileall` 和 `git diff --check` 替代。
+
+---
+
+## Fix round 4/5：重复 caller cancellation 的确定性清理
+
+### 交付变更
+
+- Coordinator 捕获首次 caller `CancelledError` 后创建唯一、独立的 Grant cleanup task；
+  cleanup 依次取消并 await delivery child、收容精确 lease、再以 `query_cancelled` 撤销
+  Grant。
+- consumer 通过 `asyncio.shield()` 循环等待 cleanup task 确定结束；cleanup 期间后续
+  `consumer.cancel()` 只被等待循环吸收，不会传播到 delivery gather、containment 或
+  revoke。cleanup 完成后使用 bare `raise` 原样传播首次 caller cancellation。
+- 重复取消仍只触发一次 exact containment；外层通用 `aclose()` 保持既有幂等语义。
+  用户 pre-query cancel 和 ACK 后 Host cancel 路径未改。
+
+### Fix round 4 RED
+
+1. 新增精确回归：Provider Grant repository 已进入 `delivering` 后第一次取消 consumer，
+   等待 cleanup 进入受控 containment，再次取消 consumer；测试以 1 秒硬边界等待结束，
+   并检查 delivery child、lease containment 与 Grant revocation。
+2. `.venv/bin/python -m pytest tests/unit/runtime/provider_grants/test_coordinator.py::test_repeated_caller_cancel_cannot_interrupt_delivery_cleanup -q -o faulthandler_timeout=5`
+   - `1 failed in 0.96s`。
+   - 旧实现失败于 `exact_lease_contained is True`：第二次取消中断了 cleanup，未完成精确
+     containment；测试 finally 释放所有 blocker，未给 pytest teardown 留下 orphan task。
+
+### Fix round 4 GREEN
+
+1. 同一重复取消精确回归：`1 passed in 0.90s`。
+2. Coordinator 完整单元文件（含单次与双次 caller cancel）：`5 passed in 4.11s`。
+3. Grant-stage 用户取消与 ACK 后 Host cancel 真实集成：`2 passed in 2.55s`。
+4. brief 指定 executor、Conversation Worker、真实 federated Worker、Supervisor 集成与
+   Coordinator 组合：`56 passed in 11.54s`。
+5. Broker、Coordinator 与 private transport cancellation 回归：
+   `37 passed in 24.96s`。
+
+### Fix round 4 最终新鲜验证
+
+1. brief 指定 executor、Conversation Worker、真实 federated Worker、Supervisor 集成与
+   Coordinator 组合：`56 passed in 11.73s`。
+2. Broker、Coordinator 与 private transport cancellation 回归：
+   `37 passed in 24.86s`。
+3. 修改文件 `compileall`、`git diff --check` 与敏感信息 diff 扫描：退出码 0，无发现。
+
+### Fix round 4 文件说明
+
+- `mvp/src/workbench/runtime/provider_grants/coordinator.py`：在既有 child delivery 所有权
+  边界增加独立 cleanup task 与可重复取消的 shield 等待，不修改 Supervisor、Broker
+  状态机、Gate、Conversation 或 UI。
+- `mvp/tests/unit/runtime/provider_grants/test_coordinator.py`：增加受控 containment fixture
+  和双重 caller cancellation 回归；测试直接观察真实 Grant repository 状态。
+
+### Fix round 4 自审
+
+- cleanup task 在首次 caller cancellation 分支只创建一次；任意后续取消仅重新进入
+  shield 等待循环，不会创建第二个 containment/revoke 流程。
+- cleanup task 完成前 consumer 不会结束；因此 delivery child 已停止、exact lease 已
+  contained、Grant 已 revoked 后才向上重新抛出首次 `CancelledError`。
+- cleanup 顺序仍为 cancel delivery → await delivery → contain exact lease → revoke bound
+  Grant；未放宽 Grant ACK、authority receipt、Runtime/build/generation 或 assignment 校验。
+- Grant ACK 前仍不公开 Runtime event；单次 caller cancel、用户 pre-query cancel、ACK 后
+  Host cancel、唯一 terminal 与 Python Term 专属 executor 合同均保持原状。
+
+### Fix round 4 Concerns
+
+- 未运行仓库全量测试；执行了 Task 2 brief 指定组合及本次修改边界的全部
+  Broker/Coordinator/private transport cancellation 回归。
+- 所有新增并发等待均有测试硬超时；生产 cleanup 故意等待精确 containment/revoke 完成，
+  不以超时换取可能的 child/Grant 泄漏。

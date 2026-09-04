@@ -157,6 +157,17 @@ class FederatedRuntimeCoordinator:
                     {delivery_task, cancel_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+            except asyncio.CancelledError:
+                cleanup_task = asyncio.create_task(
+                    self._cancel_delivery_and_contain(
+                        delivery_task,
+                        lease=lease,
+                        offer=offer,
+                        target=target,
+                    )
+                )
+                await _await_cleanup_after_cancellation(cleanup_task)
+                raise
             except BaseException:
                 await self._cancel_delivery_and_contain(
                     delivery_task,
@@ -215,6 +226,17 @@ class FederatedRuntimeCoordinator:
 def _pre_query_cancel_requested(lease: FederatedRuntimeLease) -> bool:
     requested = getattr(lease, "pre_query_cancel_requested", None)
     return bool(callable(requested) and requested())
+
+
+async def _await_cleanup_after_cancellation(
+    cleanup_task: asyncio.Task[None],
+) -> None:
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    cleanup_task.result()
 
 
 __all__ = [

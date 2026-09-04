@@ -163,6 +163,24 @@ class _Lease:
         yield runtime_event("runtime.status", payload={"status": "completed"})
 
 
+class _BlockingContainmentLease(_Lease):
+    def __init__(
+        self,
+        target: ProviderGrantTarget,
+        delivery: _Delivery,
+        authority: _Authority,
+        order: list[str],
+    ) -> None:
+        super().__init__(target, delivery, authority, order)
+        self.containment_started = asyncio.Event()
+        self.release_containment = asyncio.Event()
+
+    async def contain_provider_grant(self, target, *, reason):
+        self.containment_started.set()
+        await self.release_containment.wait()
+        return await super().contain_provider_grant(target, reason=reason)
+
+
 def _runtime_input() -> RuntimeQueryInputV2:
     messages = (
         RuntimeMessageInputV2(
@@ -319,6 +337,60 @@ async def test_caller_cancel_stops_delivery_and_contains_before_propagating(
         delivery.release.set()
         await asyncio.wait_for(delivery.stopped.wait(), timeout=1.0)
         await asyncio.sleep(0)
+
+    assert delivery_stopped is True
+    assert lease.closed is True
+    assert exact_lease_contained is True
+    assert grant.state == "revoked"
+    assert grant.reason == "query_cancelled"
+
+
+@pytest.mark.asyncio
+async def test_repeated_caller_cancel_cannot_interrupt_delivery_cleanup(
+    tmp_path: Path,
+) -> None:
+    broker, original_lease, envelope, runtime_input, database, order = _fixture(
+        tmp_path
+    )
+    delivery = _BlockingDelivery(order)
+    lease = _BlockingContainmentLease(
+        original_lease.target,
+        delivery,
+        original_lease.authority,
+        order,
+    )
+    coordinator = FederatedRuntimeCoordinator(broker, clock=lambda: 102.0)
+
+    async def consume() -> None:
+        async for _ in coordinator.run_query(
+            lease, envelope, runtime_input=runtime_input
+        ):
+            pass
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.wait_for(delivery.entered.wait(), timeout=1.0)
+    assert delivery.binding is not None
+    grant_id = delivery.binding.grant_id
+    repository = ProviderGrantRepository(database)
+    assert repository.get(grant_id).state == "delivering"
+
+    consumer.cancel("first caller cancellation")
+    await asyncio.wait_for(lease.containment_started.wait(), timeout=1.0)
+    consumer.cancel("second caller cancellation")
+    await asyncio.sleep(0)
+    lease.release_containment.set()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(consumer), timeout=1.0)
+        delivery_stopped = delivery.stopped.is_set()
+        exact_lease_contained = order.count("contain") == 1
+        grant = repository.get(grant_id)
+    finally:
+        lease.release_containment.set()
+        delivery.release.set()
+        await asyncio.wait_for(delivery.stopped.wait(), timeout=1.0)
+        await asyncio.gather(consumer, return_exceptions=True)
 
     assert delivery_stopped is True
     assert lease.closed is True
