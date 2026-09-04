@@ -699,6 +699,18 @@ class AssignmentRepository:
             ).fetchone()
         return None if row is None else self._assignment_from_row(row)
 
+    def require(self, command_id: str) -> RuntimeAssignment:
+        """Load the one authoritative assignment bound to a global command id."""
+        _require_text(command_id, "command_id")
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_assignments WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(command_id)
+        return self._assignment_from_row(row)
+
     def get_assignment_by_digest(
         self, assignment_digest: str
     ) -> RuntimeAssignment | None:

@@ -55,6 +55,14 @@ from workbench.runtime.conversation_execution import (
     RuntimeConversationRoute,
     read_runtime_execution,
 )
+from workbench.runtime.federated_conversation import (
+    FederatedConversationExecutionError,
+    FederatedConversationExecutor,
+    FederatedConversationProtocolError,
+    FederatedConversationSnapshotError,
+    PublicFederatedFailure,
+    project_runtime_event,
+)
 from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeAdmissionBlocked,
     RuntimeAdmissionConflict,
@@ -218,6 +226,22 @@ class PythonTermAdmissionConflict(RuntimeError):
         super().__init__(self.public_detail)
 
 
+_FEDERATED_TERMINAL_OUTCOMES = frozenset(
+    {
+        "completed",
+        "runtime_unavailable",
+        "runtime_admission_blocked",
+        "runtime_selection_conflict",
+        "provider_unavailable",
+        "provider_incompatible",
+        "provider_grant_failed",
+        "runtime_failed",
+        "runtime_cancelled",
+        "reconciliation_required",
+    }
+)
+
+
 @dataclass(frozen=True)
 class PythonTermConversationAdmission:
     """Authoritative, frozen inputs for the narrow v2 control-plane seam."""
@@ -332,6 +356,7 @@ class ConversationAPI:
     runtime_router: RuntimeConversationRouter | None = None
     python_term_router: PythonTermConversationRouter | None = None
     python_term_executor: PythonTermConversationExecutor | None = None
+    federated_executor: FederatedConversationExecutor | None = None
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
 
     def create_session(self, session_id: str) -> ConversationSession:
@@ -859,7 +884,10 @@ class ConversationAPI:
             if runner_mode not in {"python", "engine_host", "python_term", "runtime"}:
                 raise TurnSnapshotCorruption("invalid persisted runner mode")
             if runner_mode == "runtime":
-                raise RuntimeAdmissionUnavailable()
+                await self._process_federated_runtime_turn(
+                    turn, reservation_id=reservation_id
+                )
+                return
             if runner_mode == "python_term":
                 runtime_id = turn.state.get("runtime_id")
                 runtime_build_id = turn.state.get("runtime_build_id")
@@ -1171,6 +1199,257 @@ class ConversationAPI:
                 state=terminal_state,
                 result=projected,
             )
+
+    async def _process_federated_runtime_turn(
+        self, turn: TurnStatus, *, reservation_id: str
+    ) -> None:
+        runtime_id = turn.state.get("runtime_id")
+        runtime_build_id = turn.state.get("runtime_build_id")
+        runtime_command_id = turn.state.get("runtime_command_id")
+        runtime_model = turn.state.get("runtime_model")
+        snapshot = read_runtime_execution(turn.state)
+        if self.federated_executor is None:
+            raise RuntimeAdmissionUnavailable()
+        if (
+            not isinstance(runtime_id, str)
+            or not runtime_id
+            or runtime_id == "python-term"
+            or not isinstance(runtime_build_id, str)
+            or not runtime_build_id
+            or runtime_command_id
+            != python_term_command_id(turn.session_id, turn.command_id)
+            or runtime_model != turn.model
+            or not isinstance(snapshot, dict)
+        ):
+            raise TurnSnapshotCorruption("invalid federated runtime pin")
+
+        projected_cursor = turn.state.get("runtime_projected_cursor", 0)
+        accumulated = turn.state.get("runtime_projected_result", [])
+        assistant_message = turn.state.get("runtime_assistant_message")
+        terminal_outcome = turn.state.get("runtime_terminal_outcome")
+        if (
+            isinstance(projected_cursor, bool)
+            or not isinstance(projected_cursor, int)
+            or projected_cursor < 0
+            or not isinstance(accumulated, list)
+            or not all(isinstance(item, dict) for item in accumulated)
+            or (
+                assistant_message is not None
+                and (not isinstance(assistant_message, str) or not assistant_message)
+            )
+            or (
+                terminal_outcome is not None
+                and terminal_outcome not in _FEDERATED_TERMINAL_OUTCOMES
+            )
+        ):
+            raise TurnSnapshotCorruption("invalid federated runtime projection state")
+        accumulated = [dict(item) for item in accumulated]
+        if terminal_outcome is not None:
+            self._finish_federated_runtime_turn(
+                turn,
+                reservation_id=reservation_id,
+                projected_cursor=projected_cursor,
+                accumulated=accumulated,
+                assistant_message=assistant_message,
+                outcome=terminal_outcome,
+            )
+            return
+        terminal_status: str | None = None
+        try:
+            async for runtime_event in self.federated_executor.execute(snapshot):
+                projection = project_runtime_event(
+                    runtime_event, after_cursor=projected_cursor
+                )
+                if projection is None:
+                    continue
+                if terminal_status is not None:
+                    raise FederatedConversationProtocolError(
+                        "runtime event appeared after terminal"
+                    )
+                for domain_event in projection.domain_events:
+                    appended = self._append(
+                        turn.session_id,
+                        domain_event.event_type,
+                        dict(domain_event.payload),
+                        f"{turn.command_id}:runtime:{projection.cursor}",
+                        ordinal=domain_event.sequence,
+                        causation_id=reservation_id,
+                    )
+                    if appended:
+                        accumulated.append(appended)
+                if projection.assistant_message is not None:
+                    if (
+                        assistant_message is not None
+                        and assistant_message != projection.assistant_message
+                    ):
+                        raise FederatedConversationProtocolError(
+                            "runtime emitted conflicting assistant messages"
+                        )
+                    assistant_message = projection.assistant_message
+                    persisted_message = self.conversations.append_message(
+                        ConversationMessage(
+                            session_id=turn.session_id,
+                            command_id=f"{turn.command_id}:assistant",
+                            role="assistant",
+                            content=assistant_message,
+                        )
+                    )
+                    if persisted_message.content != assistant_message:
+                        raise TurnSnapshotCorruption(
+                            "persisted assistant message identity changed"
+                        )
+                terminal_status = projection.terminal_status or terminal_status
+                projected_cursor = projection.cursor
+                projected_state = dict(turn.state)
+                projected_state.update(
+                    {
+                        "runtime_projected_cursor": projected_cursor,
+                        "runtime_projected_result": accumulated,
+                        **(
+                            {"runtime_assistant_message": assistant_message}
+                            if assistant_message is not None
+                            else {}
+                        ),
+                    }
+                )
+                self.conversations.save_turn_state(
+                    turn.session_id,
+                    turn.command_id,
+                    owner_id=turn.owner_id or "",
+                    state=projected_state,
+                )
+        except asyncio.CancelledError:
+            raise
+        except FederatedConversationSnapshotError as error:
+            raise TurnSnapshotCorruption("invalid federated runtime snapshot") from error
+        except FederatedConversationExecutionError as error:
+            self._finish_federated_runtime_turn(
+                turn,
+                reservation_id=reservation_id,
+                projected_cursor=projected_cursor,
+                accumulated=accumulated,
+                assistant_message=assistant_message,
+                outcome=error.category,
+            )
+            return
+        except FederatedConversationProtocolError:
+            self._finish_federated_runtime_turn(
+                turn,
+                reservation_id=reservation_id,
+                projected_cursor=projected_cursor,
+                accumulated=accumulated,
+                assistant_message=assistant_message,
+                outcome="runtime_failed",
+            )
+            return
+
+        outcome: PublicFederatedFailure | Literal["completed"]
+        if terminal_status == "completed":
+            outcome = "completed"
+        elif terminal_status == "failed":
+            outcome = "runtime_failed"
+        elif terminal_status == "cancelled":
+            outcome = "runtime_cancelled"
+        else:
+            outcome = "runtime_failed"
+        self._finish_federated_runtime_turn(
+            turn,
+            reservation_id=reservation_id,
+            projected_cursor=projected_cursor,
+            accumulated=accumulated,
+            assistant_message=assistant_message,
+            outcome=outcome,
+        )
+
+    def _finish_federated_runtime_turn(
+        self,
+        turn: TurnStatus,
+        *,
+        reservation_id: str,
+        projected_cursor: int,
+        accumulated: list[dict[str, Any]],
+        assistant_message: str | None,
+        outcome: PublicFederatedFailure | Literal["completed"],
+    ) -> None:
+        completed = outcome == "completed"
+        turn_status = (
+            "completed"
+            if completed
+            else (
+                "reconciliation_required"
+                if outcome == "reconciliation_required"
+                else "failed"
+            )
+        )
+        phase = "cancelled" if outcome == "runtime_cancelled" else turn_status
+        terminal_state = dict(turn.state)
+        terminal_state.update(
+            {
+                "runtime_projected_cursor": projected_cursor,
+                "runtime_projected_result": accumulated,
+                "runtime_terminal_outcome": outcome,
+                **(
+                    {"runtime_assistant_message": assistant_message}
+                    if assistant_message is not None
+                    else {}
+                ),
+            }
+        )
+        self.conversations.save_turn_state(
+            turn.session_id,
+            turn.command_id,
+            owner_id=turn.owner_id or "",
+            state=terminal_state,
+        )
+        terminal_payload: dict[str, Any] = {
+            "command_id": turn.command_id,
+            **(
+                {"status": "completed"}
+                if completed
+                else {
+                    "reason": outcome,
+                    **(
+                        {"response_status": "cancelled"}
+                        if outcome == "runtime_cancelled"
+                        else {}
+                    ),
+                }
+            ),
+        }
+        terminal = self._append(
+            turn.session_id,
+            (
+                "conversation.turn.finished"
+                if completed
+                else "conversation.turn.failed"
+            ),
+            terminal_payload,
+            f"{turn.command_id}:runtime:terminal",
+            ordinal=projected_cursor + 1,
+            causation_id=reservation_id,
+        )
+        if terminal:
+            accumulated.append(terminal)
+        self.conversations.finish_turn(
+            turn.session_id,
+            turn.command_id,
+            owner_id=turn.owner_id or "",
+            status=turn_status,
+            state={
+                "phase": phase,
+                "events": [],
+                "runtime_projected_cursor": projected_cursor,
+                "runtime_projected_result": accumulated,
+                "runtime_terminal_outcome": outcome,
+                **(
+                    {"runtime_assistant_message": assistant_message}
+                    if assistant_message is not None
+                    else {}
+                ),
+                **({"reason": outcome} if not completed else {}),
+            },
+            result=accumulated,
+        )
 
     async def _process_sequential_turn(
         self, turn: TurnStatus, orchestration: dict[str, Any]

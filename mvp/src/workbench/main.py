@@ -77,6 +77,7 @@ from workbench.runtime.conversation_execution import (
     build_runtime_execution_snapshot,
     build_runtime_query_input,
 )
+from workbench.runtime.federated_conversation import FederatedConversationExecutor
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
     PythonTermDevelopmentTrust,
@@ -84,7 +85,10 @@ from workbench.runtime.python_term.gate import (
     compose_python_term_production,
 )
 from workbench.runtime.python_term.repository import PythonTermRepository
-from workbench.runtime.provider_grants import ProviderGrantBroker
+from workbench.runtime.provider_grants import (
+    FederatedRuntimeCoordinator,
+    ProviderGrantBroker,
+)
 from workbench.settings import RuntimeProcessConfig, WorkbenchSettings
 from workbench.workflow.repository import WorkflowRepository
 from workbench.orchestration.development_execution import DevelopmentExecutionAdapter
@@ -631,23 +635,6 @@ def build_app(
         if resolved.engine_host_v2_enabled
         else None
     )
-    sidecar_supervisor = (
-        SidecarSupervisor(
-            runtimes=resolved.engine_host_v2_runtimes,
-            registry=runtime_registry_v2,
-            assignments=AssignmentRepository.production(resolved.database),
-            runtime_dir=resolved.runtime_dir,
-            app_instance_id=service_instance_id or str(uuid4()),
-        )
-        if runtime_registry_v2 is not None and resolved.engine_host_v2_runtimes
-        else None
-    )
-    provider_grant_broker = ProviderGrantBroker(
-        database=resolved.database,
-        providers=providers,
-        vault=vault,
-        authority=sidecar_supervisor,
-    )
     python_term_runtime = None
     python_term_executor = None
     python_term_gate_proof = None
@@ -717,6 +704,37 @@ def build_app(
         if runtime_admission_coordinator is not None
         else None
     )
+    runtime_assignments = (
+        runtime_admission_coordinator.assignments
+        if runtime_admission_coordinator is not None
+        else AssignmentRepository.production(resolved.database)
+    )
+    sidecar_supervisor = (
+        SidecarSupervisor(
+            runtimes=resolved.engine_host_v2_runtimes,
+            registry=runtime_registry_v2,
+            assignments=runtime_assignments,
+            runtime_dir=resolved.runtime_dir,
+            app_instance_id=service_instance_id or str(uuid4()),
+        )
+        if runtime_registry_v2 is not None and resolved.engine_host_v2_runtimes
+        else None
+    )
+    provider_grant_broker = ProviderGrantBroker(
+        database=resolved.database,
+        providers=providers,
+        vault=vault,
+        authority=sidecar_supervisor,
+    )
+    federated_executor = (
+        FederatedConversationExecutor(
+            assignments=runtime_assignments,
+            supervisor=sidecar_supervisor,
+            coordinator=FederatedRuntimeCoordinator(provider_grant_broker),
+        )
+        if sidecar_supervisor is not None
+        else None
+    )
     runtime_query_router = RuntimeQueryRouter(
         runtime_registry_v2,
         _gate_proof=python_term_gate_proof,
@@ -739,6 +757,7 @@ def build_app(
             development_processor=DurableDevelopmentProcessor(database=resolved.database, port=DevelopmentExecutionAdapter(selected_runner), worktree_root=resolved.runtime_dir / "development-worktrees"),
             runtime_router=runtime_query_router,
             python_term_executor=python_term_executor,
+            federated_executor=federated_executor,
         )
     )
     include_router = getattr(app, "include_router", None)

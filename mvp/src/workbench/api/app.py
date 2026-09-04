@@ -45,6 +45,7 @@ from workbench.orchestration.research_worker import ResearchTaskWorker
 from workbench.orchestration.development_jobs import DevelopmentJobRepository
 from workbench.orchestration.development_worker import DevelopmentTaskWorker
 from workbench.providers.repository import ProviderRepository
+from workbench.runtime.federated_conversation import FederatedConversationExecutor
 from workbench.workflow.engine import (
     PauseRun,
     ResumeRun,
@@ -79,6 +80,7 @@ class AppSettings:
     runtime_router: RuntimeConversationRouter | None = None
     python_term_router: PythonTermConversationRouter | None = None
     python_term_executor: PythonTermConversationExecutor | None = None
+    federated_executor: FederatedConversationExecutor | None = None
 
 
 def _require_key(value: str | None) -> str:
@@ -128,6 +130,7 @@ def create_app(settings: AppSettings) -> FastAPI:
         runtime_router=settings.runtime_router,
         python_term_router=settings.python_term_router,
         python_term_executor=settings.python_term_executor,
+        federated_executor=settings.federated_executor,
     )
     conversation_worker = ConversationTaskWorker(
         conversation_api.conversations, conversation_api

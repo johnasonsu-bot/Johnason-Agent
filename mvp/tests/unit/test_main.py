@@ -191,6 +191,7 @@ def test_build_app_consumes_v2_runtime_config_only_when_enabled(
     main.build_app(disabled, runner=NoopRunner())
     assert created == []
     assert captured_settings[-1].sidecar_lifecycle is None
+    assert captured_settings[-1].federated_executor is None
 
     enabled = WorkbenchSettings(
         runtime_dir=tmp_path / "enabled",
@@ -205,6 +206,7 @@ def test_build_app_consumes_v2_runtime_config_only_when_enabled(
     assert created[0]["runtimes"] == (runtime,)
     assert created[0]["app_instance_id"] == "app-instance-1"
     assert captured_settings[-1].sidecar_lifecycle is lifecycle
+    assert captured_settings[-1].federated_executor is not None
     assert app.state.sidecar_supervisor is lifecycle
 
 

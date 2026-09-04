@@ -5,11 +5,29 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 import pytest
 
+from tests.fixtures.host_v2 import run_envelope, runtime_event
+from workbench.api.conversations import (
+    ConversationAPI,
+    RuntimeConversationRoute,
+    python_term_command_id,
+)
 from workbench.api.app import AppSettings, create_app
 from workbench.conversations.repository import ConversationRepository
 from workbench.conversations.repository import TurnSnapshotCorruption
 from workbench.conversations.worker import ConversationTaskWorker
+from workbench.models.profiles import ProviderProfileRecord
+from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.client import HostExecutionUnknown
+from workbench.runtime.engine_host.v2.contracts import (
+    RuntimeMessageInputV2,
+    RuntimePromptSectionInputV2,
+    RuntimeQueryInputV2,
+    canonical_runtime_input_digest,
+)
+from workbench.runtime.federated_conversation import (
+    FederatedConversationExecutionError,
+)
+from workbench.workflow.event_store import EventStore
 
 
 def _enqueue(repository: ConversationRepository, command_id: str = "turn-1") -> None:
@@ -263,3 +281,359 @@ def test_worker_host_retry_waits_for_a_new_generation(tmp_path: Path) -> None:
         ).claim_next_turn(owner_id="new-generation")
         is not None
     )
+
+
+def _federated_snapshot(runtime_id: str, command_id: str) -> dict[str, object]:
+    messages = (
+        RuntimeMessageInputV2(
+            message_id="message-1", role="user", content="federated hello"
+        ),
+    )
+    prompt_sections = (
+        RuntimePromptSectionInputV2(
+            section_id="section-1", order=0, content="pinned instructions"
+        ),
+    )
+    runtime_input = RuntimeQueryInputV2(
+        messages=messages,
+        message_snapshot_digest=canonical_runtime_input_digest(messages),
+        context_items=(),
+        context_snapshot_digest=canonical_runtime_input_digest(()),
+        prompt_sections=prompt_sections,
+        prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
+    )
+    envelope = run_envelope(
+        runtime_id=runtime_id,
+        command_id=command_id,
+        overrides={
+            "message_snapshot_digest": runtime_input.message_snapshot_digest,
+            "context.snapshot_digest": runtime_input.context_snapshot_digest,
+            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+        },
+    )
+    return {
+        "selector": runtime_id,
+        "runtime_id": runtime_id,
+        "build_id": envelope.runtime.build_id,
+        "envelope": envelope.model_dump(mode="json"),
+        "runtime_input": runtime_input.model_dump(mode="json"),
+    }
+
+
+class _FederatedRouter:
+    def route_conversation_query(self, *, selector, admission):
+        command_id = python_term_command_id(admission.session_id, admission.command_id)
+        return RuntimeConversationRoute(
+            runtime_id=selector,
+            build_id=f"{selector}:test",
+            runtime_command_id=command_id,
+            execution_snapshot=_federated_snapshot(selector, command_id),
+        )
+
+
+class _FederatedExecutor:
+    def __init__(self, *, failure: str | None = None) -> None:
+        self.failure = failure
+
+    async def execute(self, snapshot):
+        if self.failure is not None:
+            raise FederatedConversationExecutionError(self.failure)
+        yield runtime_event(
+            "runtime.status", cursor=1, payload={"status": "running"}
+        )
+        yield runtime_event(
+            "assistant.delta", cursor=2, payload={"text": "hello "}
+        )
+        yield runtime_event(
+            "assistant.message", cursor=3, payload={"content": "hello runtime"}
+        )
+        yield runtime_event(
+            "runtime.status", cursor=4, payload={"status": "completed"}
+        )
+
+
+class _TerminalFederatedExecutor:
+    def __init__(self, status: str) -> None:
+        self.status = status
+
+    async def execute(self, snapshot):
+        del snapshot
+        yield runtime_event(
+            "runtime.status", cursor=1, payload={"status": "running"}
+        )
+        yield runtime_event(
+            "runtime.status", cursor=2, payload={"status": self.status}
+        )
+
+
+class _IsolatedFederatedExecutor:
+    async def execute(self, snapshot):
+        status = "failed" if snapshot["runtime_id"] == "goose" else "completed"
+        yield runtime_event(
+            "runtime.status", cursor=1, payload={"status": "running"}
+        )
+        yield runtime_event(
+            "runtime.status", cursor=2, payload={"status": status}
+        )
+
+
+class _ForbiddenFederatedExecutor:
+    def __init__(self) -> None:
+        self.called = False
+
+    async def execute(self, snapshot):
+        del snapshot
+        self.called = True
+        raise AssertionError("durable terminal projection must not rerun the runtime")
+        yield
+
+
+class _NoopRunner:
+    async def run_turn(self, _command):
+        if False:
+            yield None
+
+
+def _federated_api(
+    database: Path, executor: _FederatedExecutor
+) -> tuple[ConversationAPI, ConversationRepository]:
+    repository = ConversationRepository(database)
+    providers = ProviderRepository(database)
+    providers.save(
+        ProviderProfileRecord(
+            id="provider-1",
+            name="Provider",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234",
+            model_aliases={"default": "configured-model"},
+        )
+    )
+    api = ConversationAPI(
+        conversations=repository,
+        events=EventStore(database),
+        runner=_NoopRunner(),
+        providers=providers,
+        runtime_router=_FederatedRouter(),
+        federated_executor=executor,
+    )
+    api.create_session("session-1")
+    return api, repository
+
+
+@pytest.mark.asyncio
+async def test_worker_projects_federated_runtime_and_persists_assistant_message(
+    tmp_path: Path,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "federated-worker.sqlite", _FederatedExecutor()
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    claimed = repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    assert claimed is not None
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None
+    assert turn.status == "completed"
+    assert turn.state["runtime_projected_cursor"] == 4
+    assert [message.content for message in repository.list_messages("session-1")] == [
+        "federated hello",
+        "hello runtime",
+    ]
+    event_types = [
+        event.event_type
+        for event in api.events.read_stream("run:session-1")
+        if event.causation_id == api._reservation_event_id("session-1", "turn-1")
+    ]
+    assert event_types[-1] == "conversation.turn.finished"
+    assert event_types.count("conversation.turn.finished") == 1
+
+
+@pytest.mark.asyncio
+async def test_grant_ack_failure_has_stable_terminal_without_runtime_event(
+    tmp_path: Path,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "grant-failure.sqlite",
+        _FederatedExecutor(failure="provider_grant_failed"),
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="dsh",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30) is not None
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None
+    assert turn.status == "failed"
+    assert turn.state["reason"] == "provider_grant_failed"
+    events = api.events.read_stream("run:session-1")
+    assert not any(event.event_type.startswith("runtime.") for event in events)
+    terminal = [
+        event for event in events if event.event_type == "conversation.turn.failed"
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].payload["reason"] == "provider_grant_failed"
+
+
+@pytest.mark.parametrize(
+    ("runtime_status", "turn_status", "phase", "reason", "response_status"),
+    [
+        ("failed", "failed", "failed", "runtime_failed", "failed"),
+        ("cancelled", "failed", "cancelled", "runtime_cancelled", "cancelled"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_worker_seals_failed_and_cancelled_runtime_once(
+    tmp_path: Path,
+    runtime_status: str,
+    turn_status: str,
+    phase: str,
+    reason: str,
+    response_status: str,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / f"{runtime_status}.sqlite",
+        _TerminalFederatedExecutor(runtime_status),
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    assert repository.claim_next_turn(owner_id="worker-1", lease_seconds=30) is not None
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None
+    assert turn.status == turn_status
+    assert turn.state["phase"] == phase
+    assert turn.state["reason"] == reason
+    response = api._terminal_response(
+        "session-1",
+        "turn-1",
+        api._reservation_event_id("session-1", "turn-1"),
+    )
+    assert response is not None
+    assert response["status"] == response_status
+    assert sum(
+        event.event_type == "conversation.turn.failed"
+        for event in api.events.read_stream("run:session-1")
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_runtime_does_not_modify_other_runtime_or_python_turn(
+    tmp_path: Path,
+) -> None:
+    api, repository = _federated_api(
+        tmp_path / "runtime-isolation.sqlite",
+        _IsolatedFederatedExecutor(),
+    )
+    api.create_session("session-2")
+    api.create_session("session-3")
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="goose-turn",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    await api.enqueue_message(
+        session_id="session-2",
+        command_id="dsh-turn",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="dsh",
+    )
+    for owner in ("worker-1", "worker-2"):
+        claimed = repository.claim_next_turn(owner_id=owner, lease_seconds=30)
+        assert claimed is not None
+        await api.process_queued_turn(claimed.session_id, claimed.command_id)
+    repository.enqueue_turn(
+        session_id="session-3",
+        command_id="python-turn",
+        run_id="run-3",
+        provider_id="provider-1",
+        model="configured-model",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "runner_mode": "python",
+            "messages": [],
+            "events": [],
+        },
+    )
+
+    goose = repository.load_turn_status("session-1", "goose-turn")
+    dsh = repository.load_turn_status("session-2", "dsh-turn")
+    python = repository.load_turn_status("session-3", "python-turn")
+    assert goose is not None and goose.status == "failed"
+    assert goose.state["reason"] == "runtime_failed"
+    assert dsh is not None and dsh.status == "completed"
+    assert python is not None and python.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_worker_recovers_durable_runtime_terminal_without_reexecution(
+    tmp_path: Path,
+) -> None:
+    executor = _ForbiddenFederatedExecutor()
+    api, repository = _federated_api(
+        tmp_path / "runtime-terminal-recovery.sqlite",
+        executor,
+    )
+    await api.enqueue_message(
+        session_id="session-1",
+        command_id="turn-1",
+        content="federated hello",
+        model="default",
+        provider_id="provider-1",
+        runtime="goose",
+    )
+    claimed = repository.claim_next_turn(owner_id="worker-1", lease_seconds=30)
+    assert claimed is not None
+    recovered_state = dict(claimed.state)
+    recovered_state.update(
+        {
+            "runtime_projected_cursor": 4,
+            "runtime_projected_result": [],
+            "runtime_terminal_outcome": "completed",
+        }
+    )
+    repository.save_turn_state(
+        "session-1",
+        "turn-1",
+        owner_id="worker-1",
+        state=recovered_state,
+    )
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    turn = repository.load_turn_status("session-1", "turn-1")
+    assert turn is not None and turn.status == "completed"
+    assert executor.called is False
+    assert sum(
+        event.event_type == "conversation.turn.finished"
+        for event in api.events.read_stream("run:session-1")
+    ) == 1
