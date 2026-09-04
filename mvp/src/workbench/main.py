@@ -24,7 +24,6 @@ from workbench.api.app import AppSettings, create_app
 from workbench.api.conversations import (
     PythonTermAdmissionConflict,
     PythonTermConversationAdmission,
-    PythonTermConversationRoute,
     PythonTermRuntimeUnavailable,
     python_term_command_id,
 )
@@ -72,6 +71,12 @@ from workbench.runtime.engine_host.v2.contracts import (
     QueryCommandV2,
     RunEnvelopeV2,
     ToolManifestEntryV2,
+    canonical_runtime_input_digest,
+)
+from workbench.runtime.conversation_execution import (
+    RuntimeConversationRoute,
+    build_runtime_execution_snapshot,
+    runtime_input_messages,
 )
 from workbench.runtime.python_term import PythonTermRuntime
 from workbench.runtime.python_term.gate import (
@@ -139,7 +144,7 @@ class RuntimeQueryRouter:
         *,
         selector: str = "python-term",
         admission: PythonTermConversationAdmission,
-    ) -> PythonTermConversationRoute:
+    ) -> RuntimeConversationRoute:
         """Resolve one catalog selector before creating any Conversation turn."""
         if self._registry is None:
             if selector == "python-term":
@@ -184,13 +189,11 @@ class RuntimeQueryRouter:
             # registration, gate, provider, or validation detail crosses this
             # request boundary.
             raise PythonTermRuntimeUnavailable() from None
-        if selected.runtime_id != "python-term":
-            raise RuntimeAdmissionUnavailable()
-        return PythonTermConversationRoute(
+        return RuntimeConversationRoute(
             runtime_id=selected.runtime_id,
             build_id=selected.build_id,
             runtime_command_id=admission.runtime_command_id,
-            execution_snapshot=self._conversation_execution_snapshot(
+            execution_snapshot=build_runtime_execution_snapshot(
                 admission, command, envelope
             ),
         )
@@ -230,88 +233,6 @@ class RuntimeQueryRouter:
             capabilities=entry.required_capabilities,
             command_id=None,
         )
-
-    def _conversation_execution_snapshot(
-        self,
-        admission: PythonTermConversationAdmission,
-        command: QueryCommandV2,
-        envelope: RunEnvelopeV2,
-    ) -> dict[str, object]:
-        """Persist only the frozen, secret-free inputs required by the worker."""
-        profiles = admission.agent_profiles
-        if len(profiles) == 1:
-            profile = profiles[0]
-            agents = (
-                {
-                    "agent_id": profile.agent_id,
-                    "name": profile.display_name,
-                    "provider_ref": f"provider-profile:{admission.provider.id}",
-                    "model": admission.model,
-                    "instructions": None,
-                },
-            )
-        else:
-            agents = (
-                {
-                    "agent_id": envelope.agent_id,
-                    "name": "Conversation Agent",
-                    "provider_ref": f"provider-profile:{admission.provider.id}",
-                    "model": admission.model,
-                    "instructions": None,
-                },
-            )
-        project = admission.project_context
-        project_id = project.project_id if project is not None else "conversation-project"
-        project_version = project.version if project is not None else 0
-        project_digest = self._digest(
-            project.model_dump(mode="json") if project is not None else None
-        )
-        development_smoke = tuple(envelope.workspace_grant.readable_paths) == (
-            "/workspace/README.md",
-        )
-        permission_policy = (
-            {"tool_policy": "allow", "filesystem_policy": "allow"}
-            if development_smoke
-            else {"tool_policy": "deny", "filesystem_policy": "deny"}
-        )
-        return {
-            "command": command.model_dump(mode="json"),
-            "envelope": envelope.model_dump(mode="json"),
-            "agents": agents,
-            "handoffs": (),
-            "model_messages": tuple(
-                {"role": message.role, "content": message.content}
-                for message in admission.messages
-            ),
-            "conversation_context": {
-                "session_id": envelope.session_id,
-                "snapshot_ref": envelope.context.snapshot_ref,
-                "snapshot_digest": envelope.context.snapshot_digest,
-                "version": envelope.context.version,
-            },
-            "project_context": {
-                "project_id": project_id,
-                "version": project_version,
-                "snapshot_digest": project_digest,
-            },
-            "work_state": {
-                "term_id": envelope.term_id,
-                "agent_id": envelope.agent_id,
-                "root_ref": f".runtime/terms/{envelope.term_id}",
-                "metadata_digest": self._digest(
-                    {"term_id": envelope.term_id, "agent_id": envelope.agent_id}
-                ),
-            },
-            "permission_policy": permission_policy,
-            "environment_allowlist": (),
-            "effect_scope": {
-                "scope_id": f"conversation-scope-{envelope.term_id[-32:]}",
-                "write_effects": False,
-                "allowed_tool_ids": (
-                    ("workspace.read",) if development_smoke else ()
-                ),
-            },
-        }
 
     def _resume_or_registration(self, command_id: str) -> RuntimeSelectionV2:
         assert self._registry is not None
@@ -368,6 +289,7 @@ class RuntimeQueryRouter:
             {"role": message.role, "content": message.content}
             for message in admission.messages
         ]
+        runtime_messages = runtime_input_messages(admission)
         project_snapshot = (
             admission.project_context.model_dump(mode="json")
             if admission.project_context is not None
@@ -382,7 +304,9 @@ class RuntimeQueryRouter:
             "messages": message_snapshot,
         }
         identity = self._digest(binding)
-        development_smoke = self._development_smoke(admission)
+        development_smoke = (
+            runtime_id == "python-term" and self._development_smoke(admission)
+        )
         workspace_manifest = ToolManifestEntryV2(
             tool_id="workspace.read",
             version="1",
@@ -478,7 +402,9 @@ class RuntimeQueryRouter:
                 "model_options_digest": self._digest(
                     {"provider": provider_snapshot, "model": admission.model}
                 ),
-                "message_snapshot_digest": self._digest(model_message_snapshot),
+                "message_snapshot_digest": canonical_runtime_input_digest(
+                    runtime_messages
+                ),
                 "context": {
                     "snapshot_ref": session_ref,
                     "snapshot_digest": self._digest(

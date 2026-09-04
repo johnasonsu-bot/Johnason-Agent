@@ -315,6 +315,39 @@ def test_turn_routing_metadata_survives_every_state_transition(tmp_path: Path) -
     }
 
 
+def test_runtime_execution_snapshot_survives_turn_state_compaction(tmp_path: Path) -> None:
+    repository = ConversationRepository(tmp_path / "runtime-execution.sqlite")
+    repository.create_session("session-1")
+    execution = {
+        "selector": "goose",
+        "envelope": {"command_id": "runtime-command-1"},
+        "runtime_input": {"messages": [{"content": "hello"}]},
+    }
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="provider-1",
+        model="configured-model",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "runner_mode": "runtime",
+            "runtime_execution": execution,
+        },
+    )
+    claimed = repository.claim_next_turn(owner_id="worker")
+    assert claimed is not None
+
+    repository.save_turn_state(
+        "session-1", "turn-1", owner_id="worker", state={"phase": "running"}
+    )
+
+    persisted = repository.load_turn_status("session-1", "turn-1")
+    assert persisted is not None
+    assert persisted.state["runtime_execution"] == execution
+
+
 def test_turn_routing_metadata_rejects_an_attempted_change(tmp_path: Path) -> None:
     repository = ConversationRepository(tmp_path / "immutable-metadata.sqlite")
     repository.create_session("session-1")

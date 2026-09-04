@@ -270,7 +270,8 @@ def test_explicit_dev_admission_freezes_only_readonly_smoke_workspace(
         "session-1", "public-command"
     )
     assert turn is not None
-    snapshot = turn.state["python_term_execution"]
+    snapshot = turn.state["runtime_execution"]
+    assert "python_term_execution" not in turn.state
     envelope = snapshot["envelope"]
     assert [item["tool_id"] for item in envelope["tool_manifest"]] == [
         "workspace.read"
@@ -337,7 +338,7 @@ def test_ready_runtime_retry_reuses_frozen_dev_envelope_when_current_probe_chang
         "session-1", "public-command"
     )
     assert before is not None
-    frozen = json.loads(json.dumps(before.state["python_term_execution"]))
+    frozen = json.loads(json.dumps(before.state["runtime_execution"]))
 
     retry_app = app
     if change == "expired":
@@ -364,8 +365,8 @@ def test_ready_runtime_retry_reuses_frozen_dev_envelope_when_current_probe_chang
         "session-1", "public-command"
     )
     assert after is not None
-    assert after.state["python_term_execution"] == frozen
-    assert after.state["python_term_execution"]["permission_policy"] == {
+    assert after.state["runtime_execution"] == frozen
+    assert after.state["runtime_execution"]["permission_policy"] == {
         "tool_policy": "allow",
         "filesystem_policy": "allow",
     }

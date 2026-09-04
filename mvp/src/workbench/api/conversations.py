@@ -51,6 +51,10 @@ from workbench.runtime.engine_host.client import (
 from workbench.runtime.engine_host.contracts import HostProtocolError
 from workbench.runtime.engine_host.selector import host_run_id_for
 from workbench.runtime.engine_host.v2.mapper import map_runtime_event
+from workbench.runtime.conversation_execution import (
+    RuntimeConversationRoute,
+    read_runtime_execution,
+)
 from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeAdmissionBlocked,
     RuntimeAdmissionConflict,
@@ -228,14 +232,7 @@ class PythonTermConversationAdmission:
     messages: tuple[ConversationMessage, ...]
 
 
-@dataclass(frozen=True)
-class PythonTermConversationRoute:
-    """The durable Host v2 selection returned before a turn is enqueued."""
-
-    runtime_id: str
-    build_id: str
-    runtime_command_id: str
-    execution_snapshot: dict[str, Any] = field(default_factory=dict)
+PythonTermConversationRoute = RuntimeConversationRoute
 
 
 class PythonTermConversationExecutor(Protocol):
@@ -312,7 +309,7 @@ class RuntimeConversationRouter(Protocol):
         *,
         selector: str,
         admission: PythonTermConversationAdmission,
-    ) -> PythonTermConversationRoute: ...
+    ) -> RuntimeConversationRoute: ...
 
 
 PythonTermConversationRouter = RuntimeConversationRouter
@@ -573,7 +570,7 @@ class ConversationAPI:
             )
             if recovered is not None:
                 return recovered
-        selected_runtime: PythonTermConversationRoute | None = None
+        selected_runtime: RuntimeConversationRoute | None = None
         if runtime is not None:
             router = self.runtime_router or self.python_term_router
             if router is None:
@@ -620,14 +617,16 @@ class ConversationAPI:
         )
         initial_state = self._initial_turn_state(session_id)
         if selected_runtime is not None:
-            if selected_runtime.runtime_id != "python-term":
-                raise RuntimeAdmissionUnavailable()
-            runner_mode = "python_term"
+            runner_mode = (
+                "python_term"
+                if selected_runtime.runtime_id == "python-term"
+                else "runtime"
+            )
             initial_state["runtime_id"] = selected_runtime.runtime_id
             initial_state["runtime_build_id"] = selected_runtime.build_id
             initial_state["runtime_command_id"] = selected_runtime.runtime_command_id
             initial_state["runtime_model"] = execution_model
-            initial_state["python_term_execution"] = selected_runtime.execution_snapshot
+            initial_state["runtime_execution"] = selected_runtime.execution_snapshot
         else:
             mode_for = getattr(self.runner, "mode_for", None)
             runner_mode = (
@@ -857,9 +856,9 @@ class ConversationAPI:
                 await self._process_sequential_turn(turn, orchestration)
                 return
             runner_mode = turn.state.get("runner_mode", "python")
-            if runner_mode not in {"python", "engine_host", "python_term"}:
+            if runner_mode not in {"python", "engine_host", "python_term", "runtime"}:
                 raise TurnSnapshotCorruption("invalid persisted runner mode")
-            if runner_mode == "python_term":
+            if runner_mode in {"python_term", "runtime"}:
                 runtime_id = turn.state.get("runtime_id")
                 runtime_build_id = turn.state.get("runtime_build_id")
                 runtime_command_id = turn.state.get("runtime_command_id")
@@ -870,7 +869,7 @@ class ConversationAPI:
                     session_id, command_id
                 ) or runtime_model != turn.model:
                     raise TurnSnapshotCorruption("invalid Python Term runtime pin")
-                snapshot = turn.state.get("python_term_execution")
+                snapshot = read_runtime_execution(turn.state)
                 if self.python_term_executor is None or not isinstance(snapshot, dict):
                     raise TurnSnapshotCorruption("Python Term executor is unavailable")
                 execution = await self.python_term_executor.execute_snapshot(snapshot)
@@ -884,10 +883,10 @@ class ConversationAPI:
                     "reconciliation_required",
                 }:
                     raise TurnSnapshotCorruption("invalid Python Term execution result")
-                projected_cursor = turn.state.get("python_term_projected_cursor", 0)
+                projected_cursor = turn.state.get("runtime_projected_cursor", 0)
                 if not isinstance(projected_cursor, int) or projected_cursor < 0:
                     raise TurnSnapshotCorruption("invalid Python Term projected cursor")
-                accumulated = turn.state.get("python_term_projected_result", [])
+                accumulated = turn.state.get("runtime_projected_result", [])
                 if not isinstance(accumulated, list) or not all(
                     isinstance(item, dict) for item in accumulated
                 ):
@@ -914,8 +913,8 @@ class ConversationAPI:
                             accumulated.append(appended)
                     projected_cursor = cursor
                     projected_state = dict(turn.state)
-                    projected_state["python_term_projected_cursor"] = projected_cursor
-                    projected_state["python_term_projected_result"] = accumulated
+                    projected_state["runtime_projected_cursor"] = projected_cursor
+                    projected_state["runtime_projected_result"] = accumulated
                     self.conversations.save_turn_state(
                         session_id,
                         command_id,
@@ -937,8 +936,8 @@ class ConversationAPI:
                         {
                             "phase": "paused",
                             "reason": "reconciliation_required",
-                            "python_term_projected_cursor": projected_cursor,
-                            "python_term_projected_result": accumulated,
+                            "runtime_projected_cursor": projected_cursor,
+                            "runtime_projected_result": accumulated,
                             "reconciliation_effect_ids": list(effect_ids),
                         }
                     )
@@ -967,8 +966,8 @@ class ConversationAPI:
                     state={
                         "phase": terminal_status,
                         "events": [],
-                        "python_term_projected_cursor": projected_cursor,
-                        "python_term_projected_result": accumulated,
+                        "runtime_projected_cursor": projected_cursor,
+                        "runtime_projected_result": accumulated,
                         **(
                             {
                                 "reconciled_effect_ids": turn.state[
@@ -2142,9 +2141,9 @@ class ConversationAPI:
         turn = self.conversations.load_turn_status(session_id, command_id)
         if turn is None:
             return None
-        execution = turn.state.get("python_term_execution")
+        execution = read_runtime_execution(turn.state)
         if (
-            turn.state.get("runner_mode") != "python_term"
+            turn.state.get("runner_mode") not in {"python_term", "runtime"}
             or turn.state.get("runtime_id") != runtime
             or turn.state.get("runtime_command_id")
             != python_term_command_id(session_id, command_id)
