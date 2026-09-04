@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -111,6 +113,8 @@ def _formal_private_frame(
     build_id: str,
     provider_id: str,
     instance_id_digest: str,
+    base_url: str = "https://api.deepseek.com",
+    resolved_model: str = "fixture-model-resolved",
 ) -> bytes:
     now = time.time()
     binding = {
@@ -134,12 +138,12 @@ def _formal_private_frame(
         "provider_profile_digest": "d" * 64,
         "route": {
             "protocol": "deepseek",
-            "base_url": "https://api.deepseek.com",
+            "base_url": base_url,
             "metadata_headers": [],
             "thinking_enabled": True,
             "reasoning_effort": "high",
         },
-        "model": "fixture-model-resolved",
+        "model": resolved_model,
         "scopes": ["inference"],
         "issued_at": now,
         "expires_at": now + 30,
@@ -373,3 +377,92 @@ def test_each_fixed_smoke_lane_reports_an_independent_non_federation_verdict(
     assert "GO_RUNTIME_FEDERATION" not in json.dumps(
         verdict.__dict__, sort_keys=True
     )
+
+
+def test_goose_release_binary_streams_a_real_mock_provider_without_fixture_fallback() -> None:
+    build_and_attest_goose_query_smoke(REPOSITORY_ROOT)
+    captured: dict[str, object] = {}
+
+    class ProviderHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+            length = int(self.headers.get("Content-Length", "0"))
+            captured["path"] = self.path
+            captured["authorization"] = self.headers.get("Authorization")
+            captured["body"] = json.loads(self.rfile.read(length))
+            body = (
+                'data: {"id":"chunk-1","object":"chat.completion.chunk",'
+                '"created":1,"model":"deepseek-chat","choices":[{"index":0,'
+                '"delta":{"role":"assistant","content":"real "},'
+                '"finish_reason":null}]}\n\n'
+                'data: {"id":"chunk-2","object":"chat.completion.chunk",'
+                '"created":1,"model":"deepseek-chat","choices":[{"index":0,'
+                '"delta":{"content":"Goose"},"finish_reason":null}]}\n\n'
+                'data: {"id":"chunk-3","object":"chat.completion.chunk",'
+                '"created":1,"model":"deepseek-chat","choices":[{"index":0,'
+                '"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,'
+                '"completion_tokens":2,"total_tokens":5}}\n\n'
+                "data: [DONE]\n\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), ProviderHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        runtime_input = canonical_runtime_query_input_v2().model_dump(mode="json")
+        start, envelope = _command(
+            "goose",
+            command_id="start-goose-real-mock",
+            provider_ref="provider-profile:deepseek",
+            runtime_input=runtime_input,
+        )
+        private_frame = _formal_private_frame(
+            envelope,
+            grant_id="grant-goose-real-mock",
+            runtime_id="goose",
+            build_id="goose-host-v2:fixture-wrapper-r2",
+            provider_id="deepseek",
+            instance_id_digest="1" * 64,
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            resolved_model="deepseek-chat",
+        )
+        frames, surfaces = _run_process(
+            (str(MVP_ROOT / "runtime-hosts/goose-host-v2/target/release/goose-host-v2"),),
+            [{"kind": "command", **start}],
+            private_frame=private_frame,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert captured["path"] == "/chat/completions"
+    assert captured["authorization"] == f"Bearer {TEST_SECRET_VALUE}"
+    request_body = captured["body"]
+    assert isinstance(request_body, dict)
+    assert request_body["model"] == "deepseek-chat"
+    assert request_body["thinking"] == {"type": "enabled"}
+    assert request_body["reasoning_effort"] == "high"
+    assert frames[0]["type"] == "query.start"
+    assert frames[0]["payload"] == {"accepted": True}
+    event_payloads = [
+        frame["payload"] for frame in frames if frame["kind"] == "event"
+    ]
+    assert [item["type"] for item in event_payloads] == [
+        "runtime.status",
+        "assistant.delta",
+        "assistant.delta",
+        "assistant.message",
+        "runtime.status",
+    ]
+    assert event_payloads[-2]["payload"] == {"content": "real Goose"}
+    assert event_payloads[-1]["payload"] == {"status": "completed"}
+    assert TEST_SECRET_VALUE not in json.dumps(frames)
+    assert TEST_SECRET_VALUE not in json.dumps(surfaces)
