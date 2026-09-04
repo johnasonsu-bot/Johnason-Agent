@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from workbench.api.conversations import (
     python_term_command_id,
 )
 from workbench.conversations.repository import ConversationRepository
+from workbench.runtime.engine_host.v2.runtime_admission import RuntimeAdmissionUnavailable
 from workbench.runtime.engine_host.v2 import (
     ContextBudgetV2,
     RunEnvelopeV2,
@@ -133,6 +135,7 @@ def _prepare_reconciliation(
     *,
     pending_effect_ids: tuple[str, ...] = ("effect-1",),
     idempotency_key: str = "reconcile-1",
+    execution_key: str = "python_term_execution",
 ) -> ConversationRepository:
     repository = ConversationRepository(database)
     repository.create_session("session-1")
@@ -149,6 +152,7 @@ def _prepare_reconciliation(
         "phase": "paused",
         "reason": "reconciliation_required",
         "runner_mode": "python_term",
+        execution_key: {"envelope": {"term_id": "term-1"}},
         "reconciliation_effect_ids": list(pending_effect_ids),
         "reconciled_effect_ids": [],
     }
@@ -225,6 +229,7 @@ def _mark_legacy_confirmation(
     *,
     terminal: bool = False,
     public_status: str = "completed",
+    execution_key: str = "python_term_execution",
 ) -> None:
     python_repository = PythonTermRepository(repository.store.path)
     python_repository.confirm_reconciled_tool_effect(
@@ -258,7 +263,7 @@ def _mark_legacy_confirmation(
         else {
             "phase": "before_model",
             "runner_mode": "python_term",
-            "python_term_execution": {"envelope": {"term_id": "term-1"}},
+            execution_key: {"envelope": {"term_id": "term-1"}},
             "reconciliation_effect_ids": [],
             "reconciled_effect_ids": ["effect-1"],
         }
@@ -276,12 +281,31 @@ def _mark_legacy_confirmation(
         )
 
 
-def _api(repository: ConversationRepository) -> ConversationAPI:
+class _ReconciliationExecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str, str]] = []
+
+    def reconcile_effect_for_turn(
+        self, *, term_id: str, effect_id: str, outcome: str, summary: str
+    ) -> None:
+        self.calls.append((term_id, effect_id, outcome, summary))
+
+
+class _PythonExecutorMustNotRun:
+    async def execute_snapshot(self, snapshot: dict[str, object]) -> object:
+        raise AssertionError(f"Python Term executor received {snapshot!r}")
+
+
+def _api(
+    repository: ConversationRepository,
+    *,
+    executor: _ReconciliationExecutor | None = None,
+) -> ConversationAPI:
     return ConversationAPI(
         conversations=repository,
         events=EventStore(repository.store.path),
         runner=object(),
-        python_term_executor=None,
+        python_term_executor=executor,
     )
 
 
@@ -400,13 +424,17 @@ def test_reconciliation_identity_conflict_does_not_echo_private_summary(
 
 
 @pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("execution_key", ["python_term_execution", "runtime_execution"])
 def test_legacy_null_response_is_repaired_after_restart_without_reexecuting_effect(
     tmp_path: Path,
     terminal: bool,
+    execution_key: str,
 ) -> None:
-    database = tmp_path / f"legacy-{'terminal' if terminal else 'queued'}.sqlite"
+    database = tmp_path / f"legacy-{execution_key}-{terminal}.sqlite"
     repository = _prepare_reconciliation(database)
-    _mark_legacy_confirmation(repository, terminal=terminal)
+    _mark_legacy_confirmation(
+        repository, terminal=terminal, execution_key=execution_key
+    )
     with repository.store.connect() as connection:
         before_effect = connection.execute(
             "SELECT * FROM python_tool_effects WHERE effect_id = 'effect-1'"
@@ -450,6 +478,64 @@ def test_legacy_null_response_is_repaired_after_restart_without_reexecuting_effe
     assert dict(after_effect) == dict(before_effect)
     assert dict(after_turn) == dict(before_turn)
     assert command is not None and json.loads(command["response_json"]) == response
+
+
+def test_runtime_execution_snapshot_reconciles_a_paused_python_term_turn(
+    tmp_path: Path,
+) -> None:
+    repository = _prepare_reconciliation(
+        tmp_path / "runtime-execution.sqlite", execution_key="runtime_execution"
+    )
+    executor = _ReconciliationExecutor()
+
+    response = _api(repository, executor=executor).reconcile_python_term_effect(
+        session_id="session-1",
+        command_id="command-1",
+        effect_id="effect-1",
+        idempotency_key="reconcile-1",
+        request=PythonTermReconciliationRequest(
+            outcome="applied", summary="private confirmation"
+        ),
+    )
+
+    assert response["status"] == "queued"
+    assert executor.calls == [
+        ("term-1", "effect-1", "applied", "private confirmation")
+    ]
+    turn = repository.load_turn_status("session-1", "command-1")
+    assert turn is not None
+    assert turn.state["runtime_execution"] == {"envelope": {"term_id": "term-1"}}
+
+
+def test_claimed_non_python_runtime_fails_unavailable_without_python_executor(
+    tmp_path: Path,
+) -> None:
+    repository = ConversationRepository(tmp_path / "runtime-unavailable.sqlite")
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="command-1",
+        run_id="run-1",
+        provider_id="provider-1",
+        model="model-1",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "runner_mode": "runtime",
+            "runtime_id": "goose",
+            "runtime_build_id": "goose-build-1",
+            "runtime_command_id": "goose-command-1",
+            "runtime_model": "model-1",
+            "runtime_execution": {"envelope": {"term_id": "term-1"}},
+        },
+    )
+    api = _api(repository, executor=_PythonExecutorMustNotRun())
+    api._reserve("session-1", "command-1", "message", {})
+    claimed = repository.claim_next_turn(owner_id="worker")
+    assert claimed is not None
+
+    with pytest.raises(RuntimeAdmissionUnavailable):
+        asyncio.run(api.process_queued_turn("session-1", "command-1"))
 
 
 def test_legacy_repair_fails_closed_when_effect_outcome_is_not_verifiable(

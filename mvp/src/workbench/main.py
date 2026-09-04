@@ -76,6 +76,7 @@ from workbench.runtime.engine_host.v2.contracts import (
 from workbench.runtime.conversation_execution import (
     RuntimeConversationRoute,
     build_runtime_execution_snapshot,
+    runtime_input_context_items,
     runtime_input_messages,
 )
 from workbench.runtime.python_term import PythonTermRuntime
@@ -183,12 +184,16 @@ class RuntimeQueryRouter:
             CommandIdentityConflict,
             CorruptCommandPin,
         ):
-            raise PythonTermAdmissionConflict() from None
+            if selector == "python-term":
+                raise PythonTermAdmissionConflict() from None
+            raise RuntimeAdmissionConflict() from None
         except (NoConformantRuntime, RuntimeRegistryIntegrityError, TypeError, ValueError):
             # The browser only learns the fixed availability result.  No
             # registration, gate, provider, or validation detail crosses this
             # request boundary.
-            raise PythonTermRuntimeUnavailable() from None
+            if selector == "python-term":
+                raise PythonTermRuntimeUnavailable() from None
+            raise RuntimeAdmissionUnavailable() from None
         return RuntimeConversationRoute(
             runtime_id=selected.runtime_id,
             build_id=selected.build_id,
@@ -285,11 +290,8 @@ class RuntimeQueryRouter:
             }
             for message in admission.messages
         ]
-        model_message_snapshot = [
-            {"role": message.role, "content": message.content}
-            for message in admission.messages
-        ]
         runtime_messages = runtime_input_messages(admission)
+        runtime_context_items = runtime_input_context_items(admission)
         project_snapshot = (
             admission.project_context.model_dump(mode="json")
             if admission.project_context is not None
@@ -407,12 +409,8 @@ class RuntimeQueryRouter:
                 ),
                 "context": {
                     "snapshot_ref": session_ref,
-                    "snapshot_digest": self._digest(
-                        {
-                            "messages": message_snapshot,
-                            "project": project_snapshot,
-                            "agents": agent_snapshots,
-                        }
+                    "snapshot_digest": canonical_runtime_input_digest(
+                        runtime_context_items
                     ),
                     "version": (
                         admission.project_context.version

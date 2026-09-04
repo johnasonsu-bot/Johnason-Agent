@@ -3,12 +3,14 @@
 import json
 import hashlib
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from workbench.conversations.models import ConversationMessage, ConversationSession
 from workbench.protocol.events import DomainEvent
+from workbench.runtime.conversation_execution import read_runtime_execution
 from workbench.workflow.store import WorkflowStore
 
 
@@ -1484,12 +1486,12 @@ class ConversationRepository:
                     "legacy reconciliation recovery conflict"
                 )
             if queued_last_pending:
-                snapshot = state.get("python_term_execution")
+                snapshot = read_runtime_execution(state)
                 envelope = (
-                    snapshot.get("envelope") if isinstance(snapshot, dict) else None
+                    snapshot.get("envelope") if isinstance(snapshot, Mapping) else None
                 )
                 if (
-                    not isinstance(envelope, dict)
+                    not isinstance(envelope, Mapping)
                     or envelope.get("term_id") != effect.term_id
                 ):
                     raise ReconciliationRecoveryConflict(

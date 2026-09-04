@@ -8,6 +8,7 @@ from workbench.models.profiles import ProviderProfileRecord
 from workbench.runtime.conversation_execution import (
     build_runtime_execution_snapshot,
     read_runtime_execution,
+    runtime_input_context_items,
 )
 from workbench.runtime.engine_host.v2.contracts import (
     QueryCommandV2,
@@ -52,6 +53,7 @@ def _envelope() -> RunEnvelopeV2:
             message_id="message-1", role="user", content="hello"
         ),
     )
+    context_items = runtime_input_context_items(_admission())
     return RunEnvelopeV2.model_validate(
         {
             "runtime": {
@@ -74,7 +76,7 @@ def _envelope() -> RunEnvelopeV2:
             "message_snapshot_digest": canonical_runtime_input_digest(messages),
             "context": {
                 "snapshot_ref": "conversation-session:session-1",
-                "snapshot_digest": "d" * 64,
+                "snapshot_digest": canonical_runtime_input_digest(context_items),
                 "version": 0,
             },
             "context_budget": {
@@ -115,8 +117,12 @@ def test_runtime_execution_snapshot_materializes_query_input() -> None:
     )
 
     runtime_input = RuntimeQueryInputV2.model_validate(snapshot["runtime_input"])
+    envelope = RunEnvelopeV2.model_validate(snapshot["envelope"])
 
     assert runtime_input.messages[-1].content == "hello"
+    assert runtime_input.message_snapshot_digest == envelope.message_snapshot_digest
+    assert runtime_input.context_snapshot_digest == envelope.context.snapshot_digest
+    assert runtime_input.prompt_manifest_digest == envelope.prompt_manifest_digest
     assert snapshot["selector"] == "goose"
 
 
@@ -126,12 +132,32 @@ def test_old_python_term_execution_is_read_only_compatible() -> None:
     ) == {"envelope": {"command_id": "c1"}}
 
 
-def test_runtime_execution_snapshot_rejects_an_unbound_input_digest() -> None:
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("message_snapshot_digest", "c" * 64, "message snapshot digest"),
+        ("prompt_manifest_digest", "e" * 64, "prompt manifest digest"),
+    ],
+)
+def test_runtime_execution_snapshot_rejects_an_unbound_input_digest(
+    field: str, value: str, match: str
+) -> None:
+    envelope = _envelope().model_copy(update={field: value})
+
+    with pytest.raises(ValueError, match=match):
+        build_runtime_execution_snapshot(
+            _admission(),
+            QueryCommandV2(type="query.start", command_id="runtime-command-1"),
+            envelope,
+        )
+
+
+def test_runtime_execution_snapshot_rejects_an_unbound_context_digest() -> None:
     envelope = _envelope().model_copy(
-        update={"message_snapshot_digest": "c" * 64}
+        update={"context": _envelope().context.model_copy(update={"snapshot_digest": "d" * 64})}
     )
 
-    with pytest.raises(ValueError, match="message snapshot digest"):
+    with pytest.raises(ValueError, match="context snapshot digest"):
         build_runtime_execution_snapshot(
             _admission(),
             QueryCommandV2(type="query.start", command_id="runtime-command-1"),

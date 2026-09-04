@@ -37,6 +37,7 @@ from workbench.runtime.engine_host.v2.registry import (
     RuntimeRequirementsV2,
 )
 from workbench.runtime.engine_host.v2.repository import (
+    CommandIdentityConflict,
     RuntimeV2Repository,
     canonical_capability_snapshot,
 )
@@ -758,6 +759,27 @@ def test_unknown_selector_has_stable_public_error_and_no_durable_side_effect(
     assert ConversationRepository(database).load_turn_status(
         "session-1", "unknown-command"
     ) is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (ValueError("invalid runtime registration"), RuntimeAdmissionUnavailable),
+        (CommandIdentityConflict("changed durable identity"), RuntimeAdmissionConflict),
+    ],
+)
+def test_non_python_selector_maps_runtime_failures_to_generic_outcomes(
+    failure: Exception, expected: type[Exception]
+) -> None:
+    router = main.RuntimeQueryRouter(object())
+
+    def invalid_identity(_selector, _admission):
+        raise failure
+
+    router._runtime_identity = invalid_identity  # type: ignore[method-assign]
+
+    with pytest.raises(expected):
+        router.route_conversation_query(selector="goose", admission=object())
 
 
 @pytest.mark.parametrize("winner", ["omitted", "explicit"])

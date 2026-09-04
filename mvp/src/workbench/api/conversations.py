@@ -417,7 +417,7 @@ class ConversationAPI:
             raise KeyError((session_id, command_id))
         if self.python_term_executor is None:
             raise RuntimeError("Python Term executor is unavailable")
-        snapshot = turn.state.get("python_term_execution")
+        snapshot = read_runtime_execution(turn.state)
         pending = turn.state.get("reconciliation_effect_ids", [])
         reconciled = turn.state.get("reconciled_effect_ids", [])
         if (
@@ -858,7 +858,9 @@ class ConversationAPI:
             runner_mode = turn.state.get("runner_mode", "python")
             if runner_mode not in {"python", "engine_host", "python_term", "runtime"}:
                 raise TurnSnapshotCorruption("invalid persisted runner mode")
-            if runner_mode in {"python_term", "runtime"}:
+            if runner_mode == "runtime":
+                raise RuntimeAdmissionUnavailable()
+            if runner_mode == "python_term":
                 runtime_id = turn.state.get("runtime_id")
                 runtime_build_id = turn.state.get("runtime_build_id")
                 runtime_command_id = turn.state.get("runtime_command_id")

@@ -50,26 +50,36 @@ def runtime_input_messages(admission: Any) -> tuple[RuntimeMessageInputV2, ...]:
     )
 
 
-def build_runtime_query_input(
-    admission: Any, envelope: RunEnvelopeV2
-) -> RuntimeQueryInputV2:
-    """Construct full Host-v2 input solely from durable admission facts."""
-    messages = runtime_input_messages(admission)
-    context_items = (
+def runtime_input_context_items(admission: Any) -> tuple[RuntimeContextItemV2, ...]:
+    """Materialize the admission-owned context once for Envelope and query input."""
+    project = (
+        admission.project_context.model_dump(mode="json")
+        if admission.project_context is not None
+        else None
+    )
+    agents = [profile.model_dump(mode="json") for profile in admission.agent_profiles]
+    content = json.dumps(
+        {
+            "session_id": admission.session_id,
+            "project": project,
+            "agents": agents,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
         RuntimeContextItemV2(
-            item_id=f"conversation-context-{_digest(envelope.context.snapshot_ref)[:32]}",
-            kind="conversation-snapshot",
-            content=json.dumps(
-                {
-                    "snapshot_ref": envelope.context.snapshot_ref,
-                    "snapshot_digest": envelope.context.snapshot_digest,
-                    "version": envelope.context.version,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
+            item_id=f"conversation-context-{_digest(content)[:32]}",
+            kind="conversation-context",
+            content=content,
         ),
     )
+
+
+def build_runtime_query_input(admission: Any) -> RuntimeQueryInputV2:
+    """Construct full Host-v2 input solely from durable admission facts."""
+    messages = runtime_input_messages(admission)
+    context_items = runtime_input_context_items(admission)
     prompt_sections: tuple[RuntimePromptSectionInputV2, ...] = ()
     return RuntimeQueryInputV2(
         messages=messages,
@@ -121,9 +131,13 @@ def build_runtime_execution_snapshot(
         if development_smoke
         else {"tool_policy": "deny", "filesystem_policy": "deny"}
     )
-    runtime_input = build_runtime_query_input(admission, envelope)
+    runtime_input = build_runtime_query_input(admission)
     if runtime_input.message_snapshot_digest != envelope.message_snapshot_digest:
         raise ValueError("runtime input message snapshot digest does not match envelope")
+    if runtime_input.context_snapshot_digest != envelope.context.snapshot_digest:
+        raise ValueError("runtime input context snapshot digest does not match envelope")
+    if runtime_input.prompt_manifest_digest != envelope.prompt_manifest_digest:
+        raise ValueError("runtime input prompt manifest digest does not match envelope")
     return {
         "selector": envelope.runtime.runtime_id,
         "runtime_id": envelope.runtime.runtime_id,
