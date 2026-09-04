@@ -1,6 +1,7 @@
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
@@ -252,6 +253,84 @@ async def test_worker_fails_corrupt_snapshot_once_without_retry(tmp_path: Path) 
     assert turn.lease_expires_at == 0
     assert turn.state["reason"] == "snapshot_corrupt"
     assert api.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_python_term_worker_projects_neutral_snapshot_to_legacy_contract(
+    tmp_path: Path,
+) -> None:
+    class RecordingPythonTermExecutor:
+        def __init__(self) -> None:
+            self.snapshots: list[dict[str, object]] = []
+
+        async def execute_snapshot(self, snapshot: dict[str, object]) -> object:
+            self.snapshots.append(snapshot)
+            return SimpleNamespace(
+                events=(), status="completed", final_output=None
+            )
+
+    legacy_snapshot = {
+        "command": {"command_id": "runtime-command-1"},
+        "envelope": {"command_id": "runtime-command-1"},
+        "agents": [],
+        "handoffs": [],
+        "model_messages": [{"role": "user", "content": "hello"}],
+        "conversation_context": {},
+        "project_context": {},
+        "work_state": {},
+        "permission_policy": {},
+        "environment_allowlist": [],
+        "effect_scope": {},
+    }
+    runtime_messages = [
+        {"message_id": "message-1", "role": "user", "content": "hello"}
+    ]
+    neutral_snapshot = {
+        "selector": "python-term",
+        "runtime_id": "python-term",
+        "build_id": "python-term:test",
+        "provider_profile_digest": "a" * 64,
+        "resolved_model": "configured-model",
+        "runtime_input": {"messages": runtime_messages},
+        **legacy_snapshot,
+    }
+    database = tmp_path / "python-term-snapshot-boundary.sqlite"
+    repository = ConversationRepository(database)
+    repository.create_session("session-1")
+    repository.enqueue_turn(
+        session_id="session-1",
+        command_id="turn-1",
+        run_id="run-1",
+        provider_id="provider-1",
+        model="configured-model",
+        prompt="hello",
+        initial_state={
+            "phase": "before_model",
+            "runner_mode": "python_term",
+            "runtime_id": "python-term",
+            "runtime_build_id": "python-term:test",
+            "runtime_command_id": python_term_command_id("session-1", "turn-1"),
+            "runtime_model": "configured-model",
+            "runtime_execution": neutral_snapshot,
+            "runtime_projected_cursor": 0,
+            "runtime_projected_result": [],
+        },
+    )
+    executor = RecordingPythonTermExecutor()
+    api = ConversationAPI(
+        conversations=repository,
+        events=EventStore(database),
+        runner=object(),
+        python_term_executor=executor,
+    )
+    api._reserve("session-1", "turn-1", "message", {"test": "snapshot-boundary"})
+    assert repository.claim_next_turn(owner_id="worker-1") is not None
+
+    await api.process_queued_turn("session-1", "turn-1")
+
+    assert executor.snapshots == [
+        {**legacy_snapshot, "model_messages": runtime_messages}
+    ]
 
 
 def test_worker_host_retry_waits_for_a_new_generation(tmp_path: Path) -> None:

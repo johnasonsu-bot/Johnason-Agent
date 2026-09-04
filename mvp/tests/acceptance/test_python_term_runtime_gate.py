@@ -32,11 +32,16 @@ from workbench.conversations.repository import ConversationRepository
 from workbench.runtime.engine_host.v2 import registry as registry_module
 from workbench.runtime.engine_host.v2.registry import RuntimeRegistryV2
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
-from workbench.runtime.engine_host.v2.contracts import QueryCommandV2, RunEnvelopeV2
+from workbench.runtime.engine_host.v2.contracts import (
+    QueryCommandV2,
+    RunEnvelopeV2,
+    RuntimeQueryInputV2,
+)
 from workbench.models.contracts import ContinuationMetadata, ModelResponse, ToolCall
 from workbench.models.gateway import ModelGateway
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.providers.repository import ProviderRepository
+from workbench.runtime.conversation_execution import read_runtime_execution
 from workbench.runtime.python_term.gate import (
     ControlPlaneSdkModel,
     REQUIRED_GATE_SCENARIOS,
@@ -1135,7 +1140,7 @@ async def test_runtime_commit_before_projection_recovers_complete_timeline(
     turn = conversations.load_turn_status("session-1", "command-1")
     timeline = events.read_stream("run:session-1")
     assert turn is not None and turn.status == "completed"
-    assert turn.state["python_term_projected_cursor"] > 0
+    assert turn.state["runtime_projected_cursor"] > 0
     assert any(event.event_type == "agent.message.completed" for event in timeline)
     assert turn.result is not None
     by_sequence = {event.sequence: event for event in timeline}
@@ -1189,16 +1194,21 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
     )
     queued = conversations.load_turn_status("session-1", "command-1")
     assert queued is not None
-    snapshot = queued.state["python_term_execution"]
+    snapshot = read_runtime_execution(queued.state)
     assert isinstance(snapshot, dict)
-    messages = snapshot["model_messages"]
+    assert "runtime_execution" in queued.state
+    assert "python_term_execution" not in queued.state
+    runtime_input = RuntimeQueryInputV2.model_validate(snapshot["runtime_input"])
+    messages = tuple(
+        message.model_dump(mode="json") for message in runtime_input.messages
+    )
     environment = snapshot["environment_allowlist"]
     compiled = composition.runtime.compile_start(
         QueryCommandV2.model_validate(snapshot["command"]),
         envelope=RunEnvelopeV2.model_validate(snapshot["envelope"]),
         agents=tuple(AgentDescriptor.model_validate(item) for item in snapshot["agents"]),
         handoffs=tuple(HandoffDescriptor.model_validate(item) for item in snapshot["handoffs"]),
-        model_messages=tuple(messages),
+        model_messages=messages,
         conversation_context=ConversationContextRef.model_validate(snapshot["conversation_context"]),
         project_context=ProjectContextRef.model_validate(snapshot["project_context"]),
         work_state=TermWorkStateRef.model_validate(snapshot["work_state"]),
@@ -1387,7 +1397,7 @@ async def test_unknown_effect_pauses_then_reconciles_and_completes_consistently(
         ).fetchone()
         assert row is not None
         compacted_state = json.loads(row["state_json"])
-        compacted_state.pop("python_term_execution", None)
+        compacted_state.pop("runtime_execution", None)
         compacted_state.pop("reconciliation_effect_ids", None)
         compacted_state.pop("reconciled_effect_ids", None)
         connection.execute(

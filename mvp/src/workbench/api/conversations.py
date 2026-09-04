@@ -279,6 +279,46 @@ class PythonTermConversationExecutor(Protocol):
     ) -> None: ...
 
 
+_PYTHON_TERM_EXECUTION_SNAPSHOT_FIELDS = (
+    "command",
+    "envelope",
+    "agents",
+    "handoffs",
+    "model_messages",
+    "conversation_context",
+    "project_context",
+    "work_state",
+    "permission_policy",
+    "environment_allowlist",
+    "effect_scope",
+)
+
+
+def _project_python_term_execution_snapshot(
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Adapt a neutral snapshot to the legacy executor's closed contract."""
+    try:
+        projected = {
+            field: snapshot[field]
+            for field in _PYTHON_TERM_EXECUTION_SNAPSHOT_FIELDS
+        }
+    except KeyError as exc:
+        raise TurnSnapshotCorruption(
+            "Python Term execution snapshot is incomplete"
+        ) from exc
+    if "runtime_input" in snapshot:
+        runtime_input = snapshot["runtime_input"]
+        if not isinstance(runtime_input, dict) or not isinstance(
+            runtime_input.get("messages"), list
+        ):
+            raise TurnSnapshotCorruption(
+                "Python Term runtime input messages are invalid"
+            )
+        projected["model_messages"] = runtime_input["messages"]
+    return projected
+
+
 def python_term_command_id(session_id: str, command_id: str) -> str:
     """Derive the Host-v2-only pin key without exposing it as a public command id."""
     if not isinstance(session_id, str) or not isinstance(command_id, str):
@@ -907,7 +947,9 @@ class ConversationAPI:
                 snapshot = read_runtime_execution(turn.state)
                 if self.python_term_executor is None or not isinstance(snapshot, dict):
                     raise TurnSnapshotCorruption("Python Term executor is unavailable")
-                execution = await self.python_term_executor.execute_snapshot(snapshot)
+                execution = await self.python_term_executor.execute_snapshot(
+                    _project_python_term_execution_snapshot(snapshot)
+                )
                 runtime_events = getattr(execution, "events", None)
                 status = getattr(execution, "status", None)
                 final_output = getattr(execution, "final_output", None)
