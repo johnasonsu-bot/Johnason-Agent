@@ -129,6 +129,7 @@ def _write_host_v2_sidecar(root: Path) -> None:
         "src/checkpoint.ts",
         "src/event-mapper.ts",
         "src/grant-channel.ts",
+        "src/native-session.ts",
         "src/server.ts",
     )
     for relative in source_relatives[3:]:
@@ -139,6 +140,7 @@ def _write_host_v2_sidecar(root: Path) -> None:
         "deepseek-harness-host-v2.mjs",
         "event-mapper.mjs",
         "grant-channel.mjs",
+        "native-session.mjs",
         "server.mjs",
     )
     for artifact in artifact_names:

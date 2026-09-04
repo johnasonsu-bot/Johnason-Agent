@@ -13,6 +13,7 @@ import { loadFixedPreset } from "../src/bootstrap.ts";
 import { createCheckpoint, sealAcknowledgement } from "../src/checkpoint.ts";
 import { mapSessionEvents, sortPromptSections } from "../src/event-mapper.ts";
 import { EphemeralGrantChannel } from "../src/grant-channel.ts";
+import { runDeepSeekHarnessSession } from "../src/native-session.ts";
 import { createSidecar } from "../src/server.ts";
 
 
@@ -192,7 +193,7 @@ test("build receipt binds actual artifacts to the exact sidecar source", () => {
   assert.equal(receipt.command, "npm run build");
   assert.match(receipt.source_digest, /^[0-9a-f]{64}$/);
   assert.match(receipt.artifact_digest, /^[0-9a-f]{64}$/);
-  assert.equal(receipt.artifacts.length, 6);
+  assert.equal(receipt.artifacts.length, 7);
 });
 
 
@@ -472,6 +473,86 @@ test("real provider query streams through the pinned DeepSeek Harness adapter", 
   assert.deepEqual(emitted.at(-2).payload, { content: "real DSH" });
   assert.deepEqual(emitted.at(-1).payload, { status: "completed" });
   assert.equal(JSON.stringify(emitted).includes("one-shot-test-secret"), false);
+});
+
+
+test("pinned DeepSeek Harness Session preserves ordered input and native lifecycle", async () => {
+  const requests = [];
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on("data", chunk => chunks.push(chunk));
+    request.on("end", () => {
+      requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      const body = [
+        'data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}',
+        'data: {"choices":[{"delta":{"content":"native "}}]}',
+        'data: {"choices":[{"delta":{"content":"session"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2}}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n");
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-length": Buffer.byteLength(body),
+      });
+      response.end(body);
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const nativeEvents = [];
+  const materialized = {
+    promptSections: [
+      { section_id: "first", order: 10, content: "First instruction" },
+      { section_id: "second", order: 20, content: "Second instruction" },
+    ],
+    contextItems: [{ item_id: "ctx-1", kind: "document", content: "Context evidence" }],
+    messages: [
+      { message_id: "m-1", role: "user", content: "Earlier question" },
+      { message_id: "m-2", role: "assistant", content: "Earlier answer" },
+      { message_id: "m-3", role: "user", content: "Current question" },
+    ],
+  };
+
+  try {
+    const result = await runDeepSeekHarnessSession({
+      materialized,
+      provider: {
+        model: "deepseek-v4-flash",
+        route: {
+          protocol: "deepseek",
+          base_url: `http://127.0.0.1:${address.port}`,
+          metadata_headers: [],
+          thinking_enabled: true,
+          reasoning_effort: "high",
+        },
+      },
+      credential: () => "native-session-secret",
+      sessionId: "native-session-test",
+      signal: new AbortController().signal,
+      onEvent: event => nativeEvents.push(event.type),
+    });
+    assert.equal(result.content, "native session");
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  assert.equal(requests.length, 1);
+  const conversationMessages = requests[0].messages.filter(message => message.role !== "system");
+  assert.deepEqual(conversationMessages.map(message => message.role), [
+    "user", "assistant", "user", "user",
+  ]);
+  assert.deepEqual(conversationMessages.slice(0, 3).map(message => message.content), [
+    "Earlier question", "Earlier answer", "Current question",
+  ]);
+  assert.match(conversationMessages[3].content, /Context evidence$/);
+  const system = requests[0].messages.find(message => message.role === "system")?.content;
+  assert.match(system, /First instruction[\s\S]*Second instruction/);
+  assert.ok(nativeEvents.includes("turn/start"));
+  assert.ok(nativeEvents.includes("step/start"));
+  assert.ok(nativeEvents.includes("assistant/chunk"));
+  assert.ok(nativeEvents.includes("assistant/message"));
+  assert.ok(nativeEvents.includes("turn/end"));
 });
 
 

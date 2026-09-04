@@ -13,6 +13,7 @@ const expectedSourceEntries = [
   "checkpoint.ts",
   "event-mapper.ts",
   "grant-channel.ts",
+  "native-session.ts",
   "server.ts",
 ];
 const expectedArtifactEntries = [
@@ -22,6 +23,7 @@ const expectedArtifactEntries = [
   "deepseek-harness-host-v2.mjs",
   "event-mapper.mjs",
   "grant-channel.mjs",
+  "native-session.mjs",
   "server.mjs",
 ];
 
@@ -101,6 +103,7 @@ const sourceFiles = [
   "src/checkpoint.ts",
   "src/event-mapper.ts",
   "src/grant-channel.ts",
+  "src/native-session.ts",
   "src/server.ts",
 ];
 const artifactFiles = [
@@ -109,6 +112,7 @@ const artifactFiles = [
   "dist/deepseek-harness-host-v2.mjs",
   "dist/event-mapper.mjs",
   "dist/grant-channel.mjs",
+  "dist/native-session.mjs",
   "dist/server.mjs",
 ];
 const sources = await Promise.all(sourceFiles.map(fileRecord));

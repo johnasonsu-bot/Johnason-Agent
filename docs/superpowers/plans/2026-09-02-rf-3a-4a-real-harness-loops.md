@@ -29,8 +29,8 @@
 
 - [x] Slice 3.1：Sidecar 已直接绑定 pinned upstream `DeepSeekAdapter`，由正式 Grant 注入 endpoint、Broker 解析模型、thinking/effort 与一次性内存凭据；不读取运行时专属配置文件或 API Key 环境变量。
 - [x] Slice 3.2：源码路径和发布后的 NDJSON Sidecar 均通过本地真实 SSE Provider；验证增量文本、完整消息、唯一完成态，以及请求到达 Provider 后仍可并发取消并形成 cursor 2 的 cancelled 终态。
-- [ ] 通过 pinned DeepSeek Harness session/bootstrap API 注入有序 PromptSection、消息和上下文，不读取运行时专属配置文件或 API Key 环境变量。
-- [x] 使用 Grant 的 protocol/base URL/model/thinking 配置和短生命周期密钥；映射原生文本流事件、唯一终态与 seal。（Session 原生工具事件留待 Session/bootstrap 切片）
+- [x] 通过 pinned DeepSeek Harness session/bootstrap API 注入有序 PromptSection、消息和上下文，不读取运行时专属配置文件或 API Key 环境变量。
+- [x] 使用 Grant 的 protocol/base URL/model/thinking 配置和短生命周期密钥；映射原生 Session 文本流、消息、生命周期、唯一终态与 seal。（原生工具执行仍等待持久化 Tool bridge）
 - [x] 固定冒烟与真实 provider 分支明确分离；真实分支失败不得回落 fixture 或其他 Provider。
 - [ ] 真实能力验证后才把 DSH `model` capability 改为 true，并生成独立 `GO_DSH_PLUGIN_SMOKE` 用户验收证据。
 

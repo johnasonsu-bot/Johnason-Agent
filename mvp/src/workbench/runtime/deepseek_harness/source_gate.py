@@ -56,6 +56,7 @@ _HOST_V2_SOURCE_FILES = (
     f"{_HOST_V2_ROOT}/src/checkpoint.ts",
     f"{_HOST_V2_ROOT}/src/event-mapper.ts",
     f"{_HOST_V2_ROOT}/src/grant-channel.ts",
+    f"{_HOST_V2_ROOT}/src/native-session.ts",
     f"{_HOST_V2_ROOT}/src/server.ts",
 )
 _HOST_V2_ARTIFACT_FILES = (
@@ -64,6 +65,7 @@ _HOST_V2_ARTIFACT_FILES = (
     f"{_HOST_V2_ROOT}/dist/deepseek-harness-host-v2.mjs",
     f"{_HOST_V2_ROOT}/dist/event-mapper.mjs",
     f"{_HOST_V2_ROOT}/dist/grant-channel.mjs",
+    f"{_HOST_V2_ROOT}/dist/native-session.mjs",
     f"{_HOST_V2_ROOT}/dist/server.mjs",
 )
 _FIXED_HOST_V2_PLUGINS = (
