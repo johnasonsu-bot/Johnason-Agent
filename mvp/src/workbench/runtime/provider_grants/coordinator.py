@@ -152,15 +152,25 @@ class FederatedRuntimeCoordinator:
         )
         cancel_task = asyncio.create_task(wait_cancel())
         try:
-            done, _ = await asyncio.wait(
-                {delivery_task, cancel_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            try:
+                done, _ = await asyncio.wait(
+                    {delivery_task, cancel_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except BaseException:
+                await self._cancel_delivery_and_contain(
+                    delivery_task,
+                    lease=lease,
+                    offer=offer,
+                    target=target,
+                )
+                raise
             if cancel_task in done:
-                delivery_task.cancel()
-                await asyncio.gather(delivery_task, return_exceptions=True)
-                await self._contain_cancelled_grant(
-                    lease, offer=offer, target=target
+                await self._cancel_delivery_and_contain(
+                    delivery_task,
+                    lease=lease,
+                    offer=offer,
+                    target=target,
                 )
                 raise FederatedRuntimeCancelled()
             await delivery_task
@@ -173,6 +183,21 @@ class FederatedRuntimeCoordinator:
                 lease, offer=offer, target=target
             )
             raise FederatedRuntimeCancelled()
+
+    async def _cancel_delivery_and_contain(
+        self,
+        delivery_task: asyncio.Task[object],
+        *,
+        lease: FederatedRuntimeLease,
+        offer: ProviderGrantOffer,
+        target: ProviderGrantTarget,
+    ) -> None:
+        if not delivery_task.done():
+            delivery_task.cancel()
+        await asyncio.gather(delivery_task, return_exceptions=True)
+        await self._contain_cancelled_grant(
+            lease, offer=offer, target=target
+        )
 
     async def _contain_cancelled_grant(
         self,

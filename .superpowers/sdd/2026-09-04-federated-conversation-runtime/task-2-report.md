@@ -353,3 +353,67 @@
 - 仓库环境仍未安装 `ruff`；使用 `compileall`、`git diff --check` 和相关 pytest 回归替代。
 - 未执行仓库全量测试；执行了 Task 2 指定组合、所有本轮修改模块的完整单元/集成文件，
   以及 147 个相邻 main/Admission/Conversation/Python Term/Grant acceptance 回归。
+
+---
+
+## Fix round 3/5：caller cancellation 的 Grant delivery 所有权
+
+### 交付变更
+
+- Coordinator 在创建 Broker `delivery_task` 后继续承担完整所有权。caller task 在
+  `asyncio.wait()` 中被取消或出现异常时，先取消并 await 该 child task，确认 private
+  delivery coroutine 已停止，再收容精确 lease 并以 `query_cancelled` 撤销 Grant，最后
+  原样重新抛出 caller cancellation/异常。
+- 正常用户 pre-query cancel 复用同一 cancel → await → contain → revoke helper，避免两套
+  清理路径分叉；ACK 后 Host `query.cancel` 仍走原路径。
+- 外层 lease `aclose()` 保持幂等，因此 caller cancellation 完成 containment 后的通用
+  exception cleanup 不会重复撤销 Grant 或产生第二个 recovery。
+
+### Fix round 3 RED
+
+1. 新增精确测试，在真实 Provider Grant repository 已进入 `delivering` 后阻塞 delivery，
+   直接取消 coordinator consumer task。
+2. `.venv/bin/python -m pytest tests/unit/runtime/provider_grants/test_coordinator.py::test_caller_cancel_stops_delivery_and_contains_before_propagating -q -o faulthandler_timeout=5`
+   - `1 failed in 0.95s`。
+   - consumer 已在 1 秒内重新抛出 `CancelledError`，但 delivery coroutine 仍在运行；记录
+     的 Grant 仍为 `delivering`，且没有 exact-lease containment。测试在断言后显式释放
+     blocker，未把 orphan task 留给 pytest teardown。
+
+### Fix round 3 GREEN
+
+1. 同一精确测试：`1 passed in 0.91s`。
+2. Coordinator 完整单元文件：`4 passed in 3.30s`。
+3. 正常执行、Grant-stage 用户取消与 ACK 后 Host cancel 真实集成：
+   `3 passed in 6.16s`。
+4. Broker、Coordinator 与 private transport cancellation 回归：
+   `36 passed in 24.20s`。
+
+### Fix round 3 最终新鲜验证
+
+1. brief 指定 executor、Conversation Worker、真实 federated Worker、Supervisor 集成与
+   Coordinator 组合：`55 passed in 10.74s`。
+2. `compileall` 与 `git diff --check`：退出码 0。
+
+### Fix round 3 相邻文件说明
+
+- 仅修改 `mvp/src/workbench/runtime/provider_grants/coordinator.py` 和对应 Coordinator
+  单元测试；该相邻合同正是 child delivery task 的所有权边界。未修改 Gate、UI、
+  Assignment、Supervisor 或 Conversation 状态机。
+
+### Fix round 3 自审
+
+- child delivery 只存在三种退出：正常 ACK 后已 await；用户 pre-query cancel 后已
+  cancel+await 并 containment；caller cancellation/异常后已 cancel+await 并
+  containment。不存在 Coordinator 返回后仍运行的 delivery task。
+- containment 在 Broker revoke 前完成，且使用原 offer/target/lease；不会跨 Runtime、
+  generation 或 assignment 清理。
+- caller 的 `CancelledError` 不会被 `ProviderGrantDeliveryFailed` 替换；cleanup 完成后
+  保持原取消语义向上传播。
+- Grant ACK 前仍不公开 Runtime event；正常 pre-query cancel、ACK 后 Host cancel、唯一
+  cancelled terminal、一次性 Grant 与 Python Term 专属 executor 均未弱化。
+
+### Fix round 3 Concerns
+
+- 未运行仓库全量测试；执行了 Task 2 指定组合及 Broker/Coordinator/private transport
+  全部相关回归，所有并发测试均有硬超时。
+- 仓库环境未安装 `ruff`；使用 `compileall` 和 `git diff --check` 替代。

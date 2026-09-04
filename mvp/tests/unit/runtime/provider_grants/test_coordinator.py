@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from secrets import token_urlsafe
@@ -83,6 +84,30 @@ class _Delivery:
         )
 
 
+class _BlockingDelivery(_Delivery):
+    def __init__(self, order: list[str]) -> None:
+        super().__init__(order)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.stopped = asyncio.Event()
+
+    async def deliver(self, binding, secret: memoryview) -> ProviderGrantAck:
+        self.binding = binding
+        self.order.append("delivery_started")
+        assert bytes(secret) == b"opaque-provider-test-value"
+        self.entered.set()
+        try:
+            await self.release.wait()
+        finally:
+            self.stopped.set()
+        return ProviderGrantAck(
+            grant_id=binding.grant_id,
+            grant_digest=canonical_grant_digest(binding),
+            target_instance_digest=binding.target.instance_id_digest,
+            acknowledged_at=100.5,
+        )
+
+
 class _Lease:
     def __init__(
         self,
@@ -96,6 +121,7 @@ class _Lease:
         self.authority = authority
         self.order = order
         self.closed = False
+        self.pre_query_cancel = asyncio.Event()
 
     def provider_grant_target(self, envelope) -> ProviderGrantTarget:
         del envelope
@@ -121,6 +147,12 @@ class _Lease:
     async def release_for_retry(self) -> None:
         self.order.append("release_retry")
         self.closed = True
+
+    async def wait_pre_query_cancel(self) -> None:
+        await self.pre_query_cancel.wait()
+
+    def pre_query_cancel_requested(self) -> bool:
+        return self.pre_query_cancel.is_set()
 
     async def run_query(
         self, envelope, *, runtime_input: RuntimeQueryInputV2
@@ -252,6 +284,47 @@ async def test_ambiguous_delivery_contains_exact_lease_before_revoking_grant(
     assert lease.closed is True
     grant_id = lease.delivery.binding.grant_id
     assert ProviderGrantRepository(database).get(grant_id).state == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_caller_cancel_stops_delivery_and_contains_before_propagating(
+    tmp_path: Path,
+) -> None:
+    broker, lease, envelope, runtime_input, database, order = _fixture(tmp_path)
+    delivery = _BlockingDelivery(order)
+    lease.delivery = delivery
+    coordinator = FederatedRuntimeCoordinator(broker, clock=lambda: 102.0)
+
+    async def consume() -> None:
+        async for _ in coordinator.run_query(
+            lease, envelope, runtime_input=runtime_input
+        ):
+            pass
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.wait_for(delivery.entered.wait(), timeout=1.0)
+    assert delivery.binding is not None
+    grant_id = delivery.binding.grant_id
+    repository = ProviderGrantRepository(database)
+    assert repository.get(grant_id).state == "delivering"
+
+    consumer.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(consumer, timeout=1.0)
+        delivery_stopped = delivery.stopped.is_set()
+        exact_lease_contained = order.count("contain") == 1
+        grant = repository.get(grant_id)
+    finally:
+        delivery.release.set()
+        await asyncio.wait_for(delivery.stopped.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+
+    assert delivery_stopped is True
+    assert lease.closed is True
+    assert exact_lease_contained is True
+    assert grant.state == "revoked"
+    assert grant.reason == "query_cancelled"
 
 
 @pytest.mark.asyncio
