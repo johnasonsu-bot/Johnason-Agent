@@ -2,6 +2,10 @@
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 
+import {
+  DeepSeekAdapter,
+  resolveAdapterOptions,
+} from "../../../../third_party/deepseek-harness/packages/llm/llm-deepseek/lib/index.js";
 import { createCheckpoint, sealAcknowledgement } from "./checkpoint.mjs";
 import { mapSessionEvents, sortPromptSections } from "./event-mapper.mjs";
 
@@ -100,6 +104,70 @@ function fixedProviderOutcome(providerRef) {
 }
 
 
+function isFixedProvider(providerRef) {
+  return typeof providerRef === "string"
+    && providerRef.startsWith("provider-profile:fixture-");
+}
+
+
+function harnessInput(materialized, model) {
+  const system = [
+    ...materialized.promptSections.map(section => section.content),
+    ...materialized.messages
+      .filter(message => message.role === "system")
+      .map(message => message.content),
+    ...materialized.contextItems.map(item => item.content),
+  ].join("\n");
+  const messages = materialized.messages
+    .filter(message => message.role !== "system")
+    .map(message => {
+      const content = [{ type: "text", text: message.content }];
+      if (message.role === "user") {
+        return Object.freeze({
+          id: message.message_id,
+          role: "user",
+          content: Object.freeze(content),
+          source: Object.freeze({ kind: "user" }),
+        });
+      }
+      if (message.role === "assistant") {
+        return Object.freeze({
+          id: message.message_id,
+          role: "assistant",
+          content: Object.freeze(content),
+          source: Object.freeze({ kind: "model", provider: "deepseek-official", model }),
+        });
+      }
+      throw new Error("DSH real model path does not yet accept tool-role history");
+    });
+  return Object.freeze({ system, messages: Object.freeze(messages) });
+}
+
+
+function realProviderAdapter(provider, credential) {
+  const route = provider.route;
+  if (route.protocol !== "deepseek") {
+    throw new Error("DSH upstream adapter requires the deepseek protocol");
+  }
+  if (route.metadata_headers.length !== 0) {
+    throw new Error("DSH upstream adapter does not accept custom metadata headers");
+  }
+  const thinking = route.thinking_enabled ? "enabled" : "disabled";
+  const reasoningEffort = route.thinking_enabled ? route.reasoning_effort : "off";
+  const connection = resolveAdapterOptions({
+    baseURL: route.base_url,
+    thinking,
+    reasoningEffort,
+    models: [{ id: provider.model, name: provider.model }],
+  });
+  return new DeepSeekAdapter({
+    options: () => connection,
+    resolveApiKey: () => Promise.resolve(credential()),
+    resolveUserId: () => "00000000-0000-4000-8000-000000000001",
+  });
+}
+
+
 export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest }) {
   if (!grantChannel || typeof runtimeId !== "string" || typeof buildId !== "string") {
     throw new Error("DSH Host v2 bootstrap is invalid");
@@ -133,7 +201,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
       });
     },
 
-    startQuery(payload) {
+    startQuery(payload, emit = () => {}) {
       if (active !== null) throw new Error("a DSH query is already active");
       const envelope = payload?.envelope;
       const runtimeInput = payload?.runtime_input;
@@ -141,19 +209,106 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
         throw new Error("DSH query input is incomplete");
       }
       const materialized = materializeRuntimeInput(runtimeInput, envelope);
-      const outcome = fixedProviderOutcome(envelope.provider_ref);
       const consumedGrant = grantChannel.consumeForEnvelope(envelope);
       const secret = consumedGrant.secret;
+      terminal = null;
+      checkpoint = null;
+      if (typeof instanceDigest === "string" && instanceDigest.length !== 64) {
+        secret.fill(0);
+        throw new Error("DSH instance digest is invalid");
+      }
+      if (consumedGrant.acknowledgement.command_id !== envelope.command_id
+          || consumedGrant.acknowledgement.run_id !== envelope.run_id
+          || consumedGrant.acknowledgement.term_id !== envelope.term_id
+          || consumedGrant.acknowledgement.step_id !== envelope.step_id) {
+        secret.fill(0);
+        throw new Error("DSH provider grant acknowledgement identity is invalid");
+      }
+      if (!isFixedProvider(envelope.provider_ref)) {
+        let credential = secret.toString("utf8");
+        secret.fill(0);
+        const identity = Object.freeze({
+          run_id: envelope.run_id,
+          term_id: envelope.term_id,
+          step_id: envelope.step_id,
+        });
+        const [running] = mapSessionEvents(identity, [
+          { seq: 0, type: "turn/start", data: {} },
+        ]);
+        const controller = new AbortController();
+        active = {
+          identity,
+          cursor: running.cursor,
+          controller,
+          events: [running],
+        };
+        const completion = (async () => {
+          let content = "";
+          try {
+            const input = harnessInput(materialized, consumedGrant.provider.model);
+            const adapter = realProviderAdapter(
+              consumedGrant.provider,
+              () => credential,
+            );
+            for await (const chunk of adapter.stream({
+              provider: "deepseek-official",
+              model: consumedGrant.provider.model,
+              reasoningEffort: consumedGrant.provider.route.thinking_enabled
+                ? consumedGrant.provider.route.reasoning_effort
+                : "off",
+              messages: input.messages,
+              system: input.system,
+              signal: controller.signal,
+              sessionId: envelope.session_id,
+            })) {
+              if (active === null || active.identity !== identity) return;
+              if (chunk.type === "text-delta" && chunk.text.length !== 0) {
+                content += chunk.text;
+                const [event] = mapSessionEvents(identity, [
+                  { seq: 0, type: "assistant/delta", data: { content: chunk.text } },
+                ], { cursorOffset: active.cursor });
+                active.cursor = event.cursor;
+                active.events.push(event);
+                emit(event);
+              } else if (chunk.type === "finish"
+                  && !["stop", "max-tokens"].includes(chunk.reason.kind)) {
+                throw new Error(`DSH model finished with ${chunk.reason.kind}`);
+              }
+            }
+            if (active === null || active.identity !== identity) return;
+            const completed = mapSessionEvents(identity, [
+              { seq: 0, type: "assistant/message", data: { content } },
+              { seq: 1, type: "turn/end", data: { reason: "completed" } },
+            ], { cursorOffset: active.cursor });
+            active.events.push(...completed);
+            terminal = completed.at(-1);
+            checkpoint = createCheckpoint(active.events, buildId);
+            active = null;
+            for (const event of completed) emit(event);
+          } catch (error) {
+            if (active === null || active.identity !== identity || controller.signal.aborted) {
+              return;
+            }
+            const [failed] = mapSessionEvents(identity, [
+              { seq: 0, type: "turn/end", data: { reason: "failed" } },
+            ], { cursorOffset: active.cursor });
+            terminal = failed;
+            checkpoint = null;
+            active = null;
+            emit(failed);
+          } finally {
+            credential = "";
+          }
+        })();
+        return Object.freeze({
+          accepted: true,
+          events: Object.freeze([running]),
+          checkpoint: null,
+          completion,
+        });
+      }
+      const outcome = fixedProviderOutcome(envelope.provider_ref);
       try {
-        if (typeof instanceDigest === "string" && instanceDigest.length !== 64) {
-          throw new Error("DSH instance digest is invalid");
-        }
-        if (consumedGrant.acknowledgement.command_id !== envelope.command_id
-            || consumedGrant.acknowledgement.run_id !== envelope.run_id
-            || consumedGrant.acknowledgement.term_id !== envelope.term_id
-            || consumedGrant.acknowledgement.step_id !== envelope.step_id) {
-          throw new Error("DSH provider grant acknowledgement identity is invalid");
-        }
         const content = [
           ...materialized.promptSections.map(section => section.content),
           ...materialized.messages.map(message => message.content),
@@ -200,6 +355,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
       if (active === null || active.identity.run_id !== runId) {
         throw new Error("cancel identity does not match an active DSH query");
       }
+      active.controller?.abort("Host v2 query.cancel");
       const [event] = mapSessionEvents(
         active.identity,
         [{ seq: 0, type: "turn/end", data: { reason: "cancelled" } }],
@@ -247,7 +403,9 @@ export function serveNdjson(
         payload = sidecar.capabilities();
       } else if (command.type === "query.start") {
         await grantReady;
-        const started = sidecar.startQuery(command.payload);
+        const started = sidecar.startQuery(command.payload, event => {
+          output.write(`${JSON.stringify({ kind: "event", payload: event })}\n`);
+        });
         output.write(`${JSON.stringify({
           kind: "response",
           type: command.type,

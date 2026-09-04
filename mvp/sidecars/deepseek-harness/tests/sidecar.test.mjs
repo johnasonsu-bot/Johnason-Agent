@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
+import { createServer } from "node:http";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
@@ -389,6 +390,166 @@ test("query consumes the shared Host v2 input and returns identity-bound seal ac
 });
 
 
+test("real provider query streams through the pinned DeepSeek Harness adapter", async () => {
+  const requests = [];
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on("data", chunk => chunks.push(chunk));
+    request.on("end", () => {
+      requests.push({
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      const body = [
+        'data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}',
+        'data: {"choices":[{"delta":{"content":"real "}}]}',
+        'data: {"choices":[{"delta":{"content":"DSH"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n");
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-length": Buffer.byteLength(body),
+      });
+      response.end(body);
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const grants = new EphemeralGrantChannel(() => 100);
+  grants.accept({
+    grant_id: "grant-real",
+    grant_digest: "a".repeat(64),
+    target_instance_digest: "b".repeat(64),
+    command_id: "start-1",
+    run_id: "run-wire",
+    term_id: "term-wire",
+    step_id: "step-wire",
+    provider_ref: "provider-profile:deepseek-primary",
+    route: {
+      protocol: "deepseek",
+      base_url: `http://127.0.0.1:${address.port}`,
+      metadata_headers: [],
+      thinking_enabled: true,
+      reasoning_effort: "high",
+    },
+    model: "deepseek-v4-flash",
+    expires_at: 110,
+  }, Buffer.from("one-shot-test-secret", "utf8"));
+  const sidecar = createSidecar({
+    grantChannel: grants,
+    runtimeId: "dsh",
+    buildId: "dsh:test-build",
+    instanceDigest: "b".repeat(64),
+  });
+  const emitted = [];
+
+  try {
+    const started = sidecar.startQuery(
+      queryCommand("provider-profile:deepseek-primary").payload,
+      event => emitted.push(event),
+    );
+    assert.equal(started.accepted, true);
+    assert.deepEqual(started.events.map(event => event.payload), [{ status: "running" }]);
+    await started.completion;
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].path, "/chat/completions");
+  assert.equal(requests[0].authorization, "Bearer one-shot-test-secret");
+  assert.equal(requests[0].body.model, "deepseek-v4-flash");
+  assert.equal(requests[0].body.reasoning_effort, "high");
+  assert.deepEqual(emitted.map(event => event.type), [
+    "assistant.delta",
+    "assistant.delta",
+    "assistant.message",
+    "runtime.status",
+  ]);
+  assert.deepEqual(emitted.at(-2).payload, { content: "real DSH" });
+  assert.deepEqual(emitted.at(-1).payload, { status: "completed" });
+  assert.equal(JSON.stringify(emitted).includes("one-shot-test-secret"), false);
+});
+
+
+test("real provider query can be cancelled after the DeepSeek Harness request is in flight", async () => {
+  let markRequestStarted;
+  const requestStarted = new Promise(resolve => { markRequestStarted = resolve; });
+  let releaseResponse;
+  const responseReleased = new Promise(resolve => { releaseResponse = resolve; });
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", async () => {
+      markRequestStarted();
+      await responseReleased;
+      if (response.destroyed) return;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const grants = new EphemeralGrantChannel(() => 100);
+  grants.accept({
+    grant_id: "grant-real-cancel",
+    grant_digest: "a".repeat(64),
+    target_instance_digest: "b".repeat(64),
+    command_id: "start-1",
+    run_id: "run-wire",
+    term_id: "term-wire",
+    step_id: "step-wire",
+    provider_ref: "provider-profile:deepseek-cancel",
+    route: {
+      protocol: "deepseek",
+      base_url: `http://127.0.0.1:${address.port}`,
+      metadata_headers: [],
+      thinking_enabled: true,
+      reasoning_effort: "high",
+    },
+    model: "deepseek-v4-flash",
+    expires_at: 110,
+  }, Buffer.from("cancel-test-secret", "utf8"));
+  const sidecar = createSidecar({
+    grantChannel: grants,
+    runtimeId: "dsh",
+    buildId: "dsh:test-build",
+    instanceDigest: "b".repeat(64),
+  });
+
+  try {
+    const started = sidecar.startQuery(
+      queryCommand("provider-profile:deepseek-cancel").payload,
+    );
+    await requestStarted;
+    const cancelled = sidecar.cancel("run-wire");
+    assert.deepEqual(cancelled.payload, { status: "cancelled" });
+    assert.equal(cancelled.cursor, 2);
+    releaseResponse();
+    await started.completion;
+    assert.deepEqual(sidecar.seal({
+      run_id: "run-wire",
+      term_id: "term-wire",
+      step_id: "step-wire",
+      terminal_cursor: 2,
+    }), {
+      state: "terminal",
+      run_id: "run-wire",
+      term_id: "term-wire",
+      step_id: "step-wire",
+      terminal_cursor: 2,
+      sealed: true,
+    });
+  } finally {
+    releaseResponse();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+
 test("plugin smoke capabilities do not overclaim RF-4B controls or tools", () => {
   const sidecar = createSidecar({
     grantChannel: new EphemeralGrantChannel(),
@@ -453,6 +614,117 @@ test("published NDJSON sidecar accepts before events and seals completed termina
     });
   } finally {
     await wire.close();
+  }
+});
+
+
+test("published NDJSON sidecar streams a real local provider through pinned DeepSeek Harness", async () => {
+  const requests = [];
+  const server = createServer((request, response) => {
+    const chunks = [];
+    request.on("data", chunk => chunks.push(chunk));
+    request.on("end", () => {
+      requests.push({
+        path: request.url,
+        authorization: request.headers.authorization,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      });
+      const body = [
+        'data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}',
+        'data: {"choices":[{"delta":{"content":"published "}}]}',
+        'data: {"choices":[{"delta":{"content":"DSH"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}',
+        "data: [DONE]",
+        "",
+      ].join("\n\n");
+      response.writeHead(200, {
+        "content-type": "text/event-stream",
+        "content-length": Buffer.byteLength(body),
+      });
+      response.end(body);
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const providerRef = "provider-profile:deepseek-published";
+  const grant = privateGrant(providerRef, "grant-real-published");
+  grant.secret = Buffer.from("published-test-secret", "utf8");
+  grant.binding.route.base_url = `http://127.0.0.1:${address.port}`;
+  grant.binding.model = "deepseek-v4-flash";
+  grant.grant_digest = digest(grant.binding);
+  const wire = await launchPublishedSidecar(grant);
+  try {
+    wire.send(queryCommand(providerRef));
+    assert.deepEqual((await wire.read()).payload, { accepted: true });
+    const events = [
+      await wire.read(),
+      await wire.read(),
+      await wire.read(),
+      await wire.read(),
+      await wire.read(),
+    ];
+    assert.deepEqual(events.map(frame => frame.payload.type), [
+      "runtime.status",
+      "assistant.delta",
+      "assistant.delta",
+      "assistant.message",
+      "runtime.status",
+    ]);
+    assert.deepEqual(events.at(-2).payload.payload, { content: "published DSH" });
+    assert.deepEqual(events.at(-1).payload.payload, { status: "completed" });
+  } finally {
+    await wire.close();
+    await new Promise(resolve => server.close(resolve));
+  }
+  assert.equal(requests[0].path, "/chat/completions");
+  assert.equal(requests[0].authorization, "Bearer published-test-secret");
+  assert.equal(requests[0].body.model, "deepseek-v4-flash");
+});
+
+
+test("published NDJSON sidecar accepts cancel while a real DSH request is in flight", async () => {
+  let markRequestStarted;
+  const requestStarted = new Promise(resolve => { markRequestStarted = resolve; });
+  let releaseResponse;
+  const responseReleased = new Promise(resolve => { releaseResponse = resolve; });
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", async () => {
+      markRequestStarted();
+      await responseReleased;
+      if (response.destroyed) return;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const providerRef = "provider-profile:deepseek-published-cancel";
+  const grant = privateGrant(providerRef, "grant-real-published-cancel");
+  grant.secret = Buffer.from("published-cancel-test-secret", "utf8");
+  grant.binding.route.base_url = `http://127.0.0.1:${address.port}`;
+  grant.binding.model = "deepseek-v4-flash";
+  grant.grant_digest = digest(grant.binding);
+  const wire = await launchPublishedSidecar(grant);
+  try {
+    wire.send(queryCommand(providerRef));
+    assert.deepEqual((await wire.read()).payload, { accepted: true });
+    assert.deepEqual((await wire.read()).payload.payload, { status: "running" });
+    await requestStarted;
+    wire.send({
+      type: "query.cancel",
+      command_id: "cancel-real-published",
+      payload: { run_id: "run-wire", reason: "user_requested" },
+    });
+    assert.deepEqual((await wire.read()).payload, { accepted: true });
+    const cancelled = await wire.read();
+    assert.deepEqual(cancelled.payload.payload, { status: "cancelled" });
+    assert.equal(cancelled.payload.cursor, 2);
+  } finally {
+    releaseResponse();
+    await wire.close();
+    await new Promise(resolve => server.close(resolve));
   }
 });
 
