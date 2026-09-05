@@ -914,7 +914,6 @@ class ConversationAPI:
 
     async def process_queued_turn(self, session_id: str, command_id: str) -> None:
         """Advance one Worker-owned turn and seal it if the runtime did not."""
-        reservation_id = self._reservation_event_id(session_id, command_id)
         async with self._session_lock(session_id):
             turn = self.conversations.load_turn_status(session_id, command_id)
             if turn is None or turn.status in {
@@ -923,8 +922,21 @@ class ConversationAPI:
                 "reconciliation_required",
             }:
                 return
+            if self.conversations.is_turn_held(session_id, command_id):
+                if turn.owner_id is not None and turn.status == "running":
+                    self.conversations.release_turn(
+                        session_id,
+                        command_id,
+                        owner_id=turn.owner_id,
+                        state=turn.state,
+                    )
+                    self.conversations.mark_retryable_unowned(
+                        session_id, command_id, state=turn.state
+                    )
+                return
             if turn.owner_id is None:
                 return
+            reservation_id = self._reservation_event_id(session_id, command_id)
             orchestration = turn.state.get("orchestration")
             if isinstance(orchestration, dict):
                 await self._process_sequential_turn(turn, orchestration)

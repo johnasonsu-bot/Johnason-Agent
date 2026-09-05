@@ -78,3 +78,22 @@ class WorkflowStore:
                 """
             )
             migrate_phase1(connection)
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_turn_manual_holds (
+                    hold_operation_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    held_at REAL NOT NULL,
+                    release_operation_id TEXT UNIQUE,
+                    released_at REAL,
+                    FOREIGN KEY (session_id, command_id)
+                        REFERENCES conversation_turns(session_id, command_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                    conversation_turn_manual_holds_one_active
+                ON conversation_turn_manual_holds(session_id, command_id)
+                WHERE released_at IS NULL;
+                """
+            )

@@ -35,6 +35,14 @@ class ReconciliationRecoveryConflict(TurnSnapshotCorruption):
     """A legacy reconciliation command cannot be recovered unambiguously."""
 
 
+class ManualTurnHoldError(RuntimeError):
+    """A manual hold operation or claim was rejected with a stable code."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 @dataclass(frozen=True)
 class TurnClaim:
     disposition: str
@@ -57,6 +65,21 @@ class TurnStatus:
     result: list[dict[str, Any]] | None
     enqueue_sequence: int
     updated_at: float
+
+
+@dataclass(frozen=True)
+class ManualTurnHold:
+    session_id: str
+    command_id: str
+    operation_id: str
+    reason: str
+    held_at: float
+    release_operation_id: str | None
+    released_at: float | None
+
+    @property
+    def active(self) -> bool:
+        return self.released_at is None
 
 
 @dataclass(frozen=True)
@@ -390,6 +413,12 @@ class ConversationRepository:
                 """
                 SELECT candidate.* FROM conversation_turns AS candidate
                 WHERE candidate.status IN ('queued', 'retryable')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM conversation_turn_manual_holds AS held
+                    WHERE held.session_id = candidate.session_id
+                      AND held.command_id = candidate.command_id
+                      AND held.released_at IS NULL
+                  )
                   AND (
                     candidate.owner_id IS NULL
                     OR candidate.lease_expires_at <= ?
@@ -439,6 +468,12 @@ class ConversationRepository:
                 SET status = 'running', owner_id = ?, lease_expires_at = ?, updated_at = ?
                 WHERE session_id = ? AND command_id = ?
                   AND status IN ('queued', 'retryable')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM conversation_turn_manual_holds AS held
+                    WHERE held.session_id = conversation_turns.session_id
+                      AND held.command_id = conversation_turns.command_id
+                      AND held.released_at IS NULL
+                  )
                   AND (owner_id IS NULL OR lease_expires_at <= ?)
                   AND (
                     status = 'queued'
@@ -731,6 +766,152 @@ class ConversationRepository:
             ).fetchone()
         return self._turn_status(row) if row is not None else None
 
+    def hold_turn(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        operation_id: str,
+        reason: str,
+    ) -> ManualTurnHold:
+        """Durably prevent one idle queued/retryable Turn from being claimed."""
+        if not operation_id or not reason:
+            raise ValueError("hold operation_id and reason are required")
+        now = time.time()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                """SELECT * FROM conversation_turn_manual_holds
+                WHERE hold_operation_id = ? OR release_operation_id = ?""",
+                (operation_id, operation_id),
+            ).fetchone()
+            if operation is not None:
+                if (
+                    operation["hold_operation_id"] == operation_id
+                    and operation["session_id"] == session_id
+                    and operation["command_id"] == command_id
+                    and operation["reason"] == reason
+                ):
+                    connection.commit()
+                    return self._manual_turn_hold(operation)
+                connection.rollback()
+                raise ManualTurnHoldError("operation_id_conflict")
+            turn = connection.execute(
+                """SELECT status, owner_id, lease_expires_at
+                FROM conversation_turns
+                WHERE session_id = ? AND command_id = ?""",
+                (session_id, command_id),
+            ).fetchone()
+            if turn is None:
+                connection.rollback()
+                raise ManualTurnHoldError("turn_not_found")
+            if turn["status"] not in {"queued", "retryable"}:
+                connection.rollback()
+                raise ManualTurnHoldError("turn_not_holdable")
+            if turn["owner_id"] is not None and float(turn["lease_expires_at"]) > now:
+                connection.rollback()
+                raise ManualTurnHoldError("turn_busy")
+            active = connection.execute(
+                """SELECT 1 FROM conversation_turn_manual_holds
+                WHERE session_id = ? AND command_id = ? AND released_at IS NULL""",
+                (session_id, command_id),
+            ).fetchone()
+            if active is not None:
+                connection.rollback()
+                raise ManualTurnHoldError("turn_held")
+            connection.execute(
+                """INSERT INTO conversation_turn_manual_holds(
+                    hold_operation_id, session_id, command_id, reason, held_at,
+                    release_operation_id, released_at
+                ) VALUES (?, ?, ?, ?, ?, NULL, NULL)""",
+                (operation_id, session_id, command_id, reason, now),
+            )
+            row = connection.execute(
+                """SELECT * FROM conversation_turn_manual_holds
+                WHERE hold_operation_id = ?""",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._manual_turn_hold(row)
+
+    def release_hold(
+        self,
+        session_id: str,
+        command_id: str,
+        *,
+        operation_id: str,
+    ) -> ManualTurnHold:
+        """Explicitly release the active manual hold for one Turn."""
+        if not operation_id:
+            raise ValueError("release operation_id is required")
+        now = time.time()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                """SELECT * FROM conversation_turn_manual_holds
+                WHERE hold_operation_id = ? OR release_operation_id = ?""",
+                (operation_id, operation_id),
+            ).fetchone()
+            if operation is not None:
+                if (
+                    operation["release_operation_id"] == operation_id
+                    and operation["session_id"] == session_id
+                    and operation["command_id"] == command_id
+                ):
+                    connection.commit()
+                    return self._manual_turn_hold(operation)
+                connection.rollback()
+                raise ManualTurnHoldError("operation_id_conflict")
+            row = connection.execute(
+                """SELECT * FROM conversation_turn_manual_holds
+                WHERE session_id = ? AND command_id = ? AND released_at IS NULL""",
+                (session_id, command_id),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise ManualTurnHoldError("active_hold_not_found")
+            changed = connection.execute(
+                """UPDATE conversation_turn_manual_holds
+                SET release_operation_id = ?, released_at = ?
+                WHERE hold_operation_id = ? AND released_at IS NULL""",
+                (operation_id, now, row["hold_operation_id"]),
+            )
+            if changed.rowcount != 1:
+                connection.rollback()
+                raise ManualTurnHoldError("active_hold_not_found")
+            released = connection.execute(
+                """SELECT * FROM conversation_turn_manual_holds
+                WHERE hold_operation_id = ?""",
+                (row["hold_operation_id"],),
+            ).fetchone()
+            connection.commit()
+        assert released is not None
+        return self._manual_turn_hold(released)
+
+    def is_turn_held(self, session_id: str, command_id: str) -> bool:
+        with self.store.connect() as connection:
+            row = connection.execute(
+                """SELECT 1 FROM conversation_turn_manual_holds
+                WHERE session_id = ? AND command_id = ? AND released_at IS NULL""",
+                (session_id, command_id),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _manual_turn_hold(row: Any) -> ManualTurnHold:
+        return ManualTurnHold(
+            session_id=row["session_id"],
+            command_id=row["command_id"],
+            operation_id=row["hold_operation_id"],
+            reason=row["reason"],
+            held_at=float(row["held_at"]),
+            release_operation_id=row["release_operation_id"],
+            released_at=(
+                float(row["released_at"]) if row["released_at"] is not None else None
+            ),
+        )
+
     @staticmethod
     def _validate_turn_identity(
         row: Any,
@@ -830,6 +1011,14 @@ class ConversationRepository:
                 raise ValueError("turn identity cannot change")
             if row["provider_id"] != provider_id or row["model"] != model:
                 raise ValueError("turn provider/model cannot change")
+            held = connection.execute(
+                """SELECT 1 FROM conversation_turn_manual_holds
+                WHERE session_id = ? AND command_id = ? AND released_at IS NULL""",
+                (session_id, command_id),
+            ).fetchone()
+            if held is not None:
+                connection.rollback()
+                raise ManualTurnHoldError("turn_held")
             if row["prompt_digest"] is None:
                 connection.execute(
                     """
