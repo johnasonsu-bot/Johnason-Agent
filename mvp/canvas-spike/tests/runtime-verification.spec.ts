@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-type Mode = "success" | "failed" | "timed_out" | "running" | "unavailable" | "poll_error" | "poll_missing";
+type Mode = "success" | "failed" | "timed_out" | "running" | "unavailable" | "poll_error" | "poll_missing" | "stale_cancel_success" | "stale_cancel_error";
 
 // Only the local HTTP service is a test double. The Electron window, React forms,
 // navigation and IPC transport are real. No external provider is called.
@@ -16,6 +16,8 @@ const mode = ${JSON.stringify(mode)};
 const profileMode = ${JSON.stringify(profileMode)};
 let bootstrap = "", started = false, starts = 0, polls = 0, cancelled = false;
 let accepted = null;
+let releaseOldCancel = null, secondJobPolls = 0, cancelledJobId = null;
+const staleCancelMode = mode.startsWith("stale_cancel_");
 const profile = { id: "deepseek-primary", name: "DeepSeek", protocol: "deepseek", headers: {}, base_url: "https://api.deepseek.invalid", model_aliases: { default: "saved-deepseek-model" }, enabled: true, credential_mode: "reference", credential_status: "configured", capabilities: [], thinking_enabled: true, reasoning_effort: "high" };
 if (profileMode === "disabled") profile.enabled = false;
 if (profileMode === "no-model") profile.model_aliases = {};
@@ -32,7 +34,7 @@ process.stdin.on("data", chunk => {
     for await (const chunk of request) body += chunk;
     const pathname = new URL(request.url, "http://127.0.0.1").pathname;
     const send = (status, value) => { response.writeHead(status, { "content-type": "application/json" }); response.end(JSON.stringify(value)); };
-    const job = status => ({ id: "verification-1", status, runtime_id: "dsh", provider_profile_id: profile.id, model: "saved-deepseek-model", message: "safe summary", raw_body: "RAW_RESPONSE_MUST_NOT_RENDER" });
+    const job = (status, id = "verification-1") => ({ id, status, runtime_id: "dsh", provider_profile_id: profile.id, model: "saved-deepseek-model", message: "safe summary", raw_body: "RAW_RESPONSE_MUST_NOT_RENDER" });
     if (pathname === "/api/health") return send(200, { status: "ok", service: "hermes-workbench", instance_id: identity.instance_id, port: server.address().port });
     if (pathname === "/api/vault/status") return send(200, { status: "unlocked" });
     if (pathname === "/api/vault/lock") return send(200, { status: "locked" });
@@ -46,16 +48,25 @@ process.stdin.on("data", chunk => {
       // Remember only whether the contract matched; never store the password.
       accepted = { runtime_id: value.runtime_id, provider_profile_id: value.provider_profile_id, hasPassword: typeof value.vault_password === "string" && value.vault_password.length > 0, keys: Object.keys(value).sort() };
       if (mode === "unavailable") return send(503, { detail: "verification_unavailable", raw_body: "RAW_RESPONSE_MUST_NOT_RENDER" });
-      return setTimeout(() => send(202, job("running")), 150);
+      const id = staleCancelMode ? "verification-" + starts : "verification-1";
+      return setTimeout(() => send(202, job("running", id)), 150);
     }
+    if (pathname === "/api/providers/release-old-cancel/models") { releaseOldCancel?.(); return send(200, {}); }
+    if (staleCancelMode && pathname === "/api/runtime-verifications/verification-1/cancel") {
+      releaseOldCancel = () => mode === "stale_cancel_error" ? send(503, { detail: "verification_unavailable" }) : send(200, job("cancelled"));
+      return;
+    }
+    if (staleCancelMode && pathname === "/api/runtime-verifications/verification-2") { secondJobPolls += 1; return send(200, job("running", "verification-2")); }
+    if (staleCancelMode && pathname === "/api/runtime-verifications/verification-2/cancel") { cancelledJobId = "verification-2"; return send(200, job("cancelled", "verification-2")); }
     if (pathname === "/api/runtime-verifications/verification-1/cancel") { cancelled = true; return send(200, job("cancelled")); }
     if (pathname === "/api/runtime-verifications/verification-1") {
       polls += 1;
+      if (staleCancelMode) return releaseOldCancel ? send(404, { detail: "verification_not_found" }) : send(200, job("running"));
       if (mode === "poll_error") return send(503, { detail: "verification_unavailable" });
       if (mode === "poll_missing") return send(404, { detail: "verification_not_found" });
       return send(200, job(cancelled ? "cancelled" : mode === "running" || polls < 2 ? "running" : mode === "success" ? "succeeded" : mode));
     }
-    if (pathname === "/api/providers/verification-test-stats/models") return send(200, { starts, polls, cancelled, accepted });
+    if (pathname === "/api/providers/verification-test-stats/models") return send(200, { starts, polls, cancelled, accepted, secondJobPolls, cancelledJobId });
     if (pathname.startsWith("/api/sessions")) return send(200, { session_id: "ui-session-0" });
     return send(404, { detail: "not found" });
   });
@@ -178,3 +189,38 @@ test("poll failure does not report the accepted job as completed or allow duplic
     await expect(panel).toContainText("验收已取消");
   } finally { await app.close(); }
 });
+
+for (const mode of ["stale_cancel_success", "stale_cancel_error"] as const) {
+  test(`${mode} cannot replace or disable a new job after the old record disappears`, async ({}, testInfo) => {
+    const { app, page, panel } = await launchFixture(testInfo.outputPath("backend"), mode);
+    try {
+      await panel.getByLabel("本次验收 Vault 密码").fill(randomUUID());
+      await panel.getByRole("button", { name: "开始真实验收" }).click();
+      await expect(panel).toContainText("验收运行中");
+      await panel.getByRole("button", { name: "取消验收" }).click();
+      await expect(panel).toContainText("验收记录已失效");
+      await panel.getByLabel("本次验收 Vault 密码").fill(randomUUID());
+      await panel.getByRole("button", { name: "重新验收" }).click();
+      await expect(panel).toContainText("验收编号：verification-2");
+      await expect.poll(async () => (await stats(page)).secondJobPolls).toBeGreaterThan(0);
+      // Record observable renderer transitions while releasing the old response;
+      // even a transient old error/result is a regression, not just the final UI.
+      await page.evaluate(() => {
+        (window as any).__verificationTransitions = [];
+        const section = document.getElementById("runtime-verification-title")!.closest("section")!;
+        new MutationObserver(() => (window as any).__verificationTransitions.push(section.textContent)).observe(section, { childList: true, subtree: true, characterData: true });
+      });
+      const before = (await stats(page)).secondJobPolls;
+      await page.evaluate(async () => { await (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/providers/release-old-cancel/models" }); });
+      await expect.poll(async () => (await stats(page)).secondJobPolls).toBeGreaterThan(before);
+      await expect(panel).toContainText("验收编号：verification-2");
+      await expect(panel.getByRole("button", { name: "取消验收" })).toBeEnabled();
+      const transitions = await page.evaluate(() => (window as any).__verificationTransitions.join("\n"));
+      expect(transitions).not.toContain("验收编号：verification-1");
+      expect(transitions).not.toContain("验收服务暂不可用");
+      await panel.getByRole("button", { name: "取消验收" }).click();
+      await expect(panel).toContainText("验收已取消");
+      expect(await stats(page)).toMatchObject({ starts: 2, cancelledJobId: "verification-2" });
+    } finally { await app.close(); }
+  });
+}

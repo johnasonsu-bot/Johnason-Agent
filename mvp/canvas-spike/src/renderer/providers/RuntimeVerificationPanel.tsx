@@ -2,10 +2,10 @@ import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } fro
 import type { ProviderProfile } from "../api";
 import { runtimeVerificationApi, VerificationRequestError, type RuntimeVerification, type VerificationStatus } from "./runtimeVerificationApi";
 
-type ViewState = { job: RuntimeVerification | null; starting: boolean; cancelling: boolean; attempted: boolean; recordMissing: boolean; error: string };
+type ViewState = { job: RuntimeVerification | null; generation: number; starting: boolean; cancelling: boolean; attempted: boolean; recordMissing: boolean; error: string };
 // Job metadata survives route changes in memory only. Passwords never enter this
 // store, browser storage, logs, or a saved provider profile.
-let retained: ViewState = { job: null, starting: false, cancelling: false, attempted: false, recordMissing: false, error: "" };
+let retained: ViewState = { job: null, generation: 0, starting: false, cancelling: false, attempted: false, recordMissing: false, error: "" };
 const listeners = new Set<() => void>();
 const subscribe = (listener: () => void) => { listeners.add(listener); return () => { listeners.delete(listener); }; };
 const snapshot = () => retained;
@@ -13,6 +13,7 @@ function update(patch: Partial<ViewState>) {
   retained = { ...retained, ...patch };
   listeners.forEach((listener) => listener());
 }
+const isCurrentJob = (generation: number, id: string) => retained.generation === generation && retained.job?.id === id;
 
 const statusCopy: Record<VerificationStatus, string> = {
   running: "验收运行中", succeeded: "验收通过", failed: "验收失败", timed_out: "验收超时", cancelled: "验收已取消",
@@ -44,7 +45,7 @@ export function RuntimeVerificationPanel({ providers, selectedProviderId }: { pr
   const passwordInput = useRef<HTMLInputElement>(null);
   const selected = compatible.find((provider) => provider.id === providerId);
   const running = state.job?.status === "running" && !state.recordMissing;
-  const busy = state.starting || running;
+  const busy = state.starting || state.cancelling || running;
   const problem = ineligible(selected);
 
   useEffect(() => {
@@ -54,49 +55,54 @@ export function RuntimeVerificationPanel({ providers, selectedProviderId }: { pr
   useEffect(() => {
     if (!state.job || state.job.status !== "running" || state.recordMissing) return;
     const id = state.job.id;
+    const generation = state.generation;
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
       try {
         const job = await runtimeVerificationApi.status(id);
-        if (active && retained.job?.id === id && retained.job.status === "running" && !retained.cancelling) update({ job, error: "" });
+        if (active && isCurrentJob(generation, id) && retained.job?.status === "running" && !retained.cancelling) update({ job, error: "" });
       } catch (error) {
-        if (active && retained.job?.id === id && retained.job.status === "running") {
+        if (active && isCurrentJob(generation, id) && retained.job?.status === "running") {
           if (error instanceof VerificationRequestError && error.code === "verification_not_found") {
-            update({ recordMissing: true, error: "验收记录已失效，结果未知。本地服务可能已重启；请检查后重新验收。" });
+            // A missing record invalidates every outstanding operation on it,
+            // including a cancellation response that can still arrive later.
+            update({ generation: generation + 1, cancelling: false, recordMissing: true, error: "验收记录已失效，结果未知。本地服务可能已重启；请检查后重新验收。" });
           } else update({ error: "暂时无法读取验收状态；结果仍未确认，将继续查询。请勿重复启动。" });
         }
       }
-      if (active && retained.job?.id === id && retained.job.status === "running" && !retained.recordMissing) timer = setTimeout(() => void poll(), 1000);
+      if (active && isCurrentJob(generation, id) && retained.job?.status === "running" && !retained.recordMissing) timer = setTimeout(() => void poll(), 1000);
     };
     timer = setTimeout(() => void poll(), 1000);
     return () => { active = false; if (timer) clearTimeout(timer); };
-  }, [state.job?.id, state.job?.status, state.recordMissing]);
+  }, [state.generation, state.job?.id, state.job?.status, state.recordMissing]);
 
   const start = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (retained.starting || (retained.job?.status === "running" && !retained.recordMissing) || problem || !password) return;
+    if (retained.starting || retained.cancelling || (retained.job?.status === "running" && !retained.recordMissing) || problem || !password) return;
     const submittedPassword = password;
     if (passwordInput.current) passwordInput.current.value = "";
     setPassword("");
-    update({ starting: true, attempted: true, job: null, recordMissing: false, error: "" });
+    const generation = retained.generation + 1;
+    update({ generation, starting: true, cancelling: false, attempted: true, job: null, recordMissing: false, error: "" });
     try {
       const job = await runtimeVerificationApi.start(providerId, submittedPassword);
-      update({ job, starting: false });
+      if (retained.generation === generation && retained.starting) update({ job, starting: false });
     } catch (error) {
-      update({ starting: false, error: error instanceof Error ? error.message : "无法启动验收。" });
+      if (retained.generation === generation && retained.starting) update({ starting: false, error: error instanceof Error ? error.message : "无法启动验收。" });
     }
   };
 
   const cancel = async () => {
     const job = retained.job;
-    if (!job || job.status !== "running" || retained.cancelling) return;
+    if (!job || job.status !== "running" || retained.recordMissing || retained.cancelling) return;
+    const generation = retained.generation;
     update({ cancelling: true, error: "" });
     try {
       const result = await runtimeVerificationApi.cancel(job.id);
-      update({ job: result, cancelling: false });
+      if (isCurrentJob(generation, job.id)) update({ job: result, cancelling: false });
     } catch (error) {
-      update({ cancelling: false, error: error instanceof Error ? error.message : "未确认取消结果，请重试。" });
+      if (isCurrentJob(generation, job.id)) update({ cancelling: false, error: error instanceof Error ? error.message : "未确认取消结果，请重试。" });
     }
   };
 
