@@ -12,12 +12,13 @@ from .vault import CredentialVault
 class VaultService:
     """Keep the application vault locked until an explicit local API action."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = path
+        self._read_only = read_only
         self._lock = RLock()
         self._recovery_required = False
         try:
-            self._vault = CredentialVault.open(path)
+            self._vault = CredentialVault.open(path, read_only=read_only)
         except FileNotFoundError:
             self._vault = None
         except VaultRecoveryRequiredError:
@@ -35,6 +36,7 @@ class VaultService:
 
     def create(self, password: str) -> None:
         with self._lock:
+            self._require_writable()
             if self._recovery_required or self._vault is not None or self.path.exists():
                 raise FileExistsError("vault already exists")
             try:
@@ -47,6 +49,7 @@ class VaultService:
     def recover(self, password: str) -> None:
         """Replace only an explicitly detected corrupt vault, preserving a backup."""
         with self._lock:
+            self._require_writable()
             if not self._recovery_required:
                 raise FileExistsError("vault does not require recovery")
             try:
@@ -88,3 +91,7 @@ class VaultService:
         if self._vault is None:
             raise VaultLockedError("vault is locked")
         return self._vault
+
+    def _require_writable(self) -> None:
+        if self._read_only:
+            raise PermissionError("vault is read-only")

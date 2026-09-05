@@ -1829,7 +1829,7 @@ def _seal_preparer(
             raise ValueError(
                 "no-credential profile must not receive a Vault password"
             )
-        vault = VaultService(runtime_dir / "credentials.vault")
+        vault = VaultService(runtime_dir / "credentials.vault", read_only=True)
         try:
             if profile.credential_mode == "reference":
                 vault.unlock(vault_password)

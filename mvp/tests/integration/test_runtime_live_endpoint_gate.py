@@ -60,7 +60,6 @@ async def test_external_verifier_isolates_execution_state_from_saved_runtime(tmp
     password = token_urlsafe(24)
     vault = VaultService(runtime / "credentials.vault")
     vault.create(password)
-    vault.lock()
     captured = []
     original = SidecarSupervisor.__init__
 
@@ -73,10 +72,14 @@ async def test_external_verifier_isolates_execution_state_from_saved_runtime(tmp
 
     monkeypatch.setattr(SidecarSupervisor, "__init__", capture)
     monkeypatch.setattr(SidecarSupervisor, "start", stop_before_process_or_network)
-    with pytest.raises(RuntimeError, match="offline stop"):
-        await _signer_module().prepare_development_environment(
-            ("dsh",), "manual-provider", runtime, output, password
-        )
+    try:
+        with pytest.raises(RuntimeError, match="offline stop"):
+            await _signer_module().prepare_development_environment(
+                ("dsh",), "manual-provider", runtime, output, password
+            )
+        assert vault.status == "unlocked"
+    finally:
+        vault.lock()
     assert len(captured) == 1
     assert captured[0].parent == output
     assert captured[0] != runtime

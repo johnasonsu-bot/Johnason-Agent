@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "011b46cdf5e8ae43170f45fd56044f7f5db5d824d92c11ec51cbb505a48783a0",
-      "size": 2114398
+      "sha256": "b744aca4d7a1f91c130278ebcb00c56644c735a631691781963fbf65447761ae",
+      "size": 2119027
     },
     {
       "path": "uv.lock",
@@ -219,13 +219,13 @@
     },
     {
       "path": "credentials/service.py",
-      "sha256": "ef060217c461b2674fd5a98a764dd955bde6ffc6ab2bd7a335e6902509616b4d",
-      "size": 3191
+      "sha256": "ac1f89d9cc535768876bf58e05382e4820a6e408a42b1fda0ee0f289b258796a",
+      "size": 3476
     },
     {
       "path": "credentials/vault.py",
-      "sha256": "1bd6cf57e6673c0a09d1a6fc862be06be4374ea2cab48d1166f7bf24a623b410",
-      "size": 29508
+      "sha256": "c0fbed6fa7ba55d7120403fb9663cc9dd5fd59c4e851fc8cde85f21e97acb87c",
+      "size": 30038
     },
     {
       "path": "domain/__init__.py",
@@ -629,8 +629,8 @@
     },
     {
       "path": "runtime/manual_verification.py",
-      "sha256": "ed6b0bd34b36f6f054273df105115683b60b3afda770c08cc77956226d57314d",
-      "size": 10469
+      "sha256": "5b64f7bbc23a0696044306fb64b655fcf5a4351d349b05607283653af27d2ddb",
+      "size": 11274
     },
     {
       "path": "runtime/provider_grants/__init__.py",

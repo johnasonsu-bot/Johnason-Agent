@@ -117,8 +117,9 @@ class _CrossProcessWriterLock:
 class CredentialVault:
     """A password-unlocked file vault whose contents are AES-GCM authenticated."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self._path = path.expanduser().resolve(strict=False)
+        self._read_only = read_only
         self._state = _state_for(self._path)
         self._writer_lock: _CrossProcessWriterLock | None = None
         self._salt: bytes | None = None
@@ -147,11 +148,13 @@ class CredentialVault:
         return vault
 
     @classmethod
-    def open(cls, path: Path) -> CredentialVault:
+    def open(cls, path: Path, *, read_only: bool = False) -> CredentialVault:
         """Return a locked vault instance for an existing vault file."""
-        vault = cls(path)
+        vault = cls(path, read_only=read_only)
         with vault._state.lock:
             if vault._recovery_marker_path().exists():
+                if read_only:
+                    raise VaultRecoveryRequiredError("read-only vault cannot complete recovery")
                 vault._acquire_writer()
                 try:
                     try:
@@ -224,7 +227,7 @@ class CredentialVault:
     def unlock(self, password: str) -> None:
         """Authenticate *password* and load the encrypted credential mapping."""
         with self._state.lock:
-            acquired_here = self._writer_lock is None
+            acquired_here = not self._read_only and self._writer_lock is None
             if acquired_here:
                 self._acquire_writer()
             key: bytearray | None = None
@@ -270,6 +273,7 @@ class CredentialVault:
     def put(self, secret_id: str, value: str) -> None:
         """Store a credential and persist a freshly encrypted vault payload."""
         with self._state.lock:
+            self._require_writable()
             secrets = self._require_unlocked()
             if not isinstance(secret_id, str) or not isinstance(value, str):
                 raise TypeError("secret id and value must be strings")
@@ -291,6 +295,7 @@ class CredentialVault:
     def delete(self, secret_id: str) -> None:
         """Remove a credential and atomically persist the reduced mapping."""
         with self._state.lock:
+            self._require_writable()
             secrets = self._require_unlocked()
             updated = dict(secrets)
             updated.pop(secret_id, None)
@@ -334,6 +339,7 @@ class CredentialVault:
             self._key = None
 
     def _acquire_writer(self) -> None:
+        self._require_writable()
         if self._writer_lock is not None:
             return
         if self._state.writer_owner not in (None, self):
@@ -358,7 +364,12 @@ class CredentialVault:
             raise VaultLockedError("vault is locked")
         return self._secrets
 
+    def _require_writable(self) -> None:
+        if self._read_only:
+            raise PermissionError("vault is read-only")
+
     def _write(self, secrets: dict[str, str], *, create: bool = False) -> None:
+        self._require_writable()
         payload = self._serialize(secrets)
         if create:
             self._atomic_create(payload)

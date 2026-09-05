@@ -20,6 +20,10 @@ args = parser.parse_args()
 password = sys.stdin.readline()
 assert password.endswith("\n") and len(password) > 1
 password = None
+if args.provider_profile_id.startswith("blocked-"):
+    reason = "vault_unlock_failed" if args.provider_profile_id == "blocked-known" else "private-untrusted-text"
+    print(json.dumps({"status": "blocked", "reason_code": reason}))
+    raise SystemExit(1)
 if args.provider_profile_id in {"stubborn", "orphan"}:
     from types import SimpleNamespace
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))

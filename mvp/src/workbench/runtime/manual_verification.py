@@ -17,10 +17,12 @@ from workbench.runtime.provider_grants import canonical_provider_profile_digest
 
 _SCRIPT = Path(__file__).resolve().parents[3] / "scripts/verify_runtime_live_endpoint.py"
 _ENV_NAMES = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "SYSTEMROOT")
+_REASON_CODES = frozenset({"vault_unlock_failed", "vault_in_use", "provider_request_failed",
+    "runtime_verification_failed", "runtime_build_unavailable", "verification_process_failed"})
 _MESSAGES = {
     "running": "正在执行 DeepSeek Harness 人工验收。",
     "succeeded": "Harness 验收通过，独立证据已保存；未自动启用现有运行时。",
-    "failed": "Harness 验收失败。请检查 Provider、模型、Vault 密码和本机构建后重试。",
+    "failed": "Harness 验收失败。请根据具体失败原因处理后重试。",
     "timed_out": "Harness 验收超过 300 秒，已停止。",
     "cancelled": "Harness 验收已取消。",
 }
@@ -40,9 +42,13 @@ class VerificationJob:
     provider_profile_id: str
     model: str
     message: str
+    reason_code: str | None = None
 
     def response(self) -> dict[str, str]:
-        return asdict(self)
+        response = asdict(self)
+        if self.reason_code is None:
+            response.pop("reason_code")
+        return response
 
 
 class ManualRuntimeVerification:
@@ -108,6 +114,7 @@ class ManualRuntimeVerification:
         process = None
         spawn = None
         status = "failed"
+        reason_code = "verification_process_failed"
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 spawn = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -133,10 +140,16 @@ class ManualRuntimeVerification:
                         raise ValueError("oversized verifier response")
                 code = await process.wait()
                 payload = json.loads(stdout)
+                if code != 0 and payload.get("status") == "blocked":
+                    reason = payload.get("reason_code")
+                    if isinstance(reason, str) and reason in _REASON_CODES:
+                        reason_code = reason
+                    raise ValueError("verification blocked")
                 if (code != 0 or payload.get("status") != "prepared"
                         or payload.get("runtime_ids") != ["dsh"]
                         or Path(payload.get("output_dir", "")) != output):
                     raise ValueError("verification failed")
+                reason_code = "runtime_verification_failed"
                 self._check_evidence(output, job, profile_digest)
                 status = "succeeded"
         except TimeoutError:
@@ -169,6 +182,8 @@ class ManualRuntimeVerification:
                     job.message = "无法确认验收进程已停止；已阻止新的验收，请关闭应用并检查进程。"
                     return
             self._finish(job, status)
+            if status == "failed":
+                job.reason_code = reason_code
 
     def _check_evidence(self, output: Path, job: VerificationJob, profile_digest: str) -> None:
         directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

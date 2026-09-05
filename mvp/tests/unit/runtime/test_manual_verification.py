@@ -15,7 +15,7 @@ def service(tmp_path, monkeypatch):
     fake_script = Path(__file__).resolve().parents[2] / "fixtures/manual_verifier.py"
     monkeypatch.setattr(module, "_SCRIPT", fake_script)
     repository = ProviderRepository(tmp_path / "workbench.sqlite")
-    for name in ("success", "failed", "hang", "oversized", "split", "wrong-model", "stubborn", "orphan"):
+    for name in ("success", "failed", "hang", "oversized", "split", "wrong-model", "stubborn", "orphan", "blocked-known", "blocked-unknown"):
         repository.upsert(ProviderProfileRecord.deepseek(id=name))
     return module.ManualRuntimeVerification(tmp_path)
 
@@ -57,6 +57,16 @@ async def test_actual_child_group_is_reaped_before_terminal(service, action):
 
 async def completed(service):
     await asyncio.wait_for(asyncio.shield(service._task), 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile,expected", [("blocked-known", "vault_unlock_failed"), ("blocked-unknown", "verification_process_failed")])
+async def test_only_whitelisted_child_reason_reaches_public_response(service, profile, expected):
+    job = service.start(profile, token_urlsafe(24))
+    await completed(service)
+    assert job.status == "failed"
+    assert job.response()["reason_code"] == expected
+    assert "private-untrusted" not in json.dumps(job.response())
 
 
 @pytest.mark.asyncio

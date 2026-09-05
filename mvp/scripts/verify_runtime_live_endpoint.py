@@ -15,6 +15,23 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from federated_runtime_dev_signer import prepare_development_environment
+from workbench.credentials.models import VaultUnlockError, VaultInUseError
+from workbench.models.lmstudio import ProviderUnavailable, ProviderResponseError
+from workbench.runtime.goose.source_gate import GooseSourceReadinessError
+from workbench.runtime.deepseek_harness.source_gate import SourceReadinessError
+import httpx
+
+
+def _reason_code(error: Exception) -> str:
+    if isinstance(error, VaultUnlockError):
+        return "vault_unlock_failed"
+    if isinstance(error, VaultInUseError):
+        return "vault_in_use"
+    if isinstance(error, (GooseSourceReadinessError, SourceReadinessError)):
+        return "runtime_build_unavailable"
+    if isinstance(error, (ProviderUnavailable, ProviderResponseError, httpx.HTTPError)):
+        return "provider_request_failed"
+    return "runtime_verification_failed"
 
 
 def _arguments() -> argparse.Namespace:
@@ -62,16 +79,15 @@ def main() -> int:
     arguments = _arguments()
     try:
         result = asyncio.run(_verify(arguments))
-    except Exception:
+    except Exception as error:
         print(
             json.dumps(
                 {
                     "status": "blocked",
-                    "reason": "live_endpoint_verification_failed",
+                    "reason_code": _reason_code(error),
                 },
                 sort_keys=True,
             ),
-            file=sys.stderr,
         )
         return 1
     print(json.dumps(asdict(result), sort_keys=True))
