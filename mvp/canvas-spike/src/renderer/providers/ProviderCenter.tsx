@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { providerApi, type ConnectionResult, type ProviderProfile, type VaultStatus } from "../api";
 import { ProviderForm, type ProviderDraft } from "./ProviderForm";
+import { RuntimeVerificationPanel } from "./RuntimeVerificationPanel";
 
 const statusCopy: Record<ConnectionResult["status"], string> = {
   online: "连接正常", offline: "服务离线", locked: "保险库已锁定", missing: "缺少凭据", authentication_failed: "身份验证失败", error: "连接错误",
@@ -186,6 +187,7 @@ export function ProviderCenter() {
         <aside aria-label="已保存的供应商"><h3>供应商</h3>{providers.length === 0 ? <p className="empty">从预设开始连接一个模型。</p> : providers.map((provider) => <button aria-pressed={provider.id === selectedId} className={provider.id === selectedId ? "provider-item active" : "provider-item"} type="button" key={provider.id} onClick={() => { setSelectedId(provider.id); setModels([]); setConnection(null); }}><strong>{provider.name}</strong><span>{provider.enabled ? credentialCopy[provider.credential_status] : "已停用"}</span></button>)}</aside>
         <div className="provider-detail">
           <ProviderForm provider={selected} onSave={save} onTest={test} />
+          <RuntimeVerificationPanel providers={providers} selectedProviderId={selectedId ?? undefined} />
           {selected && <button type="button" className="quiet" disabled={!selected.enabled} onClick={() => void discoverModels()}>发现模型</button>}
           {selected && <button type="button" className="quiet danger" disabled={deleting} onClick={() => void removeSelected()}>{deleting ? "正在删除…" : "删除供应商"}</button>}
           {connection && <section className={`connection ${connection.status}`} aria-live="polite"><strong>{statusCopy[connection.status]}</strong>{connection.latency_ms !== undefined && <span>{connection.latency_ms} ms</span>}{connection.error_code && <span>{connection.error_code}</span>}</section>}
