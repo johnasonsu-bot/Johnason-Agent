@@ -7,13 +7,14 @@ type Mode = "success" | "failed" | "timed_out" | "running" | "unavailable" | "po
 
 // Only the local HTTP service is a test double. The Electron window, React forms,
 // navigation and IPC transport are real. No external provider is called.
-async function launchFixture(root: string, mode: Mode, profileMode = "valid") {
+async function launchFixture(root: string, mode: Mode, profileMode = "valid", reasonCode?: string) {
   await mkdir(root, { recursive: true });
   const executable = path.join(root, "verification-service.mjs");
   const source = `#!/usr/bin/env node
 import http from "node:http";
 const mode = ${JSON.stringify(mode)};
 const profileMode = ${JSON.stringify(profileMode)};
+const reasonCode = ${JSON.stringify(reasonCode ?? null)};
 let bootstrap = "", started = false, starts = 0, polls = 0, cancelled = false;
 let accepted = null;
 let releaseOldCancel = null, secondJobPolls = 0, cancelledJobId = null;
@@ -34,7 +35,7 @@ process.stdin.on("data", chunk => {
     for await (const chunk of request) body += chunk;
     const pathname = new URL(request.url, "http://127.0.0.1").pathname;
     const send = (status, value) => { response.writeHead(status, { "content-type": "application/json" }); response.end(JSON.stringify(value)); };
-    const job = (status, id = "verification-1") => ({ id, status, runtime_id: "dsh", provider_profile_id: profile.id, model: "saved-deepseek-model", message: "safe summary", raw_body: "RAW_RESPONSE_MUST_NOT_RENDER" });
+    const job = (status, id = "verification-1") => ({ id, status, runtime_id: "dsh", provider_profile_id: profile.id, model: "saved-deepseek-model", ...(status === "failed" && reasonCode ? {reason_code: reasonCode} : {}), message: "safe summary", raw_body: "RAW_RESPONSE_MUST_NOT_RENDER" });
     if (pathname === "/api/health") return send(200, { status: "ok", service: "hermes-workbench", instance_id: identity.instance_id, port: server.address().port });
     if (pathname === "/api/vault/status") return send(200, { status: "unlocked" });
     if (pathname === "/api/vault/lock") return send(200, { status: "locked" });
@@ -83,6 +84,26 @@ process.stdin.on("data", chunk => {
 
 async function stats(page: Page) {
   return page.evaluate(async () => (await (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/providers/verification-test-stats/models" })).body);
+}
+
+for (const [code, explanation] of [
+  ["vault_in_use", "保险库被其他进程占用"],
+  ["vault_unlock_failed", "保险库密码校验失败"],
+  ["provider_request_failed", "模型 API 请求失败"],
+  ["runtime_build_unavailable", "本地运行时构建不可用"],
+  ["RAW_REASON_MUST_NOT_RENDER", "未返回可识别的失败原因"],
+] as const) {
+  test(`verification explains ${code} without blaming unrelated passwords`, async ({}, info) => {
+    const { app, panel } = await launchFixture(info.outputPath("backend"), "failed", "valid", code);
+    try {
+      await panel.getByLabel("本次验收 Vault 密码").fill(randomUUID());
+      await panel.getByRole("button", { name: "开始真实验收" }).click();
+      await expect(panel).toContainText(explanation, { timeout: 10000 });
+      await expect(panel).not.toContainText("请检查 Vault 密码、已保存凭据、模型及本地验收环境");
+      await expect(panel).not.toContainText("RAW_REASON_MUST_NOT_RENDER");
+      await expect(panel).not.toContainText("RAW_RESPONSE_MUST_NOT_RENDER");
+    } finally { await app.close(); }
+  });
 }
 
 test("explicit verification uses the saved profile and clears the one-time password before the response", async ({}, testInfo) => {

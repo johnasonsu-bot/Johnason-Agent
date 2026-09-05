@@ -1,4 +1,6 @@
 export type VerificationStatus = "running" | "succeeded" | "failed" | "timed_out" | "cancelled";
+const failureCodes = ["vault_unlock_failed", "vault_in_use", "provider_request_failed", "runtime_verification_failed", "runtime_build_unavailable", "verification_process_failed"] as const;
+export type VerificationFailureCode = typeof failureCodes[number];
 
 export interface RuntimeVerification {
   id: string;
@@ -6,6 +8,7 @@ export interface RuntimeVerification {
   runtime_id: "dsh";
   provider_profile_id: string;
   model: string;
+  reason_code?: VerificationFailureCode;
 }
 
 interface VerificationBridge {
@@ -45,7 +48,10 @@ async function request(path: string, method: string, body?: Record<string, unkno
   }
   // Keep only the public contract. Raw subprocess output and server messages are
   // deliberately not retained in renderer state or displayed in the UI.
-  return { id: value.id, status: value.status as VerificationStatus, runtime_id: "dsh", provider_profile_id: value.provider_profile_id, model: value.model };
+  const reason = failureCodes.find((code) => code === value.reason_code);
+  return { id: value.id, status: value.status as VerificationStatus, runtime_id: "dsh", provider_profile_id: value.provider_profile_id, model: value.model,
+    ...(value.status === "failed" && reason ? { reason_code: reason } : {}),
+  };
 }
 
 export const runtimeVerificationApi = {

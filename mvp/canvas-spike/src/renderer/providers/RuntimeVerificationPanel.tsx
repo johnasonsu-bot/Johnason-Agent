@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import type { ProviderProfile } from "../api";
-import { runtimeVerificationApi, VerificationRequestError, type RuntimeVerification, type VerificationStatus } from "./runtimeVerificationApi";
+import { runtimeVerificationApi, VerificationRequestError, type RuntimeVerification, type VerificationStatus, type VerificationFailureCode } from "./runtimeVerificationApi";
 
 type ViewState = { job: RuntimeVerification | null; generation: number; starting: boolean; cancelling: boolean; attempted: boolean; recordMissing: boolean; error: string };
 // Job metadata survives route changes in memory only. Passwords never enter this
@@ -21,9 +21,18 @@ const statusCopy: Record<VerificationStatus, string> = {
 const resultCopy: Record<VerificationStatus, string> = {
   running: "后台正在进行独立外部验证，最长约 5 分钟。请求已受理不代表验收通过。",
   succeeded: "独立验证已完成；结果不会自动更新运行时准入。",
-  failed: "独立验证未通过。请检查 Vault 密码、已保存凭据、模型及本地验收环境后重新验收。",
+  failed: "独立验证未通过，后台未返回可识别的失败原因；不能据此判断密码错误。请保留验收编号用于排查。",
   timed_out: "已达到后台验收时限。请检查网络及本地运行环境后重新验收。",
   cancelled: "本次验收已停止；已产生的 API 费用不会撤销。",
+};
+
+const failureCopy: Record<VerificationFailureCode, string> = {
+  vault_unlock_failed: "保险库密码校验失败。请使用解锁此保险库的主密码，不是模型 API Key。",
+  vault_in_use: "保险库被其他进程占用，未能读取凭据；这不代表密码错误。请更新并重启客户端后重试。",
+  provider_request_failed: "模型 API 请求失败。请检查已保存的 API 凭据、网络和模型可用性；这不是保险库密码校验失败。",
+  runtime_build_unavailable: "本地运行时构建不可用或与当前源码不一致。请更新运行环境；无需修改密码。",
+  runtime_verification_failed: "运行时执行或验收证据校验未通过。请保留验收编号排查，不要仅凭此结果重置密码。",
+  verification_process_failed: "本地验收进程未正常完成。请检查客户端运行环境；尚不能判断模型或密码是否有效。",
 };
 
 function ineligible(provider: ProviderProfile | undefined): string {
@@ -129,7 +138,8 @@ export function RuntimeVerificationPanel({ providers, selectedProviderId }: { pr
     {state.starting && <p role="status">正在提交验收请求，尚未确认启动。</p>}
     {state.job && <div role="status" aria-live="polite" className="notice">
       <strong>{state.recordMissing ? "结果未知" : statusCopy[state.job.status]}</strong>
-      {!state.recordMissing && <p>{resultCopy[state.job.status]}</p>}
+      {!state.recordMissing && <p>{state.job.status === "failed" && state.job.reason_code ? failureCopy[state.job.reason_code] : resultCopy[state.job.status]}</p>}
+      {!state.recordMissing && state.job.reason_code && <p>诊断代码：{state.job.reason_code}</p>}
       <p>验收编号：{state.job.id} · 供应商：{state.job.provider_profile_id} · 模型：{state.job.model}</p>
     </div>}
     {state.error && <p role="alert">{state.error}</p>}
