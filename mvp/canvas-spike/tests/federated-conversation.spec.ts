@@ -11,7 +11,7 @@ async function launch(root: string) {
   await writeFile(stateFile, JSON.stringify({ events: [], reject: false }));
   await writeFile(executable, `#!/usr/bin/env node
 import http from 'node:http'; import fs from 'node:fs';
-let input = ''; let started = false;
+let input = ''; let started = false; let messageSequence = 0;
 let profiles = [
  {id:'lmstudio',name:'Local',protocol:'lmstudio',credential_mode:'none'},
  {id:'custom-cloud',name:'Custom cloud',protocol:'deepseek',credential_mode:'reference'},
@@ -33,7 +33,12 @@ const server=http.createServer((req,res)=>{let raw='';req.on('data',c=>raw+=c);r
  if(p==='/api/agents')return send(200,[{agent_id:'cloud',display_name:'Cloud',role:'worker',provider_id:'custom-cloud',model:'stale-model',enabled:true,tool_ids:[],skill_refs:[],version:1,created_at:1},{agent_id:'bad',display_name:'Bad',role:'worker',provider_id:'deepseek',model:'bad-model',enabled:true,tool_ids:[],skill_refs:[],version:1,created_at:1}]);
  if(p==='/api/v1/engine-host')return send(200,{v2:{enabled:true,protocol:'2.0',runtimes:['python-term','goose','dsh','unknown-runtime'].map(selector=>({runtime_id:selector,selector,build_id:'test',state:'ready',capabilities:[],selectable_for_new_commands:!state.reject,admission_state:state.reject?'blocked':'ready',trust_status:'DEV_UNTRUSTED',admission_reason:state.reject?'proof_revoked':null}))}});
  if(p.includes('/runtime-admissions/'))return send(200,{state:'ready',selector:'goose'});
- if(p.endsWith('/messages'))return send(state.reject?503:200,state.reject?{detail:'private internal exception /secret/path'}:{session_id:p.split('/')[3],command_id:'command-1',status:'queued',cursor:'ack'});
+ if(p.endsWith('/messages')) {
+   const commandId = 'command-' + (++messageSequence);
+   const reply = current => {send(current.reject?503:200,current.reject?{detail:'private internal exception /secret/path'}:{session_id:p.split('/')[3],command_id:commandId,status:current.postStatus??'queued',cursor:'ack'});fs.appendFileSync(${JSON.stringify(logFile)},JSON.stringify({path:'fixture-ack',commandId})+'\\n');};
+   if(state.holdMessages) {const timer=setInterval(()=>{const current=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8'));if(!current.holdMessages){clearInterval(timer);reply(current);}},20);return;}
+   return reply(state);
+ }
  if(p.endsWith('/events')) {const events=p.includes('ui-session-0')?state.events:[];const after=req.headers['last-event-id'];const i=events.findIndex(e=>e.cursor===after);return send(200,events.slice(after&&i>=0?i+1:0).map(e=>'id: '+e.cursor+'\\ndata: '+JSON.stringify(e)+'\\n\\n').join(''),'text/event-stream');}
  if(p==='/api/sessions')return send(200,{session_id:body.session_id});
  return send(404,{detail:'not found'});
@@ -173,5 +178,87 @@ test("federated runtime pause is not a terminal and keeps all selection frozen",
     await expect(f.page.getByTestId("conversation-status")).toContainText("已暂停");
     await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
     await expect(f.page.getByLabel("当前模型")).toBeDisabled();
+  } finally { await f.app.close(); }
+});
+
+test("federated review delayed ACK cannot release a new command through old terminal replay", async ({}, info) => {
+  const f = await launch(info.outputPath("backend"));
+  const history = [{cursor:"old-q",eventId:"old-q",name:"turn_queued",value:{command_id:"old-command"}},{cursor:"old-f",eventId:"old-f",name:"turn_finished",value:{command_id:"old-command",status:"completed"}}];
+  try {
+    await f.state({events:history,holdMessages:true});
+    await expect(f.page.getByTestId("conversation-status")).toContainText("已完成");
+    await f.page.getByLabel("当前运行模式").selectOption("goose");
+    await f.page.getByLabel("当前模型").selectOption("standalone/local-agent");
+    await f.page.getByLabel("会话消息").fill("pending replay");
+    await f.page.getByLabel("发送", {exact:true}).click();
+    await expect.poll(async () => (await f.requests()).filter(r=>r.path.endsWith('/messages')).length).toBe(1);
+    const roundTrip = async () => {
+      await f.page.getByText("方案评审 · Architecture review", {exact:true}).click();
+      await f.page.getByText("Jira 看板配置修复指引", {exact:true}).first().click();
+      await expect(f.page.getByText("执行完成 · Turn finished")).toBeVisible();
+      await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
+      await expect(f.page.getByLabel("当前运行模式")).toHaveValue("goose");
+      await expect(f.page.getByLabel("当前模型")).toHaveValue("standalone/local-agent");
+      await expect(f.page.getByLabel("当前模型")).toBeDisabled();
+    };
+    await roundTrip();
+    await f.state({events:history});
+    await expect.poll(async () => (await f.requests()).filter(r=>r.path==='fixture-ack').length).toBe(1);
+    await roundTrip();
+    await f.state({events:[...history,{cursor:"new-q",eventId:"new-q",name:"turn_queued",value:{command_id:"command-1"}},{cursor:"new-f",eventId:"new-f",name:"turn_finished",value:{command_id:"command-1",status:"completed"}}]});
+    await expect(f.page.getByLabel("当前运行模式")).toBeEnabled();
+  } finally { await f.app.close(); }
+});
+
+test("federated review POST paused ACK preserves the pending selection", async ({}, info) => {
+  const f = await launch(info.outputPath("backend"));
+  try {
+    await f.state({events:[],postStatus:"paused"});
+    await f.page.getByLabel("当前运行模式").selectOption("goose");
+    await f.page.getByLabel("会话消息").fill("paused ACK");
+    await f.page.getByLabel("发送", {exact:true}).click();
+    await expect(f.page.getByTestId("conversation-status")).toContainText("已暂停");
+    await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
+    await expect(f.page.getByLabel("当前模型")).toBeDisabled();
+  } finally { await f.app.close(); }
+});
+
+test("federated review buffers a terminal arriving before the matching ACK", async ({}, info) => {
+  const f = await launch(info.outputPath("backend"));
+  try {
+    await f.state({events:[],holdMessages:true});
+    await f.page.getByLabel("当前运行模式").selectOption("goose");
+    await f.page.getByLabel("会话消息").fill("terminal before ACK");
+    await f.page.getByLabel("发送", {exact:true}).click();
+    await expect.poll(async () => (await f.requests()).filter(r=>r.path.endsWith('/messages')).length).toBe(1);
+    const events = [{cursor:"q",eventId:"q",name:"turn_queued",value:{command_id:"command-1"}},{cursor:"f",eventId:"f",name:"turn_finished",value:{command_id:"command-1",status:"completed"}}];
+    await f.state({events,holdMessages:true});
+    await expect(f.page.getByText("执行完成 · Turn finished")).toBeVisible();
+    await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
+    await f.state({events});
+    await expect(f.page.getByLabel("当前运行模式")).toBeEnabled();
+  } finally { await f.app.close(); }
+});
+
+test("federated review confirms optimistic messages by command without collapsing equal text", async ({}, info) => {
+  const f = await launch(info.outputPath("backend"));
+  try {
+    await f.page.getByLabel("当前运行模式").selectOption("goose");
+    const events: object[] = [];
+    for (let turn=1;turn<=2;turn++) {
+      await f.page.getByLabel("会话消息").fill("合法重复消息");
+      await f.page.getByLabel("发送", {exact:true}).click();
+      await expect.poll(async () => (await f.requests()).filter(r=>r.path.endsWith('/messages')).length).toBe(turn);
+      events.push({cursor:`q${turn}`,eventId:`q${turn}`,name:"turn_queued",value:{command_id:`command-${turn}`}}, {cursor:`u${turn}`,eventId:`u${turn}`,name:"user.message.received",value:{content:"合法重复消息"}}, {cursor:`f${turn}`,eventId:`f${turn}`,name:"turn_finished",value:{command_id:`command-${turn}`,status:"completed"}});
+      await f.state({events});
+      await expect(f.page.getByLabel("当前运行模式")).toBeEnabled();
+      await expect(f.page.getByText("合法重复消息", {exact:true})).toHaveCount(turn);
+    }
+    await f.page.getByText("方案评审 · Architecture review", {exact:true}).click();
+    await f.page.getByText("Jira 看板配置修复指引", {exact:true}).first().click();
+    await expect(f.page.getByText("合法重复消息", {exact:true})).toHaveCount(2);
+    await f.page.evaluate(()=>localStorage.removeItem("hermes.v4.conversation-timelines"));
+    await f.page.reload();
+    await expect(f.page.getByText("合法重复消息", {exact:true})).toHaveCount(2);
   } finally { await f.app.close(); }
 });

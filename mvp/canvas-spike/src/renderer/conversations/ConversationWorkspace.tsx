@@ -179,7 +179,8 @@ function compatibleProvider(runtime: RuntimeSelector, provider: ProviderProfile 
   return true;
 }
 
-type FrozenSelection = { runtime: "" | RuntimeSelector; providerId: string; model: string; pending: boolean; commandId?: string };
+type FrozenSelection = { runtime: "" | RuntimeSelector; providerId: string; model: string; pending: boolean; commandId?: string; ackPaused?: boolean };
+type OptimisticMessage = { entry: TimelineEntry; commandId?: string };
 
 export function ConversationWorkspace() {
   const [sessionId, setSessionId] = useState("ui-session-0");
@@ -207,6 +208,10 @@ export function ConversationWorkspace() {
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
   const selectionsRef = useRef<Record<string, FrozenSelection>>({});
+  const projectionsRef = useRef<Record<string, ConversationStatusProjection>>({});
+  const commandStatesRef = useRef<Record<string, Map<string, ConversationStatusProjection>>>({});
+  const confirmedUsersRef = useRef<Record<string, Set<string>>>({});
+  const optimisticMessagesRef = useRef<Record<string, OptimisticMessage[]>>({});
   const group = groups[sessionId] ?? ["产品经理"];
   const title = titles[sessionId] ?? "新建会话 · New task";
   const activeProfile = useMemo(() => agentModelProfileFor(modelProfiles, group[0] ?? "产品经理"), [group, modelProfiles]);
@@ -228,6 +233,32 @@ export function ConversationWorkspace() {
   const artifact = useMemo(() => artifacts.find((candidate) => candidate.id === artifactId) ?? artifacts[0], [artifactId]);
   const Renderer = registry.resolve(artifact.kind);
 
+  const publishProjection = (targetSession: string) => {
+    const frozen = selectionsRef.current[targetSession];
+    const matching = frozen?.commandId ? commandStatesRef.current[targetSession]?.get(frozen.commandId) : undefined;
+    // Until the ACK binds a server command identity, no replayed terminal is
+    // authoritative for this local request. A terminal seen before ACK is kept
+    // in commandStatesRef and reconciled when that binding finally arrives.
+    if (frozen?.pending && matching?.terminal && matching.phase !== "paused") frozen.pending = false;
+    if (activeSessionRef.current !== targetSession) return;
+    const projected = frozen?.pending
+      ? (frozen.ackPaused ? { phase: "paused", label: "已暂停 · paused", terminal: true } as const : matching ?? { phase: "queued", label: "排队中 · queued", terminal: false } as const)
+      : projectionsRef.current[targetSession] ?? readyStatus;
+    setPending(frozen?.pending === true || ["queued", "running", "retryable", "paused"].includes(projected.phase));
+    setStatusProjection(projected);
+  };
+
+  const reconcileOptimisticMessages = (targetSession: string): Set<string> => {
+    const confirmed = confirmedUsersRef.current[targetSession];
+    const removed = new Set<string>();
+    optimisticMessagesRef.current[targetSession] = (optimisticMessagesRef.current[targetSession] ?? []).filter(message => {
+      if (!message.commandId || !confirmed?.has(message.commandId)) return true;
+      removed.add(message.entry.id);
+      return false;
+    });
+    return removed;
+  };
+
   useEffect(() => {
     let active = true;
     const generation = ++watcherGenerationRef.current;
@@ -237,6 +268,12 @@ export function ConversationWorkspace() {
     const seen = new Set<string>();
     seenEventsRef.current[sessionId] = seen;
     let hydratedGraph = false;
+    let projected = readyStatus;
+    let queuedCommandContext: string | undefined;
+    const commandStates = new Map<string, ConversationStatusProjection>();
+    commandStatesRef.current[sessionId] = commandStates;
+    const confirmedUsers = new Set<string>();
+    confirmedUsersRef.current[sessionId] = confirmedUsers;
     setEntries([]);
     setPending(selectionsRef.current[sessionId]?.pending ?? false);
     setSequential(emptySequentialState());
@@ -259,20 +296,26 @@ export function ConversationWorkspace() {
           seen.add(id);
           return true;
         });
+        const firstSnapshot = !hydratedGraph;
+        for (const event of fresh) {
+          if (event.name === "turn_queued" && typeof event.value?.command_id === "string") queuedCommandContext = event.value.command_id;
+          if (event.name === "user.message.received" && queuedCommandContext) confirmedUsers.add(queuedCommandContext);
+          projected = reduceConversationStatus(projected, event);
+          if (statusForEvent(event) && projected.commandId) commandStates.set(projected.commandId, projected);
+        }
+        projectionsRef.current[sessionId] = projected;
+        const confirmedLocalIds = reconcileOptimisticMessages(sessionId);
         const mapped = fresh.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry));
         if (!hydratedGraph) {
           setSequential(graphEvents.reduce(reduceSequentialEvent, emptySequentialState()));
           setResearch(graphEvents.reduce(reduceResearchEvent, emptyResearchGraphState()));
-          const recovered = graphEvents.reduce(reduceConversationStatus, readyStatus);
-          setStatusProjection(recovered);
-          if (["queued", "running", "retryable", "paused"].includes(recovered.phase)) setPending(true);
-          setEntries(graphEvents.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry)));
+          setEntries([...mapped, ...(optimisticMessagesRef.current[sessionId] ?? []).map(message => message.entry)]);
           hydratedGraph = true;
         } else if (fresh.length) {
           setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
           setResearch((current) => fresh.reduce(reduceResearchEvent, current));
           if (mapped.length) setEntries((current) => {
-              const next = current.concat(mapped);
+              const next = current.filter(entry => !confirmedLocalIds.has(entry.id)).concat(mapped);
               saveConversationTimeline(sessionId, next);
               return next;
             });
@@ -290,21 +333,11 @@ export function ConversationWorkspace() {
             cursorsRef.current[sessionId] = event.cursor;
             saveConversationCursor(sessionId, event.cursor);
           }
-          setStatusProjection((current) => {
-            const next = reduceConversationStatus(current, event);
-            if (next.terminal && next.phase !== "paused") {
-              const frozen = selectionsRef.current[sessionId];
-              if (!frozen?.pending || !frozen.commandId || next.commandId === frozen.commandId) {
-                if (frozen) frozen.pending = false;
-                setPending(false);
-              }
-            } else if (["queued", "running", "retryable"].includes(next.phase)) setPending(true);
-            return next;
-          });
           if (event.name === "turn_failed" || event.type === "RUN_ERROR" || (event.name === "runtime.status.changed" && ["failed", "cancelled"].includes(String(event.value?.status)))) {
             void engineHostApi.v2Status().then(setRuntimeDiagnostic).catch(() => setRuntimeDiagnostic(null));
           }
         }
+        if (firstSnapshot || fresh.length) publishProjection(sessionId);
         setSource("Task 3 REST/SSE · cursor");
       } catch (error: unknown) {
         if (active) {
@@ -377,11 +410,15 @@ export function ConversationWorkspace() {
     return { sessionId: createdSessionId, title: newTitle };
   };
   const selectSession = (nextSessionId: string) => { setSessionId(nextSessionId); setPaused(false); };
-  const addUserEntry = (prompt: string, kind: "user" | "decision" = "user") => setEntries((current) => {
-    const next = [...current, { id: `local-${++sequence}`, kind, title: kind === "user" ? "你" : "人工介入 · Human", content: prompt, status: "刚刚" }];
-    saveConversationTimeline(sessionId, next);
-    return next;
-  });
+  const addUserEntry = (prompt: string, kind: "user" | "decision" = "user") => {
+    const entry: TimelineEntry = { id: `local-${++sequence}`, kind, title: kind === "user" ? "你" : "人工介入 · Human", content: prompt, status: "刚刚" };
+    setEntries(current => {
+      const next = [...current, entry];
+      saveConversationTimeline(sessionId, next);
+      return next;
+    });
+    return entry;
+  };
   const send = (prompt: string, contexts: string[] = []) => {
     if (pending || selectionsRef.current[sessionId]?.pending) return;
     const chosenRuntime = selectedRuntime
@@ -394,7 +431,8 @@ export function ConversationWorkspace() {
       return;
     }
     const apiPrompt = contexts.length ? `${prompt}\n\n[本轮上下文]\n${contexts.map((context) => `- ${context}`).join("\n")}` : prompt;
-    addUserEntry(prompt);
+    const optimistic: OptimisticMessage = { entry: addUserEntry(prompt) };
+    (optimisticMessagesRef.current[sessionId] ??= []).push(optimistic);
     let agentBindings: Array<{ agent_id: string; expected_version: number }> = [];
     try {
       agentBindings = orderedMentionBindings(prompt, modelProfiles);
@@ -410,20 +448,20 @@ export function ConversationWorkspace() {
     setStatusProjection({ phase: "queued", label: "排队中 · queued", terminal: false });
     const commandId = createConversationCommandId("message", sessionId);
     void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId, agentBindings, selectedRuntime || undefined).then((result) => {
+      if (selectionsRef.current[sessionId] !== frozen) return;
       frozen.commandId = result.command_id;
-      if (result.status === "paused") frozen.pending = false;
+      frozen.ackPaused = result.status === "paused";
+      optimistic.commandId = result.command_id;
+      const confirmedLocalIds = reconcileOptimisticMessages(sessionId);
+      publishProjection(sessionId);
       if (activeSessionRef.current !== sessionId) return;
+      if (confirmedLocalIds.size) setEntries(current => current.filter(entry => !confirmedLocalIds.has(entry.id)));
       setSource("Task 3 REST/SSE · queued");
       // Only consumed SSE events advance the read cursor. The POST cursor is
       // an acknowledgement, not evidence that queued/status events were read.
-      if (result.status === "paused") {
-        setStatusProjection({ phase: "paused", label: "已暂停 · paused", terminal: true });
-        setPending(false);
-        frozen.pending = false;
-      }
       if (selectedRuntime) {
         void engineHostApi.runtimeAdmission(sessionId, result.command_id).then((admission) => {
-          if (activeSessionRef.current !== sessionId) return;
+          if (activeSessionRef.current !== sessionId || selectionsRef.current[sessionId] !== frozen) return;
           if (admission.state === "blocked") {
             setStatusProjection({ phase: "failed", label: "执行失败 · runtime_admission_blocked", terminal: true });
             setPending(false);
@@ -435,6 +473,7 @@ export function ConversationWorkspace() {
         }).catch(() => { /* SSE remains authoritative when the read-only diagnostic is temporarily unavailable. */ });
       }
     }).catch(async (error: unknown) => {
+      if (selectionsRef.current[sessionId] !== frozen) return;
       const reason = selectedRuntime ? publicRuntimeError(error) : describeConversationError(error);
       frozen.pending = false;
       {
@@ -445,7 +484,7 @@ export function ConversationWorkspace() {
           // Preserve the original stable HTTP category when diagnostics are unavailable.
         }
       }
-      if (activeSessionRef.current !== sessionId) return;
+      if (activeSessionRef.current !== sessionId || selectionsRef.current[sessionId] !== frozen) return;
       setSource("Task 3 API error");
       setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
       setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · API diagnosis", content: `conversation.messages → ${reason}`, agent: "Task3 Conversation API", status: "failed" }]);
