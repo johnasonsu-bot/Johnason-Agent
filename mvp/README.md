@@ -481,8 +481,12 @@ secret-free 的签名证据和用户人工验收；未来最小补强是提供 c
 全量 Python `pytest -q` 在 898.60 秒上限被人工中断，当时为
 `17 passed, 2 skipped`，停留于 Development Graph blueprint 内嵌的前端测试，因此
 不能记为全量 PASS，也不覆盖之后的会话事件分页修改。真实用户环境另发现旧会话首次
-全量回放约 8.6 MB、超过 IPC 1 MiB 限制并使页面停在“等待本地服务”；必须在不删除
-用户历史的前提下完成有界分页并复验，才能关闭前端/恢复 Gate。
+全量回放约 8.6 MB、超过 IPC 1 MiB 限制并使页面停在“等待本地服务”。commit
+`9fd5626` 已实现不删除用户历史的有界分页；focused 验证与真实 SQLite 的 15,341 frame、
+20 页逐字节匹配均已通过，真实 GUI 重启恢复复验仍待完成，因此前端/恢复 Gate 尚未关闭。
+
+原有 31 个 DeepSeek 历史任务已获用户批准后续以 `manual_hold` 暂停；guard commit
+`61d9cbd` 当前仍在 review，尚未对真实数据库执行 hold，不能表述为已暂停。
 
 ### 10.7 Electron/Playwright
 

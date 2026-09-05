@@ -53,7 +53,9 @@
 - [ ] DSH 当前 bundle 的真实取消、错误、重复命令和重启恢复仍为 `MANUAL_PENDING`，因此 `GO_DSH_PLUGIN_SMOKE=HOLD`。
 - [ ] `GO_GOOSE_QUERY_SMOKE=HOLD`；需补当前 bundle 的独立真实证据。
 - [ ] `GO_RUNTIME_FEDERATION=HOLD`；三通道、共享合同、持久恢复和前端全量验收未同时通过。
-- [ ] 真实用户旧会话 `ui-session-0` 首次无 cursor 的全量事件约 8.6 MB（15,341 条 domain events，其中 15,088 条 retryable），超过 IPC 1 MiB 聚合限制并使页面停在“等待本地服务”；需有界分页且不得删除用户历史，修复后重新执行真实恢复验收。
+- [x] commit `9fd5626` 已为真实用户旧会话 `ui-session-0` 实现不删除用户历史的有界分页；focused 验证与真实 SQLite 的 15,341 frame、20 页逐字节匹配均通过。
+- [ ] 上述旧会话仍需完成真实 GUI 重启恢复复验，完成前不关闭前端/恢复 Gate。
+- [ ] 原有 31 个 DeepSeek 历史任务已获用户批准后续以 `manual_hold` 暂停；guard commit `61d9cbd` 仍在 review，尚未真正写入用户数据库，不记为已暂停。
 
 回归记录：Task 5 review focused 为 `19 passed, 3 skipped`；从 revision `cb40882` 启动的唯一
 一次全量 Python `pytest -q` 在 898.60 秒上限中断，当时 `17 passed, 2 skipped`，

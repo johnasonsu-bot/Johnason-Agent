@@ -213,8 +213,12 @@ proof identity 关联起来；不得回显凭据，也不得以 queued request �
 
 真实环境的旧会话恢复仍有一个明确阻塞：`ui-session-0` 首次不带 cursor 的全量 SSE
 包含约 15,341 条 domain events（约 8.6 MB），经 IPC 聚合超过 1 MiB 上限，页面停在
-“等待本地服务”。恢复实现必须进行有界分页并保留全部用户历史；分页修改完成后的
-focused 验证与真实 GUI 复验是 `GO_RUNTIME_FEDERATION` 的必要未完成项。
+“等待本地服务”。commit `9fd5626` 已实现保留全部用户历史的有界分页，focused 验证与
+真实 SQLite 的 15,341 frame、20 页逐字节匹配均已通过；真实 GUI 重启恢复复验仍是
+`GO_RUNTIME_FEDERATION` 的必要未完成项。
+
+原有 31 个 DeepSeek 历史任务已获用户批准后续以 `manual_hold` 暂停。guard commit
+`61d9cbd` 仍在 review，尚未真正对用户数据库执行 hold；设计台账不得将其写成已暂停。
 
 ## 9. 明确不在本批范围
 
