@@ -35,6 +35,7 @@ from workbench.api.conversations import (
 from workbench.conversations.repository import ConversationRepository
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.providers.repository import ProviderRepository
+from workbench.runtime.agent_loop import AgentEvent
 from workbench.runtime.engine_host.v2.contracts import (
     RuntimeEventV2,
     RuntimeMessageInputV2,
@@ -47,12 +48,41 @@ from workbench.runtime.provider_grants import canonical_provider_profile_digest
 
 LIVE_OPT_IN = os.environ.get("WORKBENCH_RUN_LIVE_RUNTIME_ACCEPTANCE") == "1"
 TERMINAL_NAMES = frozenset({"turn_finished", "turn_failed"})
+LIVE_MARKER = "FEDERATED_RUNTIME_LIVE_OK"
+LIVE_RUNTIME_IDS = frozenset({"python-term", "goose", "dsh"})
+TEST_BUILD_MAP_JSON = json.dumps(
+    {
+        "python-term": "python-term:test-build",
+        "goose": "goose:test-build",
+        "dsh": "dsh:test-build",
+    }
+)
 
 
 class _NoopRunner:
     async def run_turn(self, _command: object) -> Any:
         if False:
             yield None
+
+
+class _CompletingChatRunner:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def run_turn(self, command: Any) -> Any:
+        self.calls += 1
+        yield AgentEvent(
+            kind="turn_started", session_id=command.session_id, run_id=command.run_id
+        )
+        yield AgentEvent(
+            kind="text_delta",
+            session_id=command.session_id,
+            run_id=command.run_id,
+            payload={"text": "chat reply"},
+        )
+        yield AgentEvent(
+            kind="turn_finished", session_id=command.session_id, run_id=command.run_id
+        )
 
 
 def _runtime_input(content: str) -> RuntimeQueryInputV2:
@@ -83,6 +113,9 @@ def _runtime_input(content: str) -> RuntimeQueryInputV2:
 class _OfflineRuntimeRouter:
     """Materialize the same frozen route shape used by the production router."""
 
+    def __init__(self, *, build_ids: dict[str, str] | None = None) -> None:
+        self.build_ids = {} if build_ids is None else dict(build_ids)
+
     def route_conversation_query(self, *, selector: str, admission: Any) -> RuntimeConversationRoute:
         runtime_command_id = python_term_command_id(
             admission.session_id, admission.command_id
@@ -101,6 +134,9 @@ class _OfflineRuntimeRouter:
             command_id=runtime_command_id,
             overrides={
                 "session_id": f"conversation-session:{admission.session_id}",
+                "runtime.build_id": self.build_ids.get(
+                    selector, f"{selector}:test"
+                ),
                 "run_id": f"run-{admission.command_id}",
                 "term_id": f"term-{admission.command_id}",
                 "step_id": f"step-{admission.command_id}",
@@ -209,7 +245,13 @@ class _IsolatingRuntime:
         yield _runtime_event(snapshot, "runtime.status", 2, {"status": status})
 
 
-def _service_app(database: Path, executor: Any):
+def _service_app(
+    database: Path,
+    executor: Any,
+    *,
+    runner: Any | None = None,
+    router: _OfflineRuntimeRouter | None = None,
+):
     providers = ProviderRepository(database)
     for provider_id in ("provider-a", "provider-b"):
         providers.upsert(
@@ -225,9 +267,9 @@ def _service_app(database: Path, executor: Any):
     return create_app(
         AppSettings(
             database=database,
-            runner=_NoopRunner(),
+            runner=_NoopRunner() if runner is None else runner,
             owner_id="runtime-user-path-acceptance",
-            runtime_router=_OfflineRuntimeRouter(),
+            runtime_router=_OfflineRuntimeRouter() if router is None else router,
             federated_executor=executor,
         )
     )
@@ -398,19 +440,236 @@ def test_failed_runtime_does_not_block_another_runtime(tmp_path: Path) -> None:
     assert len(_terminal_events(dsh)) == 1
 
 
+def test_chat_mode_omits_runtime_selector_and_uses_chat_runner(tmp_path: Path) -> None:
+    """Catches chat being silently rewritten to an explicit Runtime selector."""
+    database = tmp_path / "chat.sqlite"
+    runner = _CompletingChatRunner()
+    runtime = _CompletingRuntime()
+    app = _service_app(database, runtime, runner=runner)
+    payload = {
+        "content": "exercise chat without a Runtime selector",
+        "model": "default",
+        "provider_id": "provider-a",
+    }
+    assert "runtime" not in payload
+
+    with TestClient(app) as client:
+        _create_session(client, "session-chat")
+        accepted = client.post(
+            "/api/sessions/session-chat/messages",
+            headers={"Idempotency-Key": "message-chat"},
+            json=payload,
+        )
+        assert accepted.status_code == 202, accepted.text
+        completed = _wait_for_terminal(
+            client, "session-chat", "message-chat", payload
+        )
+        empty_selector = client.post(
+            "/api/sessions/session-chat/messages",
+            headers={"Idempotency-Key": "message-empty-runtime"},
+            json={**payload, "runtime": ""},
+        )
+
+    assert completed["status"] == "completed"
+    assert len(_terminal_events(completed)) == 1
+    assert empty_selector.status_code == 422
+    assert runner.calls == 1
+    assert runtime.calls == 0
+
+
+def test_same_command_keeps_build_a_when_environment_moves_to_build_b(
+    tmp_path: Path,
+) -> None:
+    """Catches a completed command being silently re-routed to a newer build."""
+    database = tmp_path / "build-freeze.sqlite"
+    router = _OfflineRuntimeRouter(build_ids={"goose": "goose:build-a"})
+    payload = _message_payload("goose")
+    with TestClient(
+        _service_app(database, _CompletingRuntime(), router=router)
+    ) as client:
+        _create_session(client, "session-build")
+        accepted = client.post(
+            "/api/sessions/session-build/messages",
+            headers={"Idempotency-Key": "message-build"},
+            json=payload,
+        )
+        assert accepted.status_code == 202, accepted.text
+        first = _wait_for_terminal(
+            client, "session-build", "message-build", payload
+        )
+
+        router.build_ids["goose"] = "goose:build-b"
+        replay = _wait_for_terminal(
+            client, "session-build", "message-build", payload
+        )
+        next_payload = {**payload, "content": "new command uses current build"}
+        next_accepted = client.post(
+            "/api/sessions/session-build/messages",
+            headers={"Idempotency-Key": "message-next-build"},
+            json=next_payload,
+        )
+        assert next_accepted.status_code == 202, next_accepted.text
+        _wait_for_terminal(
+            client, "session-build", "message-next-build", next_payload
+        )
+
+    repository = ConversationRepository(database)
+    frozen = repository.load_turn_status("session-build", "message-build")
+    current = repository.load_turn_status("session-build", "message-next-build")
+    assert replay == first
+    assert frozen is not None
+    assert frozen.state["runtime_build_id"] == "goose:build-a"
+    assert frozen.state["runtime_execution"]["build_id"] == "goose:build-a"
+    assert current is not None
+    assert current.state["runtime_build_id"] == "goose:build-b"
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://127.0.0.1:43127",
+        "http://example.com:43127",
+        "http://localhost.example:43127",
+        "http://user@127.0.0.1:43127",
+        "http://127.0.0.1:43127/api",
+        "http://127.0.0.1:43127/?target=remote",
+    ],
+)
+def test_live_client_rejects_non_loopback_or_ambiguous_base_urls(
+    monkeypatch: pytest.MonkeyPatch, base_url: str
+) -> None:
+    """Catches a capability-bearing client accepting a larger trust boundary."""
+    monkeypatch.setenv("WORKBENCH_LIVE_ACCEPTANCE_BASE_URL", base_url)
+    monkeypatch.setenv("WORKBENCH_LIVE_PROVIDER_PROFILE_ID", "provider-a")
+    monkeypatch.setenv("WORKBENCH_LIVE_MODEL", "model-a")
+    monkeypatch.setenv("WORKBENCH_LIVE_CAPABILITY", "sensitive-capability-value")
+    monkeypatch.setenv(
+        "WORKBENCH_LIVE_EXPECTED_BUILD_IDS_JSON", TEST_BUILD_MAP_JSON
+    )
+
+    with pytest.raises(AssertionError, match="loopback HTTP origin"):
+        _LiveWorkbenchClient()
+
+
+def test_live_client_rejects_redirect_without_forwarding_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a redirect moving the live request and capability off loopback."""
+    requests: list[httpx.Request] = []
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            307,
+            headers={"Location": "https://example.com/collect"},
+            request=request,
+        )
+
+    monkeypatch.setenv(
+        "WORKBENCH_LIVE_ACCEPTANCE_BASE_URL", "http://127.0.0.1:43127"
+    )
+    monkeypatch.setenv("WORKBENCH_LIVE_PROVIDER_PROFILE_ID", "provider-a")
+    monkeypatch.setenv("WORKBENCH_LIVE_MODEL", "model-a")
+    monkeypatch.setenv("WORKBENCH_LIVE_CAPABILITY", "sensitive-capability-value")
+    monkeypatch.setenv(
+        "WORKBENCH_LIVE_EXPECTED_BUILD_IDS_JSON", TEST_BUILD_MAP_JSON
+    )
+    with _LiveWorkbenchClient(transport=httpx.MockTransport(redirect)) as live:
+        with pytest.raises(AssertionError, match="redirect"):
+            live._json("GET", "/api/sessions/example/events")
+
+    assert len(requests) == 1
+    assert requests[0].url.host == "127.0.0.1"
+
+
+@pytest.mark.parametrize(
+    "build_ids",
+    [
+        "not-json",
+        "{}",
+        '{"python-term":"python:build","goose":"goose:build"}',
+        '{"python-term":"","goose":"goose:build","dsh":"dsh:build"}',
+        '{"python-term":"python:build","goose":"goose:build","dsh":"dsh:build","other":"x"}',
+    ],
+)
+def test_live_client_requires_exact_expected_build_map(
+    monkeypatch: pytest.MonkeyPatch, build_ids: str
+) -> None:
+    """Catches arbitrary ready builds satisfying the limited completion check."""
+    monkeypatch.setenv(
+        "WORKBENCH_LIVE_ACCEPTANCE_BASE_URL", "http://127.0.0.1:43127"
+    )
+    monkeypatch.setenv("WORKBENCH_LIVE_PROVIDER_PROFILE_ID", "provider-a")
+    monkeypatch.setenv("WORKBENCH_LIVE_MODEL", "model-a")
+    monkeypatch.setenv("WORKBENCH_LIVE_EXPECTED_BUILD_IDS_JSON", build_ids)
+
+    with pytest.raises(AssertionError, match="expected build map"):
+        _LiveWorkbenchClient()
+
+
+def test_limited_live_completion_contract_requires_marker_and_expected_build() -> None:
+    """Catches arbitrary text or an unexpected admitted build being called a pass."""
+    result = {
+        "command_id": "command-1",
+        "terminal": {
+            "command_id": "command-1",
+            "status": "completed",
+            "events": [
+                {"type": "TEXT_MESSAGE_CONTENT", "delta": "FEDERATED_RUNTIME_LIVE_OK"},
+                {"type": "CUSTOM", "name": "turn_finished"},
+            ],
+        },
+        "duplicate_status": 200,
+        "duplicate": None,
+        "conflict_statuses": [409, 409, 409],
+        "admission_status": 200,
+        "admission": {
+            "selector": "dsh",
+            "runtime_id": "dsh",
+            "build_id": "dsh:expected-build",
+            "state": "ready",
+            "trust_status": "DEV_UNTRUSTED",
+        },
+    }
+    result["duplicate"] = result["terminal"]
+
+    _assert_limited_live_completion(
+        result, runtime_id="dsh", expected_build_id="dsh:expected-build"
+    )
+    wrong_marker = {**result, "terminal": {**result["terminal"], "events": [
+        {"type": "TEXT_MESSAGE_CONTENT", "delta": "arbitrary answer"},
+        {"type": "CUSTOM", "name": "turn_finished"},
+    ]}}
+    with pytest.raises(AssertionError, match="exact marker"):
+        _assert_limited_live_completion(
+            wrong_marker, runtime_id="dsh", expected_build_id="dsh:expected-build"
+        )
+    with pytest.raises(AssertionError, match="expected build"):
+        _assert_limited_live_completion(
+            result, runtime_id="dsh", expected_build_id="dsh:other-build"
+        )
+
+
 class _LiveWorkbenchClient:
     """HTTP-only adapter for an already unlocked, user-operated Workbench."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, transport: httpx.BaseTransport | None = None) -> None:
         base_url = os.environ.get("WORKBENCH_LIVE_ACCEPTANCE_BASE_URL")
         provider_id = os.environ.get("WORKBENCH_LIVE_PROVIDER_PROFILE_ID")
         model = os.environ.get("WORKBENCH_LIVE_MODEL")
+        expected_build_ids_json = os.environ.get(
+            "WORKBENCH_LIVE_EXPECTED_BUILD_IDS_JSON"
+        )
         missing = [
             name
             for name, value in (
                 ("WORKBENCH_LIVE_ACCEPTANCE_BASE_URL", base_url),
                 ("WORKBENCH_LIVE_PROVIDER_PROFILE_ID", provider_id),
                 ("WORKBENCH_LIVE_MODEL", model),
+                (
+                    "WORKBENCH_LIVE_EXPECTED_BUILD_IDS_JSON",
+                    expected_build_ids_json,
+                ),
             )
             if not value
         ]
@@ -422,8 +681,36 @@ class _LiveWorkbenchClient:
             headers["X-Workbench-Capability"] = capability
         self.provider_id = str(provider_id)
         self.model = str(model)
+        try:
+            expected_build_ids = json.loads(str(expected_build_ids_json))
+        except (TypeError, ValueError):
+            raise AssertionError("live acceptance requires an exact expected build map") from None
+        if (
+            not isinstance(expected_build_ids, dict)
+            or set(expected_build_ids) != LIVE_RUNTIME_IDS
+            or any(
+                not isinstance(value, str) or not value
+                for value in expected_build_ids.values()
+            )
+        ):
+            raise AssertionError("live acceptance requires an exact expected build map")
+        self.expected_build_ids = expected_build_ids
+        url = httpx.URL(str(base_url))
+        if (
+            url.scheme != "http"
+            or url.host not in {"127.0.0.1", "localhost", "::1"}
+            or url.userinfo != b""
+            or url.raw_path != b"/"
+            or url.query != b""
+            or url.fragment != ""
+        ):
+            raise AssertionError("live acceptance requires a loopback HTTP origin")
         self.client = httpx.Client(
-            base_url=str(base_url).rstrip("/"), headers=headers, timeout=30.0
+            base_url=str(url).rstrip("/"),
+            headers=headers,
+            timeout=30.0,
+            follow_redirects=False,
+            transport=transport,
         )
 
     def __enter__(self) -> "_LiveWorkbenchClient":
@@ -434,6 +721,8 @@ class _LiveWorkbenchClient:
 
     def _json(self, method: str, path: str, **kwargs: Any) -> tuple[int, dict[str, Any]]:
         response = self.client.request(method, path, **kwargs)
+        if 300 <= response.status_code < 400:
+            raise AssertionError("live acceptance redirect rejected")
         try:
             value = response.json()
         except ValueError as exc:
@@ -446,7 +735,7 @@ class _LiveWorkbenchClient:
         nonce = uuid4().hex
         session_id = f"live-runtime-{runtime_id}-{nonce}"
         command_id = f"live-message-{nonce}"
-        prompt = "Reply with exactly: FEDERATED_RUNTIME_LIVE_OK"
+        prompt = f"Reply with exactly: {LIVE_MARKER}"
         payload = {
             "content": prompt,
             "model": self.model,
@@ -515,24 +804,21 @@ class _LiveWorkbenchClient:
         }
 
 
-@pytest.mark.skipif(not LIVE_OPT_IN, reason="live endpoint opt-in required")
-@pytest.mark.parametrize("runtime_id", ["python-term", "goose", "dsh"])
-def test_live_runtime_user_path_uses_saved_provider_and_unique_terminal(
-    runtime_id: str,
+def _assert_limited_live_completion(
+    result: dict[str, Any], *, runtime_id: str, expected_build_id: str
 ) -> None:
-    """Real endpoint proof: no fixture client and no direct credential access."""
-    with _LiveWorkbenchClient() as live:
-        result = live.run(runtime_id)
-
+    """Verify only HTTP completion/identity facts exposed by the public API."""
     terminal = result["terminal"]
     admission = result["admission"]
+    rendered_text = "".join(
+        str(event.get("delta", ""))
+        for event in terminal["events"]
+        if event.get("type") == "TEXT_MESSAGE_CONTENT"
+    )
+    assert rendered_text == LIVE_MARKER, "live completion did not return exact marker"
     assert terminal["status"] == "completed"
     assert terminal["command_id"] == result["command_id"]
     assert len(_terminal_events(terminal)) == 1
-    assert any(
-        event.get("type") == "TEXT_MESSAGE_CONTENT" and event.get("delta")
-        for event in terminal["events"]
-    )
     assert result["duplicate_status"] == 200
     assert result["duplicate"] == terminal
     assert result["conflict_statuses"] == [409, 409, 409]
@@ -541,4 +827,22 @@ def test_live_runtime_user_path_uses_saved_provider_and_unique_terminal(
     assert admission["runtime_id"] == runtime_id
     assert admission["state"] == "ready"
     assert admission["trust_status"] in {"DEV_UNTRUSTED", "PRODUCTION_TRUSTED"}
-    assert "fake" not in str(admission["build_id"]).lower()
+    assert admission["build_id"] == expected_build_id, (
+        "live completion did not use the expected build"
+    )
+
+
+@pytest.mark.skipif(not LIVE_OPT_IN, reason="live endpoint opt-in required")
+@pytest.mark.parametrize("runtime_id", ["python-term", "goose", "dsh"])
+def test_live_runtime_limited_completion_uses_marker_and_expected_build(
+    runtime_id: str,
+) -> None:
+    """Finite live check; Provider/Model proof remains a separate manual Gate."""
+    with _LiveWorkbenchClient() as live:
+        result = live.run(runtime_id)
+
+    _assert_limited_live_completion(
+        result,
+        runtime_id=runtime_id,
+        expected_build_id=live.expected_build_ids[runtime_id],
+    )

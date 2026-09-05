@@ -448,9 +448,19 @@ cd mvp
 默认结果包含 3 个 live case 的 `SKIPPED`。只有用户先启动并解锁真实 Workbench，且
 明确接受真实 Provider 调用可能产生的费用后，才可用
 `WORKBENCH_RUN_LIVE_RUNTIME_ACCEPTANCE=1`，并提供 loopback 服务地址、已保存的
-Provider Profile ID 与模型，执行同一文件。测试只调用正式 Conversation HTTP 控制面，
-不读取 Vault、密码、Runtime 数据库或验收 evidence 文件；若本地控制面启用 capability，
-只通过当前进程环境传入，不写入仓库、命令示例或测试输出。
+Provider Profile ID、模型，以及覆盖 Python Term/Goose/DSH 的精确预期 build map，
+执行同一文件。base URL 只接受无 userinfo、path、query 的 loopback HTTP origin，客户端
+不跟随 redirect；若本地控制面启用 capability，只通过当前进程环境传入，不写入仓库、
+命令示例或测试输出。测试只调用正式 Conversation HTTP 控制面，不读取 Vault、密码、
+Runtime 数据库或验收 evidence 文件。
+
+该自动 live case 仅为 `LIMITED_COMPLETION_CHECK`：它断言完整回复精确等于 marker，并将
+admission build 与显式预期值绑定。当前公共 Conversation API 不提供 command 实际执行时的
+Provider Profile digest、resolved model 或 fallback attestation，因此此 case 不能证明
+Provider/Model 精确绑定且无 fallback，也不能单独签发任何 GO。该缺口继续依赖正式、
+secret-free 的签名证据和用户人工验收；未来最小补强是提供 command-scoped 执行 attestation，
+将冻结的 Provider digest、resolved model、Runtime build 与签名 proof identity 关联起来，
+而不是回显凭据或把请求字段当成执行结果。
 
 截至 2026-09-05 的证据台账：
 
@@ -467,7 +477,7 @@ Provider Profile ID 与模型，执行同一文件。测试只调用正式 Conve
 `GO_DSH_PLUGIN_SMOKE`。CLI 显示 `prepared`、离线 fixture 通过或单个 Runtime 完成，均不等于
 四模式 UI 和三通道联邦整体通过。
 
-本次 focused 离线结果为 `4 passed, 3 skipped`。从 revision `cb40882` 启动的唯一一次
+本次 Task 5 review focused 结果为 `19 passed, 3 skipped`。从 revision `cb40882` 启动的唯一一次
 全量 Python `pytest -q` 在 898.60 秒上限被人工中断，当时为
 `17 passed, 2 skipped`，停留于 Development Graph blueprint 内嵌的前端测试，因此
 不能记为全量 PASS，也不覆盖之后的会话事件分页修改。真实用户环境另发现旧会话首次
@@ -490,7 +500,7 @@ LMSTUDIO_MODEL="<loaded-model-id>" \
 .venv/bin/python -m pytest tests/integration/test_lmstudio_tool_calling.py -v
 ```
 
-### 10.8 Data Platform 验收
+### 10.9 Data Platform 验收
 
 在当前 shell 中提供本地 Data Platform 连接信息，不要写入仓库：
 

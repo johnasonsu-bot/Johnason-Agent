@@ -185,7 +185,7 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 
 | 项目 | 状态 | 决策依据 |
 |---|---|---|
-| 离线服务用户路径 | `PASS_CONTRACT_ONLY` | 真实 Conversation HTTP/SQLite 路径覆盖 Goose/DSH 的消息、唯一终态、幂等/身份冲突、恢复去重、取消和隔离；外部 Runtime 为确定性测试实现，不是 live proof |
+| 离线服务用户路径 | `PASS_CONTRACT_ONLY` | 真实 Conversation HTTP/SQLite 路径覆盖 chat 省略 selector、Goose/DSH 消息、唯一终态、幂等/身份冲突、恢复去重、取消、隔离，以及同一 command 的 build 冻结；外部 Runtime 为确定性测试实现，不是 live proof |
 | Python Term 当前 bundle | `MANUAL_PENDING` | 既有真实验收属于旧 build，不迁移到当前 source/build identity |
 | Goose 当前 bundle | `MANUAL_PENDING` | 既有真实验收属于旧 build，不迁移到当前 source/build identity |
 | DSH 当前 bundle | `PASS_SINGLE_COMPLETION` | 用户 GUI job `4898e6381c184ba19a84cc321617c91e` 绑定 `deepseek-primary` / `deepseek-v4-flash-vision-exp`，云端完成，evidence 延迟 `1015 ms`；正式 loader 验证 public proof/Profile digest 匹配，`DEV_UNTRUSTED` |
@@ -197,6 +197,14 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 真实调用继续由用户从 GUI 或已启动的 loopback Workbench 显式触发；测试不得主动索取
 Vault 密码，普通离线回归缺少 live opt-in 时必须报告 `SKIPPED`。CLI 的 `prepared`
 只表示开发证据准备完成，不代表 UI 会话、幂等、取消和恢复全部通过。
+
+自动 live 验收的网络边界只允许无 userinfo/path/query 的 loopback HTTP origin，禁止
+跟随 redirect；结果必须精确命中 marker，并将 admission build 与调用者提供的预期 build
+相等。该用例分类为 `LIMITED_COMPLETION_CHECK`：当前公共 Conversation API 不提供实际执行
+使用的 Provider Profile digest、resolved model 或 fallback attestation，所以它不能证明
+Provider/Model 精确绑定且无 fallback。最小后续设计是新增 secret-free、command-scoped 的
+签名执行 attestation，把冻结的 Provider digest、resolved model、Runtime build 与正式
+proof identity 关联起来；不得回显凭据，也不得以 queued request 字段替代执行证据。
 
 当前用户 Runtime 数据库只读核验显示 DSH registration 为 `ready`，build
 `dsh:model-host-v2-r1`，只发布 `model/query/streaming/event_cursor/prompt_sections=true`，

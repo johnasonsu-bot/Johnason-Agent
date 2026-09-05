@@ -45,14 +45,17 @@
 
 - [x] 新增 `tests/acceptance/test_federated_runtime_user_path.py`：离线 case 经真实 Conversation HTTP/SQLite 路径覆盖 Goose/DSH 消息、唯一终态、幂等、身份冲突、恢复、取消和故障隔离；外部 Runtime 为确定性测试实现，明确不计 live GO。
 - [x] Python Term、Goose、DSH 的真实 HTTP 用户路径均要求 `WORKBENCH_RUN_LIVE_RUNTIME_ACCEPTANCE=1`，默认 3 个 case 为 `SKIPPED`；测试不读取 Vault 或明文凭据。
+- [x] live 客户端只接受无 userinfo/path/query 的 loopback HTTP origin，不跟随 redirect；自动检查要求精确回复 marker 与显式预期 build，不再以任意文本或任意 ready build 计作通过。
+- [x] 离线回归补充 chat 省略 selector 的固定通道（显式空字符串返回 422），以及同一 command 在环境从 build A 切至 build B 后仍冻结引用 A、新 command 才引用 B 的护栏。
 - [x] 记录 DSH 当前 bundle 的一条用户 GUI 真实云端 completion，并与 fixture/CLI `prepared` 证据分开。
+- [ ] 当前自动 live case 仅为 `LIMITED_COMPLETION_CHECK`；公共 API 未暴露实际 Provider Profile digest、resolved model 或 fallback attestation，不能用请求字段代替执行绑定证据。最小后续方案是增加 secret-free、command-scoped 的签名执行 attestation，绑定冻结 Provider digest、resolved model、Runtime build 与 proof identity。
 - [ ] Python Term 与 Goose 当前 bundle 的真实用户路径仍为 `MANUAL_PENDING`；既往旧 build 证据不迁移。
 - [ ] DSH 当前 bundle 的真实取消、错误、重复命令和重启恢复仍为 `MANUAL_PENDING`，因此 `GO_DSH_PLUGIN_SMOKE=HOLD`。
 - [ ] `GO_GOOSE_QUERY_SMOKE=HOLD`；需补当前 bundle 的独立真实证据。
 - [ ] `GO_RUNTIME_FEDERATION=HOLD`；三通道、共享合同、持久恢复和前端全量验收未同时通过。
 - [ ] 真实用户旧会话 `ui-session-0` 首次无 cursor 的全量事件约 8.6 MB（15,341 条 domain events，其中 15,088 条 retryable），超过 IPC 1 MiB 聚合限制并使页面停在“等待本地服务”；需有界分页且不得删除用户历史，修复后重新执行真实恢复验收。
 
-回归记录：Task 5 focused 为 `4 passed, 3 skipped`；从 revision `cb40882` 启动的唯一
+回归记录：Task 5 review focused 为 `19 passed, 3 skipped`；从 revision `cb40882` 启动的唯一
 一次全量 Python `pytest -q` 在 898.60 秒上限中断，当时 `17 passed, 2 skipped`，
 停留于 Development Graph blueprint 内嵌前端流程。该结果不是全量 PASS，也不覆盖
 随后进行的事件分页改动；按约束不重复运行另一轮全量。
