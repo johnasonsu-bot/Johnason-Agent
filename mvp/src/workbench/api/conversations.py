@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -196,6 +196,10 @@ class DevelopmentInterruptRequest(BaseModel):
     decision: Literal["approved", "retry_merge", "request_replan", "rework_branch"] | None = None
     decisions: dict[str, Literal["approved"]] | None = None
     target_branch: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class ConversationEventFrameTooLarge(ValueError):
+    """A public SSE frame cannot fit within the requested bounded page."""
 
 
 class SessionPausedError(RuntimeError):
@@ -2164,9 +2168,21 @@ class ConversationAPI:
         return {"session_id": session_id, "status": status, "event": event}
 
     def stream(
-        self, session_id: str, *, after_cursor: tuple[int, int]
+        self, session_id: str, *, after_cursor: tuple[int, int], page_bytes: int | None = None
     ) -> StreamingResponse:
         self._require_session(session_id)
+        if page_bytes is not None:
+            frames: list[str] = []
+            used = 0
+            for frame in self._event_frames(session_id, after_cursor=after_cursor):
+                size = len(frame.encode("utf-8"))
+                if used + size > page_bytes:
+                    if not frames:
+                        raise ConversationEventFrameTooLarge("conversation_event_frame_too_large")
+                    break
+                frames.append(frame)
+                used += size
+            return StreamingResponse(iter(frames), media_type="text/event-stream")
         return StreamingResponse(
             self._stream_events(session_id, after_cursor=after_cursor),
             media_type="text/event-stream",
@@ -2175,6 +2191,12 @@ class ConversationAPI:
     async def _stream_events(
         self, session_id: str, *, after_cursor: tuple[int, int]
     ) -> AsyncIterator[str]:
+        for frame in self._event_frames(session_id, after_cursor=after_cursor):
+            yield frame
+
+    def _event_frames(
+        self, session_id: str, *, after_cursor: tuple[int, int]
+    ) -> Iterator[str]:
         import json
 
         paused = False
@@ -2202,7 +2224,9 @@ class ConversationAPI:
                 if event.causation_id is not None:
                     terminal_causes.add(event.causation_id)
                 paused = paused or event.payload.get("response_status") == "paused"
-            if stale:
+            # Earlier events still contribute pause/terminal suppression state,
+            # but need not be projected again for each history page.
+            if stale or (event.sequence or 0) < after_cursor[0]:
                 continue
             for projection_index, projected in enumerate(map_domain_event(event)):
                 cursor = (event.sequence or 0, projection_index)
@@ -3125,6 +3149,7 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
     def session_events(
         session_id: str,
         last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+        page_bytes: int | None = Header(None, alias="X-Event-Page-Bytes", ge=1024, le=262144),
     ) -> StreamingResponse:
         try:
             cursor = _parse_last_event_id(last_event_id)
@@ -3133,7 +3158,9 @@ def conversation_router(api: ConversationAPI) -> APIRouter:
         if cursor[0] < 0 or cursor[1] < -1:
             raise HTTPException(400, "Last-Event-ID must be non-negative")
         try:
-            return api.stream(session_id, after_cursor=cursor)
+            return api.stream(session_id, after_cursor=cursor, page_bytes=page_bytes)
+        except ConversationEventFrameTooLarge as exc:
+            raise HTTPException(413, "conversation_event_frame_too_large") from exc
         except KeyError as exc:
             raise HTTPException(404, "session not found") from exc
         except ValueError as exc:

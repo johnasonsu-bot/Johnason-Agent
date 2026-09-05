@@ -207,6 +207,12 @@ export function isRetryableConversationError(error: unknown): boolean {
   return message.includes("agent turn is retryable");
 }
 
+export class ConversationHistoryError extends ApiRequestError {
+  constructor(message: string, status: number, public readonly events: ConversationEvent[]) {
+    super(message, status);
+  }
+}
+
 export const conversationApi = {
   createSession: (sessionId: string) => request<{ session_id: string }>("/sessions", { method: "POST", body: JSON.stringify({ session_id: sessionId }) }),
   sendMessage,
@@ -214,20 +220,35 @@ export const conversationApi = {
     () => sendMessage(sessionId, content, commandId, model, providerId),
     isRetryableConversationError,
   ),
-  events: async (sessionId: string, lastEventId?: string): Promise<ConversationEvent[]> => {
+  events: async (sessionId: string, lastEventId?: string, options?: { shouldContinue?: () => boolean }): Promise<ConversationEvent[]> => {
     const bridge = (window as Window & { workbenchBridge: ApiBridge }).workbenchBridge;
-    const response = await bridge.apiRequest({ method: "GET", path: `/sessions/${encodeURIComponent(sessionId)}/events`, headers: lastEventId ? { "Last-Event-ID": lastEventId } : undefined });
-    if (response.status < 200 || response.status >= 300) {
-      const body = response.body as { detail?: unknown; message?: unknown; error?: unknown } | null;
-      const detail = body && typeof body === "object" ? body.detail ?? body.message ?? body.error : undefined;
-      const suffix = typeof detail === "string" && detail.length > 0 ? `：${detail}` : "";
-      throw new Error(`本地服务请求失败（${response.status}）${suffix}`);
+    const events: ConversationEvent[] = [];
+    let cursor = lastEventId;
+    const cursors = new Set(cursor ? [cursor] : []);
+    const checkActive = () => { if (options?.shouldContinue?.() === false) throw new DOMException("History read cancelled", "AbortError"); };
+    while (true) {
+      checkActive();
+      const response = await bridge.apiRequest({ method: "GET", path: `/sessions/${encodeURIComponent(sessionId)}/events`, headers: { "X-Event-Page-Bytes": "262144", ...(cursor ? { "Last-Event-ID": cursor } : {}) } });
+      checkActive();
+      if (response.status < 200 || response.status >= 300) {
+        const body = response.body as { detail?: unknown; message?: unknown; error?: unknown } | null;
+        const detail = body && typeof body === "object" ? body.detail ?? body.message ?? body.error : undefined;
+        if (response.status === 413) throw new ConversationHistoryError("conversation_event_frame_too_large", response.status, events);
+        const suffix = typeof detail === "string" && detail.length > 0 ? `：${detail}` : "";
+        throw new Error(`本地服务请求失败（${response.status}）${suffix}`);
+      }
+      const page = (response.text ?? "").split("\n\n").filter(Boolean).map((frame) => {
+        const cursor = frame.split("\n").find((line) => line.startsWith("id: "))?.slice(4);
+        const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+        return data ? { ...(JSON.parse(data) as ConversationEvent), ...(cursor ? { cursor } : {}) } : null;
+      }).filter((event): event is ConversationEvent => event !== null);
+      if (!page.length) return events;
+      const next = page[page.length - 1].cursor;
+      if (!next || cursors.has(next)) throw new ConversationHistoryError("conversation_event_cursor_invalid", 502, events);
+      cursors.add(next);
+      events.push(...page);
+      cursor = next;
     }
-    return (response.text ?? "").split("\n\n").filter(Boolean).map((frame) => {
-      const cursor = frame.split("\n").find((line) => line.startsWith("id: "))?.slice(4);
-      const data = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
-      return data ? { ...(JSON.parse(data) as ConversationEvent), ...(cursor ? { cursor } : {}) } : null;
-    }).filter((event): event is ConversationEvent => event !== null);
   },
   intervene: (sessionId: string, content: string, commandId: string) => request<{ status: string }>(`/sessions/${encodeURIComponent(sessionId)}/interventions`, {
     method: "POST", body: JSON.stringify({ kind: "supplement", content, context_version: 0 }), headers: { "Idempotency-Key": commandId },

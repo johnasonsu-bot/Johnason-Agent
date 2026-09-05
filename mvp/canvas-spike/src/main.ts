@@ -38,6 +38,18 @@ function isApiRequest(value: unknown): value is ApiRequest {
   if (!value || typeof value !== "object") return false;
   const request = value as Partial<ApiRequest>;
   if ((request.method !== "GET" && request.method !== "POST" && request.method !== "PUT" && request.method !== "DELETE") || typeof request.path !== "string") return false;
+  // Validate before route-specific early returns; renderer headers may never
+  // override the main-process capability or introduce arbitrary HTTP headers.
+  if (request.headers !== undefined) {
+    if (!request.headers || typeof request.headers !== "object" || Array.isArray(request.headers)) return false;
+    for (const [key, value] of Object.entries(request.headers)) {
+      if (typeof value !== "string" || value.length > 256 || /[\r\n]/.test(value)) return false;
+      if (!["Idempotency-Key", "Last-Event-ID", "X-Event-Page-Bytes"].includes(key)) return false;
+      if (key === "X-Event-Page-Bytes" && (request.method !== "GET"
+        || !/^\/sessions\/[A-Za-z0-9_-]{1,64}\/events$/.test(request.path)
+        || !/^\d+$/.test(value) || Number(value) < 1024 || Number(value) > 262144)) return false;
+    }
+  }
   const verificationPath = /^\/runtime-verifications\/[A-Za-z0-9_-]{1,64}(?:\/(cancel))?$/.exec(request.path);
   if (verificationPath) {
     if (request.method !== (verificationPath[1] ? "POST" : "GET")) return false;

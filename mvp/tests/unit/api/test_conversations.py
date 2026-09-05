@@ -643,6 +643,62 @@ def test_sse_composite_cursor_replays_later_projections_of_the_same_event(
     assert ids == ["2:1", "3:0", "3:1", "4:0", "4:1"]
 
 
+def test_sse_byte_pages_preserve_large_history_and_intra_event_cursors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import workbench.api.conversations as conversation_api
+
+    with _client(tmp_path / "paged.sqlite") as client:
+        _start_session(client)
+        _send_message(client, "session-1", "hello", "message-1")
+        monkeypatch.setattr(conversation_api, "map_domain_event", lambda event: [
+            {"type": "CUSTOM", "name": "page-test", "value": {"text": "x" * 16000 + "汉" * 1000, "index": index}}
+            for index in range(20)
+        ])
+        legacy = client.get("/api/sessions/session-1/events")
+        assert legacy.status_code == 200
+        assert len(legacy.content) > 1_048_576
+        pages = []
+        cursor = None
+        for _ in range(100):
+            headers = {"X-Event-Page-Bytes": "32768"}
+            if cursor is not None:
+                headers["Last-Event-ID"] = cursor
+            page = client.get("/api/sessions/session-1/events", headers=headers)
+            assert page.status_code == 200
+            assert len(page.content) <= 32768
+            if not page.content:
+                break
+            pages.append(page.content)
+            next_cursor = page.text.strip().split("\n\n")[-1].splitlines()[0][4:]
+            assert next_cursor != cursor
+            cursor = next_cursor
+        else:
+            pytest.fail("pagination never reached the empty terminal page")
+        assert b"".join(pages) == legacy.content
+        ids = [line for page in pages for line in page.decode().splitlines() if line.startswith("id: ")]
+        assert len(ids) == len(set(ids)) == 80
+        assert "id: 2:0" in ids and "id: 2:19" in ids
+
+
+def test_sse_page_rejects_single_oversized_frame_without_changing_legacy_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import workbench.api.conversations as conversation_api
+
+    with _client(tmp_path / "oversized.sqlite") as client:
+        _start_session(client)
+        _send_message(client, "session-1", "hello", "message-1")
+        monkeypatch.setattr(conversation_api, "map_domain_event", lambda event: [
+            {"type": "CUSTOM", "name": "large", "value": "汉" * 2000}
+        ])
+        assert client.get("/api/sessions/session-1/events").status_code == 200
+        page = client.get("/api/sessions/session-1/events", headers={"X-Event-Page-Bytes": "4096"})
+        assert page.status_code == 413
+        assert page.json() == {"detail": "conversation_event_frame_too_large"}
+        assert client.get("/api/sessions/session-1/events", headers={"X-Event-Page-Bytes": "1048577"}).status_code == 422
+
+
 def test_concurrent_duplicate_message_runs_the_runner_once(tmp_path: Path) -> None:
     runner = ConversationRunner()
     with _client(tmp_path / "conversation.sqlite", runner) as client:

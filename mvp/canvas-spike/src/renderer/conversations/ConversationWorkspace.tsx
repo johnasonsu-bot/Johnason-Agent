@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ConversationHistoryError } from "../api";
 import { artifacts } from "../artifacts";
 import { agentApi, conversationApi, engineHostApi, providerApi, runtimeLabels, isRuntimeSelector, type RuntimeSelector, type ProviderProfile, type ConversationEvent, type EngineHostV2Diagnostic } from "../api";
 import { registry } from "../renderers";
@@ -289,7 +290,14 @@ export function ConversationWorkspace() {
         // A cursor is not a snapshot: always rebuild projections from durable
         // events when entering a session, including when browser caches vanished.
         const resumeCursor = hydratedGraph ? cursorsRef.current[sessionId] : undefined;
-        const events = await conversationApi.events(sessionId, resumeCursor);
+        let historyFailure: ConversationHistoryError | undefined;
+        const events = await conversationApi.events(sessionId, resumeCursor, {
+          shouldContinue: () => active && watcherGenerationRef.current === generation,
+        }).catch((error: unknown) => {
+          if (!(error instanceof ConversationHistoryError)) throw error;
+          historyFailure = error;
+          return error.events;
+        });
         const graphEvents = events;
         if (!active || watcherGenerationRef.current !== generation) return;
         const fresh = events.filter((event) => {
@@ -347,6 +355,11 @@ export function ConversationWorkspace() {
         }
         if (firstSnapshot || fresh.length) publishProjection(sessionId);
         setSource("Task 3 REST/SSE · cursor");
+        if (historyFailure) {
+          setSource(`历史读取中止 · ${historyFailure.message}（已保留此前历史）`);
+          setPending(true);
+          return;
+        }
       } catch (error: unknown) {
         if (active) {
           setSource("Task 3 API · 等待本地服务");
