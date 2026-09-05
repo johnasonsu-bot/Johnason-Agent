@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,6 +21,7 @@ const expectedArtifactEntries = [
   "build-receipt.json",
   "checkpoint.mjs",
   "deepseek-harness-host-v2.mjs",
+  "deepseek-harness-model-host-v2.mjs",
   "event-mapper.mjs",
   "grant-channel.mjs",
   "native-session.mjs",
@@ -57,7 +58,6 @@ if (sourceEntries.some(entry => !entry.isFile())
   throw new Error("DeepSeek Harness sidecar source file set drift");
 }
 
-await rm(outputRoot, { recursive: true, force: true });
 await mkdir(outputRoot, { recursive: true });
 
 for (const entry of expectedSourceEntries) {
@@ -67,8 +67,12 @@ for (const entry of expectedSourceEntries) {
   await writeFile(path.join(outputRoot, output), executable, "utf8");
 }
 
+for (const [entrypoint, buildId] of [
+  ["deepseek-harness-host-v2.mjs", "dsh:fixed-host-v2-smoke"],
+  ["deepseek-harness-model-host-v2.mjs", "dsh:model-host-v2-r1"],
+]) {
 await writeFile(
-  path.join(outputRoot, "deepseek-harness-host-v2.mjs"),
+  path.join(outputRoot, entrypoint),
   [
     "#!/usr/bin/env node",
     'import { readFixedPreset } from "./bootstrap.mjs";',
@@ -78,7 +82,7 @@ await writeFile(
     'readFixedPreset(new URL("../cordis.host-v2.yml", import.meta.url));',
     "if (process.argv.length !== 2) throw new Error(\"DSH Host v2 rejects argv configuration\");",
     'const runtimeId = "dsh";',
-    'const buildId = "dsh:fixed-host-v2-smoke";',
+    `const buildId = ${JSON.stringify(buildId)};`,
     'const descriptor = process.env.WORKBENCH_PROVIDER_GRANT_FD ?? "";',
     "delete process.env.WORKBENCH_PROVIDER_GRANT_FD;",
     "if (!/^[0-9]+$/.test(descriptor)) throw new Error(\"DSH Provider Grant descriptor is missing\");",
@@ -93,6 +97,7 @@ await writeFile(
   ].join("\n"),
   { encoding: "utf8", mode: 0o755 },
 );
+}
 
 const sourceFiles = [
   "package.json",
@@ -110,6 +115,7 @@ const artifactFiles = [
   "dist/bootstrap.mjs",
   "dist/checkpoint.mjs",
   "dist/deepseek-harness-host-v2.mjs",
+  "dist/deepseek-harness-model-host-v2.mjs",
   "dist/event-mapper.mjs",
   "dist/grant-channel.mjs",
   "dist/native-session.mjs",

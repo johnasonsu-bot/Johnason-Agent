@@ -33,7 +33,7 @@ def _valid_live_evidence(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "verification_challenge_digest": "4" * 64,
         "runtime_id": "goose",
-        "build_id": "goose-host-v2:fixture-wrapper-r2",
+        "build_id": "goose-host-v2:model-host-r1",
         "provider_profile_digest": "1" * 64,
         "model": "deepseek-chat",
         "endpoint_kind": "cloud",
@@ -69,7 +69,7 @@ def test_live_evidence_is_bound_to_runtime_provider_model_and_build() -> None:
     )
 
     assert evidence.runtime_id == "goose"
-    assert evidence.build_id == "goose-host-v2:fixture-wrapper-r2"
+    assert evidence.build_id == "goose-host-v2:model-host-r1"
     assert evidence.provider_profile_digest == "1" * 64
     assert evidence.model == "deepseek-chat"
     assert evidence.output_digest == "2" * 64
@@ -88,7 +88,7 @@ def test_live_execution_snapshot_freezes_profile_model_and_runtime_without_secre
 
     snapshot = signer._build_live_execution_snapshot(
         runtime_id="goose",
-        build_id="goose-host-v2:fixture-wrapper-r2",
+        build_id="goose-host-v2:model-host-r1",
         host_generation="7",
         profile=profile,
         now=1_800_000_000.0,
@@ -96,7 +96,7 @@ def test_live_execution_snapshot_freezes_profile_model_and_runtime_without_secre
 
     envelope = snapshot["envelope"]
     assert snapshot["runtime_id"] == "goose"
-    assert snapshot["build_id"] == "goose-host-v2:fixture-wrapper-r2"
+    assert snapshot["build_id"] == "goose-host-v2:model-host-r1"
     assert snapshot["provider_profile_digest"] == (
         canonical_provider_profile_digest(profile)
     )
@@ -355,7 +355,7 @@ def test_goose_source_gate_exports_only_verified_build_identity(
 
     assert identity == {
         "runtime_id": "goose",
-        "build_id": "goose-host-v2:fixture-wrapper-r2",
+        "build_id": "goose-host-v2:model-host-r1",
         "source_manifest_digest": "3" * 64,
         "build_manifest_digest": hashlib.sha256(evidence_bytes).hexdigest(),
     }
@@ -418,7 +418,7 @@ def test_dsh_source_gate_exports_only_verified_build_identity(
 
     assert identity == {
         "runtime_id": "dsh",
-        "build_id": "dsh:fixed-host-v2-smoke",
+        "build_id": "dsh:model-host-v2-r1",
         "source_manifest_digest": "4" * 64,
         "build_manifest_digest": hashlib.sha256(receipt_bytes).hexdigest(),
     }

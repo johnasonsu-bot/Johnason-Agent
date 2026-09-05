@@ -40,6 +40,23 @@ from workbench.settings import RuntimeProcessConfig
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("binary_name,model", [("goose-host-v2", False), ("goose-model-host-v2", True)])
+async def test_fixed_goose_entrypoint_negotiates_honest_model_capability(tmp_path, binary_name, model):
+    binary = Path(__file__).resolve().parents[2] / "runtime-hosts/goose-host-v2/target/release" / binary_name
+    client = EngineHostV2Client((str(binary),), containment_lock=tmp_path / "host.lock",
+        containment_generation="1", provider_grant_transport=True)
+    try:
+        await client.start()
+        assert client.capabilities.model is model
+        assert not client.capabilities.workspace
+        assert not client.capabilities.tools
+        assert not client.capabilities.skills
+        assert not client.capabilities.interventions
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_supervisor_sends_materialized_input_through_real_client(
     tmp_path: Path,
 ) -> None:
@@ -438,13 +455,16 @@ async def test_coordinator_delivers_private_grant_before_real_supervised_query(
 
 @pytest.mark.skipif(os.name != "posix", reason="private descriptor is POSIX-only")
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
 async def test_coordinator_delivers_empty_grant_to_real_goose_local_route(
-    tmp_path: Path,
+    tmp_path: Path, outcome: str,
 ) -> None:
     """Exercise Broker→socket→Goose with an explicit no-credential route."""
     from workbench.runtime.provider_grants import canonical_provider_profile_digest
 
     captured: dict[str, object] = {}
+    request_started = threading.Event()
+    release_response = threading.Event()
     response_body = (
         'data: {"id":"local-1","object":"chat.completion.chunk",'
         '"created":1,"model":"local-model","choices":[{"index":0,'
@@ -463,6 +483,15 @@ async def test_coordinator_delivers_empty_grant_to_real_goose_local_route(
             captured["path"] = self.path
             captured["authorization"] = self.headers.get("Authorization")
             captured["body"] = json.loads(self.rfile.read(length))
+            request_started.set()
+            if outcome == "cancelled":
+                release_response.wait(timeout=10)
+                return
+            if outcome == "failed":
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(response_body)))
@@ -513,7 +542,7 @@ async def test_coordinator_delivers_empty_grant_to_real_goose_local_route(
             overrides={
                 "runtime": {
                     "runtime_id": "goose",
-                    "build_id": "goose-host-v2:fixture-wrapper-r2",
+                    "build_id": "goose-host-v2:model-host-r1",
                     "config_digest": "c" * 64,
                     "host_generation": "1",
                 },
@@ -543,16 +572,16 @@ async def test_coordinator_delivers_empty_grant_to_real_goose_local_route(
         )
         capabilities = runtime_capabilities(
             "goose",
-            build_id="goose-host-v2:fixture-wrapper-r2",
+            build_id="goose-host-v2:model-host-r1",
             query=True,
-            model=False,
+            model=True,
             streaming=True,
             event_cursor=True,
         )
         assignments, assignment = admitted_assignment(database, envelope, capabilities)
         binary = (
             Path(__file__).resolve().parents[2]
-            / "runtime-hosts/goose-host-v2/target/release/goose-host-v2"
+            / "runtime-hosts/goose-host-v2/target/release/goose-model-host-v2"
         )
         supervisor = SidecarSupervisor(
             runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=(str(binary),)),),
@@ -572,22 +601,24 @@ async def test_coordinator_delivers_empty_grant_to_real_goose_local_route(
         await supervisor.start()
         handle = await supervisor.acquire_initial(assignment)
         try:
-            events = [
-                event
-                async for event in coordinator.run_query(
-                    handle,
-                    envelope,
-                    runtime_input=runtime_input,
-                )
-            ]
+            async def consume():
+                return [event async for event in coordinator.run_query(
+                    handle, envelope, runtime_input=runtime_input)]
+            task = asyncio.create_task(consume())
+            if outcome == "cancelled":
+                assert await asyncio.to_thread(request_started.wait, 5)
+                await handle.cancel()
+            events = await asyncio.wait_for(task, timeout=15)
         finally:
+            release_response.set()
             await supervisor.aclose()
     finally:
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
 
-    assert events[-1].payload == {"status": "completed"}
+    assert events[-1].payload == {"status": outcome}
+    assert sum(event.type == "runtime.status" and event.payload.get("status") in {"completed", "failed", "cancelled"} for event in events) == 1
     assert captured["path"] == "/v1/chat/completions"
     assert captured["authorization"] is None
     assert captured["body"]["model"] == "local-model"

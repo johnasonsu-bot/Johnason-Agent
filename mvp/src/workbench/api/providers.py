@@ -37,6 +37,7 @@ class ProviderPayload(BaseModel):
     name: str
     protocol: str
     base_url: str
+    credential_mode: Literal["reference", "none"] = "reference"
     headers: dict[str, str] = Field(default_factory=dict)
     model_aliases: dict[str, str] = Field(default_factory=dict)
     capabilities: set[ProviderCapability] = Field(default_factory=set)
@@ -96,7 +97,7 @@ def credential_status(
     vault: CredentialVault | VaultService | None,
 ) -> str:
     """Return a masked credential state without returning a credential reference."""
-    if record.protocol == "lmstudio":
+    if record.credential_mode == "none" or record.protocol == "lmstudio":
         return "not_required"
     if vault is None:
         return "locked"
@@ -119,6 +120,7 @@ def provider_response(
         "name": record.name,
         "protocol": record.protocol,
         "base_url": record.base_url,
+        "credential_mode": record.credential_mode,
         "headers": dict(record.headers),
         "model_aliases": record.model_aliases,
         "capabilities": sorted(capability.value for capability in record.capabilities),
@@ -232,7 +234,8 @@ def provider_router(
             except KeyError:
                 existing = None
             cleanup_unconfirmed = False
-            if existing is not None and not same_credential_scope(existing, record):
+            if (existing is not None and existing.credential_mode == "reference"
+                    and not same_credential_scope(existing, record)):
                 if vault is None:
                     raise HTTPException(423, "credential vault is locked")
                 try:
@@ -265,6 +268,8 @@ def provider_router(
             raise HTTPException(423, "credential vault is locked")
         with _provider_locks.hold(provider_id):
             record = _record_or_404(repository, provider_id)
+            if record.credential_mode == "none":
+                raise HTTPException(422, "provider does not accept credentials")
             try:
                 vault.put(record.secret_id or "", secret.value)
             except VaultLockedError as exc:

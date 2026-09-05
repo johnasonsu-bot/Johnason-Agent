@@ -428,8 +428,7 @@ def _real_endpoint_kind(profile: ProviderProfileRecord) -> EndpointKind:
     loopback = host == "localhost" or (address is not None and address.is_loopback)
     if loopback:
         if (
-            profile.credential_mode == "none"
-            and profile.protocol in {"lmstudio", "openai_chat", "openai_compatible"}
+            profile.protocol in {"lmstudio", "openai_chat", "openai_compatible"}
             and parsed.scheme == "http"
         ):
             return "local"
@@ -610,8 +609,6 @@ async def _collect_federated_observation(
     except KeyError as error:
         raise ValueError("saved provider profile is unavailable") from error
     endpoint_kind = _real_endpoint_kind(profile)
-    if endpoint_kind == "local":
-        raise ValueError("trusted local runtime attestation is required")
     identity = _public_admission._runtime_build_identity(runtime_id, root)
     process = _live_runtime_process(runtime_id, root)
 
@@ -684,9 +681,9 @@ async def _collect_federated_observation(
             }
         )
         minimum = (
-            {"query", "streaming", "event_cursor"}
+            {"query", "model", "streaming", "event_cursor"}
             if runtime_id == "goose"
-            else {"query", "streaming", "prompt_sections", "event_cursor"}
+            else {"query", "model", "streaming", "prompt_sections", "event_cursor"}
         )
         if not minimum.issubset(registration.capabilities):
             raise RuntimeError("live runtime capability is unavailable")
@@ -781,12 +778,12 @@ def _live_runtime_process(
     if runtime_id == "goose":
         executable = (
             repository_root
-            / "mvp/runtime-hosts/goose-host-v2/target/release/goose-host-v2"
+            / "mvp/runtime-hosts/goose-host-v2/target/release/goose-model-host-v2"
         )
     elif runtime_id == "dsh":
         executable = (
             repository_root
-            / "mvp/sidecars/deepseek-harness/dist/deepseek-harness-host-v2.mjs"
+            / "mvp/sidecars/deepseek-harness/dist/deepseek-harness-model-host-v2.mjs"
         )
     else:
         raise ValueError("live verification runtime is unsupported")
@@ -1452,6 +1449,12 @@ def _publish_observations(
             base64.b64encode(public_key) + b"\n"
         )
     }
+    if "python-term" in selected:
+        # Compatibility composition proof is published only AFTER the real
+        # observation. Unified model admission still requires its live evidence.
+        legacy_documents, _ = _build_python_term_documents(private_key, issued_at=issued_at)
+        for name in ("python-term-dev-public-key.txt", "python-term-dev-signed-proof.json"):
+            documents[name] = legacy_documents[name].encode("utf-8")
     runtime_documents: dict[str, dict[str, object]] = {}
     for runtime_id in selected:
         evidence = by_runtime[runtime_id]
@@ -1584,7 +1587,9 @@ async def _collect_python_term_observation(
         ProjectContextRef,
         TermWorkStateRef,
     )
-    from workbench.runtime.python_term.gate import compose_python_term_production
+    from workbench.runtime.python_term.gate import (
+        PythonTermDevelopmentTrust, compose_python_term_development,
+    )
     from workbench.runtime.python_term.repository import PythonTermRepository
 
     providers = ProviderRepository(runtime_dir / "workbench.sqlite")
@@ -1593,8 +1598,6 @@ async def _collect_python_term_observation(
     except KeyError as error:
         raise ValueError("saved provider profile is unavailable") from error
     endpoint_kind = _real_endpoint_kind(profile)
-    if endpoint_kind == "local":
-        raise ValueError("trusted local runtime attestation is required")
     identity = _public_admission._runtime_build_identity(
         "python-term", _public_admission._repository_root()
     )
@@ -1609,12 +1612,31 @@ async def _collect_python_term_observation(
         }
     )
     try:
-        composition = compose_python_term_production(
+        # Provisional compatibility proof stays in a private verification
+        # directory. It is not a catalog receipt or a live GO. The private key
+        # exists only in this external process, never in the application.
+        bootstrap_dir = runtime_dir / f"live-python-bootstrap-{uuid4().hex}"
+        bootstrap_dir.mkdir(mode=0o700)
+        bootstrap_documents, _ = _build_python_term_documents(
+            Ed25519PrivateKey.generate(), issued_at=time.time()
+        )
+        directory_fd = _public_admission._open_directory_fd(bootstrap_dir)
+        try:
+            for name in ("python-term-dev-public-key.txt", "python-term-dev-signed-proof.json"):
+                _publish_at(directory_fd, name, bootstrap_documents[name].encode("utf-8"))
+        finally:
+            os.close(directory_fd)
+        composition = compose_python_term_development(
             registry=registry,
             repository=PythonTermRepository(verification_database),
             gateway=gateway,
             profiles=(profile,),
             runtime_dir=runtime_dir,
+            development_trust=PythonTermDevelopmentTrust.development(
+                runtime_dir=runtime_dir,
+                public_key_path=bootstrap_dir / "python-term-dev-public-key.txt",
+                proof_path=bootstrap_dir / "python-term-dev-signed-proof.json",
+            ),
         )
         challenge = secrets.token_urlsafe(32)
         observed_at = time.time()
@@ -1648,10 +1670,7 @@ async def _collect_python_term_observation(
             ),
             "handoffs": (),
             "model_messages": tuple(
-                {
-                    "role": message.role,
-                    "content": message.content,
-                }
+                message.model_dump(mode="json")
                 for message in runtime_input.messages
             ),
             "conversation_context": ConversationContextRef(

@@ -24,6 +24,7 @@ from workbench.runtime.engine_host.v2.contracts import (
 GO_GOOSE_SOURCE_READY = "GO_GOOSE_SOURCE_READY"
 GO_GOOSE_QUERY_SMOKE = "GO_GOOSE_QUERY_SMOKE"
 GOOSE_HOST_V2_BUILD_ID = "goose-host-v2:fixture-wrapper-r2"
+GOOSE_MODEL_HOST_V2_BUILD_ID = "goose-host-v2:model-host-r1"
 PINNED_REVISION = "d9d08f0e051531e921f561fcb77aa0ed589e9de9"
 PINNED_SOURCE_PATH = "third_party/goose"
 PINNED_SOURCE_URL = "git@github.com:johnasonsu-bot/goose.git"
@@ -52,7 +53,7 @@ _WRAPPER_MANIFEST_PATH = f"{_WRAPPER_ROOT}/Cargo.toml"
 _WRAPPER_LOCKFILE_PATH = f"{_WRAPPER_ROOT}/Cargo.lock"
 _WRAPPER_ROOT_FILES = (".gitignore", "Cargo.toml", "Cargo.lock")
 _WRAPPER_SOURCE_FILES = (
-    "event_mapper.rs", "grant_channel.rs", "main.rs", "protocol.rs",
+    "event_mapper.rs", "grant_channel.rs", "host.rs", "live.rs", "main.rs", "protocol.rs",
     "provider_bridge.rs", "query.rs",
 )
 _WRAPPER_OPTIONAL_GENERATED_DIRECTORIES = ("target",)
@@ -61,6 +62,8 @@ _WRAPPER_INPUTS = (
     _WRAPPER_LOCKFILE_PATH,
     f"{_WRAPPER_ROOT}/.gitignore",
     f"{_WRAPPER_ROOT}/src/main.rs",
+    f"{_WRAPPER_ROOT}/src/host.rs",
+    f"{_WRAPPER_ROOT}/src/live.rs",
     f"{_WRAPPER_ROOT}/src/protocol.rs",
     f"{_WRAPPER_ROOT}/src/query.rs",
     f"{_WRAPPER_ROOT}/src/event_mapper.rs",
@@ -71,6 +74,7 @@ _QUERY_SMOKE_EVIDENCE_PATH = (
     f"{_WRAPPER_ROOT}/target/release/goose-host-v2.build-evidence.json"
 )
 _QUERY_SMOKE_BINARY_PATH = f"{_WRAPPER_ROOT}/target/release/goose-host-v2"
+_MODEL_BINARY_PATH = f"{_WRAPPER_ROOT}/target/release/goose-model-host-v2"
 _QUERY_SMOKE_SCHEMA = "workbench.runtime.goose.fixture-build-evidence.v1"
 _QUERY_SMOKE_BUILDER = "johnason.goose.fixture-wrapper.local-release.v1"
 _QUERY_SMOKE_BUILD_ID = GOOSE_HOST_V2_BUILD_ID
@@ -263,7 +267,7 @@ def goose_runtime_build_identity(
         ) from error
     return {
         "runtime_id": "goose",
-        "build_id": GOOSE_HOST_V2_BUILD_ID,
+        "build_id": GOOSE_MODEL_HOST_V2_BUILD_ID,
         "source_manifest_digest": receipt.manifest_digest,
         "build_manifest_digest": _sha256(evidence_bytes),
     }
@@ -304,6 +308,7 @@ def build_and_attest_goose_query_smoke(
         if item["path"] == wrapper["lockfile_path"]
     )
     evidence: dict[str, Any] = {
+        "model_binary": _model_binary_record(root),
         "binary": {
             "format": binary_format,
             "path": _QUERY_SMOKE_BINARY_PATH,
@@ -345,6 +350,7 @@ def _validate_query_smoke_evidence(
         if item["path"] == wrapper["lockfile_path"]
     )
     expected_fields: dict[str, Any] = {
+        "model_binary": _model_binary_record(root),
         "build_command": list(_QUERY_SMOKE_BUILD_COMMAND),
         "build_id": _QUERY_SMOKE_BUILD_ID,
         "builder": _QUERY_SMOKE_BUILDER,
@@ -381,6 +387,14 @@ def _validate_query_smoke_evidence(
         raise GooseSourceReadinessError("Goose wrapper binary evidence drift")
     if _identify_binary_format(binary) != expected_binary["format"]:
         raise GooseSourceReadinessError("Goose wrapper executable format does not match target")
+
+
+def _model_binary_record(root: Path) -> dict[str, Any]:
+    binary = root / _MODEL_BINARY_PATH
+    if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
+        raise GooseSourceReadinessError("Goose model Host build is unavailable")
+    return {"path": _MODEL_BINARY_PATH, "build_id": GOOSE_MODEL_HOST_V2_BUILD_ID,
+            "sha256": _sha256(binary.read_bytes()), "size": binary.stat().st_size}
 
 
 def _current_build_identity() -> dict[str, str]:

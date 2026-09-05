@@ -245,7 +245,7 @@ def runtime_capabilities_for(runtime_id: RuntimeId) -> RuntimeCapabilitiesV2:
     if runtime_id == "goose":
         return RuntimeCapabilitiesV2(
             runtime_id=runtime_id,
-            build_id="goose-host-v2:fixture-wrapper-r2",
+            build_id="goose-host-v2:model-host-r1",
             query=True,
             model=True,
             streaming=True,
@@ -254,7 +254,7 @@ def runtime_capabilities_for(runtime_id: RuntimeId) -> RuntimeCapabilitiesV2:
     if runtime_id == "dsh":
         return RuntimeCapabilitiesV2(
             runtime_id=runtime_id,
-            build_id="dsh:fixed-host-v2-smoke",
+            build_id="dsh:model-host-v2-r1",
             query=True,
             model=True,
             streaming=True,

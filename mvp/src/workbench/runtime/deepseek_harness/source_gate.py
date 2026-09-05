@@ -22,6 +22,7 @@ DSH_PINNED_REVISION = "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
 DSH_SOURCE_MANIFEST_SCHEMA = "workbench.runtime.dsh.source_manifest.v1"
 DSH_HOST_V2_BUILD_SCHEMA = "workbench.runtime.dsh.host_v2_build.v1"
 DSH_HOST_V2_BUILD_ID = "dsh:fixed-host-v2-smoke"
+DSH_MODEL_HOST_V2_BUILD_ID = "dsh:model-host-v2-r1"
 
 _DEPENDENCY_PREPARATION_COMMAND = (
     "corepack pnpm@11.7.0 install --frozen-lockfile"
@@ -64,6 +65,7 @@ _HOST_V2_ARTIFACT_FILES = (
     f"{_HOST_V2_ROOT}/dist/bootstrap.mjs",
     f"{_HOST_V2_ROOT}/dist/checkpoint.mjs",
     f"{_HOST_V2_ROOT}/dist/deepseek-harness-host-v2.mjs",
+    f"{_HOST_V2_ROOT}/dist/deepseek-harness-model-host-v2.mjs",
     f"{_HOST_V2_ROOT}/dist/event-mapper.mjs",
     f"{_HOST_V2_ROOT}/dist/grant-channel.mjs",
     f"{_HOST_V2_ROOT}/dist/native-session.mjs",
@@ -652,7 +654,7 @@ def deepseek_harness_runtime_build_identity(
         ) from error
     return {
         "runtime_id": "dsh",
-        "build_id": DSH_HOST_V2_BUILD_ID,
+        "build_id": DSH_MODEL_HOST_V2_BUILD_ID,
         "source_manifest_digest": verdict["manifest_digest"],
         "build_manifest_digest": _sha256_bytes(receipt_bytes),
     }

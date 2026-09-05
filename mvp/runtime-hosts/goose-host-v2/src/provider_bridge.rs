@@ -370,4 +370,19 @@ mod tests {
         assert_eq!(body["messages"][2]["content"], "say hello");
         server.join().expect("mock provider server");
     }
+
+    #[tokio::test]
+    #[ignore = "explicit user-operated local endpoint only; not a runtime GO"]
+    async fn explicit_local_model_bridge() {
+        let material = ProviderMaterial::for_test(
+            "lmstudio", std::env::var("WORKBENCH_LIVE_BASE_URL").expect("explicit endpoint"),
+            "none", vec![], false, "high",
+            &std::env::var("WORKBENCH_LIVE_MODEL").expect("explicit model"), vec![],
+        );
+        let events = stream_provider(material, ProviderPrompt {
+            system: "Return READY only.".into(),
+            messages: vec![ProviderPromptMessage { role: ProviderPromptRole::User, content: "Return READY only.".into() }],
+        }).await.expect("local model bridge completion");
+        assert!(events.iter().any(|event| matches!(event, ProviderStreamEvent::OutputToken(text) if text.contains("READY"))));
+    }
 }

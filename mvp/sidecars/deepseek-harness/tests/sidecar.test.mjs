@@ -33,6 +33,13 @@ const QUERY_FIXTURE = JSON.parse(readFileSync(
   "utf8",
 ));
 
+test("fixed model build advertises model but cannot run fixture requests", () => {
+  const sidecar = createSidecar({ grantChannel: {}, runtimeId: "dsh", buildId: "dsh:model-host-v2-r1" });
+  assert.equal(sidecar.capabilities().model, true);
+  for (const name of ["workspace", "tools", "skills", "interventions"]) assert.equal(sidecar.capabilities()[name], false);
+  assert.throws(() => sidecar.startQuery(queryCommand().payload), /fixture/);
+});
+
 
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
@@ -51,6 +58,9 @@ function digest(value) {
 function queryCommand(providerRef = "provider-profile:fixture-completed") {
   const command = structuredClone(QUERY_FIXTURE);
   command.payload.envelope.provider_ref = providerRef;
+  if (!providerRef.startsWith("provider-profile:fixture-")) {
+    command.payload.envelope.runtime.build_id = "dsh:model-host-v2-r1";
+  }
   return command;
 }
 
@@ -66,7 +76,7 @@ function privateGrant(
     grant_id: grantId,
     target: {
       runtime_id: "dsh",
-      build_id: "dsh:fixed-host-v2-smoke",
+      build_id: providerRef.startsWith("provider-profile:fixture-") ? "dsh:fixed-host-v2-smoke" : "dsh:model-host-v2-r1",
       lease_id: "lease-wire",
       instance_id_digest: instanceDigest,
       instance_nonce_digest: "c".repeat(64),
@@ -147,7 +157,9 @@ async function readPrivateAck(stream) {
 
 
 async function launchPublishedSidecar(grant = privateGrant()) {
-  const child = spawn(process.execPath, [ENTRYPOINT], {
+  const entrypoint = grant.binding.target.build_id === "dsh:model-host-v2-r1"
+    ? path.join(ROOT, "dist/deepseek-harness-model-host-v2.mjs") : ENTRYPOINT;
+  const child = spawn(process.execPath, [entrypoint], {
     cwd: ROOT,
     env: {
       PATH: process.env.PATH ?? "",
@@ -195,7 +207,7 @@ test("build receipt binds actual artifacts to the exact sidecar source", () => {
   assert.equal(receipt.command, "npm run build");
   assert.match(receipt.source_digest, /^[0-9a-f]{64}$/);
   assert.match(receipt.artifact_digest, /^[0-9a-f]{64}$/);
-  assert.equal(receipt.artifacts.length, 7);
+  assert.equal(receipt.artifacts.length, 8);
 });
 
 
@@ -809,6 +821,34 @@ test("published NDJSON sidecar accepts cancel while a real DSH request is in fli
     assert.equal(cancelled.payload.cursor, 2);
   } finally {
     releaseResponse();
+    await wire.close();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("published model Host maps an HTTP provider error to one failed terminal", async () => {
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => { response.writeHead(401); response.end(); });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  const providerRef = "provider-profile:deepseek-http-error";
+  const grant = privateGrant(providerRef, "grant-http-error");
+  grant.binding.route.base_url = `http://127.0.0.1:${server.address().port}`;
+  grant.grant_digest = digest(grant.binding);
+  const wire = await launchPublishedSidecar(grant);
+  try {
+    wire.send({ type: "runtime.capabilities", command_id: "cap-model", payload: {} });
+    const capabilities = (await wire.read()).payload;
+    assert.equal(capabilities.model, true);
+    assert.equal(capabilities.build_id, "dsh:model-host-v2-r1");
+    wire.send(queryCommand(providerRef));
+    assert.equal((await wire.read()).payload.accepted, true);
+    assert.deepEqual((await wire.read()).payload.payload, { status: "running" });
+    const failed = await wire.read();
+    assert.deepEqual(failed.payload.payload, { status: "failed" });
+    assert.equal(failed.payload.cursor, 2);
+  } finally {
     await wire.close();
     await new Promise(resolve => server.close(resolve));
   }

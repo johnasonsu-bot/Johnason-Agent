@@ -122,7 +122,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
         build_id: buildId,
         protocol_version: "2.0",
         query: true,
-        model: false,
+        model: buildId === "dsh:model-host-v2-r1",
         tools: false,
         skills: false,
         plugins: false,
@@ -148,6 +148,9 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
         throw new Error("DSH query input is incomplete");
       }
       const materialized = materializeRuntimeInput(runtimeInput, envelope);
+      if (buildId === "dsh:model-host-v2-r1" && isFixedProvider(envelope.provider_ref)) {
+        throw new Error("model Host rejects fixture provider");
+      }
       const consumedGrant = grantChannel.consumeForEnvelope(envelope);
       const secret = consumedGrant.secret;
       terminal = null;

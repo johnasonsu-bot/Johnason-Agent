@@ -110,6 +110,37 @@ def test_provider_response_never_contains_secret(tmp_path: Path) -> None:
     assert response.json()["credential_status"] == "missing"
 
 
+def test_none_profile_round_trip_and_update_without_vault(tmp_path: Path) -> None:
+    client = _client(tmp_path / "workflow.sqlite", None)
+    payload = {"id": "local-primary", "name": "Local", "protocol": "openai_chat",
+               "base_url": "http://127.0.0.1:1234", "credential_mode": "none"}
+    response = client.post("/api/providers", json=payload)
+    assert response.status_code == 201
+    assert response.json()["credential_mode"] == "none"
+    assert response.json()["credential_status"] == "not_required"
+    assert ProviderRepository(tmp_path / "workflow.sqlite").get("local-primary").secret_id is None
+    updated = client.post("/api/providers", json=payload | {"base_url": "http://127.0.0.1:4321"})
+    assert updated.status_code == 200
+    assert client.get("/api/providers").json()[0]["credential_mode"] == "none"
+
+
+def test_reference_to_none_cleans_old_vault_secret(tmp_path: Path) -> None:
+    vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")
+    database = tmp_path / "workflow.sqlite"
+    client = _client(database, vault)
+    payload = {"id": "local-primary", "name": "Local", "protocol": "openai_chat",
+               "base_url": "http://127.0.0.1:1234"}
+    assert client.post("/api/providers", json=payload).status_code == 201
+    old_id = ProviderRepository(database).get("local-primary").secret_id
+    vault.put(old_id, secrets.token_urlsafe(24))
+    response = client.post("/api/providers", json=payload | {"credential_mode": "none"})
+    assert response.status_code == 200
+    with pytest.raises(KeyError):
+        vault.get(old_id)
+    assert ProviderRepository(database).get("local-primary").secret_id is None
+    assert client.post("/api/providers/local-primary/secret", json={"value": "not-a-real-key"}).status_code == 422
+
+
 @pytest.mark.parametrize("provider_id", ["contains.dot", "has space", "中文", "line\nbreak", "slash/id"])
 def test_provider_creation_rejects_unsafe_provider_ids(tmp_path: Path, provider_id: str) -> None:
     vault = CredentialVault.create(tmp_path / "vault.bin", "correct horse")

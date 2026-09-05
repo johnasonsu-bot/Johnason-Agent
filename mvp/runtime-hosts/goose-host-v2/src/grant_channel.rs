@@ -366,7 +366,7 @@ fn validate_binding(binding: &ProviderGrantBinding) -> Result<(), String> {
     let scopes: BTreeSet<&str> = binding.scopes.iter().map(String::as_str).collect();
     validate_route(&binding.route)?;
     if target.runtime_id != "goose"
-        || target.build_id != "goose-host-v2:fixture-wrapper-r2"
+        || target.build_id != crate::BUILD_ID
         || target.lease_generation_seq == 0
         || !is_digest(&target.instance_id_digest)
         || !is_digest(&target.instance_nonce_digest)

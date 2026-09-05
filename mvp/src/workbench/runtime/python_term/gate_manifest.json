@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "1658382aeefcd941d1ba49d9735dfdd2e00c0db3b45a189522ab1adbb8828f06",
-      "size": 2091264
+      "sha256": "42a1e54a33d92a779e15482ea494d1b1bc3ed05cac1e4a819bf74b60e11a783b",
+      "size": 2099770
     },
     {
       "path": "uv.lock",
@@ -159,8 +159,8 @@
     },
     {
       "path": "api/providers.py",
-      "sha256": "4b1e1a47d98e2fec11d7593c667ef6957e6a88ced65403ab9e0ba47012557bc4",
-      "size": 16446
+      "sha256": "9234e5257356cb095ce7be088e57c81de181ed6a8f21ef7fd4db2d82a129ac8f",
+      "size": 16793
     },
     {
       "path": "artifacts/__init__.py",
@@ -489,18 +489,18 @@
     },
     {
       "path": "runtime/deepseek_harness/source_gate.py",
-      "sha256": "6d463005f398ebacad5581411e3d0ba9ab58e460386a40db9e4eded3c464fc54",
-      "size": 25544
+      "sha256": "c0ab9db7f8445820949d5f420c6849b307e5ef482ad990ab69366183356e9d95",
+      "size": 25666
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "48465962aaa9d022f588303ead7bdcbc3cac34ddb18ea51cea7641455b17a04c",
-      "size": 6889
+      "sha256": "f051e17efae7320107bb14a49c8980db9e3bc7c0ccf2d1fe68e711dafc2cc2fc",
+      "size": 7057
     },
     {
       "path": "runtime/development_admission.py",
-      "sha256": "59110f3cadf42dc47a8e6b963f23265ceb9b530eb4b9fe70db9cc40fed888dbd",
-      "size": 33671
+      "sha256": "762da55dbfcf15e4f47fc08bae25a8364a3754dfbe6b7cb9a7ce46c93089585b",
+      "size": 33663
     },
     {
       "path": "runtime/engine_host/__init__.py",
@@ -539,8 +539,8 @@
     },
     {
       "path": "runtime/engine_host/v2/client.py",
-      "sha256": "8a99c8796bc8599f946f6f283423d31203c290f5398fcc0ffc46aa16f03311a0",
-      "size": 77635
+      "sha256": "c0397d55e47166ffa7f21ef1b9781b176c788f98a4360cbab6b083002464c9ed",
+      "size": 77412
     },
     {
       "path": "runtime/engine_host/v2/contracts.py",
@@ -614,13 +614,13 @@
     },
     {
       "path": "runtime/goose/source_gate.py",
-      "sha256": "448260d15f1ab82a6c4afce72c7ab506be48cb73a190f96c89dab480cb423eb3",
-      "size": 39368
+      "sha256": "4316e149cf743ffd7830f6cdb1c9b4d1a4c9c2cc34c68f73d406a79d462d4ac6",
+      "size": 40137
     },
     {
       "path": "runtime/goose/source_manifest.json",
-      "sha256": "13282fc67c83e1106bf468cf81bf9b19050dc9a1c94a63a839f6dac3d3bfaad4",
-      "size": 4779
+      "sha256": "71493d946453f00e2c34b51815b55a3952969e3303cc32e966919e35b6d9c7b1",
+      "size": 5061
     },
     {
       "path": "runtime/provider_grants/__init__.py",
