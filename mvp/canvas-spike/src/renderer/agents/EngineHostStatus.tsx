@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   engineHostApi,
+  isRuntimeSelector,
+  runtimeLabels,
   type EngineHostStatus as EngineHostStatusValue,
   type EngineHostV2Diagnostic,
 } from "../api";
@@ -64,7 +66,7 @@ export function EngineHostStatus() {
         <span>{`Host v2 · ${v2Status?.v2.enabled ? "enabled" : "disabled"}`}</span>
         {v2Status?.v2.runtimes.map((runtime) => (
           <span key={`${runtime.runtime_id}:${runtime.build_id}`} data-testid={`runtime-diagnostic-${runtime.selector}`}>
-            {`${runtime.selector} · ${runtime.admission_state} · ${runtime.trust_status ?? "UNTRUSTED"}${runtime.admission_reason ? ` · ${runtime.admission_reason}` : ""}`}
+            {`${isRuntimeSelector(runtime.selector) ? runtimeLabels[runtime.selector] : "未知 Runtime（不可选择）"} · ${runtime.admission_state} · ${runtime.trust_status ?? "UNTRUSTED"}${runtime.admission_reason ? ` · ${runtime.admission_reason}` : ""}`}
           </span>
         ))}
       </div>

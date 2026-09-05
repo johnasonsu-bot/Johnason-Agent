@@ -15,6 +15,7 @@ function asInput(draft: ProviderDraft, defaultModel?: string) {
     id: draft.id,
     name: draft.name,
     protocol: draft.protocol,
+    credential_mode: draft.credential_mode ?? "reference",
     base_url: draft.base_url,
     model_aliases: defaultModel ? { ...draft.model_aliases, default: defaultModel } : draft.model_aliases,
     capabilities: draft.capabilities,
@@ -107,6 +108,7 @@ export function ProviderCenter() {
         id: selected.id, name: selected.name, protocol: selected.protocol, base_url: selected.base_url,
         model_aliases: { ...selected.model_aliases, default: model }, capabilities: selected.capabilities,
         enabled: selected.enabled, thinking_enabled: selected.thinking_enabled, reasoning_effort: selected.reasoning_effort,
+        credential_mode: selected.credential_mode ?? "reference",
       });
       setModels((current) => current.includes(model) ? current : [model, ...current]);
       await refresh();

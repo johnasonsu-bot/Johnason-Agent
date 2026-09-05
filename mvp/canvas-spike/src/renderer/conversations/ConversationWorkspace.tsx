@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { artifacts } from "../artifacts";
-import { agentApi, conversationApi, engineHostApi, type ConversationEvent, type EngineHostV2Diagnostic } from "../api";
+import { agentApi, conversationApi, engineHostApi, providerApi, runtimeLabels, isRuntimeSelector, type RuntimeSelector, type ProviderProfile, type ConversationEvent, type EngineHostV2Diagnostic } from "../api";
 import { registry } from "../renderers";
 import { Composer, type RuntimeOption } from "./Composer";
 import { SessionSidebar } from "./SessionSidebar";
@@ -84,18 +84,19 @@ function mapEvent(event: ConversationEvent, index: number): TimelineEntry | null
   const id = event.eventId ?? `${event.sequence ?? index}-${index}`;
   const value = event.value ?? {};
   const type = event.type ?? "";
+  if (event.name === "user.message.received") return { id, kind: "user", title: "你", content: String(value.content ?? "") };
   if (event.delta) return { id, kind: "delta", title: "流式输出 · Streaming", content: event.delta, agent: "Agent / API", status: "TEXT_MESSAGE_CONTENT" };
   if (event.name === "turn_finished" || type === "RUN_FINISHED") return { id, kind: "agent", title: "执行完成 · Turn finished", content: String(value.status ?? "completed"), agent: "Agent / API", status: "completed" };
-  if (event.name === "turn_failed" || type === "RUN_ERROR") return { id, kind: "agent", title: "执行失败 · Turn failed", content: String(value.reason ?? "agent_error"), agent: "Agent / API", status: "failed" };
+  if (event.name === "turn_failed" || type === "RUN_ERROR") return { id, kind: "agent", title: value.reason === "runtime_cancelled" ? "执行取消 · Turn cancelled" : "执行失败 · Turn failed", content: publicRuntimeError(value.reason), agent: "Agent / API", status: "failed" };
   if (event.name?.includes("tool") || type.startsWith("TOOL_CALL")) return { id, kind: "tool", title: "工具执行 · Tool evidence", content: String(value.public_result ?? value.result ?? event.result ?? event.name ?? event.toolCallName ?? "tool"), agent: "Tool / API", status: event.name?.includes("completed") || type === "TOOL_CALL_END" ? "completed" : "running" };
   if (event.name?.includes("decision")) return { id, kind: "decision", title: "决策摘要 · Decision", content: String(value.summary ?? "decision"), agent: "Supervisor / API" };
   if (event.name === "conversation.status") return { id, kind: "step", title: "会话状态 · Conversation status", content: String(value.status ?? "running"), agent: "Task3 Conversation API" };
-  if (event.name === "runtime.status.changed") return { id, kind: "step", title: "Runtime 状态 · Runtime status", content: String(value.status ?? "running"), agent: "Python Term Runtime" };
+  if (event.name === "runtime.status.changed") return { id, kind: "step", title: "Runtime 状态 · Runtime status", content: String(value.status ?? "running"), agent: "Federated Runtime" };
   if (event.name === "turn_queued") return { id, kind: "step", title: "已排队 · Turn queued", content: `command ${String(value.command_id ?? "")}`, agent: "Conversation Worker", status: "queued" };
   return null;
 }
 
-export type ConversationStatusPhase = "ready" | "queued" | "running" | "retryable" | "paused" | "completed" | "failed" | "reconciliation_required";
+export type ConversationStatusPhase = "ready" | "queued" | "running" | "retryable" | "paused" | "completed" | "failed" | "cancelled" | "reconciliation_required";
 export type ConversationStatusProjection = { phase: ConversationStatusPhase; label: string; terminal: boolean; commandId?: string };
 
 const readyStatus: ConversationStatusProjection = { phase: "ready", label: "准备就绪 · ready", terminal: false };
@@ -116,7 +117,8 @@ function statusForEvent(event: ConversationEvent): ConversationStatusProjection 
   if (event.name === "runtime.status.changed") {
     const status = String(event.value?.status ?? "running");
     if (status === "completed") return { ...completedStatus, commandId };
-    if (status === "failed" || status === "cancelled") return { phase: "failed", label: "执行失败 · failed", terminal: true, commandId };
+    if (status === "cancelled") return { phase: "cancelled", label: "已取消 · runtime_cancelled", terminal: true, commandId };
+    if (status === "failed") return { phase: "failed", label: "执行失败 · runtime_failed", terminal: true, commandId };
     if (status === "paused") return { phase: "paused", label: "已暂停 · paused", terminal: true, commandId };
     if (status === "queued") return { phase: "queued", label: "排队中 · queued", terminal: false, commandId };
     return { phase: "running", label: "执行中 · running", terminal: false, commandId };
@@ -124,9 +126,10 @@ function statusForEvent(event: ConversationEvent): ConversationStatusProjection 
   if (event.name === "turn_retryable") return { phase: "retryable", label: "等待重试 · retryable", terminal: false, commandId };
   if (event.name === "turn_finished" || event.type === "RUN_FINISHED") return { ...completedStatus, commandId };
   if (event.name === "turn_failed" || event.type === "RUN_ERROR") {
+    if (event.value?.reason === "runtime_cancelled") return { phase: "cancelled", label: "已取消 · runtime_cancelled", terminal: true, commandId };
     return event.value?.response_status === "reconciliation_required"
       ? { phase: "reconciliation_required", label: "需要对账 · reconciliation required", terminal: true, commandId }
-      : { phase: "failed", label: "执行失败 · failed", terminal: true, commandId };
+      : { phase: "failed", label: `执行失败 · ${publicRuntimeError(event.value?.reason)}`, terminal: true, commandId };
   }
   if (event.delta) return { phase: "running", label: "执行中 · running", terminal: false };
   return null;
@@ -149,7 +152,7 @@ export function reduceConversationStatus(
     && prior.commandId !== undefined
     && next.commandId !== undefined
     && prior.commandId !== next.commandId;
-  return sticky && regressive && !explicitResume && !newCommand ? prior : next;
+  return sticky && regressive && !explicitResume && !newCommand ? prior : { ...next, commandId: next.commandId ?? prior.commandId };
 }
 
 export function describeConversationError(error: unknown): string {
@@ -161,11 +164,28 @@ export function describeConversationError(error: unknown): string {
   return raw || "未知的本地服务错误";
 }
 
+function publicRuntimeError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const categories = ["runtime_unavailable", "runtime_admission_blocked", "runtime_selection_conflict", "provider_unavailable", "provider_incompatible", "provider_grant_failed", "runtime_failed", "runtime_cancelled", "reconciliation_required"];
+  return categories.find((category) => raw.split(/[^a-z_]+/).includes(category)) ?? "runtime_unavailable";
+}
+
+// Match the broker's public protocol restrictions, never infer them from an ID.
+function compatibleProvider(runtime: RuntimeSelector, provider: ProviderProfile | undefined, model: string): boolean {
+  if (!provider?.enabled) return false;
+  if (!Object.keys(provider.model_aliases).includes(model) && !Object.values(provider.model_aliases).includes(model)) return false;
+  if (runtime === "dsh") return provider.protocol === "deepseek" && Object.keys(provider.headers ?? {}).length === 0;
+  if (runtime === "goose") return ["deepseek", "lmstudio", "openai", "openai_chat", "openai_compatible"].includes(provider.protocol);
+  return true;
+}
+
+type FrozenSelection = { runtime: "" | RuntimeSelector; providerId: string; model: string; pending: boolean; commandId?: string };
+
 export function ConversationWorkspace() {
   const [sessionId, setSessionId] = useState("ui-session-0");
   const [titles, setTitles] = useState({ ...seededTitles, ...persistedTitles });
   const [groups, setGroups] = useState({ ...seededGroups, ...persistedGroups });
-  const [entries, setEntries] = useState<TimelineEntry[]>(initialTimeline);
+  const [entries, setEntries] = useState<TimelineEntry[]>([]);
   const [source, setSource] = useState("Task 3 REST/SSE");
   const [statusProjection, setStatusProjection] = useState<ConversationStatusProjection>(completedStatus);
   const status = statusProjection.label;
@@ -178,24 +198,32 @@ export function ConversationWorkspace() {
   const [research, setResearch] = useState(emptyResearchGraphState);
   const [selectedModel, setSelectedModel] = useState("local-agent");
   const [selectedProviderId, setSelectedProviderId] = useState("lmstudio");
-  const [selectedRuntime, setSelectedRuntime] = useState<"" | "python-term">("");
+  const [selectedRuntime, setSelectedRuntime] = useState<"" | RuntimeSelector>("");
+  const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [runtimeDiagnostic, setRuntimeDiagnostic] = useState<EngineHostV2Diagnostic | null>(null);
   const cursorsRef = useRef<Record<string, string>>(loadConversationCursors());
   const seenEventsRef = useRef<Record<string, Set<string>>>({});
   const watcherGenerationRef = useRef(0);
+  const activeSessionRef = useRef(sessionId);
+  activeSessionRef.current = sessionId;
+  const selectionsRef = useRef<Record<string, FrozenSelection>>({});
   const group = groups[sessionId] ?? ["产品经理"];
   const title = titles[sessionId] ?? "新建会话 · New task";
   const activeProfile = useMemo(() => agentModelProfileFor(modelProfiles, group[0] ?? "产品经理"), [group, modelProfiles]);
-  const modelOptions = useMemo(() => modelProfiles.filter((profile) => profile.enabled).map((profile) => ({ id: profile.id, providerId: profile.providerId, model: profile.model, label: `${profile.name} · ${providerLabels[profile.providerId]} · ${profile.model}` })), [modelProfiles]);
-  const runtimeOptions = useMemo<RuntimeOption[]>(() => runtimeDiagnostic?.v2.runtimes
-    .filter((runtime) => runtime.selector === "python-term")
-    .map((runtime) => ({
-      selector: "python-term",
-      label: "Python Term",
-      selectable: runtime.selectable_for_new_commands,
-      trustStatus: runtime.trust_status,
-      reason: runtime.admission_reason,
-    })) ?? [], [runtimeDiagnostic]);
+  const allModelOptions = useMemo(() => {
+    const configured = providers.filter(provider => provider.enabled).flatMap(provider => [...new Set(Object.values(provider.model_aliases))].filter(Boolean).map(model => ({ id: `provider:${provider.id}:${model}`, providerId: provider.id, model, label: `${provider.name} · ${model}` })));
+    const agents = modelProfiles.filter(profile => profile.enabled).map(profile => ({ id: profile.id, providerId: profile.providerId, model: profile.model, label: `${profile.name} · ${providers.find(p => p.id === profile.providerId)?.name ?? providerLabels[profile.providerId] ?? profile.providerId} · ${profile.model}` }));
+    const unique = new Map<string, typeof agents[number]>();
+    for (const option of [...agents, ...configured]) if (!unique.has(`${option.providerId}/${option.model}`)) unique.set(`${option.providerId}/${option.model}`, option);
+    return [...unique.values()];
+  }, [modelProfiles, providers]);
+  const modelOptions = useMemo(() => allModelOptions.filter(option => !selectedRuntime || compatibleProvider(selectedRuntime, providers.find(p => p.id === option.providerId), option.model) || (pending && option.providerId === selectedProviderId && option.model === selectedModel)), [allModelOptions, providers, selectedRuntime, pending, selectedProviderId, selectedModel]);
+  const runtimeOptions = useMemo<RuntimeOption[]>(() => (["python-term", "goose", "dsh"] as const).map(selector => {
+    const diagnostic = runtimeDiagnostic?.v2.runtimes.find(runtime => runtime.selector === selector);
+    const compatible = allModelOptions.some(option => compatibleProvider(selector, providers.find(p => p.id === option.providerId), option.model));
+    return { selector, label: runtimeLabels[selector], selectable: diagnostic?.selectable_for_new_commands === true && compatible,
+      trustStatus: diagnostic?.trust_status ?? null, reason: diagnostic?.admission_reason ?? (!diagnostic?.selectable_for_new_commands ? "runtime_unavailable" : !compatible ? "provider_incompatible" : null) };
+  }), [runtimeDiagnostic, providers, allModelOptions]);
   const selectedProviderLabel = providerLabels[selectedProviderId as keyof typeof providerLabels] ?? selectedProviderId;
   const artifact = useMemo(() => artifacts.find((candidate) => candidate.id === artifactId) ?? artifacts[0], [artifactId]);
   const Renderer = registry.resolve(artifact.kind);
@@ -203,11 +231,14 @@ export function ConversationWorkspace() {
   useEffect(() => {
     let active = true;
     const generation = ++watcherGenerationRef.current;
-    const seen = seenEventsRef.current[sessionId] ?? new Set<string>();
+    // Replay starts a new cursor lineage. An empty server history must not
+    // leave a stale browser cursor active for the next poll/new command.
+    cursorsRef.current[sessionId] = "";
+    const seen = new Set<string>();
     seenEventsRef.current[sessionId] = seen;
-    const storedTimeline = loadConversationTimeline(sessionId);
     let hydratedGraph = false;
-    setEntries(storedTimeline.length ? storedTimeline : (sessionId === "ui-session-0" ? initialTimeline : []));
+    setEntries([]);
+    setPending(selectionsRef.current[sessionId]?.pending ?? false);
     setSequential(emptySequentialState());
     setResearch(emptyResearchGraphState());
     setStatusProjection(readyStatus);
@@ -216,11 +247,11 @@ export function ConversationWorkspace() {
       if (!active || watcherGenerationRef.current !== generation) return;
       try {
         await conversationApi.createSession(sessionId);
-        const resumeCursor = cursorsRef.current[sessionId];
+        // A cursor is not a snapshot: always rebuild projections from durable
+        // events when entering a session, including when browser caches vanished.
+        const resumeCursor = hydratedGraph ? cursorsRef.current[sessionId] : undefined;
         const events = await conversationApi.events(sessionId, resumeCursor);
-        const graphEvents = !hydratedGraph && resumeCursor
-          ? await conversationApi.events(sessionId)
-          : events;
+        const graphEvents = events;
         if (!active || watcherGenerationRef.current !== generation) return;
         const fresh = events.filter((event) => {
           const id = event.cursor ?? event.eventId ?? `${event.sequence ?? ""}:${event.name ?? event.type ?? ""}`;
@@ -232,29 +263,47 @@ export function ConversationWorkspace() {
         if (!hydratedGraph) {
           setSequential(graphEvents.reduce(reduceSequentialEvent, emptySequentialState()));
           setResearch(graphEvents.reduce(reduceResearchEvent, emptyResearchGraphState()));
-          setStatusProjection(graphEvents.reduce(reduceConversationStatus, readyStatus));
+          const recovered = graphEvents.reduce(reduceConversationStatus, readyStatus);
+          setStatusProjection(recovered);
+          if (["queued", "running", "retryable", "paused"].includes(recovered.phase)) setPending(true);
+          setEntries(graphEvents.map(mapEvent).filter((entry): entry is TimelineEntry => Boolean(entry)));
           hydratedGraph = true;
         } else if (fresh.length) {
           setSequential((current) => fresh.reduce(reduceSequentialEvent, current));
           setResearch((current) => fresh.reduce(reduceResearchEvent, current));
-        }
-        if (mapped.length) {
-          setEntries((current) => {
-            const next = current.concat(mapped);
-            saveConversationTimeline(sessionId, next);
-            return next;
-          });
+          if (mapped.length) setEntries((current) => {
+              const next = current.concat(mapped);
+              saveConversationTimeline(sessionId, next);
+              return next;
+            });
         }
         for (const event of fresh) {
+          const queuedCommand = event.name === "turn_queued" ? event.value?.command_id : undefined;
+          if (typeof queuedCommand === "string") {
+            void engineHostApi.runtimeAdmission(sessionId, queuedCommand).then(admission => {
+              if (!active || watcherGenerationRef.current !== generation || admission.state !== "ready" || !admission.selector || !isRuntimeSelector(admission.selector)) return;
+              const label = runtimeLabels[admission.selector];
+              setEntries(current => current.some(entry => entry.id === `admission-${queuedCommand}`) ? current : [...current, { id: `admission-${queuedCommand}`, kind: "step", title: "准入已确认 · Admission ready", content: "Grant 阶段暂无独立状态播报", agent: label }]);
+            }).catch(() => { /* Legacy commands may have no runtime admission. */ });
+          }
           if (event.cursor) {
             cursorsRef.current[sessionId] = event.cursor;
             saveConversationCursor(sessionId, event.cursor);
           }
           setStatusProjection((current) => {
             const next = reduceConversationStatus(current, event);
-            if (next.terminal) setPending(false);
+            if (next.terminal && next.phase !== "paused") {
+              const frozen = selectionsRef.current[sessionId];
+              if (!frozen?.pending || !frozen.commandId || next.commandId === frozen.commandId) {
+                if (frozen) frozen.pending = false;
+                setPending(false);
+              }
+            } else if (["queued", "running", "retryable"].includes(next.phase)) setPending(true);
             return next;
           });
+          if (event.name === "turn_failed" || event.type === "RUN_ERROR" || (event.name === "runtime.status.changed" && ["failed", "cancelled"].includes(String(event.value?.status)))) {
+            void engineHostApi.v2Status().then(setRuntimeDiagnostic).catch(() => setRuntimeDiagnostic(null));
+          }
         }
         setSource("Task 3 REST/SSE · cursor");
       } catch (error: unknown) {
@@ -280,6 +329,7 @@ export function ConversationWorkspace() {
       }
     };
     void refreshRuntimeStatus();
+    void providerApi.listProviders().then(value => { if (active) setProviders(value); }).catch(() => { if (active) setProviders([]); });
     const timer = window.setInterval(() => void refreshRuntimeStatus(), 5_000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
@@ -293,9 +343,28 @@ export function ConversationWorkspace() {
   }, [sessionId]);
 
   useEffect(() => {
+    const frozen = selectionsRef.current[sessionId];
+    if (frozen?.pending) {
+      setSelectedRuntime(frozen.runtime);
+      setSelectedModel(frozen.model);
+      setSelectedProviderId(frozen.providerId);
+      return;
+    }
+    setSelectedRuntime("");
     setSelectedModel(activeProfile.model);
     setSelectedProviderId(activeProfile.providerId);
-  }, [activeProfile]);
+  }, [activeProfile, sessionId]);
+
+  const changeRuntime = (runtime: "" | RuntimeSelector) => {
+    if (pending) return;
+    setSelectedRuntime(runtime);
+    if (!runtime) return;
+    const compatible = allModelOptions.filter(option => compatibleProvider(runtime, providers.find(p => p.id === option.providerId), option.model));
+    if (!compatible.some(option => option.providerId === selectedProviderId && option.model === selectedModel) && compatible[0]) {
+      setSelectedProviderId(compatible[0].providerId);
+      setSelectedModel(compatible[0].model);
+    }
+  };
 
   const createGroup = (roles: string[], mode: "single" | "multi") => {
     const createdSessionId = `ui-group-${Date.now()}-${++sequence}`;
@@ -314,10 +383,11 @@ export function ConversationWorkspace() {
     return next;
   });
   const send = (prompt: string, contexts: string[] = []) => {
+    if (pending || selectionsRef.current[sessionId]?.pending) return;
     const chosenRuntime = selectedRuntime
       ? runtimeOptions.find((option) => option.selector === selectedRuntime)
       : undefined;
-    if (selectedRuntime && chosenRuntime?.selectable !== true) {
+    if (selectedRuntime && (chosenRuntime?.selectable !== true || !compatibleProvider(selectedRuntime, providers.find(p => p.id === selectedProviderId), selectedModel))) {
       const reason = chosenRuntime?.reason ?? "runtime_unavailable";
       setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
       setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · Runtime admission", content: reason, agent: "Runtime Admission API", status: "failed" }]);
@@ -335,37 +405,47 @@ export function ConversationWorkspace() {
       return;
     }
     setPending(true);
+    const frozen: FrozenSelection = { runtime: selectedRuntime, providerId: selectedProviderId, model: selectedModel, pending: true };
+    selectionsRef.current[sessionId] = frozen;
     setStatusProjection({ phase: "queued", label: "排队中 · queued", terminal: false });
     const commandId = createConversationCommandId("message", sessionId);
     void conversationApi.sendMessage(sessionId, apiPrompt, commandId, selectedModel, selectedProviderId, agentBindings, selectedRuntime || undefined).then((result) => {
+      frozen.commandId = result.command_id;
+      if (result.status === "paused") frozen.pending = false;
+      if (activeSessionRef.current !== sessionId) return;
       setSource("Task 3 REST/SSE · queued");
-      if (result.cursor) {
-        cursorsRef.current[sessionId] = result.cursor;
-        saveConversationCursor(sessionId, result.cursor);
-      }
+      // Only consumed SSE events advance the read cursor. The POST cursor is
+      // an acknowledgement, not evidence that queued/status events were read.
       if (result.status === "paused") {
         setStatusProjection({ phase: "paused", label: "已暂停 · paused", terminal: true });
         setPending(false);
+        frozen.pending = false;
       }
       if (selectedRuntime) {
         void engineHostApi.runtimeAdmission(sessionId, result.command_id).then((admission) => {
+          if (activeSessionRef.current !== sessionId) return;
           if (admission.state === "blocked") {
-            setStatusProjection({ phase: "failed", label: `执行失败 · ${admission.reason_category ?? "runtime_unavailable"}`, terminal: true });
+            setStatusProjection({ phase: "failed", label: "执行失败 · runtime_admission_blocked", terminal: true });
             setPending(false);
+            frozen.pending = false;
+            void engineHostApi.v2Status().then(setRuntimeDiagnostic).catch(() => setRuntimeDiagnostic(null));
+          } else if (admission.state === "ready") {
+            setEntries(current => current.some(entry => entry.id === `admission-${result.command_id}`) ? current : [...current, { id: `admission-${result.command_id}`, kind: "step", title: "准入已确认 · Admission ready", content: "Grant 阶段暂无独立状态播报", agent: runtimeLabels[selectedRuntime] }]);
           }
         }).catch(() => { /* SSE remains authoritative when the read-only diagnostic is temporarily unavailable. */ });
       }
     }).catch(async (error: unknown) => {
-      let reason = describeConversationError(error);
-      if (selectedRuntime) {
+      const reason = selectedRuntime ? publicRuntimeError(error) : describeConversationError(error);
+      frozen.pending = false;
+      {
         try {
           const diagnostic = await engineHostApi.v2Status();
           setRuntimeDiagnostic(diagnostic);
-          reason = diagnostic.v2.runtimes.find((runtime) => runtime.selector === selectedRuntime)?.admission_reason ?? reason;
         } catch {
           // Preserve the original stable HTTP category when diagnostics are unavailable.
         }
       }
+      if (activeSessionRef.current !== sessionId) return;
       setSource("Task 3 API error");
       setStatusProjection({ phase: "failed", label: `执行失败 · ${reason}`, terminal: true });
       setEntries((current) => [...current, { id: `error-${++sequence}`, kind: "tool", title: "请求失败 · API diagnosis", content: `conversation.messages → ${reason}`, agent: "Task3 Conversation API", status: "failed" }]);
@@ -408,7 +488,7 @@ export function ConversationWorkspace() {
         <GraphRun state={research} onResume={resumeResearch} sessionId={sessionId} />
       </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
-      <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { setSelectedProviderId(providerId); setSelectedModel(model); }} runtime={selectedRuntime} runtimeOptions={runtimeOptions} onRuntimeChange={setSelectedRuntime} />
+      <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { if (!pending) { setSelectedProviderId(providerId); setSelectedModel(model); } }} runtime={selectedRuntime} runtimeOptions={runtimeOptions} onRuntimeChange={changeRuntime} />
     </main>
     {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header>{htmlArtifact ? <HtmlArtifactPreview artifactId={htmlArtifact.artifactId} /> : <><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section></>}<section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>当前结果 · 历史 Attempt · 审核证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
   </section>;

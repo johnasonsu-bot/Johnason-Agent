@@ -172,7 +172,8 @@ test("real Workbench backend completes the Batch 1 Provider Center lifecycle", a
     expect(record.protocol).toBe("lmstudio");
     expect(record.enabled).toBe(true);
     expect(record.model_aliases.default).toBe("second-model");
-    expect(record.secret_id).toMatch(/^provider\/[a-f0-9]{32}$/);
+    expect(record.credential_mode).toBe("none");
+    expect(record.secret_id).toBeNull();
     expect(inspection.stdout).not.toContain(password);
     expect(inspection.stdout).not.toContain(credential);
 

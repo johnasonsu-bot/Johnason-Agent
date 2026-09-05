@@ -1,6 +1,16 @@
 import { runWithConversationRetry } from "./conversations/retry";
 
 export type VaultStatus = "uninitialized" | "locked" | "unlocked" | "recovery_required";
+export type RuntimeSelector = "python-term" | "goose" | "dsh";
+export const runtimeLabels: Record<"chat" | RuntimeSelector, string> = {
+  chat: "聊天模式",
+  "python-term": "Agent-步进执行模式（Codex Harness）",
+  goose: "Agent-寻路模式（Claude Harness）",
+  dsh: "Agent-事件驱动模式（DeepSeek Harness）",
+};
+export function isRuntimeSelector(value: string): value is RuntimeSelector {
+  return value === "python-term" || value === "goose" || value === "dsh";
+}
 
 export interface ProviderProfile {
   id: string;
@@ -14,9 +24,11 @@ export interface ProviderProfile {
   thinking_enabled: boolean;
   reasoning_effort: "high" | "max";
   credential_status: "configured" | "locked" | "missing" | "not_required";
+  credential_mode?: "none" | "reference";
 }
 
 export interface ProviderInput {
+  credential_mode?: "none" | "reference";
   id: string;
   name: string;
   protocol: string;
@@ -171,11 +183,14 @@ export const artifactApi = {
 export type AgentBinding = { agent_id: string; expected_version: number };
 export type ConversationResponse = { session_id: string; command_id: string; status: string; cursor?: string | null; events?: ConversationEvent[]; plan_id?: string; graph_run_id?: string };
 
-const sendMessage = (sessionId: string, content: string, commandId: string, model = "default", providerId?: string, agentBindings: AgentBinding[] = [], runtimeId?: "python-term") => {
-  const body: Record<string, unknown> = agentBindings.length
+const sendMessage = (sessionId: string, content: string, commandId: string, model = "default", providerId?: string, agentBindings: AgentBinding[] = [], runtimeId?: RuntimeSelector) => {
+  const body: Record<string, unknown> = agentBindings.length && !runtimeId
     ? { content, agent_bindings: agentBindings }
     : { content, model, provider_id: providerId };
-  if (runtimeId !== undefined) body.runtime = runtimeId;
+  if (runtimeId !== undefined) {
+    body.runtime = runtimeId;
+    if (agentBindings.length) body.agent_bindings = agentBindings;
+  }
   return request<ConversationResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: "POST",
     body: JSON.stringify(body),

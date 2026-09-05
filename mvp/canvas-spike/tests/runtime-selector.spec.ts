@@ -50,6 +50,7 @@ process.stdin.on("data", (chunk) => {
         return send(200, { v2: { enabled: true, protocol: "2.0", runtimes: [{ runtime_id: "python-term", build_id: "python-term-dev", state: effectiveMode === "ready" ? "ready" : "unavailable", capabilities: ["workspace.read"], selector: "python-term", selectable_for_new_commands: effectiveMode === "ready", admission_state: effectiveMode, trust_status: effectiveMode === "unavailable" ? null : "DEV_UNTRUSTED", admission_reason: effectiveMode === "ready" ? null : effectiveMode === "blocked" ? "proof_revoked" : "proof_missing" }] } });
       }
       if (pathname === "/api/agents") return send(200, []);
+      if (pathname === "/api/providers") return send(200, [{ id: "lmstudio", name: "LM Studio", protocol: "lmstudio", headers: {}, base_url: "http://127.0.0.1:1234", model_aliases: { default: "local-agent" }, enabled: true, credential_mode: "none", credential_status: "not_required", capabilities: [], thinking_enabled: false, reasoning_effort: "high" }]);
       if (pathname.includes("/runtime-admissions/")) return send(200, { session_id: "ui-session-0", command_id: "public-command", selector: "python-term", runtime_id: "python-term", build_id: "python-term-dev", state: "ready", trust_status: "DEV_UNTRUSTED", reason_category: null });
       if (pathname.endsWith("/messages")) {
         const parsed = body ? JSON.parse(body) : {};
@@ -159,7 +160,7 @@ test("default Runtime preserves the legacy payload and explicit Python Term send
   const { app, runtimeDir } = await launchFixture(testInfo.outputPath("owned-backend"), "ready");
   try {
     const page = await app.firstWindow();
-    const runtime = page.getByRole("combobox", { name: "当前 Runtime" });
+    const runtime = page.getByRole("combobox", { name: "当前运行模式" });
     await expect(runtime).toHaveValue("");
     await page.getByRole("textbox", { name: "会话消息" }).fill("默认路径");
     await page.getByRole("button", { name: "发送" }).click();
@@ -184,7 +185,7 @@ test("unavailable Runtime exposes its stable reason and cannot be selected", asy
   const { app } = await launchFixture(testInfo.outputPath("owned-backend"), "unavailable");
   try {
     const page = await app.firstWindow();
-    const runtime = page.getByRole("combobox", { name: "当前 Runtime" });
+    const runtime = page.getByRole("combobox", { name: "当前运行模式" });
     await expect(runtime.getByRole("option", { name: /proof_missing/ })).toBeDisabled();
     await expect(runtime).toHaveValue("");
   } finally {
@@ -209,10 +210,11 @@ test("explicit Runtime failure is stable and never falls back to the default pat
   const { app, runtimeDir } = await launchFixture(testInfo.outputPath("owned-backend"), "ready", true);
   try {
     const page = await app.firstWindow();
-    await page.getByRole("combobox", { name: "当前 Runtime" }).selectOption("python-term");
+    await page.getByRole("combobox", { name: "当前运行模式" }).selectOption("python-term");
     await page.getByRole("textbox", { name: "会话消息" }).fill("只执行一次");
     await page.getByRole("button", { name: "发送" }).click();
-    await expect(page.getByTestId("conversation-status")).toContainText("proof_revoked");
+    await expect(page.getByTestId("conversation-status")).toContainText("runtime_unavailable");
+    await expect(page.getByLabel("当前运行模式").locator('option[value="python-term"]')).toContainText("proof_revoked");
     await expect.poll(async () => (await requests(runtimeDir)).filter((item) => item.path.endsWith("/messages")).length).toBe(1);
     const message = (await requests(runtimeDir)).find((item) => item.path.endsWith("/messages"));
     expect(message?.body).toMatchObject({ runtime: "python-term" });
@@ -225,7 +227,7 @@ test("restores the durable SSE cursor after refresh and renders tool to terminal
   const { app, runtimeDir } = await launchFixture(testInfo.outputPath("owned-backend"), "ready", false, true);
   try {
     const page = await app.firstWindow();
-    await page.getByRole("combobox", { name: "当前 Runtime" }).selectOption("python-term");
+    await page.getByRole("combobox", { name: "当前运行模式" }).selectOption("python-term");
     await page.getByRole("textbox", { name: "会话消息" }).fill("读取 /workspace/README.md");
     await page.getByRole("button", { name: "发送" }).click();
     await expect(page.getByTestId("conversation-status")).toContainText("已完成");
@@ -237,7 +239,7 @@ test("restores the durable SSE cursor after refresh and renders tool to terminal
       try { return (await requests(runtimeDir)).filter((item) => item.path.endsWith("/events")).length; } catch { return 0; }
     }).toBeGreaterThan(0);
     const firstEventsRequest = (await requests(runtimeDir)).find((item) => item.path.endsWith("/events"));
-    expect(firstEventsRequest?.lastEventId).toBe("cursor-6");
+    expect(firstEventsRequest?.lastEventId).toBeNull();
   } finally {
     await app.close();
   }
@@ -263,6 +265,7 @@ test("real prepared Python Term environment supports the Electron-owned acceptan
         id: "fixture-provider",
         name: "Deterministic LM Studio",
         protocol: "lmstudio",
+        credential_mode: "none",
         base_url: baseUrl,
         model_aliases: { default: "fixture-model", "local-agent": "fixture-model" },
         capabilities: ["tool_calling"],
@@ -287,8 +290,8 @@ test("real prepared Python Term environment supports the Electron-owned acceptan
   });
   try {
     const page = await app.firstWindow();
-    const runtime = page.getByRole("combobox", { name: "当前 Runtime" });
-    await expect(runtime.getByRole("option", { name: /Python Term · DEV_UNTRUSTED/ })).toBeEnabled();
+    const runtime = page.getByRole("combobox", { name: "当前运行模式" });
+    await expect(runtime.getByRole("option", { name: /Codex Harness） · DEV_UNTRUSTED/ })).toBeEnabled();
     await runtime.selectOption("python-term");
     await page.getByRole("textbox", { name: "会话消息" }).fill("读取 /workspace/README.md");
     await page.getByRole("button", { name: "发送" }).click();

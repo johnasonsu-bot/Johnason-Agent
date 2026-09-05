@@ -2,17 +2,18 @@ import { useRef, useState } from "react";
 import type React from "react";
 import { ContextMenu } from "./ContextMenu";
 import { MentionMenu } from "./MentionMenu";
+import { runtimeLabels, type RuntimeSelector } from "../api";
 
 type ModelOption = { id: string; providerId: string; model: string; label: string };
 export type RuntimeOption = {
-  selector: "python-term";
+  selector: RuntimeSelector;
   label: string;
   selectable: boolean;
   trustStatus: "PRODUCTION_TRUSTED" | "DEV_UNTRUSTED" | null;
   reason: string | null;
 };
 
-export function Composer({ onSend, onIntervene, pending = false, paused = false, model = "default", providerId = "", modelOptions = [], onModelChange, runtime = "", runtimeOptions = [], onRuntimeChange }: { onSend: (prompt: string, contexts: string[]) => void; onIntervene?: (prompt: string) => void; pending?: boolean; paused?: boolean; model?: string; providerId?: string; modelOptions?: ModelOption[]; onModelChange?: (providerId: string, model: string) => void; runtime?: "" | "python-term"; runtimeOptions?: RuntimeOption[]; onRuntimeChange?: (runtime: "" | "python-term") => void }) {
+export function Composer({ onSend, onIntervene, pending = false, paused = false, model = "default", providerId = "", modelOptions = [], onModelChange, runtime = "", runtimeOptions = [], onRuntimeChange }: { onSend: (prompt: string, contexts: string[]) => void; onIntervene?: (prompt: string) => void; pending?: boolean; paused?: boolean; model?: string; providerId?: string; modelOptions?: ModelOption[]; onModelChange?: (providerId: string, model: string) => void; runtime?: "" | RuntimeSelector; runtimeOptions?: RuntimeOption[]; onRuntimeChange?: (runtime: "" | RuntimeSelector) => void }) {
   const [prompt, setPrompt] = useState("");
   const [contexts, setContexts] = useState<string[]>([]);
   const [contextOpen, setContextOpen] = useState(false);
@@ -62,11 +63,11 @@ export function Composer({ onSend, onIntervene, pending = false, paused = false,
         <small>Enter 发送 · Shift+Enter 换行</small>
       </div>
       <div className="composer-submit">
-        {modelOptions.length > 0 ? <select className="model-select" aria-label="当前模型" value={`${providerId}/${model}`} onChange={(event) => { const [nextProvider, ...rest] = event.target.value.split("/"); onModelChange?.(nextProvider, rest.join("/")); }}>
+        {modelOptions.length > 0 ? <select className="model-select" aria-label="当前模型" disabled={pending} value={`${providerId}/${model}`} onChange={(event) => { const [nextProvider, ...rest] = event.target.value.split("/"); onModelChange?.(nextProvider, rest.join("/")); }}>
           {modelOptions.map((option) => <option key={option.id} value={`${option.providerId}/${option.model}`}>{option.label}</option>)}
         </select> : <span className="model-badge" aria-label="当前模型">{model} <span>⌄</span></span>}
-        <select className="runtime-select" aria-label="当前 Runtime" value={runtime} disabled={pending} onChange={(event) => onRuntimeChange?.(event.target.value as "" | "python-term")}>
-          <option value="">默认运行路径</option>
+        <select className="runtime-select" aria-label="当前运行模式" value={runtime} disabled={pending} onChange={(event) => onRuntimeChange?.(event.target.value as "" | RuntimeSelector)}>
+          <option value="">{runtimeLabels.chat}</option>
           {runtimeOptions.map((option) => <option key={option.selector} value={option.selector} disabled={!option.selectable}>
             {option.label}{option.trustStatus ? ` · ${option.trustStatus}` : ""}{option.reason ? ` · ${option.reason}` : ""}
           </option>)}
