@@ -10,6 +10,7 @@ const CAPABILITY_HEADER = "X-Workbench-Capability";
 const allowedApiRequests = new Set([
   "GET /api/vault/status", "POST /api/vault/create", "POST /api/vault/unlock", "POST /api/vault/lock", "POST /api/vault/recover",
   "GET /api/providers", "POST /api/providers",
+  "POST /api/runtime-verifications",
   "GET /api/engine-host/status",
   "GET /api/v1/engine-host",
 ]);
@@ -37,6 +38,11 @@ function isApiRequest(value: unknown): value is ApiRequest {
   if (!value || typeof value !== "object") return false;
   const request = value as Partial<ApiRequest>;
   if ((request.method !== "GET" && request.method !== "POST" && request.method !== "PUT" && request.method !== "DELETE") || typeof request.path !== "string") return false;
+  const verificationPath = /^\/runtime-verifications\/[A-Za-z0-9_-]{1,64}(?:\/(cancel))?$/.exec(request.path);
+  if (verificationPath) {
+    if (request.method !== (verificationPath[1] ? "POST" : "GET")) return false;
+    return request.body === undefined;
+  }
   if (!allowedApiRequests.has(`${request.method} /api${request.path}`)) {
     const providerPath = /^\/providers\/[A-Za-z0-9_-]{1,64}(?:\/(secret|test|models))?$/.exec(request.path);
     const conversationPath = /^\/sessions(?:\/[A-Za-z0-9_-]{1,64}(?:\/(messages|events|interventions|pause|resume))?)?$/.exec(request.path);
@@ -117,6 +123,7 @@ function childEnvironment(): NodeJS.ProcessEnv {
     "WORKBENCH_ENGINE_HOST_V2_RUNTIMES_JSON",
     "WORKBENCH_PYTHON_TERM_RUNTIME_ENABLED",
     "WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST",
+    "WORKBENCH_FEDERATED_RUNTIME_DEVELOPMENT_TRUST",
   ]) {
     if (process.env[name] !== undefined) safe[name] = process.env[name];
   }

@@ -44,6 +44,7 @@ process.stdin.on("data", (chunk) => {
       };
       if (pathname === "/api/health") return send(200, { status: "ok", service: "hermes-workbench", instance_id: identity.instance_id, port: server.address().port });
       if (pathname === "/api/vault/lock") return send(200, { status: "locked" });
+      if (pathname === "/api/vault/status") return send(200, { status: "locked", development_trust: process.env.WORKBENCH_FEDERATED_RUNTIME_DEVELOPMENT_TRUST ?? null });
       if (pathname === "/api/engine-host/status") return send(200, { enabled: true, state: "ready", protocol: "2.0", capabilities: { model: true, tools: true, skills: true, workspace: true, agui: true, max_frame_bytes: 1048576 }, runner_mode: "engine_host" });
       if (pathname === "/api/v1/engine-host") {
         const effectiveMode = runtimeRejected ? "blocked" : mode;
@@ -96,6 +97,7 @@ async function launchFixture(testRoot: string, mode: FixtureMode, rejectExplicit
       HERMES_PYTHON: executable,
       HERMES_RUNTIME_DIR: runtimeDir,
       WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST: "true",
+      WORKBENCH_FEDERATED_RUNTIME_DEVELOPMENT_TRUST: "true",
     },
   });
   return { app, runtimeDir };
@@ -200,6 +202,7 @@ test("Engine Host exposes admission trust and Electron only permits the read-onl
     await page.getByRole("button", { name: "Agent 配置" }).click();
     await expect(page.getByTestId("runtime-diagnostic-python-term")).toContainText("blocked · DEV_UNTRUSTED · proof_revoked");
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/sessions/ui-session-0/runtime-admissions/public-command" }))).resolves.toMatchObject({ status: 200 });
+    await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "GET", path: "/vault/status" }))).resolves.toMatchObject({ body: { development_trust: "true" } });
     await expect(page.evaluate(() => (window as any).workbenchBridge.apiRequest({ method: "POST", path: "/sessions/ui-session-0/runtime-admissions/public-command" }))).rejects.toThrow("invalid local API request");
   } finally {
     await app.close();
