@@ -432,14 +432,56 @@ CI 签发后可用 `--verify-only` 验证当前完整 manifest；只有匹配 pr
 发布流水线仍应显式执行“manifest → gate → external sign → build/package”，并由 wheel
 E2E 验证打包后仍是同一 revision 的 `GO_PYTHON_TERM_RUNTIME`。
 
-### 10.6 Electron/Playwright
+### 10.6 联邦 Runtime 用户路径验收与当前 Gate
+
+离线验收通过真实 Conversation HTTP 路由和 SQLite 持久化层，覆盖 Goose/DSH 的
+消息入队、唯一终态、Idempotency-Key 重放、Runtime/Provider/Model 身份冲突、
+应用重建后的事件与 assistant message 去重、在途取消和通道故障隔离。外部 Runtime
+进程由确定性测试实现替代，因此该结果只属于合同/回归证据，不能生成任何 Runtime GO：
+
+```bash
+cd mvp
+.venv/bin/python -m pytest -q \
+  tests/acceptance/test_federated_runtime_user_path.py
+```
+
+默认结果包含 3 个 live case 的 `SKIPPED`。只有用户先启动并解锁真实 Workbench，且
+明确接受真实 Provider 调用可能产生的费用后，才可用
+`WORKBENCH_RUN_LIVE_RUNTIME_ACCEPTANCE=1`，并提供 loopback 服务地址、已保存的
+Provider Profile ID 与模型，执行同一文件。测试只调用正式 Conversation HTTP 控制面，
+不读取 Vault、密码、Runtime 数据库或验收 evidence 文件；若本地控制面启用 capability，
+只通过当前进程环境传入，不写入仓库、命令示例或测试输出。
+
+截至 2026-09-05 的证据台账：
+
+| 通道/决策 | 当前状态 | 可用证据与缺口 |
+|---|---|---|
+| Python Term 当前 bundle live | `MANUAL_PENDING` | 旧 build 的真实 LM Studio 路径不能替代当前 bundle 验收 |
+| Goose 当前 bundle live | `MANUAL_PENDING` | 旧 build 的真实 LM Studio 路径不能替代当前 bundle 验收 |
+| DSH 当前 bundle 单模型完成 | `PASS_SINGLE_COMPLETION` | 用户经 GUI 运行 job `4898e6381c184ba19a84cc321617c91e`；Provider `deepseek-primary`、模型 `deepseek-v4-flash-vision-exp`、云端 `completed`、evidence 延迟 `1015 ms`；正式 loader 另行确认 public proof 与当前 Profile digest 匹配，信任层为 `DEV_UNTRUSTED` |
+| `GO_GOOSE_QUERY_SMOKE` | `HOLD` | 当前 bundle 的真实完成/取消/错误/重启用户路径尚未齐全 |
+| `GO_DSH_PLUGIN_SMOKE` | `HOLD` | 上述证据只证明一个真实 completion；当前 bundle 的真实取消、错误、重复命令与重启恢复仍待人工验收 |
+| `GO_RUNTIME_FEDERATION` | `HOLD` | Python Term/Goose 当前 bundle live 未完成，DSH 独立 Gate 未完成，且前端全量回归仍有待关闭项 |
+
+`PASS_SINGLE_COMPLETION` 不是 Gate 名称，不得被准入代码或发布流程解释为
+`GO_DSH_PLUGIN_SMOKE`。CLI 显示 `prepared`、离线 fixture 通过或单个 Runtime 完成，均不等于
+四模式 UI 和三通道联邦整体通过。
+
+本次 focused 离线结果为 `4 passed, 3 skipped`。从 revision `cb40882` 启动的唯一一次
+全量 Python `pytest -q` 在 898.60 秒上限被人工中断，当时为
+`17 passed, 2 skipped`，停留于 Development Graph blueprint 内嵌的前端测试，因此
+不能记为全量 PASS，也不覆盖之后的会话事件分页修改。真实用户环境另发现旧会话首次
+全量回放约 8.6 MB、超过 IPC 1 MiB 限制并使页面停在“等待本地服务”；必须在不删除
+用户历史的前提下完成有界分页并复验，才能关闭前端/恢复 Gate。
+
+### 10.7 Electron/Playwright
 
 ```bash
 cd canvas-spike
 npm test
 ```
 
-### 10.7 真实 LM Studio
+### 10.8 真实 LM Studio
 
 ```bash
 cd mvp

@@ -1,6 +1,6 @@
 # 联邦 Runtime 正式会话接入设计
 
-**状态：** 已批准进入实施（2026-09-04）
+**状态：** 部分用户验收（2026-09-05）；DSH 单模型真实完成，联合 Gate 保持 HOLD
 **阶段：** P0 / RF-3A、RF-4A 用户可操作验收  
 **适用模式：** 聊天、Agent-步进执行、Agent-寻路、Agent-事件驱动
 
@@ -180,6 +180,33 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 - DeepSeek Harness 全部独立验收且至少一个真实端点通过后可授予 `GO_DSH_PLUGIN_SMOKE`。
 - 任一单通道 GO 不等于 `GO_RUNTIME_FEDERATION`。
 - 只有共享合同、三通道、重启恢复与前端验收全部通过后，才单独评估 `GO_RUNTIME_FEDERATION`。
+
+### 8.1 2026-09-05 验收快照
+
+| 项目 | 状态 | 决策依据 |
+|---|---|---|
+| 离线服务用户路径 | `PASS_CONTRACT_ONLY` | 真实 Conversation HTTP/SQLite 路径覆盖 Goose/DSH 的消息、唯一终态、幂等/身份冲突、恢复去重、取消和隔离；外部 Runtime 为确定性测试实现，不是 live proof |
+| Python Term 当前 bundle | `MANUAL_PENDING` | 既有真实验收属于旧 build，不迁移到当前 source/build identity |
+| Goose 当前 bundle | `MANUAL_PENDING` | 既有真实验收属于旧 build，不迁移到当前 source/build identity |
+| DSH 当前 bundle | `PASS_SINGLE_COMPLETION` | 用户 GUI job `4898e6381c184ba19a84cc321617c91e` 绑定 `deepseek-primary` / `deepseek-v4-flash-vision-exp`，云端完成，evidence 延迟 `1015 ms`；正式 loader 验证 public proof/Profile digest 匹配，`DEV_UNTRUSTED` |
+| `GO_GOOSE_QUERY_SMOKE` | `HOLD` | 当前 bundle 独立真实路径未完成 |
+| `GO_DSH_PLUGIN_SMOKE` | `HOLD` | 单次真实 completion 尚不能覆盖真实取消、错误、重复命令与重启恢复 |
+| `GO_RUNTIME_FEDERATION` | `HOLD` | 三通道与前端全量验收未同时通过 |
+
+`PASS_CONTRACT_ONLY` 和 `PASS_SINGLE_COMPLETION` 只是证据分类，不是 Runtime Gate。
+真实调用继续由用户从 GUI 或已启动的 loopback Workbench 显式触发；测试不得主动索取
+Vault 密码，普通离线回归缺少 live opt-in 时必须报告 `SKIPPED`。CLI 的 `prepared`
+只表示开发证据准备完成，不代表 UI 会话、幂等、取消和恢复全部通过。
+
+当前用户 Runtime 数据库只读核验显示 DSH registration 为 `ready`，build
+`dsh:model-host-v2-r1`，只发布 `model/query/streaming/event_cursor/prompt_sections=true`，
+`tools/skills/workspace/plugins/interventions=false`；live evidence 于 18:42:49 导入。
+该信息证明准入材料被导入，不等于当前 Vault 已解锁或 Provider 已在正式会话中完成选择。
+
+真实环境的旧会话恢复仍有一个明确阻塞：`ui-session-0` 首次不带 cursor 的全量 SSE
+包含约 15,341 条 domain events（约 8.6 MB），经 IPC 聚合超过 1 MiB 上限，页面停在
+“等待本地服务”。恢复实现必须进行有界分页并保留全部用户历史；分页修改完成后的
+focused 验证与真实 GUI 复验是 `GO_RUNTIME_FEDERATION` 的必要未完成项。
 
 ## 9. 明确不在本批范围
 

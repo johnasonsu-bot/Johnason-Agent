@@ -32,13 +32,34 @@
 - [x] 通过 pinned DeepSeek Harness session/bootstrap API 注入有序 PromptSection、消息和上下文，不读取运行时专属配置文件或 API Key 环境变量。
 - [x] 使用 Grant 的 protocol/base URL/model/thinking 配置和短生命周期密钥；映射原生 Session 文本流、消息、生命周期、唯一终态与 seal。（原生工具执行仍等待持久化 Tool bridge）
 - [x] 固定冒烟与真实 provider 分支明确分离；真实分支失败不得回落 fixture 或其他 Provider。
+- [x] 用户通过 GUI 完成当前 public bundle 的单次真实云端请求：job `4898e6381c184ba19a84cc321617c91e`，Provider `deepseek-primary`，模型 `deepseek-v4-flash-vision-exp`，终态 `completed`，evidence 延迟 `1015 ms`；正式 loader 已验证 public proof 与当前 Profile digest 匹配，信任层 `DEV_UNTRUSTED`。此项仅记为 `PASS_SINGLE_COMPLETION`。
 - [ ] 真实能力验证后才把 DSH `model` capability 改为 true，并生成独立 `GO_DSH_PLUGIN_SMOKE` 用户验收证据。
 
 ## Task 4：用户可操作验收与联邦证据
 
-- [ ] 前端/测试入口可选择 Codex-compatible Python、Goose、DeepSeek Harness 和已保存 Provider；不显示或复制密钥。
+- [ ] 前端/测试入口已实现四模式、保存 Provider 和不回显密钥，但最近一次全量前端回归仍出现 Goose 模式恢复为空的失败，关闭前不标记完成。
 - [ ] 三通道分别验证流式文本、Provider/模型精确绑定、错误诊断、取消、重复命令、进程重启与独立结果。
 - [ ] 任一通道失败只阻塞自身 GO；只有三通道和共享合同均通过时，才另行评估 `GO_RUNTIME_FEDERATION`。
+
+## Task 5：用户路径回归与独立 Gate 决策
+
+- [x] 新增 `tests/acceptance/test_federated_runtime_user_path.py`：离线 case 经真实 Conversation HTTP/SQLite 路径覆盖 Goose/DSH 消息、唯一终态、幂等、身份冲突、恢复、取消和故障隔离；外部 Runtime 为确定性测试实现，明确不计 live GO。
+- [x] Python Term、Goose、DSH 的真实 HTTP 用户路径均要求 `WORKBENCH_RUN_LIVE_RUNTIME_ACCEPTANCE=1`，默认 3 个 case 为 `SKIPPED`；测试不读取 Vault 或明文凭据。
+- [x] 记录 DSH 当前 bundle 的一条用户 GUI 真实云端 completion，并与 fixture/CLI `prepared` 证据分开。
+- [ ] Python Term 与 Goose 当前 bundle 的真实用户路径仍为 `MANUAL_PENDING`；既往旧 build 证据不迁移。
+- [ ] DSH 当前 bundle 的真实取消、错误、重复命令和重启恢复仍为 `MANUAL_PENDING`，因此 `GO_DSH_PLUGIN_SMOKE=HOLD`。
+- [ ] `GO_GOOSE_QUERY_SMOKE=HOLD`；需补当前 bundle 的独立真实证据。
+- [ ] `GO_RUNTIME_FEDERATION=HOLD`；三通道、共享合同、持久恢复和前端全量验收未同时通过。
+- [ ] 真实用户旧会话 `ui-session-0` 首次无 cursor 的全量事件约 8.6 MB（15,341 条 domain events，其中 15,088 条 retryable），超过 IPC 1 MiB 聚合限制并使页面停在“等待本地服务”；需有界分页且不得删除用户历史，修复后重新执行真实恢复验收。
+
+回归记录：Task 5 focused 为 `4 passed, 3 skipped`；从 revision `cb40882` 启动的唯一
+一次全量 Python `pytest -q` 在 898.60 秒上限中断，当时 `17 passed, 2 skipped`，
+停留于 Development Graph blueprint 内嵌前端流程。该结果不是全量 PASS，也不覆盖
+随后进行的事件分页改动；按约束不重复运行另一轮全量。
+
+验收台账内部用 `live_acceptance_pending` 表示尚未人工执行（它不是公共 API 错误码）；
+前端选择/恢复冲突沿用 `runtime_selection_conflict`。Provider/Grant/Host 的实际失败
+继续使用设计中既有公开分类，不得用 fixture 成功覆盖。
 
 ## 机器验收
 
