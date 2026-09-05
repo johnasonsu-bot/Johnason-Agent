@@ -33,6 +33,20 @@ def _signer_module():
     return module
 
 
+def test_manual_client_containment_is_only_for_owned_verifier_session(tmp_path, monkeypatch):
+    from workbench.runtime.engine_host.v2.client import EngineHostV2Client
+    signer = _signer_module()
+    config = SimpleNamespace(argv=(sys.executable,))
+    monkeypatch.setattr(signer.os, "getpgrp", lambda: signer.os.getpid() + 1)
+    ordinary = signer._manual_client_factory(config, 1, tmp_path / "ordinary.lock")
+    assert type(ordinary) is EngineHostV2Client
+    assert ordinary._process_group_options() == {"start_new_session": True}
+    monkeypatch.setattr(signer.os, "getpgrp", signer.os.getpid)
+    manual = signer._manual_client_factory(config, 1, tmp_path / "manual.lock")
+    assert type(manual) is signer._ManualContainedClient
+    assert manual._process_group_options() == {}
+
+
 @pytest.mark.asyncio
 async def test_external_verifier_isolates_execution_state_from_saved_runtime(tmp_path, monkeypatch):
     from secrets import token_urlsafe

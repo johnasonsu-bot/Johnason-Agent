@@ -1,6 +1,9 @@
 """Protocol-only subprocess double. Never emits model evidence or Runtime GO."""
 import argparse
 import json
+import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -17,6 +20,19 @@ args = parser.parse_args()
 password = sys.stdin.readline()
 assert password.endswith("\n") and len(password) > 1
 password = None
+if args.provider_profile_id in {"stubborn", "orphan"}:
+    from types import SimpleNamespace
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from federated_runtime_dev_signer import _manual_client_factory
+    client = _manual_client_factory(SimpleNamespace(argv=(sys.executable,)), 1, Path(args.output_dir) / "test.lock")
+    child = subprocess.Popen([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGINT,signal.SIG_IGN); signal.signal(signal.SIGTERM,signal.SIG_IGN); print('ready',flush=True); time.sleep(60)"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, **client._process_group_options())
+    child.stdout.readline()
+    (Path(args.output_dir) / "child.pid").write_text(str(child.pid))
+    if args.provider_profile_id == "orphan":
+        raise SystemExit(1)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    time.sleep(60)
 profile = ProviderRepository(Path(args.runtime_dir) / "workbench.sqlite").get(args.provider_profile_id)
 evidence = {"runtime_id": args.runtime, "terminal": "completed",
     "model": "changed-model" if args.provider_profile_id == "wrong-model" else profile.model_aliases["default"],

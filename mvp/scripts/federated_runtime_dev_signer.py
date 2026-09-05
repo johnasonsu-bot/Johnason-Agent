@@ -36,6 +36,37 @@ from pydantic import ConfigDict, Field, StrictInt, field_validator
 from workbench.credentials.service import VaultService
 from workbench.models.profiles import ProviderProfileRecord
 from workbench.providers.repository import ProviderRepository
+from workbench.runtime.engine_host.v2.client import EngineHostV2Client
+
+
+class _ManualContainedClient(EngineHostV2Client):
+    """A model-only Host inside the external verifier's owned POSIX session.
+
+    The GUI parent owns final group containment. Never use this for ordinary
+    application Hosts, whose independent process-tree policy stays unchanged.
+    """
+
+    @staticmethod
+    def _process_group_options():
+        return {}
+
+    async def _terminate_process_tree(self, process, process_group_id):
+        # Do not kill the shared verifier group from inside that same group.
+        return await super()._terminate_process_tree(process, None)
+
+
+def _manual_client_factory(config, generation, containment_lock):
+    client_type = (
+        _ManualContainedClient
+        if os.name == "posix" and os.getpgrp() == os.getpid()
+        else EngineHostV2Client
+    )
+    return client_type(
+        config.argv, containment_lock=containment_lock,
+        containment_generation=str(generation), provider_grant_transport=True,
+    )
+
+
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     RuntimeGateReceipt,
@@ -643,6 +674,7 @@ async def _collect_federated_observation(
         runtime_dir=runtime_dir,
         app_instance_id=f"live-endpoint-{runtime_id}-{uuid4().hex}",
         lease_seconds=180.0,
+        client_factory=_manual_client_factory,
     )
     started = False
     try:

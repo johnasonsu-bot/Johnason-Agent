@@ -57,6 +57,7 @@ class ManualRuntimeVerification:
         self._active: str | None = None
         self._cancel_requested = False
         self._closing = False
+        self._containment_failed = False
 
     def get(self, job_id: str) -> VerificationJob:
         if job_id not in self._jobs:
@@ -66,7 +67,7 @@ class ManualRuntimeVerification:
     def start(self, provider_id: str, password: str) -> VerificationJob:
         if self._closing or not _SCRIPT.is_file() or _SCRIPT.is_symlink():
             raise VerificationRequestError(503, "verification_unavailable")
-        if self._task is not None and not self._task.done():
+        if self._containment_failed or (self._task is not None and not self._task.done()):
             raise VerificationRequestError(409, "verification_in_progress")
         try:
             profile = ProviderRepository(self.runtime_dir / "workbench.sqlite").get(provider_id)
@@ -106,6 +107,7 @@ class ManualRuntimeVerification:
     async def _run(self, job: VerificationJob, output: Path, secret: bytearray, profile_digest: str) -> None:
         process = None
         spawn = None
+        status = "failed"
         try:
             async with asyncio.timeout(self.timeout_seconds):
                 spawn = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -136,13 +138,13 @@ class ManualRuntimeVerification:
                         or Path(payload.get("output_dir", "")) != output):
                     raise ValueError("verification failed")
                 self._check_evidence(output, job, profile_digest)
-                self._finish(job, "succeeded")
+                status = "succeeded"
         except TimeoutError:
-            self._finish(job, "timed_out")
+            status = "timed_out"
         except asyncio.CancelledError:
-            self._finish(job, "cancelled")
+            status = "cancelled"
         except Exception:
-            self._finish(job, "failed")
+            status = "failed"
         finally:
             secret.clear()
             if spawn is not None and process is None:
@@ -151,7 +153,22 @@ class ManualRuntimeVerification:
                 except Exception:
                     pass
             if process is not None:
-                await self._stop(process)
+                cleanup = asyncio.create_task(self._stop(process))
+                while True:
+                    try:
+                        confirmed = await asyncio.shield(cleanup)
+                        break
+                    except asyncio.CancelledError:
+                        status = "cancelled"
+                    except Exception:
+                        confirmed = False
+                        break
+                if not confirmed:
+                    self._containment_failed = True
+                    self._finish(job, "failed")
+                    job.message = "无法确认验收进程已停止；已阻止新的验收，请关闭应用并检查进程。"
+                    return
+            self._finish(job, status)
 
     def _check_evidence(self, output: Path, job: VerificationJob, profile_digest: str) -> None:
         directory = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -171,12 +188,21 @@ class ManualRuntimeVerification:
                 os.close(descriptor)
             os.close(directory)
 
-    async def _stop(self, process) -> None:
-        if process.returncode is not None:
-            return
+    async def _stop(self, process) -> bool:
+        def alive():
+            if os.name != "posix":
+                return process.returncode is None
+            try:
+                os.killpg(process.pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
         # SIGINT lets asyncio.run cancel the verifier and close its supervised
         # sidecars in finally. TERM/KILL bound cleanup if cooperative exit fails.
         for sig, delay in ((signal.SIGINT, 3), (signal.SIGTERM, 1), (signal.SIGKILL, 1)):
+            if not alive():
+                await process.wait()
+                return True
             try:
                 if os.name == "posix":
                     os.killpg(process.pid, sig)
@@ -185,12 +211,15 @@ class ManualRuntimeVerification:
                 else:
                     process.kill()
             except ProcessLookupError:
-                return
-            try:
-                await asyncio.wait_for(process.wait(), delay)
-                return
-            except TimeoutError:
-                continue
+                await process.wait()
+                return True
+            deadline = asyncio.get_running_loop().time() + delay
+            while alive() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+        if not alive():
+            await process.wait()
+            return True
+        return False
 
     async def cancel(self, job_id: str) -> VerificationJob:
         job = self.get(job_id)

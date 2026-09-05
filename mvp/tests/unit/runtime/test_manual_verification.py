@@ -15,13 +15,66 @@ def service(tmp_path, monkeypatch):
     fake_script = Path(__file__).resolve().parents[2] / "fixtures/manual_verifier.py"
     monkeypatch.setattr(module, "_SCRIPT", fake_script)
     repository = ProviderRepository(tmp_path / "workbench.sqlite")
-    for name in ("success", "failed", "hang", "oversized", "split", "wrong-model"):
+    for name in ("success", "failed", "hang", "oversized", "split", "wrong-model", "stubborn", "orphan"):
         repository.upsert(ProviderProfileRecord.deepseek(id=name))
     return module.ManualRuntimeVerification(tmp_path)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "timeout", "shutdown", "orphan"])
+async def test_actual_child_group_is_reaped_before_terminal(service, action):
+    import os
+    import signal
+
+    if action == "timeout":
+        service.timeout_seconds = 2.0
+    job = service.start("orphan" if action == "orphan" else "stubborn", token_urlsafe(24))
+    pidfile = service.runtime_dir / "manual-runtime-verifications" / job.id / "child.pid"
+    for _ in range(500):
+        if pidfile.exists():
+            break
+        await asyncio.sleep(0.01)
+    pid = int(pidfile.read_text())
+    try:
+        if action == "cancel":
+            pending = asyncio.create_task(service.cancel(job.id))
+            await asyncio.sleep(0.1)
+            assert job.status == "running"
+            await pending
+        elif action == "shutdown":
+            await service.aclose()
+        else:
+            await asyncio.wait_for(asyncio.shield(service._task), 10)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+        assert job.status == {"cancel": "cancelled", "shutdown": "cancelled", "timeout": "timed_out", "orphan": "failed"}[action]
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 async def completed(service):
     await asyncio.wait_for(asyncio.shield(service._task), 5)
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_cleanup_blocks_new_verification(service, monkeypatch):
+    original = service._stop
+
+    async def unconfirmed(process):
+        await original(process)
+        return False
+
+    monkeypatch.setattr(service, "_stop", unconfirmed)
+    job = service.start("success", token_urlsafe(24))
+    await completed(service)
+    assert job.status == "failed"
+    assert "无法确认" in job.message
+    with pytest.raises(module.VerificationRequestError) as error:
+        service.start("success", token_urlsafe(24))
+    assert error.value.detail == "verification_in_progress"
 
 
 @pytest.mark.asyncio
