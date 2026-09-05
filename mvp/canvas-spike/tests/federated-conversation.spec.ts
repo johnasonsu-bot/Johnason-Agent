@@ -223,6 +223,22 @@ test("federated review POST paused ACK preserves the pending selection", async (
   } finally { await f.app.close(); }
 });
 
+test("federated review matching running supersedes POST paused ACK without unlocking", async ({}, info) => {
+  const f = await launch(info.outputPath("backend"));
+  try {
+    await f.state({events:[],postStatus:"paused"});
+    await f.page.getByLabel("当前运行模式").selectOption("goose");
+    await f.page.getByLabel("会话消息").fill("resume paused ACK");
+    await f.page.getByLabel("发送", {exact:true}).click();
+    await expect(f.page.getByTestId("conversation-status")).toContainText("已暂停");
+    await f.state({events:[{cursor:"resume-q",eventId:"resume-q",name:"turn_queued",value:{command_id:"command-1"}},{cursor:"resume-r",eventId:"resume-r",name:"runtime.status.changed",value:{status:"running"}}]});
+    await expect(f.page.getByTestId("conversation-status")).toContainText("执行中");
+    await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
+    await expect(f.page.getByLabel("当前运行模式")).toHaveValue("goose");
+    await expect(f.page.getByLabel("当前模型")).toBeDisabled();
+  } finally { await f.app.close(); }
+});
+
 test("federated review buffers a terminal arriving before the matching ACK", async ({}, info) => {
   const f = await launch(info.outputPath("backend"));
   try {

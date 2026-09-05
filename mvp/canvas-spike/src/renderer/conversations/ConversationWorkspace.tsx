@@ -302,6 +302,12 @@ export function ConversationWorkspace() {
           if (event.name === "user.message.received" && queuedCommandContext) confirmedUsers.add(queuedCommandContext);
           projected = reduceConversationStatus(projected, event);
           if (statusForEvent(event) && projected.commandId) commandStates.set(projected.commandId, projected);
+          const frozen = selectionsRef.current[sessionId];
+          if (frozen?.ackPaused && frozen.commandId === projected.commandId && statusForEvent(event)?.phase === "running") {
+            // A paused POST ACK is provisional; later matching execution
+            // evidence supersedes its display without releasing the turn lock.
+            frozen.ackPaused = false;
+          }
         }
         projectionsRef.current[sessionId] = projected;
         const confirmedLocalIds = reconcileOptimisticMessages(sessionId);
