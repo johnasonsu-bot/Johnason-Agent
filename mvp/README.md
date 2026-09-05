@@ -468,9 +468,9 @@ secret-free 的签名证据和用户人工验收；未来最小补强是提供 c
 |---|---|---|
 | Python Term 当前 bundle live | `MANUAL_PENDING` | 旧 build 的真实 LM Studio 路径不能替代当前 bundle 验收 |
 | Goose 当前 bundle live | `MANUAL_PENDING` | 旧 build 的真实 LM Studio 路径不能替代当前 bundle 验收 |
-| DSH 当前 bundle 单模型完成 | `PASS_SINGLE_COMPLETION` | 用户经 GUI 运行 job `4898e6381c184ba19a84cc321617c91e`；Provider `deepseek-primary`、模型 `deepseek-v4-flash-vision-exp`、云端 `completed`、evidence 延迟 `1015 ms`；正式 loader 另行确认 public proof 与当前 Profile digest 匹配，信任层为 `DEV_UNTRUSTED` |
+| DSH 当前 bundle 单模型完成 | `PASS_SINGLE_COMPLETION` | 用户经 GUI 运行 job `4898e6381c184ba19a84cc321617c91e`；Provider `deepseek-primary`、模型 `deepseek-v4-flash-vision-exp`、云端 `completed`、evidence 延迟 `1015 ms`；正式 loader 当时确认 public proof 与 Profile digest 匹配，信任层为 `DEV_UNTRUSTED`；proof 已于北京时间 19:25:13 按既定 TTL 到期，未延长 |
 | `GO_GOOSE_QUERY_SMOKE` | `HOLD` | 当前 bundle 的真实完成/取消/错误/重启用户路径尚未齐全 |
-| `GO_DSH_PLUGIN_SMOKE` | `HOLD` | 上述证据只证明一个真实 completion；当前 bundle 的真实取消、错误、重复命令与重启恢复仍待人工验收 |
+| `GO_DSH_PLUGIN_SMOKE` | `HOLD` | 上述证据只证明一个真实 completion；当前 bundle 的新模型命令取消、错误、重复与执行恢复仍待人工验收，已通过的历史 timeline 重启读取不能替代这些路径 |
 | `GO_RUNTIME_FEDERATION` | `HOLD` | Python Term/Goose 当前 bundle live 未完成，DSH 独立 Gate 未完成，且前端全量回归仍有待关闭项 |
 
 `PASS_SINGLE_COMPLETION` 不是 Gate 名称，不得被准入代码或发布流程解释为
@@ -483,10 +483,17 @@ secret-free 的签名证据和用户人工验收；未来最小补强是提供 c
 不能记为全量 PASS，也不覆盖之后的会话事件分页修改。真实用户环境另发现旧会话首次
 全量回放约 8.6 MB、超过 IPC 1 MiB 限制并使页面停在“等待本地服务”。commit
 `9fd5626` 已实现不删除用户历史的有界分页；focused 验证与真实 SQLite 的 15,341 frame、
-20 页逐字节匹配均已通过，真实 GUI 重启恢复复验仍待完成，因此前端/恢复 Gate 尚未关闭。
+20 页逐字节匹配均已通过。实际客户端已以 session `88583` 重启，GUI 经 Task 3 REST/SSE
+cursor 读回 `ui-session-0` 的旧流式回复和 248 条可见 timeline items，未再出现 too-large
+或“等待本地服务”；因此真实 GUI 历史重启读取复验已通过。该结果不是新模型请求、取消
+验收或整体 Runtime GO。
 
-原有 31 个 DeepSeek 历史任务已获用户批准后续以 `manual_hold` 暂停；guard commit
-`61d9cbd` 当前仍在 review，尚未对真实数据库执行 hold，不能表述为已暂停。
+`manual_hold` guard 独立复审通过后，根 repository API 已将精确匹配的 31 个 DeepSeek
+历史 turn 成功置为 hold（20 queued、11 retryable，分布于 3 个 session）。操作前后全部
+target row hash 一致，数据库总量保持 235 turns / 248 messages / 22,073 events；重开
+repository 后 31 个 hold 仍保留。当前数据库为 DSH `ready`、`cloud_running=0`、
+`active_holds=31`。Provider 主密码框仍等待用户解锁，新会话模型发送尚未实测；精确
+Provider/Model attestation 缺口与相关 Gate 继续 `HOLD`。
 
 ### 10.7 Electron/Playwright
 

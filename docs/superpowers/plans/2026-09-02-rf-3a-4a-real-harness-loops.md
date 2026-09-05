@@ -50,12 +50,13 @@
 - [x] 记录 DSH 当前 bundle 的一条用户 GUI 真实云端 completion，并与 fixture/CLI `prepared` 证据分开。
 - [ ] 当前自动 live case 仅为 `LIMITED_COMPLETION_CHECK`；公共 API 未暴露实际 Provider Profile digest、resolved model 或 fallback attestation，不能用请求字段代替执行绑定证据。最小后续方案是增加 secret-free、command-scoped 的签名执行 attestation，绑定冻结 Provider digest、resolved model、Runtime build 与 proof identity。
 - [ ] Python Term 与 Goose 当前 bundle 的真实用户路径仍为 `MANUAL_PENDING`；既往旧 build 证据不迁移。
-- [ ] DSH 当前 bundle 的真实取消、错误、重复命令和重启恢复仍为 `MANUAL_PENDING`，因此 `GO_DSH_PLUGIN_SMOKE=HOLD`。
+- [ ] DSH 当前 bundle 的新模型命令取消、错误、重复与执行恢复仍为 `MANUAL_PENDING`；已通过的历史 timeline 重启读取不能替代这些路径，因此 `GO_DSH_PLUGIN_SMOKE=HOLD`。
 - [ ] `GO_GOOSE_QUERY_SMOKE=HOLD`；需补当前 bundle 的独立真实证据。
 - [ ] `GO_RUNTIME_FEDERATION=HOLD`；三通道、共享合同、持久恢复和前端全量验收未同时通过。
 - [x] commit `9fd5626` 已为真实用户旧会话 `ui-session-0` 实现不删除用户历史的有界分页；focused 验证与真实 SQLite 的 15,341 frame、20 页逐字节匹配均通过。
-- [ ] 上述旧会话仍需完成真实 GUI 重启恢复复验，完成前不关闭前端/恢复 Gate。
-- [ ] 原有 31 个 DeepSeek 历史任务已获用户批准后续以 `manual_hold` 暂停；guard commit `61d9cbd` 仍在 review，尚未真正写入用户数据库，不记为已暂停。
+- [x] 实际客户端 session `88583` 已经由 Task 3 REST/SSE cursor 读回 `ui-session-0` 旧流式回复和 248 条可见 timeline items，未再出现 too-large/“等待本地服务”；真实 GUI 历史重启读取复验通过，但不代表新模型请求、取消或整体 GO。
+- [x] `manual_hold` guard 独立复审通过后，根 repository API 已精确 hold 31 个 DeepSeek 历史 turn：20 queued、11 retryable、覆盖 3 个 session；前后全部 target row hash 一致，235 turns / 248 messages / 22,073 events 总量不变，重开 repository 后 31 个 hold 保留。
+- [ ] 当前客户端数据库为 DSH `ready`、`cloud_running=0`、`active_holds=31`；Provider 主密码框仍待用户解锁，新会话模型发送尚未实测。DSH proof 已于北京时间 19:25:13 按既定 TTL 到期且不延长，精确 Provider/Model attestation 与相关 Gate 继续 `HOLD`。
 
 回归记录：Task 5 review focused 为 `19 passed, 3 skipped`；从 revision `cb40882` 启动的唯一
 一次全量 Python `pytest -q` 在 898.60 秒上限中断，当时 `17 passed, 2 skipped`，

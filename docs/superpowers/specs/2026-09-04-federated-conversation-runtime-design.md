@@ -188,9 +188,9 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 | 离线服务用户路径 | `PASS_CONTRACT_ONLY` | 真实 Conversation HTTP/SQLite 路径覆盖 chat 省略 selector、Goose/DSH 消息、唯一终态、幂等/身份冲突、恢复去重、取消、隔离，以及同一 command 的 build 冻结；外部 Runtime 为确定性测试实现，不是 live proof |
 | Python Term 当前 bundle | `MANUAL_PENDING` | 既有真实验收属于旧 build，不迁移到当前 source/build identity |
 | Goose 当前 bundle | `MANUAL_PENDING` | 既有真实验收属于旧 build，不迁移到当前 source/build identity |
-| DSH 当前 bundle | `PASS_SINGLE_COMPLETION` | 用户 GUI job `4898e6381c184ba19a84cc321617c91e` 绑定 `deepseek-primary` / `deepseek-v4-flash-vision-exp`，云端完成，evidence 延迟 `1015 ms`；正式 loader 验证 public proof/Profile digest 匹配，`DEV_UNTRUSTED` |
+| DSH 当前 bundle | `PASS_SINGLE_COMPLETION` | 用户 GUI job `4898e6381c184ba19a84cc321617c91e` 绑定 `deepseek-primary` / `deepseek-v4-flash-vision-exp`，云端完成，evidence 延迟 `1015 ms`；正式 loader 当时验证 public proof/Profile digest 匹配，`DEV_UNTRUSTED`；proof 已于北京时间 19:25:13 按既定 TTL 到期且未延长 |
 | `GO_GOOSE_QUERY_SMOKE` | `HOLD` | 当前 bundle 独立真实路径未完成 |
-| `GO_DSH_PLUGIN_SMOKE` | `HOLD` | 单次真实 completion 尚不能覆盖真实取消、错误、重复命令与重启恢复 |
+| `GO_DSH_PLUGIN_SMOKE` | `HOLD` | 单次真实 completion 尚不能覆盖新模型命令取消、错误、重复与执行恢复；历史 timeline 重启读取不替代这些路径 |
 | `GO_RUNTIME_FEDERATION` | `HOLD` | 三通道与前端全量验收未同时通过 |
 
 `PASS_CONTRACT_ONLY` 和 `PASS_SINGLE_COMPLETION` 只是证据分类，不是 Runtime Gate。
@@ -209,16 +209,23 @@ proof identity 关联起来；不得回显凭据，也不得以 queued request �
 当前用户 Runtime 数据库只读核验显示 DSH registration 为 `ready`，build
 `dsh:model-host-v2-r1`，只发布 `model/query/streaming/event_cursor/prompt_sections=true`，
 `tools/skills/workspace/plugins/interventions=false`；live evidence 于 18:42:49 导入。
-该信息证明准入材料被导入，不等于当前 Vault 已解锁或 Provider 已在正式会话中完成选择。
+实际客户端已以 session `88583` 重启，当前 `cloud_running=0`、`active_holds=31`；Provider
+主密码框仍等待用户解锁，新会话模型发送尚未实测。该信息不等于当前 Vault 已解锁或
+Provider 已在新正式会话中完成选择。
 
 真实环境的旧会话恢复仍有一个明确阻塞：`ui-session-0` 首次不带 cursor 的全量 SSE
 包含约 15,341 条 domain events（约 8.6 MB），经 IPC 聚合超过 1 MiB 上限，页面停在
 “等待本地服务”。commit `9fd5626` 已实现保留全部用户历史的有界分页，focused 验证与
-真实 SQLite 的 15,341 frame、20 页逐字节匹配均已通过；真实 GUI 重启恢复复验仍是
-`GO_RUNTIME_FEDERATION` 的必要未完成项。
+真实 SQLite 的 15,341 frame、20 页逐字节匹配均已通过。重启后的实际 GUI 已经由 Task 3
+REST/SSE cursor 读回 `ui-session-0` 旧流式回复与 248 条可见 timeline items，未再出现
+too-large 或“等待本地服务”，所以历史重启读取复验通过。该结果不覆盖新模型请求、取消
+或整体 `GO_RUNTIME_FEDERATION`。
 
-原有 31 个 DeepSeek 历史任务已获用户批准后续以 `manual_hold` 暂停。guard commit
-`61d9cbd` 仍在 review，尚未真正对用户数据库执行 hold；设计台账不得将其写成已暂停。
+`manual_hold` guard 独立复审通过后，根 repository API 已精确 hold 31 个 DeepSeek 历史
+turn（20 queued、11 retryable，覆盖 3 个 session）。操作前后全部 target row hash 一致，
+235 turns / 248 messages / 22,073 events 总量不变；重开 repository 后 31 个 hold 保留。
+这只证明历史任务暂停与数据不变性，不补足精确 Provider/Model attestation，相关 Gate
+继续 `HOLD`。
 
 ## 9. 明确不在本批范围
 
