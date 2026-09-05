@@ -579,6 +579,7 @@ async def _collect_federated_observation(
     runtime_dir: Path,
     vault: VaultService,
     repository_root: Path | None = None,
+    profile_directory: Path | None = None,
     _observe=_observe_runtime_live_endpoint,
 ) -> LiveEndpointEvidenceV1:
     """Run one real Profile through Admission→Supervisor→Grant→Host v2.
@@ -603,7 +604,7 @@ async def _collect_federated_observation(
         if repository_root is None
         else repository_root.resolve()
     )
-    providers = ProviderRepository(runtime_dir / "workbench.sqlite")
+    providers = ProviderRepository((profile_directory or runtime_dir) / "workbench.sqlite")
     try:
         profile = providers.get(provider_profile_id)
     except KeyError as error:
@@ -1571,6 +1572,7 @@ async def _collect_python_term_observation(
     provider_profile_id: str,
     runtime_dir: Path,
     vault: VaultService,
+    profile_directory: Path | None = None,
 ) -> _public_admission.LiveEndpointEvidenceV1:
     """Exercise the real in-process Python Term executor and ModelGateway."""
     from workbench.models.deepseek import DeepSeekProvider
@@ -1592,7 +1594,7 @@ async def _collect_python_term_observation(
     )
     from workbench.runtime.python_term.repository import PythonTermRepository
 
-    providers = ProviderRepository(runtime_dir / "workbench.sqlite")
+    providers = ProviderRepository((profile_directory or runtime_dir) / "workbench.sqlite")
     try:
         profile = providers.get(provider_profile_id)
     except KeyError as error:
@@ -1784,6 +1786,7 @@ def _seal_preparer(
             profile = providers.get(provider_profile_id)
         except KeyError as error:
             raise ValueError("saved provider profile is unavailable") from error
+        _real_endpoint_kind(profile)
         if profile.credential_mode == "reference" and not isinstance(
             vault_password, str
         ):
@@ -1798,13 +1801,20 @@ def _seal_preparer(
         try:
             if profile.credential_mode == "reference":
                 vault.unlock(vault_password)
+            # Only Profile/Vault reads use the application directory. Collector
+            # databases, leases and bootstrap state belong to this invocation.
+            directory_fd = _open_publish_directory(output_dir)
+            os.close(directory_fd)
+            execution_dir = output_dir / f"execution-{uuid4().hex}"
+            execution_dir.mkdir(mode=0o700)
             observations = []
             for runtime_id in selected:
                 if runtime_id == "python-term":
                     observations.append(
                         await collect_python_term_observation(
                             provider_profile_id=provider_profile_id,
-                            runtime_dir=runtime_dir,
+                            runtime_dir=execution_dir,
+                            profile_directory=runtime_dir,
                             vault=vault,
                         )
                     )
@@ -1812,7 +1822,8 @@ def _seal_preparer(
                 observed = await collect_federated_observation(
                     runtime_id=runtime_id,
                     provider_profile_id=provider_profile_id,
-                    runtime_dir=runtime_dir,
+                    runtime_dir=execution_dir,
+                    profile_directory=runtime_dir,
                     vault=vault,
                 )
                 observations.append(observed)

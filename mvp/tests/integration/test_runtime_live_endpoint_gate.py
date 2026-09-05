@@ -33,6 +33,44 @@ def _signer_module():
     return module
 
 
+@pytest.mark.asyncio
+async def test_external_verifier_isolates_execution_state_from_saved_runtime(tmp_path, monkeypatch):
+    from secrets import token_urlsafe
+    from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
+
+    runtime = tmp_path / "saved-runtime"
+    runtime.mkdir()
+    output = tmp_path / "manual-result"
+    providers = ProviderRepository(runtime / "workbench.sqlite")
+    providers.upsert(ProviderProfileRecord.deepseek(id="manual-provider"))
+    password = token_urlsafe(24)
+    vault = VaultService(runtime / "credentials.vault")
+    vault.create(password)
+    vault.lock()
+    captured = []
+    original = SidecarSupervisor.__init__
+
+    def capture(self, *args, **kwargs):
+        captured.append(kwargs["runtime_dir"])
+        original(self, *args, **kwargs)
+
+    async def stop_before_process_or_network(self):
+        raise RuntimeError("offline stop before process")
+
+    monkeypatch.setattr(SidecarSupervisor, "__init__", capture)
+    monkeypatch.setattr(SidecarSupervisor, "start", stop_before_process_or_network)
+    with pytest.raises(RuntimeError, match="offline stop"):
+        await _signer_module().prepare_development_environment(
+            ("dsh",), "manual-provider", runtime, output, password
+        )
+    assert len(captured) == 1
+    assert captured[0].parent == output
+    assert captured[0] != runtime
+    assert not (runtime / "federated-runtime-live-dsh.sqlite").exists()
+    assert not (output / "runtime-live-evidence-dsh.json").exists()
+    assert providers.get("manual-provider").model_aliases["default"] == "deepseek-v4-flash"
+
+
 class _Assignments:
     def require(self, command_id: str) -> object:
         raise AssertionError(f"fixture must be rejected before execution: {command_id}")

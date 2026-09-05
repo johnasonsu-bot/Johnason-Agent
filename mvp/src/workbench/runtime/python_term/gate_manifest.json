@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "42a1e54a33d92a779e15482ea494d1b1bc3ed05cac1e4a819bf74b60e11a783b",
-      "size": 2099770
+      "sha256": "03bf157cc1ae31ca9d60c15baf71194ff5f6da29ddee3bf4d150f34d57c500f0",
+      "size": 2110697
     },
     {
       "path": "uv.lock",
@@ -129,8 +129,8 @@
     },
     {
       "path": "api/app.py",
-      "sha256": "c9f54030f1b8293b7426912b240dcd1faf823a3a37e751801885934a2b784d4e",
-      "size": 14256
+      "sha256": "0e3c41c36f7ad455a90db9ba10cf740363c83e616386b04e0a2b74021403e191",
+      "size": 14666
     },
     {
       "path": "api/artifacts.py",
@@ -161,6 +161,11 @@
       "path": "api/providers.py",
       "sha256": "9234e5257356cb095ce7be088e57c81de181ed6a8f21ef7fd4db2d82a129ac8f",
       "size": 16793
+    },
+    {
+      "path": "api/runtime_verifications.py",
+      "sha256": "24a47b79516276f097cb9e205d8f0c5e9511719fadeb7be9726b510e4229b942",
+      "size": 2422
     },
     {
       "path": "artifacts/__init__.py",
@@ -621,6 +626,11 @@
       "path": "runtime/goose/source_manifest.json",
       "sha256": "71493d946453f00e2c34b51815b55a3952969e3303cc32e966919e35b6d9c7b1",
       "size": 5061
+    },
+    {
+      "path": "runtime/manual_verification.py",
+      "sha256": "47df145f071b4bc470b11b87e79b8e51e3785ac05a5cfed2dbcb34ad4c080d70",
+      "size": 9244
     },
     {
       "path": "runtime/provider_grants/__init__.py",

@@ -31,6 +31,8 @@ from workbench.api.graph_plans import (
     graph_plan_router,
 )
 from workbench.api.providers import provider_router, vault_router
+from workbench.api.runtime_verifications import runtime_verification_router
+from workbench.runtime.manual_verification import ManualRuntimeVerification
 from workbench.conversations.repository import ConversationRepository
 from workbench.conversations.worker import ConversationTaskWorker
 from workbench.credentials.vault import CredentialVault
@@ -95,6 +97,7 @@ def create_app(settings: AppSettings) -> FastAPI:
     if settings.capability_token is not None and len(settings.capability_token) < 43:
         raise ValueError("capability token must contain at least 256 bits")
 
+    manual_verification = ManualRuntimeVerification(settings.database.parent)
     engine = SingleAgentEngine(
         settings.database, runner=settings.runner, owner_id=settings.owner_id
     )
@@ -174,6 +177,7 @@ def create_app(settings: AppSettings) -> FastAPI:
             yield
         finally:
             try:
+                await manual_verification.aclose()
                 if development_worker_started and development_worker is not None:
                     await development_worker.stop()
                 close_development = getattr(settings.development_processor, "aclose", None)
@@ -214,6 +218,8 @@ def create_app(settings: AppSettings) -> FastAPI:
     app = FastAPI(title="Hermes Workbench", version="0.1.0", lifespan=lifespan)
     app.state.development_jobs = development_jobs
     app.state.sidecar_supervisor = settings.sidecar_lifecycle
+    app.state.manual_verification = manual_verification
+    app.include_router(runtime_verification_router(manual_verification))
 
     @app.middleware("http")
     async def authenticate_local_control_plane(request: Request, call_next):
