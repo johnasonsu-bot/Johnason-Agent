@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const TERMINAL_STATUS = Object.freeze({
   completed: ["completed", "query.completed"],
   failed: ["failed", "query.failed"],
@@ -56,7 +58,19 @@ function mapPayload(event) {
   if (event.type === "turn/end") {
     const terminal = TERMINAL_STATUS[event.data?.reason];
     if (!terminal) throw new Error("DSH terminal reason is unsupported");
-    return ["runtime.status", { status: terminal[0] }];
+    const diagnostics = {};
+    if (terminal[0] === "failed") {
+      if (["provider_request_failed", "runtime_verification_failed"].includes(event.data?.reason_code)) {
+        diagnostics.reason_code = event.data.reason_code;
+      }
+      if (["provider_request", "session_setup", "session_execution"].includes(event.data?.failure_stage)) {
+        diagnostics.failure_stage = event.data.failure_stage;
+      }
+      if ([400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504].includes(event.data?.http_status)) {
+        diagnostics.http_status = event.data.http_status;
+      }
+    }
+    return ["runtime.status", { status: terminal[0], ...diagnostics }];
   }
   return ["vendor.dsh.event", { dsh_type: event.type }];
 }
@@ -77,7 +91,10 @@ export function mapSessionEvents(identity, events, { cursorOffset = 0 } = {}) {
     }
     const [type, payload] = mapPayload(event);
     return Object.freeze({
-      event_id: `dsh:${identity.run_id}:${identity.term_id}:${identity.step_id}:${cursorOffset + index + 1}`,
+      event_id: `dsh:${createHash("sha256").update(JSON.stringify([
+        "dsh-event-v1", identity.run_id, identity.term_id, identity.step_id,
+        cursorOffset + index + 1,
+      ])).digest("hex")}`,
       run_id: identity.run_id,
       term_id: identity.term_id,
       step_id: identity.step_id,

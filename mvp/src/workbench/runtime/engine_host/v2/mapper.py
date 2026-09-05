@@ -735,10 +735,17 @@ def _project_artifact(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
 
 
 def _project_runtime_status(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
-    _allow_only(payload, "status")
+    _allow_only(payload, "status", "reason_code", "failure_stage", "http_status")
     status = payload.get("status")
     if not isinstance(status, str) or status not in _STATUSES:
         raise ValueError("runtime status is not registered")
+    for key, allowed in (
+        ("reason_code", {"provider_request_failed", "runtime_verification_failed"}),
+        ("failure_stage", {"provider_request", "session_setup", "session_execution"}),
+        ("http_status", {400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504}),
+    ):
+        if key in payload and (status != "failed" or payload[key] not in allowed):
+            raise ValueError("runtime failure diagnostic is not registered")
     return "runtime.status.changed", {"status": status}
 
 

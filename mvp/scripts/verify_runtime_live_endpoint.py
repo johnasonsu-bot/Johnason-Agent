@@ -14,7 +14,7 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from federated_runtime_dev_signer import prepare_development_environment
+from federated_runtime_dev_signer import prepare_development_environment, RuntimeLiveVerificationError
 from workbench.credentials.models import VaultUnlockError, VaultInUseError
 from workbench.models.lmstudio import ProviderUnavailable, ProviderResponseError
 from workbench.runtime.goose.source_gate import GooseSourceReadinessError
@@ -23,6 +23,8 @@ import httpx
 
 
 def _reason_code(error: Exception) -> str:
+    if isinstance(error, RuntimeLiveVerificationError):
+        return error.reason_code
     if isinstance(error, VaultUnlockError):
         return "vault_unlock_failed"
     if isinstance(error, VaultInUseError):

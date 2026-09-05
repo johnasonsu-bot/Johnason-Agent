@@ -4,7 +4,7 @@ import { createInterface } from "node:readline";
 
 import { createCheckpoint, sealAcknowledgement } from "./checkpoint.ts";
 import { mapSessionEvents, sortPromptSections } from "./event-mapper.ts";
-import { runDeepSeekHarnessSession } from "./native-session.ts";
+import { runDeepSeekHarnessSession, DshSessionFailure } from "./native-session.ts";
 
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -222,7 +222,11 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
               return;
             }
             const [failed] = mapSessionEvents(identity, [
-              { seq: 0, type: "turn/end", data: { reason: "failed" } },
+              { seq: 0, type: "turn/end", data: {
+                reason: "failed",
+                ...(error instanceof DshSessionFailure ? error.publicFailure
+                  : { reason_code: "runtime_verification_failed", failure_stage: "session_execution" }),
+              } },
             ], { cursorOffset: active.cursor });
             terminal = failed;
             checkpoint = null;

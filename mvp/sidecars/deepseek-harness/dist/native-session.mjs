@@ -8,6 +8,7 @@ import SessionStore, {
 import SystemPrompt from "../../../../third_party/deepseek-harness/packages/core/system-prompt/lib/index.js";
 import ToolRuntime from "../../../../third_party/deepseek-harness/packages/core/tools/lib/index.js";
 import LlmRuntime, {
+  LlmError,
   createAssistantMessage,
   createUserMessage,
 } from "../../../../third_party/deepseek-harness/packages/llm/llm/lib/index.js";
@@ -15,6 +16,22 @@ import {
   DeepSeekAdapter,
   resolveAdapterOptions,
 } from "../../../../third_party/deepseek-harness/packages/llm/llm-deepseek/lib/index.js";
+
+export class DshSessionFailure extends Error {
+  constructor(failure, stage) {
+    super("DSH Session failed");
+    const provider = failure && typeof failure.code === "string"
+      && ["TRANSPORT", "AUTH", "RATE_LIMIT", "HTTP_ERROR", "INVALID_REQUEST",
+        "SERVER", "SERVER_ERROR", "EMPTY_RESPONSE", "MALFORMED_RESPONSE", "STREAM_CLOSED"].includes(failure.code)
+      || [400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504].includes(failure?.status);
+    this.publicFailure = Object.freeze({
+      reason_code: provider ? "provider_request_failed" : "runtime_verification_failed",
+      failure_stage: provider ? "provider_request" : stage,
+      ...([400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504].includes(failure?.status)
+        ? { http_status: failure.status } : {}),
+    });
+  }
+}
 
 
 function messageText(message) {
@@ -126,6 +143,7 @@ export async function runDeepSeekHarnessSession({
   let agent;
   let abort;
   let content = "";
+  let stage = "session_setup";
   try {
     await ctx.plugin(LlmRuntime);
     await ctx.plugin(SessionStore);
@@ -163,6 +181,7 @@ export async function runDeepSeekHarnessSession({
     agent = published.agent;
     abort = () => agent.cancel(signal.reason ?? new Error("DSH Session was cancelled"));
     signal.addEventListener("abort", abort, { once: true });
+    stage = "session_execution";
     agent.followup(createUserMessage({
       content: [{ type: "text", text: current.content }],
       source: { kind: "user" },
@@ -174,6 +193,12 @@ export async function runDeepSeekHarnessSession({
       throw new Error(`DSH native Session ended with ${reason ?? "no terminal"}`);
     }
     return Object.freeze({ content, nativeEvents: agent.session.events });
+  } catch (error) {
+    const terminal = agent?.session.events.findLast(event => event.type === "turn/end");
+    throw new DshSessionFailure(
+      error instanceof LlmError ? error.failure : terminal?.data?.reason?.error,
+      stage,
+    );
   } finally {
     if (abort !== undefined) signal.removeEventListener("abort", abort);
     await ctx.fiber.dispose();

@@ -55,6 +55,14 @@ class _ManualContainedClient(EngineHostV2Client):
         return await super()._terminate_process_tree(process, None)
 
 
+class RuntimeLiveVerificationError(ValueError):
+    def __init__(self, reason_code):
+        self.reason_code = reason_code if reason_code in {
+            "provider_request_failed", "runtime_verification_failed"
+        } else "runtime_verification_failed"
+        super().__init__(self.reason_code)
+
+
 def _manual_client_factory(config, generation, containment_lock):
     client_type = (
         _ManualContainedClient
@@ -393,6 +401,10 @@ async def _observe_runtime_live_endpoint(
         raise ValueError("formal runtime did not emit one terminal")
     terminal = terminals[0].terminal_status
     assert terminal is not None
+    if terminal != "completed":
+        raise RuntimeLiveVerificationError(
+            terminals[0].runtime_event.payload.get("reason_code")
+        )
     assistant_messages = tuple(
         item.assistant_message
         for item in projected

@@ -13,7 +13,7 @@ import { loadFixedPreset } from "../src/bootstrap.ts";
 import { createCheckpoint, sealAcknowledgement } from "../src/checkpoint.ts";
 import { mapSessionEvents, sortPromptSections } from "../src/event-mapper.ts";
 import { EphemeralGrantChannel } from "../src/grant-channel.ts";
-import { runDeepSeekHarnessSession } from "../src/native-session.ts";
+import { runDeepSeekHarnessSession, DshSessionFailure } from "../src/native-session.ts";
 import { createSidecar } from "../src/server.ts";
 
 
@@ -24,6 +24,15 @@ const FIXED_PLUGINS = [
   "@deepseek-ai/dsh-llm-deepseek",
   "@johnason/deepseek-harness-host-v2",
 ];
+
+test("failed Session diagnostics retain only fixed stage, reason and HTTP status", () => {
+  const error = new DshSessionFailure({code:"AUTH",status:401,message:"private-response"}, "session_execution");
+  const [event] = mapSessionEvents({run_id:"run",term_id:"term",step_id:"step"}, [
+    {seq:0,type:"turn/end",data:{reason:"failed",...error.publicFailure,detail:"private-response"}},
+  ]);
+  assert.deepEqual(event.payload,{status:"failed",reason_code:"provider_request_failed",failure_stage:"provider_request",http_status:401});
+  assert.equal(JSON.stringify(event).includes("private-response"),false);
+});
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRYPOINT = path.join(ROOT, "dist/deepseek-harness-host-v2.mjs");
@@ -846,7 +855,9 @@ test("published model Host maps an HTTP provider error to one failed terminal", 
     assert.equal((await wire.read()).payload.accepted, true);
     assert.deepEqual((await wire.read()).payload.payload, { status: "running" });
     const failed = await wire.read();
-    assert.deepEqual(failed.payload.payload, { status: "failed" });
+    assert.deepEqual(failed.payload.payload, {
+      status: "failed", reason_code: "provider_request_failed", failure_stage: "provider_request",
+    });
     assert.equal(failed.payload.cursor, 2);
   } finally {
     await wire.close();

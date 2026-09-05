@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "b744aca4d7a1f91c130278ebcb00c56644c735a631691781963fbf65447761ae",
-      "size": 2119027
+      "sha256": "b55911bcfce752a3f48d0a3f94c32354194f0d40787d2dc1c4d66b5737b759ef",
+      "size": 2121945
     },
     {
       "path": "uv.lock",
@@ -499,7 +499,7 @@
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "f051e17efae7320107bb14a49c8980db9e3bc7c0ccf2d1fe68e711dafc2cc2fc",
+      "sha256": "2f3322694439cbe4b13f8495a645fba26c8e533267c28f9ab0bf97abb7e642f3",
       "size": 7057
     },
     {
@@ -559,8 +559,8 @@
     },
     {
       "path": "runtime/engine_host/v2/mapper.py",
-      "sha256": "d321bbab2c6b288f997bb99975606c906635346ee2cee8871fb21be3de2abf52",
-      "size": 27340
+      "sha256": "7f27611e850c628add92d6e7e2727722bec8c3e05cf5c9cdf066951293d9f734",
+      "size": 27839
     },
     {
       "path": "runtime/engine_host/v2/process_guard.py",
