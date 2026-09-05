@@ -1009,7 +1009,12 @@ class EngineHostV2Client:
             raise RuntimeCapabilityError(
                 "negotiated runtime identity does not match durable selection"
             )
-        required = ["event_cursor", "query", "streaming", "model", "workspace"]
+        # Model/workspace capabilities describe what the application may expose
+        # from the admission catalog; the Host v2 query bridge itself consumes
+        # only the pinned provider Grant and streamed model events.  Keep those
+        # capability bits available for the admission probe, while gating the
+        # optional tool/workspace bridges below when an envelope uses them.
+        required = ["event_cursor", "query", "streaming"]
         if envelope.tool_manifest:
             required.append("tools")
         if envelope.skill_pins:

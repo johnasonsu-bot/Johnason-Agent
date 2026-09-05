@@ -139,6 +139,7 @@ def _formal_private_frame(
         "route": {
             "protocol": "deepseek",
             "base_url": base_url,
+            "credential_mode": "reference",
             "metadata_headers": [],
             "thinking_enabled": True,
             "reasoning_effort": "high",

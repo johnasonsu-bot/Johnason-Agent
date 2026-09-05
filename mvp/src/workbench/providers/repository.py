@@ -98,23 +98,34 @@ class ProviderRepository:
                 (record.id,),
             ).fetchone()
             created = row is None
-            if row is None:
+            if row is None and record.credential_mode == "none":
+                persisted = record
+            elif row is None:
                 persisted = record.model_copy(
                     update={"secret_id": f"provider/{uuid4().hex}"}
                 )
             else:
                 existing = ProviderProfileRecord.model_validate_json(row["record_json"])
-                if not _is_secret_id(existing.secret_id):
+                if (
+                    existing.credential_mode == "reference"
+                    and not _is_secret_id(existing.secret_id)
+                    or existing.credential_mode == "none"
+                    and existing.secret_id is not None
+                ):
                     raise ValueError("stored provider secret reference is invalid")
-                persisted = record.model_copy(
-                    update={
-                        "secret_id": (
-                            existing.secret_id
-                            if same_credential_scope(existing, record)
-                            else f"provider/{uuid4().hex}"
-                        )
-                    }
-                )
+                if record.credential_mode == "none":
+                    persisted = record.model_copy(update={"secret_id": None})
+                else:
+                    persisted = record.model_copy(
+                        update={
+                            "secret_id": (
+                                existing.secret_id
+                                if existing.credential_mode == "reference"
+                                and same_credential_scope(existing, record)
+                                else f"provider/{uuid4().hex}"
+                            )
+                        }
+                    )
             connection.execute(
                 """
                 INSERT INTO model_provider_profiles(provider_id, record_json) VALUES (?, ?)
@@ -132,10 +143,13 @@ def same_credential_scope(
     return _credential_scope(existing) == _credential_scope(replacement)
 
 
-def _credential_scope(record: ProviderProfileRecord) -> tuple[str, str, str, int | None]:
+def _credential_scope(
+    record: ProviderProfileRecord,
+) -> tuple[str, str, str, str, int | None]:
     parsed = urlsplit(record.base_url)
     default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
     return (
+        record.credential_mode,
         record.protocol,
         parsed.scheme,
         parsed.hostname or "",

@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "6184e6f5c6c28e51598d2dcd6d60f3d810027732b1879c4f3a99641be646c7bf",
-      "size": 2073903
+      "sha256": "1658382aeefcd941d1ba49d9735dfdd2e00c0db3b45a189522ab1adbb8828f06",
+      "size": 2091264
     },
     {
       "path": "uv.lock",
@@ -239,8 +239,8 @@
     },
     {
       "path": "main.py",
-      "sha256": "4c2785e01ba1891f9cf7fbd1dfa4bd9dbf43625a3e40e5b1deacd8e33b1aaf9e",
-      "size": 42132
+      "sha256": "15bf6901a17b4384e57bacbb15435b9a271dc8fbdae07fc999d52f49f9a54bb9",
+      "size": 42226
     },
     {
       "path": "models/__init__.py",
@@ -274,8 +274,8 @@
     },
     {
       "path": "models/profiles.py",
-      "sha256": "7f249fa7edbaba3398e6b63f534c1a21fcdb76158fc7f5e544666291a64a62f1",
-      "size": 6781
+      "sha256": "355dbf6021bda195ad0042b0ae4737f76f0543f5f5be8cb8760a1dffa5f770d0",
+      "size": 7804
     },
     {
       "path": "orchestration/__init__.py",
@@ -454,8 +454,8 @@
     },
     {
       "path": "providers/repository.py",
-      "sha256": "74dc40c1560a0f0a3f035fa2355ab1c6320d107b9c5bbfb771259d5bdb943794",
-      "size": 6892
+      "sha256": "ffc7f349d46cd121c320615d5d5d3f1343e351676dcfa1d5743cc616b0aa78be",
+      "size": 7520
     },
     {
       "path": "runtime/__init__.py",
@@ -494,13 +494,13 @@
     },
     {
       "path": "runtime/deepseek_harness/source_manifest.json",
-      "sha256": "2685613cdd349080aa1eb5e040bdec27ef27e2aeef92f160391fa71c1c7d818f",
+      "sha256": "48465962aaa9d022f588303ead7bdcbc3cac34ddb18ea51cea7641455b17a04c",
       "size": 6889
     },
     {
       "path": "runtime/development_admission.py",
-      "sha256": "1c960cde832f4ab9289563befb635b24dc9c662323881bc60bdede818de2e8e9",
-      "size": 52961
+      "sha256": "59110f3cadf42dc47a8e6b963f23265ceb9b530eb4b9fe70db9cc40fed888dbd",
+      "size": 33671
     },
     {
       "path": "runtime/engine_host/__init__.py",
@@ -539,8 +539,8 @@
     },
     {
       "path": "runtime/engine_host/v2/client.py",
-      "sha256": "42a4e085f56f823727770c238fea4f6e4497adfd316a4485089feb8cce1f406f",
-      "size": 77264
+      "sha256": "8a99c8796bc8599f946f6f283423d31203c290f5398fcc0ffc46aa16f03311a0",
+      "size": 77635
     },
     {
       "path": "runtime/engine_host/v2/contracts.py",
@@ -614,12 +614,12 @@
     },
     {
       "path": "runtime/goose/source_gate.py",
-      "sha256": "c818d749283431c55cc12cdd2082b2e9afb8407aed7c650a3c5b4d9a68b26899",
-      "size": 39324
+      "sha256": "448260d15f1ab82a6c4afce72c7ab506be48cb73a190f96c89dab480cb423eb3",
+      "size": 39368
     },
     {
       "path": "runtime/goose/source_manifest.json",
-      "sha256": "10868adffaba259cae07d9edbf8ed85531d558f626223c851242d84904d4c0c2",
+      "sha256": "13282fc67c83e1106bf468cf81bf9b19050dc9a1c94a63a839f6dac3d3bfaad4",
       "size": 4779
     },
     {
@@ -629,13 +629,13 @@
     },
     {
       "path": "runtime/provider_grants/broker.py",
-      "sha256": "c46f620bd32956ee56efaeaa69fe4c79e3cb6d3327e64fcb68cf69b51f6816f6",
-      "size": 15031
+      "sha256": "6e8ff8b796505e04adb24a3c53984d5af8fad6aa68b91abd1357811206236f26",
+      "size": 15393
     },
     {
       "path": "runtime/provider_grants/contracts.py",
-      "sha256": "0a0c7aa93cf06cd52c664c2aa75d5775bd3a6413f70614f46445373802464afe",
-      "size": 8984
+      "sha256": "24ea39808cf371c7984aee3183d62a232ecdb245202ad7b8d9b38b0bbff6567e",
+      "size": 9048
     },
     {
       "path": "runtime/provider_grants/coordinator.py",
@@ -649,8 +649,8 @@
     },
     {
       "path": "runtime/provider_grants/private_transport.py",
-      "sha256": "d8b623632fda829e98b14743f5a7204527580476a005c15d5a310b1d96d96ef5",
-      "size": 9699
+      "sha256": "c38da8b3d57c62ee4764b5b27a8971b0cc4d2eadf05088ad718270befadb1e74",
+      "size": 9882
     },
     {
       "path": "runtime/provider_grants/repository.py",

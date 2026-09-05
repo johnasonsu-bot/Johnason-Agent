@@ -10,11 +10,11 @@ import json
 from pathlib import Path
 import sys
 
-from workbench.credentials.service import VaultService
-from workbench.runtime.development_admission import (
-    collect_runtime_live_endpoint_evidence,
-    prepare_development_environment,
-)
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from federated_runtime_dev_signer import prepare_development_environment
 
 
 def _arguments() -> argparse.Namespace:
@@ -45,48 +45,33 @@ def _arguments() -> argparse.Namespace:
 async def _prepare(arguments: argparse.Namespace):
     if len(set(arguments.runtime_ids)) != len(arguments.runtime_ids):
         raise ValueError("runtime selectors must be unique")
-    model_runtimes = tuple(
-        item for item in arguments.runtime_ids if item in {"goose", "dsh"}
-    )
-    if model_runtimes:
-        if not arguments.provider_profile_id:
-            raise ValueError("saved provider profile is required")
-        if not arguments.vault_password_stdin:
-            raise ValueError("Vault password must be read from standard input")
+    if not arguments.provider_profile_id:
+        raise ValueError("saved provider profile is required")
     runtime_dir = arguments.runtime_dir.absolute()
     output_dir = arguments.output_dir.absolute()
-    observations = []
-    vault = VaultService(runtime_dir / "credentials.vault")
+    password: str | None = None
+    if arguments.vault_password_stdin:
+        password = sys.stdin.readline()
+        if not password:
+            raise ValueError("Vault password is unavailable")
+        password = password.rstrip("\r\n")
     try:
-        if model_runtimes:
-            password = sys.stdin.readline()
-            if not password:
-                raise ValueError("Vault password is unavailable")
-            vault.unlock(password.rstrip("\r\n"))
-            password = ""
-            for runtime_id in model_runtimes:
-                observations.append(
-                    await collect_runtime_live_endpoint_evidence(
-                        runtime_id=runtime_id,
-                        provider_profile_id=arguments.provider_profile_id,
-                        runtime_dir=runtime_dir,
-                        vault=vault,
-                    )
-                )
-        return prepare_development_environment(
-            arguments.runtime_ids,
-            output_dir,
-            live_evidence=tuple(observations),
+        return await prepare_development_environment(
+            runtime_ids=tuple(arguments.runtime_ids),
+            provider_profile_id=arguments.provider_profile_id,
+            runtime_dir=runtime_dir,
+            output_dir=output_dir,
+            vault_password=password,
         )
     finally:
-        vault.lock()
+        password = None
 
 
 def main() -> int:
     arguments = _arguments()
     try:
         result = asyncio.run(_prepare(arguments))
-    except (OSError, RuntimeError, TypeError, ValueError):
+    except Exception:
         print(
             json.dumps(
                 {
@@ -94,7 +79,8 @@ def main() -> int:
                     "reason": "live_endpoint_verification_failed",
                 },
                 sort_keys=True,
-            )
+            ),
+            file=sys.stderr,
         )
         return 1
     print(json.dumps(asdict(result), sort_keys=True))

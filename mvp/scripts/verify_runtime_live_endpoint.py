@@ -10,11 +10,11 @@ import json
 from pathlib import Path
 import sys
 
-from workbench.credentials.service import VaultService
-from workbench.runtime.development_admission import (
-    collect_runtime_live_endpoint_evidence,
-    prepare_development_environment,
-)
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from federated_runtime_dev_signer import prepare_development_environment
 
 
 def _arguments() -> argparse.Namespace:
@@ -25,7 +25,7 @@ def _arguments() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--runtime", required=True, choices=("goose", "dsh")
+        "--runtime", required=True, choices=("python-term", "goose", "dsh")
     )
     parser.add_argument("--provider-profile-id", required=True)
     parser.add_argument("--runtime-dir", required=True, type=Path)
@@ -40,28 +40,22 @@ def _arguments() -> argparse.Namespace:
 
 async def _verify(arguments: argparse.Namespace):
     runtime_dir = arguments.runtime_dir.absolute()
-    if not arguments.vault_password_stdin:
-        raise ValueError("Vault password must be read from standard input")
-    vault = VaultService(runtime_dir / "credentials.vault")
-    try:
+    password: str | None = None
+    if arguments.vault_password_stdin:
         password = sys.stdin.readline()
         if not password:
             raise ValueError("Vault password is unavailable")
-        vault.unlock(password.rstrip("\r\n"))
-        password = ""
-        evidence = await collect_runtime_live_endpoint_evidence(
-            runtime_id=arguments.runtime,
+        password = password.rstrip("\r\n")
+    try:
+        return await prepare_development_environment(
+            runtime_ids=(arguments.runtime,),
             provider_profile_id=arguments.provider_profile_id,
             runtime_dir=runtime_dir,
-            vault=vault,
-        )
-        return prepare_development_environment(
-            (arguments.runtime,),
-            arguments.output_dir.absolute(),
-            live_evidence=(evidence,),
+            output_dir=arguments.output_dir.absolute(),
+            vault_password=password,
         )
     finally:
-        vault.lock()
+        password = None
 
 
 def main() -> int:

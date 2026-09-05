@@ -129,6 +129,7 @@ class ProviderGrantBroker:
             route=ProviderGrantRouteV1(
                 protocol=profile.protocol,
                 base_url=profile.base_url,
+                credential_mode=profile.credential_mode,
                 metadata_headers=tuple(profile.headers.items()),
                 thinking_enabled=profile.thinking_enabled,
                 reasoning_effort=profile.reasoning_effort,
@@ -170,13 +171,17 @@ class ProviderGrantBroker:
             != record.binding.provider_profile_digest
         ):
             raise ProviderGrantUnavailable("provider profile changed")
-        assert profile.secret_id is not None
-        try:
-            value = self._vault.get(profile.secret_id)
-        except (KeyError, VaultError):
-            raise ProviderGrantUnavailable("provider credential unavailable") from None
-        if not isinstance(value, str):
-            raise ProviderGrantUnavailable("provider credential unavailable")
+        if profile.credential_mode == "none":
+            value = ""
+        else:
+            if profile.secret_id is None:
+                raise ProviderGrantUnavailable("provider credential unavailable")
+            try:
+                value = self._vault.get(profile.secret_id)
+            except (KeyError, VaultError):
+                raise ProviderGrantUnavailable("provider credential unavailable") from None
+            if not isinstance(value, str):
+                raise ProviderGrantUnavailable("provider credential unavailable")
 
         secret = bytearray(value.encode("utf-8"))
         view = memoryview(secret)
@@ -301,7 +306,9 @@ class ProviderGrantBroker:
             profile = self._providers.get(provider_id)
         except KeyError:
             raise ProviderGrantUnavailable("provider profile unavailable") from None
-        if not profile.enabled or profile.secret_id is None:
+        if not profile.enabled or (
+            profile.credential_mode == "reference" and profile.secret_id is None
+        ):
             raise ProviderGrantUnavailable("provider profile unavailable")
         return profile
 
@@ -342,6 +349,7 @@ def canonical_provider_profile_digest(profile: ProviderProfileRecord) -> str:
         "id": profile.id,
         "protocol": profile.protocol,
         "base_url": profile.base_url,
+        "credential_mode": profile.credential_mode,
         "secret_id": profile.secret_id,
         "headers": dict(sorted(profile.headers.items())),
         "model_aliases": dict(sorted(profile.model_aliases.items())),

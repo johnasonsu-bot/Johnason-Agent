@@ -81,7 +81,12 @@ class SocketProviderGrantDelivery:
         if secret.ndim != 1 or not secret.contiguous:
             raise ProviderGrantTransportError("provider grant secret is not contiguous")
         secret_bytes = secret.cast("B")
-        if not 0 < secret_bytes.nbytes <= self._max_secret_bytes:
+        expected_empty = binding.route.credential_mode == "none"
+        if (
+            expected_empty and secret_bytes.nbytes != 0
+            or not expected_empty
+            and not 0 < secret_bytes.nbytes <= self._max_secret_bytes
+        ):
             raise ProviderGrantTransportError("provider grant secret size is invalid")
 
         async with self._lock:

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::os::fd::{FromRawFd, RawFd};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,6 +70,7 @@ pub struct GrantMaterial {
 pub(crate) struct ProviderMaterial {
     protocol: String,
     base_url: String,
+    credential_mode: String,
     metadata_headers: Vec<(String, String)>,
     thinking_enabled: bool,
     reasoning_effort: String,
@@ -121,6 +123,7 @@ struct ProviderGrantBinding {
 struct ProviderGrantRoute {
     protocol: String,
     base_url: String,
+    credential_mode: String,
     metadata_headers: Vec<(String, String)>,
     thinking_enabled: bool,
     reasoning_effort: String,
@@ -173,13 +176,15 @@ impl GrantMaterial {
             || self.binding.step_id != step_id
             || expected_provider_ref != provider_ref
             || self.binding.model.is_empty()
-            || self.bytes.is_empty()
+            || self.binding.route.credential_mode == "reference" && self.bytes.is_empty()
+            || self.binding.route.credential_mode == "none" && !self.bytes.is_empty()
         {
             return Err("provider Grant binding identity mismatch".into());
         }
         Ok(ProviderMaterial {
             protocol: std::mem::take(&mut self.binding.route.protocol),
             base_url: std::mem::take(&mut self.binding.route.base_url),
+            credential_mode: std::mem::take(&mut self.binding.route.credential_mode),
             metadata_headers: std::mem::take(&mut self.binding.route.metadata_headers),
             thinking_enabled: self.binding.route.thinking_enabled,
             reasoning_effort: std::mem::take(&mut self.binding.route.reasoning_effort),
@@ -196,6 +201,10 @@ impl ProviderMaterial {
 
     pub(crate) fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub(crate) fn credential_mode(&self) -> &str {
+        &self.credential_mode
     }
 
     pub(crate) fn metadata_headers(&self) -> &[(String, String)] {
@@ -222,6 +231,7 @@ impl ProviderMaterial {
     pub(crate) fn for_test(
         protocol: &str,
         base_url: String,
+        credential_mode: &str,
         metadata_headers: Vec<(String, String)>,
         thinking_enabled: bool,
         reasoning_effort: &str,
@@ -231,6 +241,7 @@ impl ProviderMaterial {
         Self {
             protocol: protocol.into(),
             base_url,
+            credential_mode: credential_mode.into(),
             metadata_headers,
             thinking_enabled,
             reasoning_effort: reasoning_effort.into(),
@@ -265,11 +276,7 @@ fn read_once(fd: RawFd) -> Result<GrantMaterial, String> {
     }
     let header_size = u32::from_be_bytes(prefix[9..13].try_into().expect("header size")) as usize;
     let secret_size = u32::from_be_bytes(prefix[13..17].try_into().expect("secret size")) as usize;
-    if header_size == 0
-        || header_size > MAX_HEADER_BYTES
-        || secret_size == 0
-        || secret_size > MAX_SECRET_BYTES
-    {
+    if header_size == 0 || header_size > MAX_HEADER_BYTES || secret_size > MAX_SECRET_BYTES {
         return Err("provider Grant Channel framing is invalid".into());
     }
     let mut header_bytes = vec![0_u8; header_size];
@@ -277,6 +284,11 @@ fn read_once(fd: RawFd) -> Result<GrantMaterial, String> {
         .map_err(|_| "provider Grant Channel header is incomplete")?;
     let (binding, grant_digest) = parse_header(&header_bytes)?;
     header_bytes.fill(0);
+    if binding.route.credential_mode == "reference" && secret_size == 0
+        || binding.route.credential_mode == "none" && secret_size != 0
+    {
+        return Err("provider Grant Channel credential payload is invalid".into());
+    }
     let mut secret = vec![0_u8; secret_size];
     if file.read_exact(&mut secret).is_err() {
         secret.fill(0);
@@ -390,7 +402,14 @@ fn validate_binding(binding: &ProviderGrantBinding) -> Result<(), String> {
 fn validate_route(route: &ProviderGrantRoute) -> Result<(), String> {
     validate_opaque_route_identifier(&route.protocol)?;
     validate_route_base_url(&route.base_url)?;
-    if !matches!(route.reasoning_effort.as_str(), "high" | "max") {
+    if !matches!(route.reasoning_effort.as_str(), "high" | "max")
+        || !matches!(route.credential_mode.as_str(), "reference" | "none")
+        || route.credential_mode == "none"
+            && (!matches!(
+                route.protocol.as_str(),
+                "lmstudio" | "openai_chat" | "openai_compatible"
+            ) || !is_loopback_http(&route.base_url))
+    {
         return Err("provider Grant route is invalid".into());
     }
     let _ = route.thinking_enabled;
@@ -416,6 +435,26 @@ fn validate_route(route: &ProviderGrantRoute) -> Result<(), String> {
         previous = Some(current);
     }
     Ok(())
+}
+
+fn is_loopback_http(value: &str) -> bool {
+    let Some(authority_and_path) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    let host = if authority.starts_with('[') {
+        authority
+            .split(']')
+            .next()
+            .unwrap_or_default()
+            .trim_start_matches('[')
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn validate_opaque_route_identifier(value: &str) -> Result<(), String> {
@@ -491,6 +530,7 @@ mod tests {
         let route = ProviderGrantRoute {
             protocol: "deepseek".into(),
             base_url: "https://api.deepseek.com".into(),
+            credential_mode: "reference".into(),
             metadata_headers: vec![("Accept".into(), "application/json".into())],
             thinking_enabled: true,
             reasoning_effort: "high".into(),
@@ -509,5 +549,21 @@ mod tests {
             ..credential_url
         };
         assert!(validate_route(&credential_header).is_err());
+
+        let local_no_credential = ProviderGrantRoute {
+            protocol: "lmstudio".into(),
+            base_url: "http://127.0.0.1:1234/v1".into(),
+            credential_mode: "none".into(),
+            metadata_headers: Vec::new(),
+            thinking_enabled: false,
+            reasoning_effort: "high".into(),
+        };
+        assert!(validate_route(&local_no_credential).is_ok());
+
+        let non_loopback_name = ProviderGrantRoute {
+            base_url: "http://127.attacker.test:1234/v1".into(),
+            ..local_no_credential
+        };
+        assert!(validate_route(&non_loopback_name).is_err());
     }
 }

@@ -13,7 +13,7 @@ const GRANT_BINDING_FIELDS = Object.freeze([
   "grant_nonce_digest",
 ]);
 const GRANT_ROUTE_FIELDS = Object.freeze([
-  "protocol", "base_url", "metadata_headers", "thinking_enabled", "reasoning_effort",
+  "protocol", "base_url", "credential_mode", "metadata_headers", "thinking_enabled", "reasoning_effort",
 ]);
 const GRANT_TARGET_FIELDS = Object.freeze([
   "runtime_id", "build_id", "lease_id", "instance_id_digest", "instance_nonce_digest",
@@ -52,6 +52,7 @@ function normalizeRoute(route) {
   if (!exactKeys(route, GRANT_ROUTE_FIELDS)
       || typeof route.protocol !== "string" || route.protocol.length === 0
       || typeof route.base_url !== "string" || route.base_url.length === 0
+      || route.credential_mode !== "reference"
       || typeof route.thinking_enabled !== "boolean"
       || !["high", "max"].includes(route.reasoning_effort)
       || !Array.isArray(route.metadata_headers)) {
@@ -114,7 +115,8 @@ export class EphemeralGrantChannel {
       throw new Error("provider grant binding is invalid or expired");
     }
     const route = normalizeRoute(binding.route);
-    if (!Buffer.isBuffer(transientSecret) || transientSecret.length === 0) {
+    if (!Buffer.isBuffer(transientSecret)
+        || (route.credential_mode === "reference" && transientSecret.length === 0)) {
       throw new Error("provider grant secret is invalid");
     }
     if (this.grants.has(binding.grant_id)) {
@@ -288,7 +290,7 @@ export function startPreopenedGrantReceiver(
         const headerBytes = buffered.readUInt32BE(9);
         const secretBytes = buffered.readUInt32BE(13);
         if (headerBytes === 0 || headerBytes > MAX_HEADER_BYTES
-            || secretBytes === 0 || secretBytes > MAX_SECRET_BYTES) {
+            || secretBytes > MAX_SECRET_BYTES) {
           fail("private provider grant framing is invalid");
           return;
         }
@@ -317,6 +319,10 @@ export function startPreopenedGrantReceiver(
         return;
       }
       const secret = buffered.subarray(GRANT_PREFIX_BYTES + headerBytes);
+      if (binding.route.credential_mode === "reference" && secret.length === 0) {
+        fail("private provider grant credential payload is invalid");
+        return;
+      }
       let acknowledgement;
       try {
         acknowledgement = channel.accept({

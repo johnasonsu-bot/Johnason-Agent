@@ -1,7 +1,9 @@
-"""External DEV_UNTRUSTED runtime evidence and fail-closed catalog import.
+"""Verifier-only import of externally signed DEV_UNTRUSTED runtime evidence.
 
-The Workbench process is a verifier only.  A short-lived preparation process
-owns the sole Ed25519 private key and publishes only public, secret-free files.
+The Workbench application owns no private key, signing operation, live executor
+injection seam, or bundle publisher.  It accepts a complete public bundle only
+after verifying its signatures, fixed source/build identities, evidence
+freshness, and persistent anti-replay ledger.
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ import binascii
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 import hashlib
-import ipaddress
 import json
 import math
 import os
@@ -21,20 +22,11 @@ import sqlite3
 import stat
 import time
 from typing import Literal
-from urllib.parse import urlsplit
-from uuid import uuid4
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
-from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-from pydantic import ConfigDict, Field, StrictInt, field_validator
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from workbench.credentials.service import VaultService
-from workbench.models.profiles import ProviderProfileRecord
-from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     RuntimeGateReceipt,
@@ -44,12 +36,7 @@ from workbench.runtime.engine_host.v2.assignment import (
 )
 from workbench.runtime.engine_host.v2.contracts import (
     FrozenModel,
-    RunEnvelopeV2,
     RuntimeCapabilitiesV2,
-    RuntimeEventV2,
-    RuntimeMessageInputV2,
-    RuntimeQueryInputV2,
-    canonical_runtime_input_digest,
 )
 from workbench.runtime.engine_host.v2.registry import (
     RuntimeRegistryIntegrityError,
@@ -57,16 +44,6 @@ from workbench.runtime.engine_host.v2.registry import (
     canonical_capability_snapshot,
 )
 from workbench.runtime.engine_host.v2.runtime_admission import RuntimeCatalogEntry
-from workbench.runtime.federated_conversation import (
-    FederatedConversationExecutor,
-    project_runtime_events,
-)
-from workbench.runtime.provider_grants import canonical_provider_profile_digest
-from workbench.settings import RuntimeProcessConfig
-from workbench.runtime.python_term.dev_environment import (
-    DEVELOPMENT_PROOF_TTL_SECONDS,
-    _build_documents as _build_python_term_documents,
-)
 from workbench.runtime.python_term.gate import python_term_gate_source_revision
 from workbench.runtime.python_term.runtime import RUNTIME_BUILD_ID
 
@@ -78,25 +55,16 @@ TerminalStatus = Literal["completed", "cancelled", "failed"]
 SUPPORTED_RUNTIME_IDS: tuple[RuntimeId, ...] = ("python-term", "goose", "dsh")
 FEDERATED_DEVELOPMENT_MANIFEST = "federated-runtime-dev-manifest.json"
 FEDERATED_DEVELOPMENT_PUBLIC_KEY = "federated-runtime-dev-public-key.txt"
-_MANIFEST_SCHEMA = "workbench.runtime.development_environment.v1"
+LIVE_EVIDENCE_TTL_SECONDS = 60 * 60
+_MANIFEST_SCHEMA = "workbench.runtime.development_environment.v2"
 _EVIDENCE_SCHEMA = "workbench.runtime.live_endpoint_evidence.v1"
-_MANIFEST_DOMAIN = b"johnason.runtime-development-manifest/v1\0"
+_MANIFEST_DOMAIN = b"johnason.runtime-development-manifest/v2\0"
 _PROOF_DOMAIN = b"johnason.runtime-gate-proof/v1\0"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_KEY_ID = re.compile(r"^ed25519:[0-9a-f]{32}$")
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,255}$")
-_LIVE_EVIDENCE_ISSUER = object()
-_FIXTURE_TERMS = frozenset({"fake", "fixture", "mock", "stub", "test"})
-_LIVE_SNAPSHOT_FIELDS = frozenset(
-    {
-        "selector",
-        "runtime_id",
-        "build_id",
-        "provider_profile_digest",
-        "resolved_model",
-        "envelope",
-        "runtime_input",
-    }
-)
+_SAFE_ARTIFACT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+_MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 _CAPABILITY_NAMES = (
     "query",
     "model",
@@ -114,6 +82,22 @@ _CAPABILITY_NAMES = (
     "prompt_sections",
     "tool_interceptors",
     "event_cursor",
+)
+_EVIDENCE_ID_FIELDS = frozenset(
+    {
+        "verification_challenge_digest",
+        "runtime_id",
+        "build_id",
+        "provider_profile_digest",
+        "model",
+        "endpoint_kind",
+        "observed_at",
+        "verified_at",
+        "expires_at",
+        "latency_ms",
+        "terminal",
+        "output_digest",
+    }
 )
 
 
@@ -137,15 +121,7 @@ def _key_id(public_key: bytes) -> str:
     return "ed25519:" + _sha256(public_key)[:32]
 
 
-def _enabled_capabilities(
-    capabilities: RuntimeCapabilitiesV2,
-) -> tuple[str, ...]:
-    return tuple(
-        name for name in _CAPABILITY_NAMES if getattr(capabilities, name)
-    )
-
-
-def _timestamp(value: float, field: str) -> float:
+def _timestamp(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} must be a timestamp")
     result = float(value)
@@ -154,17 +130,41 @@ def _timestamp(value: float, field: str) -> float:
     return result
 
 
+def _enabled_capabilities(
+    capabilities: RuntimeCapabilitiesV2,
+) -> tuple[str, ...]:
+    return tuple(name for name in _CAPABILITY_NAMES if getattr(capabilities, name))
+
+
+def canonical_live_evidence_id(value: object) -> str:
+    """Return the stable content identity of one secret-free live observation."""
+    if isinstance(value, LiveEndpointEvidenceV1):
+        payload = value.model_dump(mode="json")
+    elif isinstance(value, Mapping):
+        payload = dict(value)
+    else:
+        raise TypeError("live evidence must be an object")
+    payload.pop("evidence_id", None)
+    if set(payload) != _EVIDENCE_ID_FIELDS:
+        raise ValueError("live endpoint evidence identity fields changed")
+    return _sha256(_canonical_bytes(payload))
+
+
 class LiveEndpointEvidenceV1(FrozenModel):
-    """Public evidence for one real endpoint observation; never an authority."""
+    """Public, signed evidence for one challenge-bound real endpoint call."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
 
+    evidence_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verification_challenge_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     runtime_id: RuntimeId
     build_id: str = Field(min_length=1, max_length=256)
     provider_profile_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     model: str = Field(min_length=1, max_length=256)
     endpoint_kind: EndpointKind
     observed_at: float
+    verified_at: float
+    expires_at: float
     latency_ms: StrictInt = Field(ge=0, le=86_400_000)
     terminal: TerminalStatus
     output_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -176,23 +176,22 @@ class LiveEndpointEvidenceV1(FrozenModel):
             raise ValueError("live endpoint identity is invalid")
         return value
 
-    @field_validator("observed_at", mode="before")
+    @field_validator("observed_at", "verified_at", "expires_at", mode="before")
     @classmethod
-    def validate_observed_at(cls, value: object) -> float:
-        return _timestamp(value, "observed_at")  # type: ignore[arg-type]
+    def validate_timestamp(cls, value: object, info: object) -> float:
+        return _timestamp(value, getattr(info, "field_name", "timestamp"))
 
-
-@dataclass(frozen=True, slots=True)
-class _VerifiedLiveEndpointEvidence:
-    evidence: LiveEndpointEvidenceV1
-    _issuer: object
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.evidence) is not LiveEndpointEvidenceV1
-            or self._issuer is not _LIVE_EVIDENCE_ISSUER
-        ):
-            raise ValueError("real endpoint evidence required")
+    @model_validator(mode="after")
+    def validate_freshness_and_identity(self) -> LiveEndpointEvidenceV1:
+        if self.verified_at < self.observed_at:
+            raise ValueError("live endpoint verification precedes observation")
+        if self.expires_at != self.observed_at + LIVE_EVIDENCE_TTL_SECONDS:
+            raise ValueError("live endpoint evidence expiry changed")
+        if self.verified_at >= self.expires_at:
+            raise ValueError("live endpoint evidence verification is stale")
+        if self.evidence_id != canonical_live_evidence_id(self):
+            raise ValueError("live endpoint evidence identity changed")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,15 +214,8 @@ class RuntimeDevelopmentIdentity:
 
 
 @dataclass(frozen=True, slots=True)
-class ComposedRuntimeReceipt:
-    receipt: RuntimeGateReceipt
-    proof: SignedRuntimeGateProof
-    evidence: LiveEndpointEvidenceV1
-
-
-@dataclass(frozen=True, slots=True)
 class DevelopmentEnvironmentResult:
-    status: Literal["prepared", "already_prepared"]
+    status: Literal["prepared"]
     output_dir: str
     runtime_ids: tuple[RuntimeId, ...]
     trust_status: Literal["DEV_UNTRUSTED"] = "DEV_UNTRUSTED"
@@ -237,7 +229,7 @@ class DevelopmentAdmissionImport:
 
 
 def runtime_capabilities_for(runtime_id: RuntimeId) -> RuntimeCapabilitiesV2:
-    """Return the only model capability snapshots this gate may publish."""
+    """Return model capabilities that may be published only with live evidence."""
     if runtime_id == "python-term":
         return RuntimeCapabilitiesV2(
             runtime_id=runtime_id,
@@ -280,7 +272,6 @@ def require_live_endpoint_binding(
     provider_profile_digest: str,
     model: str,
 ) -> None:
-    """Check every frozen identity without turning public evidence into trust."""
     if type(evidence) is not LiveEndpointEvidenceV1:
         raise TypeError("evidence must be LiveEndpointEvidenceV1")
     if (
@@ -292,713 +283,324 @@ def require_live_endpoint_binding(
         raise ValueError("live endpoint evidence identity changed")
 
 
-async def verify_runtime_live_endpoint(
-    *,
-    executor: FederatedConversationExecutor,
-    execution_snapshot: Mapping[str, object],
-    profile: ProviderProfileRecord,
-    observed_at: float | None = None,
-    monotonic=time.monotonic,
-) -> _VerifiedLiveEndpointEvidence:
-    """Observe one real endpoint through Assignment→Supervisor→Grant→Host v2."""
-    if type(executor) is not FederatedConversationExecutor:
-        raise TypeError("live verification requires FederatedConversationExecutor")
-    if type(profile) is not ProviderProfileRecord:
-        raise TypeError("live verification requires a ProviderProfileRecord")
-    endpoint_kind = _real_endpoint_kind(profile)
-    if not isinstance(execution_snapshot, Mapping):
-        raise ValueError("runtime execution snapshot is invalid")
-    if set(execution_snapshot) != _LIVE_SNAPSHOT_FIELDS:
-        raise ValueError("runtime execution snapshot fields changed")
+def _open_directory_fd(path: Path) -> int:
+    if not isinstance(path, Path):
+        raise TypeError("development output directory must be a Path")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     try:
-        envelope = RunEnvelopeV2.model_validate(execution_snapshot["envelope"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("runtime execution snapshot is invalid") from error
-    profile_digest = canonical_provider_profile_digest(profile)
-    runtime_id = envelope.runtime.runtime_id
-    if runtime_id not in SUPPORTED_RUNTIME_IDS:
-        raise ValueError("runtime execution snapshot is invalid")
-    require_live_endpoint_binding(
-        LiveEndpointEvidenceV1(
-            runtime_id=runtime_id,
-            build_id=envelope.runtime.build_id,
-            provider_profile_digest=profile_digest,
-            model=envelope.model,
-            endpoint_kind=endpoint_kind,
-            observed_at=observed_at or time.time(),
-            latency_ms=0,
-            terminal="completed",
-            output_digest="0" * 64,
-        ),
-        runtime_id=str(execution_snapshot.get("runtime_id")),
-        build_id=str(execution_snapshot.get("build_id")),
-        provider_profile_digest=str(
-            execution_snapshot.get("provider_profile_digest")
-        ),
-        model=str(execution_snapshot.get("resolved_model")),
-    )
-    if (
-        envelope.provider_ref != f"provider-profile:{profile.id}"
-        or envelope.extensions.get("provider_profile_digest") != profile_digest
-        or envelope.extensions.get("resolved_model") != envelope.model
-        or envelope.model not in set(profile.model_aliases.values())
-    ):
-        raise ValueError("live endpoint evidence identity changed")
-
-    started = float(monotonic())
-    events: list[RuntimeEventV2] = []
-    async for event in executor.execute(execution_snapshot):
-        if type(event) is not RuntimeEventV2:
-            raise ValueError("formal runtime emitted invalid live evidence")
-        events.append(event)
-    elapsed = float(monotonic()) - started
-    projected = project_runtime_events(tuple(events), after_cursor=0)
-    terminals = [item for item in projected if item.terminal_status is not None]
-    if len(terminals) != 1 or terminals[0] is not projected[-1]:
-        raise ValueError("formal runtime did not emit one terminal")
-    terminal = terminals[0].terminal_status
-    assert terminal is not None
-    if terminal == "completed" and not any(
-        item.assistant_message for item in projected
-    ):
-        raise ValueError("completed live endpoint emitted no model output")
-    public_transcript = [
-        item.runtime_event.model_dump(mode="json") for item in projected
-    ]
-    evidence = LiveEndpointEvidenceV1(
-        runtime_id=runtime_id,
-        build_id=envelope.runtime.build_id,
-        provider_profile_digest=profile_digest,
-        model=envelope.model,
-        endpoint_kind=endpoint_kind,
-        observed_at=time.time() if observed_at is None else observed_at,
-        latency_ms=max(0, round(elapsed * 1_000)),
-        terminal=terminal,
-        output_digest=_sha256(_canonical_bytes(public_transcript)),
-    )
-    return _VerifiedLiveEndpointEvidence(evidence, _LIVE_EVIDENCE_ISSUER)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ValueError("development output directory is invalid")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
-def _real_endpoint_kind(profile: ProviderProfileRecord) -> EndpointKind:
-    if not profile.enabled or not profile.secret_id:
-        raise ValueError("real endpoint evidence required")
-    identity_tokens = re.split(
-        r"[^a-z0-9]+",
-        " ".join(
-            (
-                profile.id,
-                profile.name,
-                *profile.model_aliases.keys(),
-                *profile.model_aliases.values(),
-            )
-        ).casefold(),
-    )
-    if _FIXTURE_TERMS.intersection(identity_tokens):
-        raise ValueError("real endpoint evidence required")
-    parsed = urlsplit(profile.base_url)
-    host = (parsed.hostname or "").casefold().rstrip(".")
+def _artifact_name(name: object) -> str:
+    if not isinstance(name, str) or _SAFE_ARTIFACT.fullmatch(name) is None:
+        raise ValueError("development artifact name is invalid")
+    return name
+
+
+def _read_bytes_at(directory_fd: int, name: str) -> bytes:
+    safe_name = _artifact_name(name)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(safe_name, flags, dir_fd=directory_fd)
     try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        address = None
-    loopback = host == "localhost" or (address is not None and address.is_loopback)
-    if loopback:
-        if profile.protocol == "lmstudio" and parsed.scheme == "http":
-            return "local"
-        raise ValueError("real endpoint evidence required")
-    if (
-        parsed.scheme != "https"
-        or not host
-        or host.endswith((".local", ".test", ".invalid", ".example"))
-        or address is not None
-        and (address.is_private or address.is_reserved or address.is_unspecified)
-    ):
-        raise ValueError("real endpoint evidence required")
-    return "cloud"
-
-
-def _build_live_execution_snapshot(
-    *,
-    runtime_id: str,
-    build_id: str,
-    host_generation: str,
-    profile: ProviderProfileRecord,
-    now: float | None = None,
-) -> dict[str, object]:
-    """Create the one secret-free query frozen for external live validation."""
-    if runtime_id not in {"goose", "dsh"}:
-        raise ValueError("live verification runtime is unsupported")
-    if not isinstance(build_id, str) or not build_id:
-        raise ValueError("live verification build is unavailable")
-    if not isinstance(host_generation, str) or not host_generation:
-        raise ValueError("live verification host generation is unavailable")
-    if type(profile) is not ProviderProfileRecord:
-        raise TypeError("profile must be a ProviderProfileRecord")
-    timestamp = time.time() if now is None else _timestamp(now, "now")
-    model = profile.model_aliases.get("default")
-    if not isinstance(model, str) or not model:
-        raise ValueError("provider profile has no default model")
-    profile_digest = canonical_provider_profile_digest(profile)
-    identity = uuid4().hex
-    message = RuntimeMessageInputV2(
-        message_id=f"live-message-{identity}",
-        role="user",
-        content=(
-            "Reply with a short confirmation that this live model endpoint "
-            "is available."
-        ),
-    )
-    messages = (message,)
-    empty_digest = canonical_runtime_input_digest(())
-    runtime_input = RuntimeQueryInputV2(
-        messages=messages,
-        message_snapshot_digest=canonical_runtime_input_digest(messages),
-        context_items=(),
-        context_snapshot_digest=empty_digest,
-        prompt_sections=(),
-        prompt_manifest_digest=empty_digest,
-    )
-    session_id = f"live-session-{identity}"
-    command_id = f"live-command-{identity}"
-    envelope = RunEnvelopeV2.model_validate(
-        {
-            "runtime": {
-                "runtime_id": runtime_id,
-                "build_id": build_id,
-                "config_digest": _sha256(
-                    _canonical_bytes(
-                        {"runtime_id": runtime_id, "build_id": build_id}
-                    )
-                ),
-                "host_generation": host_generation,
-            },
-            "session_id": session_id,
-            "run_id": f"live-run-{identity}",
-            "term_id": f"live-term-{identity}",
-            "step_id": f"live-step-{identity}",
-            "command_id": command_id,
-            "attempt": 0,
-            "agent_id": "live-endpoint-verifier",
-            "agent_role": "verifier",
-            "provider_ref": f"provider-profile:{profile.id}",
-            "model": model,
-            "model_options_digest": _sha256(_canonical_bytes({})),
-            "message_snapshot_digest": runtime_input.message_snapshot_digest,
-            "context": {
-                "snapshot_ref": f"live-context-{identity}",
-                "snapshot_digest": runtime_input.context_snapshot_digest,
-                "version": 0,
-            },
-            "context_budget": {
-                "max_input_tokens": 4096,
-                "reserved_output_tokens": 256,
-                "protected_message_ids": (message.message_id,),
-                "protected_prompt_section_ids": (),
-                "compaction_policy": "none",
-                "summary_ref": None,
-            },
-            "tool_manifest": (),
-            "tool_manifest_digest": empty_digest,
-            "skill_pins": (),
-            "skill_manifest_digest": empty_digest,
-            "plugin_pins": (),
-            "plugin_manifest_digest": empty_digest,
-            "permission_policy_digest": _sha256(
-                _canonical_bytes(
-                    {"tool_policy": "deny", "filesystem_policy": "deny"}
-                )
-            ),
-            "workspace_grant": {
-                "grant_id": f"live-workspace-{identity}",
-                "workspace_snapshot_ref": f"live-workspace-ref-{identity}",
-                "readable_paths": (),
-                "writable_paths": (),
-                "command_policy": "deny",
-                "network_policy": "deny",
-                "expires_at_ms": int(timestamp * 1_000) + 300_000,
-            },
-            "checkpoint_cursor": 0,
-            "deadline_ms": 120_000,
-            "traceparent": f"00-{uuid4().hex}-{uuid4().hex[:16]}-01",
-            "extensions": {
-                "provider_profile_digest": profile_digest,
-                "resolved_model": model,
-            },
-            "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
-        }
-    )
-    return {
-        "selector": runtime_id,
-        "runtime_id": runtime_id,
-        "build_id": build_id,
-        "provider_profile_digest": profile_digest,
-        "resolved_model": model,
-        "envelope": envelope.model_dump(mode="json"),
-        "runtime_input": runtime_input.model_dump(mode="json"),
-    }
-
-
-async def collect_runtime_live_endpoint_evidence(
-    *,
-    runtime_id: str,
-    provider_profile_id: str,
-    runtime_dir: Path,
-    vault: VaultService,
-    repository_root: Path | None = None,
-) -> _VerifiedLiveEndpointEvidence:
-    """Run one real Profile through Admission→Supervisor→Grant→Host v2.
-
-    The short-lived proof created here authorizes only the capabilities the
-    sidecar currently advertises. It is never published, so it cannot make a
-    runtime selectable in the Workbench application.
-    """
-    if runtime_id not in {"goose", "dsh"}:
-        raise ValueError("live verification runtime is unsupported")
-    if not isinstance(provider_profile_id, str) or not provider_profile_id:
-        raise ValueError("saved provider profile is required")
-    if not isinstance(runtime_dir, Path) or not runtime_dir.is_absolute():
-        raise ValueError("runtime_dir must be an absolute path")
-    if runtime_dir.is_symlink() or not runtime_dir.is_dir():
-        raise ValueError("runtime_dir must be a real directory")
-    if type(vault) is not VaultService:
-        raise TypeError("vault must be a VaultService")
-
-    root = _repository_root() if repository_root is None else repository_root.resolve()
-    providers = ProviderRepository(runtime_dir / "workbench.sqlite")
-    try:
-        profile = providers.get(provider_profile_id)
-    except KeyError as error:
-        raise ValueError("saved provider profile is unavailable") from error
-    _real_endpoint_kind(profile)
-    identity = _runtime_build_identity(runtime_id, root)
-    process = _live_runtime_process(runtime_id, root)
-
-    from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
-    from workbench.runtime.engine_host.v2.runtime_admission import (
-        RuntimeAdmissionCoordinator,
-        RuntimeAdmissionRepository,
-        RuntimeCatalog,
-    )
-    from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
-    from workbench.runtime.provider_grants import (
-        FederatedRuntimeCoordinator,
-        ProviderGrantBroker,
-    )
-
-    verification_database = (
-        runtime_dir / f"federated-runtime-live-{runtime_id}.sqlite"
-    )
-    signer = Ed25519PrivateKey.generate()
-    public_key = signer.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    signer_key_id = _key_id(public_key)
-    assignments = AssignmentRepository.development(
-        verification_database,
-        trust_keys=(RuntimeTrustKey(signer_key_id, public_key, "DEV_UNTRUSTED"),),
-    )
-    registry = RuntimeRegistryV2(RuntimeV2Repository(verification_database))
-    supervisor = SidecarSupervisor(
-        runtimes=(process,),
-        registry=registry,
-        assignments=assignments,
-        runtime_dir=runtime_dir,
-        app_instance_id=f"live-endpoint-{runtime_id}-{uuid4().hex}",
-        lease_seconds=180.0,
-    )
-    started = False
-    try:
-        await supervisor.start()
-        started = True
-        registration = next(
-            (
-                item
-                for item in registry.snapshot()
-                if item.runtime_id == runtime_id and item.state == "ready"
-            ),
-            None,
-        )
-        sidecar = next(
-            (
-                item
-                for item in supervisor.snapshot()
-                if item.runtime_id == runtime_id and item.state == "ready"
-            ),
-            None,
-        )
-        if (
-            registration is None
-            or sidecar is None
-            or registration.build_id != identity.build_id
-            or sidecar.build_id != identity.build_id
-        ):
-            raise RuntimeError("live runtime identity is unavailable")
-        advertised = RuntimeCapabilitiesV2.model_validate(
-            {
-                "runtime_id": runtime_id,
-                "build_id": registration.build_id,
-                **{
-                    name: name in registration.capabilities
-                    for name in _CAPABILITY_NAMES
-                },
-            }
-        )
-        minimum = (
-            {"query", "streaming", "event_cursor"}
-            if runtime_id == "goose"
-            else {"query", "streaming", "prompt_sections", "event_cursor"}
-        )
-        if not minimum.issubset(registration.capabilities):
-            raise RuntimeError("live runtime capability is unavailable")
-        _, capability_digest = canonical_capability_snapshot(advertised)
-        issued_at = time.time()
-        provisional_receipt = RuntimeGateReceipt(
-            proof_version=1,
-            runtime_id=runtime_id,
-            build_id=identity.build_id,
-            source_manifest_digest=identity.source_manifest_digest,
-            build_manifest_digest=identity.build_manifest_digest,
-            capability_digest=capability_digest,
-            gate_result_digest=_sha256(
-                _canonical_bytes(
-                    {
-                        "schema": "workbench.runtime.live_verification_provisional.v1",
-                        "runtime_id": runtime_id,
-                        "capability_digest": capability_digest,
-                    }
-                )
-            ),
-            signer_key_id=signer_key_id,
-            issued_at=issued_at,
-            expires_at=issued_at + 300.0,
-            trust_tier="DEV_UNTRUSTED",
-        )
-        receipt_json = canonical_json(asdict(provisional_receipt))
-        provisional = assignments.store_gate_proof(
-            SignedRuntimeGateProof(
-                receipt_json,
-                signer.sign(_PROOF_DOMAIN + receipt_json.encode("utf-8")),
-            ),
-            trusted_time=issued_at,
-        )
-        capabilities = _enabled_capabilities(advertised)
-        catalog_entry = RuntimeCatalogEntry(
-            selector=runtime_id,
-            runtime_id=runtime_id,
-            build_id=identity.build_id,
-            capability_digest=capability_digest,
-            gate_proof_digest=provisional.proof_digest,
-            required_capabilities=capabilities,
-        )
-        execution_snapshot = _build_live_execution_snapshot(
-            runtime_id=runtime_id,
-            build_id=identity.build_id,
-            host_generation=str(sidecar.host_generation),
-            profile=profile,
-            now=issued_at,
-        )
-        envelope = RunEnvelopeV2.model_validate(execution_snapshot["envelope"])
-        admission = RuntimeAdmissionCoordinator(
-            catalog=RuntimeCatalog((catalog_entry,)),
-            registry=registry,
-            assignments=assignments,
-            intents=RuntimeAdmissionRepository(verification_database),
-            trusted_time=time.time,
-        )
-        admitted = admission.admit(
-            selector=runtime_id,
-            session_id=envelope.session_id,
-            command_id=envelope.command_id,
-            envelope=envelope,
-        )
-        if admitted.assignment is None:
-            raise RuntimeError("live runtime assignment is unavailable")
-        broker = ProviderGrantBroker(
-            database=verification_database,
-            providers=providers,
-            vault=vault,
-            authority=supervisor,
-        )
-        executor = FederatedConversationExecutor(
-            assignments=assignments,
-            supervisor=supervisor,
-            coordinator=FederatedRuntimeCoordinator(broker),
-        )
-        return await verify_runtime_live_endpoint(
-            executor=executor,
-            execution_snapshot=execution_snapshot,
-            profile=profile,
-            observed_at=time.time(),
-        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > _MAX_ARTIFACT_BYTES:
+            raise ValueError("development artifact is not a regular file")
+        chunks: list[bytes] = []
+        remaining = _MAX_ARTIFACT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > _MAX_ARTIFACT_BYTES:
+            raise ValueError("development artifact is too large")
+        return raw
     finally:
-        if started:
-            await supervisor.aclose()
+        os.close(descriptor)
 
 
-def _live_runtime_process(
-    runtime_id: str, repository_root: Path
-) -> RuntimeProcessConfig:
-    if runtime_id == "goose":
-        executable = (
-            repository_root
-            / "mvp/runtime-hosts/goose-host-v2/target/release/goose-host-v2"
-        )
-    elif runtime_id == "dsh":
-        executable = (
-            repository_root
-            / "mvp/sidecars/deepseek-harness/dist/deepseek-harness-host-v2.mjs"
-        )
-    else:
-        raise ValueError("live verification runtime is unsupported")
-    resolved = executable.resolve(strict=False)
-    if (
-        not resolved.is_relative_to(repository_root)
-        or executable.is_symlink()
-        or not resolved.is_file()
-        or not os.access(resolved, os.X_OK)
-    ):
-        raise ValueError("verified runtime executable is unavailable")
-    return RuntimeProcessConfig(runtime_id=runtime_id, argv=(str(resolved),))
+def _cached_bytes_at(
+    directory_fd: int,
+    name: str,
+    artifact_cache: dict[str, bytes] | None,
+) -> bytes:
+    safe_name = _artifact_name(name)
+    if artifact_cache is not None and safe_name in artifact_cache:
+        raw = artifact_cache[safe_name]
+        if not isinstance(raw, bytes):
+            raise ValueError("development artifact cache is invalid")
+        return raw
+    raw = _read_bytes_at(directory_fd, safe_name)
+    if artifact_cache is not None:
+        artifact_cache[safe_name] = raw
+    return raw
 
 
-def compose_runtime_receipt(
+def _load_canonical_json_at(
+    directory_fd: int,
+    name: str,
     *,
-    runtime: str,
-    evidence: object,
-    identity: RuntimeDevelopmentIdentity | None = None,
-    private_key: Ed25519PrivateKey | None = None,
-    issued_at: float | None = None,
-) -> ComposedRuntimeReceipt:
-    """Compose one receipt only from a process-local formal observation."""
-    if (
-        type(evidence) is not _VerifiedLiveEndpointEvidence
-        or evidence._issuer is not _LIVE_EVIDENCE_ISSUER
+    artifact_cache: dict[str, bytes] | None = None,
+) -> dict[str, object]:
+    raw = _cached_bytes_at(directory_fd, name, artifact_cache)
+    document = json.loads(raw)
+    if not isinstance(document, dict) or raw != _canonical_line(document):
+        raise ValueError("development artifact is not canonical")
+    return document
+
+
+def _read_public_key_at(
+    directory_fd: int, *, artifact_cache: dict[str, bytes] | None = None
+) -> bytes:
+    raw = _cached_bytes_at(
+        directory_fd, FEDERATED_DEVELOPMENT_PUBLIC_KEY, artifact_cache
+    )
+    try:
+        encoded = raw.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise ValueError("development public key is invalid") from error
+    return base64.b64decode(encoded, validate=True)
+
+
+def _read_verified_manifest_at(
+    directory_fd: int,
+    *,
+    trusted_time: float,
+    artifact_cache: dict[str, bytes] | None = None,
+) -> dict[str, object] | None:
+    try:
+        document = _load_canonical_json_at(
+            directory_fd,
+            FEDERATED_DEVELOPMENT_MANIFEST,
+            artifact_cache=artifact_cache,
+        )
+        expected_fields = {
+            "schema",
+            "trust_status",
+            "signer_key_id",
+            "issued_at",
+            "expires_at",
+            "runtime_ids",
+            "runtimes",
+            "files",
+            "signature",
+        }
+        if set(document) != expected_fields:
+            raise ValueError("development manifest fields changed")
+        if (
+            document["schema"] != _MANIFEST_SCHEMA
+            or document["trust_status"] != "DEV_UNTRUSTED"
+        ):
+            raise ValueError("development manifest schema changed")
+        issued_at = _timestamp(document["issued_at"], "issued_at")
+        expires_at = _timestamp(document["expires_at"], "expires_at")
+        if (
+            expires_at <= issued_at
+            or expires_at > issued_at + LIVE_EVIDENCE_TTL_SECONDS
+            or trusted_time < issued_at
+            or trusted_time > expires_at
+        ):
+            raise ValueError("development manifest expired")
+        runtime_ids = _runtime_ids(document["runtime_ids"])
+        runtimes = document["runtimes"]
+        files = document["files"]
+        if (
+            not isinstance(runtimes, dict)
+            or set(runtimes) != set(runtime_ids)
+            or not isinstance(files, dict)
+            or FEDERATED_DEVELOPMENT_PUBLIC_KEY not in files
+        ):
+            raise ValueError("development manifest is incomplete")
+        for name, digest in files.items():
+            if (
+                not isinstance(name, str)
+                or _SAFE_ARTIFACT.fullmatch(name) is None
+                or not isinstance(digest, str)
+                or _DIGEST.fullmatch(digest) is None
+                or _sha256(_cached_bytes_at(directory_fd, name, artifact_cache))
+                != digest
+            ):
+                raise ValueError("development manifest file changed")
+        public_key = _read_public_key_at(
+            directory_fd, artifact_cache=artifact_cache
+        )
+        if document["signer_key_id"] != _key_id(public_key):
+            raise ValueError("development signer identity changed")
+        signature = base64.b64decode(document["signature"], validate=True)
+        payload = {
+            name: value for name, value in document.items() if name != "signature"
+        }
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            signature, _MANIFEST_DOMAIN + _canonical_bytes(payload)
+        )
+        return document
+    except (
+        AttributeError,
+        InvalidSignature,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        binascii.Error,
+        json.JSONDecodeError,
     ):
-        raise ValueError("real endpoint evidence required")
-    if runtime not in {"goose", "dsh"} or evidence.evidence.runtime_id != runtime:
-        raise ValueError("live endpoint evidence identity changed")
-    resolved_identity = identity or _runtime_build_identity(runtime, _repository_root())
-    if resolved_identity.runtime_id != runtime:
-        raise ValueError("live endpoint evidence identity changed")
-    require_live_endpoint_binding(
-        evidence.evidence,
-        runtime_id=runtime,
-        build_id=resolved_identity.build_id,
-        provider_profile_digest=evidence.evidence.provider_profile_digest,
-        model=evidence.evidence.model,
-    )
-    if evidence.evidence.terminal != "completed":
-        raise ValueError("completed real endpoint evidence required")
-    now = time.time() if issued_at is None else _timestamp(issued_at, "issued_at")
-    if evidence.evidence.observed_at > now + 300 or (
-        now - evidence.evidence.observed_at > DEVELOPMENT_PROOF_TTL_SECONDS
-    ):
-        raise ValueError("real endpoint evidence is stale")
-    signer = private_key or Ed25519PrivateKey.generate()
-    if type(signer) is not Ed25519PrivateKey:
-        raise TypeError("signer must be an Ed25519PrivateKey")
-    public_key = signer.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    key_id = _key_id(public_key)
-    _, capability_digest = canonical_capability_snapshot(
-        resolved_identity.capabilities
-    )
-    evidence_digest = _sha256(
-        _canonical_bytes(evidence.evidence.model_dump(mode="json"))
-    )
-    gate_result_digest = _sha256(
+        return None
+
+
+def _read_verified_manifest(
+    output_dir: Path, *, trusted_time: float
+) -> dict[str, object] | None:
+    try:
+        directory_fd = _open_directory_fd(output_dir)
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        return _read_verified_manifest_at(directory_fd, trusted_time=trusted_time)
+    finally:
+        os.close(directory_fd)
+
+
+def _evidence_gate_result_digest(
+    evidence: LiveEndpointEvidenceV1,
+    identity: RuntimeDevelopmentIdentity,
+) -> tuple[str, str]:
+    _, capability_digest = canonical_capability_snapshot(identity.capabilities)
+    evidence_digest = _sha256(_canonical_bytes(evidence.model_dump(mode="json")))
+    result = _sha256(
         _canonical_bytes(
             {
                 "schema": _EVIDENCE_SCHEMA,
                 "evidence_digest": evidence_digest,
-                "source_manifest_digest": resolved_identity.source_manifest_digest,
-                "build_manifest_digest": resolved_identity.build_manifest_digest,
+                "source_manifest_digest": identity.source_manifest_digest,
+                "build_manifest_digest": identity.build_manifest_digest,
                 "capability_digest": capability_digest,
             }
         )
     )
-    receipt = RuntimeGateReceipt(
-        proof_version=1,
-        runtime_id=runtime,
-        build_id=resolved_identity.build_id,
-        source_manifest_digest=resolved_identity.source_manifest_digest,
-        build_manifest_digest=resolved_identity.build_manifest_digest,
-        capability_digest=capability_digest,
-        gate_result_digest=gate_result_digest,
-        signer_key_id=key_id,
-        issued_at=now,
-        expires_at=now + DEVELOPMENT_PROOF_TTL_SECONDS,
-        trust_tier="DEV_UNTRUSTED",
-    )
-    receipt_json = canonical_json(asdict(receipt))
-    return ComposedRuntimeReceipt(
-        receipt=receipt,
-        proof=SignedRuntimeGateProof(
-            receipt_json,
-            signer.sign(_PROOF_DOMAIN + receipt_json.encode("utf-8")),
-        ),
-        evidence=evidence.evidence,
-    )
+    return evidence_digest, result
 
 
-def prepare_development_environment(
-    runtime_ids: Iterable[str],
-    output_dir: Path,
-    *,
-    live_evidence: Iterable[object] = (),
-    repository_root: Path | None = None,
-    now: float | None = None,
-) -> DevelopmentEnvironmentResult:
-    """Atomically publish public receipts; the manifest is the commit marker."""
-    selected = _runtime_ids(runtime_ids)
-    if not isinstance(output_dir, Path) or not output_dir.is_absolute():
-        raise ValueError("output_dir must be an absolute path")
-    try:
-        opened = output_dir.lstat()
-    except FileNotFoundError:
-        opened = None
-    if opened is not None and (
-        stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode)
-    ):
-        raise ValueError("output_dir must be a real directory")
-    issued_at = time.time() if now is None else _timestamp(now, "now")
-    root = _repository_root() if repository_root is None else repository_root.resolve()
-    observations: dict[str, _VerifiedLiveEndpointEvidence] = {}
-    for item in live_evidence:
-        if type(item) is not _VerifiedLiveEndpointEvidence:
-            raise ValueError("real endpoint evidence required")
-        if item.evidence.runtime_id in observations:
-            raise ValueError("duplicate real endpoint evidence")
-        observations[item.evidence.runtime_id] = item
+def _bounded_evidence_expiry(
+    issued_at: object, evidence: Iterable[LiveEndpointEvidenceV1]
+) -> float:
+    """Cap a new receipt by the original observation, never re-signing age away."""
+    issued = _timestamp(issued_at, "issued_at")
+    values = tuple(evidence)
+    if not values or any(type(item) is not LiveEndpointEvidenceV1 for item in values):
+        raise ValueError("live endpoint evidence is required")
     if any(
-        runtime_id != "python-term" and runtime_id not in observations
-        for runtime_id in selected
+        item.terminal != "completed"
+        or item.verified_at > issued
+        or issued > item.expires_at
+        for item in values
     ):
-        raise ValueError("real endpoint evidence required")
-    if opened is None:
-        if not output_dir.parent.is_dir():
-            raise ValueError("output_dir parent must already exist")
-        output_dir.mkdir(mode=0o700)
-        opened = output_dir.lstat()
-
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    signer_key_id = _key_id(public_key)
-    documents: dict[str, bytes] = {
-        FEDERATED_DEVELOPMENT_PUBLIC_KEY: base64.b64encode(public_key) + b"\n"
-    }
-    runtime_documents: dict[str, dict[str, object]] = {}
-    for runtime_id in selected:
-        if runtime_id == "python-term":
-            python_documents, _ = _build_python_term_documents(
-                private_key, issued_at=issued_at
-            )
-            documents.update(
-                {name: content.encode("utf-8") for name, content in python_documents.items()}
-            )
-            proof_name = "runtime-admission-dev-signed-proof.json"
-            proof_document = json.loads(documents[proof_name])
-            receipt = RuntimeGateReceipt(**json.loads(proof_document["receipt_json"]))
-            identity = _runtime_build_identity(runtime_id, root)
-            evidence_name = None
-        else:
-            identity = _runtime_build_identity(runtime_id, root)
-            composed = compose_runtime_receipt(
-                runtime=runtime_id,
-                evidence=observations[runtime_id],
-                identity=identity,
-                private_key=private_key,
-                issued_at=issued_at,
-            )
-            receipt = composed.receipt
-            proof_name = f"runtime-admission-{runtime_id}-dev-signed-proof.json"
-            documents[proof_name] = _canonical_line(
-                {
-                    "receipt_json": composed.proof.receipt_json,
-                    "signature": base64.b64encode(composed.proof.signature).decode("ascii"),
-                }
-            )
-            evidence_name = f"runtime-live-evidence-{runtime_id}.json"
-            documents[evidence_name] = _canonical_line(
-                {
-                    "schema": _EVIDENCE_SCHEMA,
-                    "evidence": composed.evidence.model_dump(mode="json"),
-                }
-            )
-        _, capability_digest = canonical_capability_snapshot(identity.capabilities)
-        if (
-            receipt.signer_key_id != signer_key_id
-            or receipt.build_id != identity.build_id
-            or receipt.source_manifest_digest != identity.source_manifest_digest
-            or receipt.build_manifest_digest != identity.build_manifest_digest
-            or receipt.capability_digest != capability_digest
-        ):
-            raise RuntimeError("runtime receipt identity changed during preparation")
-        runtime_documents[runtime_id] = {
-            "build_id": identity.build_id,
-            "source_manifest_digest": identity.source_manifest_digest,
-            "build_manifest_digest": identity.build_manifest_digest,
-            "capability_digest": capability_digest,
-            "capabilities": list(_enabled_capabilities(identity.capabilities)),
-            "proof_path": proof_name,
-            "evidence_path": evidence_name,
-        }
-
-    manifest_payload: dict[str, object] = {
-        "schema": _MANIFEST_SCHEMA,
-        "trust_status": "DEV_UNTRUSTED",
-        "signer_key_id": signer_key_id,
-        "issued_at": issued_at,
-        "expires_at": issued_at + DEVELOPMENT_PROOF_TTL_SECONDS,
-        "runtime_ids": list(selected),
-        "runtimes": runtime_documents,
-        "files": {name: _sha256(content) for name, content in sorted(documents.items())},
-    }
-    manifest = {
-        **manifest_payload,
-        "signature": base64.b64encode(
-            private_key.sign(_MANIFEST_DOMAIN + _canonical_bytes(manifest_payload))
-        ).decode("ascii"),
-    }
-    for name, content in documents.items():
-        _atomic_publish(output_dir / name, content)
-    _atomic_publish(output_dir / FEDERATED_DEVELOPMENT_MANIFEST, _canonical_line(manifest))
-    if _read_verified_manifest(output_dir, trusted_time=issued_at) is None:
-        raise RuntimeError("development environment validation failed")
-    return DevelopmentEnvironmentResult("prepared", str(output_dir), selected)
-
-
-def _atomic_publish(path: Path, content: bytes) -> None:
-    parent = path.parent
-    try:
-        parent_state = parent.lstat()
-    except FileNotFoundError:
-        grandparent_state = parent.parent.lstat()
-        if (
-            stat.S_ISLNK(grandparent_state.st_mode)
-            or not stat.S_ISDIR(grandparent_state.st_mode)
-        ):
-            raise ValueError("publish directory is invalid")
-        parent.mkdir(mode=0o700)
-        parent_state = parent.lstat()
-    if stat.S_ISLNK(parent_state.st_mode) or not stat.S_ISDIR(parent_state.st_mode):
-        raise ValueError("publish directory is invalid")
-    temporary = path.with_name(f".{path.name}.tmp-{uuid4().hex}")
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
+        raise ValueError("fresh completed live endpoint evidence is required")
+    expires_at = min(
+        issued + LIVE_EVIDENCE_TTL_SECONDS,
+        *(item.expires_at for item in values),
     )
-    try:
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, path)
-    directory_descriptor = os.open(parent, os.O_RDONLY)
-    try:
-        os.fsync(directory_descriptor)
-    finally:
-        os.close(directory_descriptor)
+    if expires_at <= issued:
+        raise ValueError("live endpoint evidence is stale")
+    return expires_at
+
+
+def _record_live_evidence_imports(
+    database: Path, records: Iterable[Mapping[str, object]]
+) -> None:
+    """Persist stable evidence consumption; duplicates never refresh time."""
+    normalized: list[dict[str, object]] = []
+    expected = {
+        "evidence_id",
+        "content_digest",
+        "signer_key_id",
+        "runtime_id",
+        "build_id",
+        "issuance_epoch",
+    }
+    for raw in records:
+        if not isinstance(raw, Mapping) or set(raw) != expected:
+            raise ValueError("live evidence import record is invalid")
+        item = dict(raw)
+        if (
+            not isinstance(item["evidence_id"], str)
+            or _DIGEST.fullmatch(item["evidence_id"]) is None
+            or not isinstance(item["content_digest"], str)
+            or _DIGEST.fullmatch(item["content_digest"]) is None
+            or not isinstance(item["signer_key_id"], str)
+            or _KEY_ID.fullmatch(item["signer_key_id"]) is None
+            or item["runtime_id"] not in SUPPORTED_RUNTIME_IDS
+            or not isinstance(item["build_id"], str)
+            or _SAFE_IDENTIFIER.fullmatch(item["build_id"]) is None
+            or isinstance(item["issuance_epoch"], bool)
+            or not isinstance(item["issuance_epoch"], int)
+            or item["issuance_epoch"] < 0
+        ):
+            raise ValueError("live evidence import record is invalid")
+        normalized.append(item)
+    if not normalized:
+        raise ValueError("live evidence import record is empty")
+
+    imported_at = time.time()
+    with sqlite3.connect(database) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS runtime_live_evidence_imports (
+            evidence_id TEXT PRIMARY KEY,
+            content_digest TEXT NOT NULL,
+            signer_key_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            issuance_epoch INTEGER NOT NULL,
+            imported_at REAL NOT NULL,
+            UNIQUE(signer_key_id, runtime_id, build_id, issuance_epoch))"""
+        )
+        for item in normalized:
+            by_id = connection.execute(
+                """SELECT evidence_id, content_digest, signer_key_id, runtime_id,
+                build_id, issuance_epoch FROM runtime_live_evidence_imports
+                WHERE evidence_id = ?""",
+                (item["evidence_id"],),
+            ).fetchone()
+            expected_row = (
+                item["evidence_id"],
+                item["content_digest"],
+                item["signer_key_id"],
+                item["runtime_id"],
+                item["build_id"],
+                item["issuance_epoch"],
+            )
+            if by_id is not None:
+                if tuple(by_id) != expected_row:
+                    raise ValueError("live evidence equivocation detected")
+                continue
+            by_epoch = connection.execute(
+                """SELECT evidence_id, content_digest FROM runtime_live_evidence_imports
+                WHERE signer_key_id = ? AND runtime_id = ? AND build_id = ?
+                AND issuance_epoch = ?""",
+                (
+                    item["signer_key_id"],
+                    item["runtime_id"],
+                    item["build_id"],
+                    item["issuance_epoch"],
+                ),
+            ).fetchone()
+            if by_epoch is not None:
+                raise ValueError("live evidence equivocation detected")
+            connection.execute(
+                """INSERT INTO runtime_live_evidence_imports(
+                evidence_id, content_digest, signer_key_id, runtime_id,
+                build_id, issuance_epoch, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (*expected_row, imported_at),
+            )
 
 
 def load_development_admission(
@@ -1009,15 +611,26 @@ def load_development_admission(
     trusted_time: float | None = None,
     configured_runtime_ids: Iterable[str] = (),
 ) -> DevelopmentAdmissionImport | None:
-    """Import a complete public bundle or return no catalog entries at all."""
+    """Import a complete public bundle or fail closed with no catalog entries."""
     if type(registry) is not RuntimeRegistryV2:
         raise TypeError("registry must be an exact RuntimeRegistryV2")
     now = time.time() if trusted_time is None else _timestamp(trusted_time, "trusted_time")
-    manifest = _read_verified_manifest(output_dir, trusted_time=now)
-    if manifest is None:
-        return None
     try:
-        public_key = _read_public_key(output_dir / FEDERATED_DEVELOPMENT_PUBLIC_KEY)
+        directory_fd = _open_directory_fd(output_dir)
+    except (OSError, TypeError, ValueError):
+        return None
+    artifact_cache: dict[str, bytes] = {}
+    try:
+        manifest = _read_verified_manifest_at(
+            directory_fd,
+            trusted_time=now,
+            artifact_cache=artifact_cache,
+        )
+        if manifest is None:
+            return None
+        public_key = _read_public_key_at(
+            directory_fd, artifact_cache=artifact_cache
+        )
         key_id = _key_id(public_key)
         configured = set(_runtime_ids(configured_runtime_ids, allow_empty=True))
         snapshots = {item.runtime_id: item for item in registry.snapshot()}
@@ -1025,36 +638,45 @@ def load_development_admission(
             tuple[
                 RuntimeDevelopmentIdentity,
                 SignedRuntimeGateProof,
-                str,
                 tuple[str, ...],
+                LiveEndpointEvidenceV1,
+                str,
             ]
         ] = []
+        manifest_expiry = _timestamp(manifest["expires_at"], "expires_at")
+        manifest_issued = _timestamp(manifest["issued_at"], "issued_at")
         for runtime_id in manifest["runtime_ids"]:
-            record = manifest["runtimes"][runtime_id]
-            expected_proof_path = (
-                "runtime-admission-dev-signed-proof.json"
-                if runtime_id == "python-term"
-                else f"runtime-admission-{runtime_id}-dev-signed-proof.json"
-            )
-            expected_evidence_path = (
-                None
-                if runtime_id == "python-term"
-                else f"runtime-live-evidence-{runtime_id}.json"
-            )
             identity = _runtime_build_identity(runtime_id, _repository_root())
             capabilities = _enabled_capabilities(identity.capabilities)
             _, capability_digest = canonical_capability_snapshot(identity.capabilities)
-            expected = {
-                "build_id": identity.build_id,
-                "source_manifest_digest": identity.source_manifest_digest,
-                "build_manifest_digest": identity.build_manifest_digest,
-                "capability_digest": capability_digest,
-                "capabilities": list(capabilities),
-                "proof_path": expected_proof_path,
-                "evidence_path": expected_evidence_path,
+            proof_name = f"runtime-admission-{runtime_id}-dev-signed-proof.json"
+            evidence_name = f"runtime-live-evidence-{runtime_id}.json"
+            record = manifest["runtimes"][runtime_id]
+            if not isinstance(record, dict):
+                raise ValueError("runtime build identity drift")
+            expected_fields = {
+                "build_id",
+                "source_manifest_digest",
+                "build_manifest_digest",
+                "capability_digest",
+                "capabilities",
+                "proof_path",
+                "evidence_path",
+                "evidence_id",
+                "evidence_digest",
+                "evidence_expires_at",
             }
-            if set(record) != set(expected) or any(
-                record.get(name) != value for name, value in expected.items()
+            if set(record) != expected_fields or any(
+                record.get(name) != value
+                for name, value in {
+                    "build_id": identity.build_id,
+                    "source_manifest_digest": identity.source_manifest_digest,
+                    "build_manifest_digest": identity.build_manifest_digest,
+                    "capability_digest": capability_digest,
+                    "capabilities": list(capabilities),
+                    "proof_path": proof_name,
+                    "evidence_path": evidence_name,
+                }.items()
             ):
                 raise ValueError("runtime build identity drift")
             snapshot = snapshots.get(runtime_id)
@@ -1064,12 +686,54 @@ def load_development_admission(
                 or snapshot.state != "ready"
             ):
                 raise ValueError("runtime registration identity drift")
-            if snapshot is None and runtime_id != "python-term" and runtime_id not in configured:
+            if snapshot is None and (
+                runtime_id == "python-term" or runtime_id not in configured
+            ):
                 raise ValueError("runtime registration is unavailable")
-            proof_path = output_dir / expected_proof_path
-            proof_document = _load_canonical_json(proof_path)
+
+            evidence_document = _load_canonical_json_at(
+                directory_fd,
+                evidence_name,
+                artifact_cache=artifact_cache,
+            )
+            if (
+                set(evidence_document) != {"schema", "evidence"}
+                or evidence_document.get("schema") != _EVIDENCE_SCHEMA
+            ):
+                raise ValueError("live endpoint evidence schema changed")
+            evidence = LiveEndpointEvidenceV1.model_validate(
+                evidence_document.get("evidence")
+            )
+            evidence_digest, gate_result_digest = _evidence_gate_result_digest(
+                evidence, identity
+            )
+            if (
+                evidence.runtime_id != runtime_id
+                or evidence.build_id != identity.build_id
+                or evidence.terminal != "completed"
+                or evidence.verified_at > manifest_issued
+                or now < evidence.observed_at
+                or now > evidence.expires_at
+                or manifest_expiry > evidence.expires_at
+                or record["evidence_id"] != evidence.evidence_id
+                or record["evidence_digest"] != evidence_digest
+                or record["evidence_expires_at"] != evidence.expires_at
+            ):
+                raise ValueError("live endpoint evidence binding changed")
+
+            proof_document = _load_canonical_json_at(
+                directory_fd,
+                proof_name,
+                artifact_cache=artifact_cache,
+            )
+            if set(proof_document) != {"receipt_json", "signature"}:
+                raise ValueError("runtime proof fields changed")
             receipt_json = proof_document["receipt_json"]
-            signature = base64.b64decode(proof_document["signature"], validate=True)
+            if not isinstance(receipt_json, str):
+                raise ValueError("runtime receipt is invalid")
+            signature = base64.b64decode(
+                proof_document["signature"], validate=True
+            )
             receipt = RuntimeGateReceipt(**json.loads(receipt_json))
             if canonical_json(asdict(receipt)) != receipt_json:
                 raise ValueError("runtime receipt is not canonical")
@@ -1084,71 +748,65 @@ def load_development_admission(
                 or receipt.source_manifest_digest != identity.source_manifest_digest
                 or receipt.build_manifest_digest != identity.build_manifest_digest
                 or receipt.capability_digest != capability_digest
+                or receipt.gate_result_digest != gate_result_digest
+                or receipt.issued_at < evidence.verified_at
+                or receipt.issued_at != manifest_issued
+                or receipt.expires_at > evidence.expires_at
+                or receipt.expires_at != manifest_expiry
                 or now < receipt.issued_at
                 or now > receipt.expires_at
             ):
                 raise ValueError("runtime receipt binding changed")
-            evidence_path = expected_evidence_path
-            if runtime_id == "python-term":
-                if evidence_path is not None:
-                    raise ValueError("unexpected Python Term live evidence path")
-            else:
-                evidence_document = _load_canonical_json(output_dir / evidence_path)
-                if evidence_document.get("schema") != _EVIDENCE_SCHEMA:
-                    raise ValueError("live endpoint evidence schema changed")
-                evidence = LiveEndpointEvidenceV1.model_validate(
-                    evidence_document.get("evidence")
-                )
-                if (
-                    evidence.runtime_id != runtime_id
-                    or evidence.build_id != identity.build_id
-                    or evidence.terminal != "completed"
-                ):
-                    raise ValueError("live endpoint evidence binding changed")
-                evidence_digest = _sha256(
-                    _canonical_bytes(evidence.model_dump(mode="json"))
-                )
-                expected_result = _sha256(
-                    _canonical_bytes(
-                        {
-                            "schema": _EVIDENCE_SCHEMA,
-                            "evidence_digest": evidence_digest,
-                            "source_manifest_digest": identity.source_manifest_digest,
-                            "build_manifest_digest": identity.build_manifest_digest,
-                            "capability_digest": capability_digest,
-                        }
-                    )
-                )
-                if receipt.gate_result_digest != expected_result:
-                    raise ValueError("live endpoint evidence digest changed")
             proofs.append(
                 (
                     identity,
                     SignedRuntimeGateProof(receipt_json, signature),
-                    receipt.gate_result_digest,
                     capabilities,
+                    evidence,
+                    evidence_digest,
                 )
             )
+
         assignments = AssignmentRepository.development(
             database,
             trust_keys=(RuntimeTrustKey(key_id, public_key, "DEV_UNTRUSTED"),),
         )
-        entries: list[RuntimeCatalogEntry] = []
-        for identity, proof, _result_digest, capabilities in proofs:
-            verified = assignments.store_gate_proof(proof, trusted_time=now)
-            entries.append(
-                RuntimeCatalogEntry(
-                    selector=identity.runtime_id,
-                    runtime_id=identity.runtime_id,
-                    build_id=identity.build_id,
-                    capability_digest=verified.capability_digest,
-                    gate_proof_digest=verified.proof_digest,
-                    required_capabilities=capabilities,
-                )
+        verified_proofs = [
+            assignments.store_gate_proof(proof, trusted_time=now)
+            for _identity, proof, _capabilities, _evidence, _digest in proofs
+        ]
+        _record_live_evidence_imports(
+            database,
+            tuple(
+                {
+                    "evidence_id": evidence.evidence_id,
+                    "content_digest": evidence_digest,
+                    "signer_key_id": key_id,
+                    "runtime_id": identity.runtime_id,
+                    "build_id": identity.build_id,
+                    "issuance_epoch": int(
+                        evidence.observed_at // LIVE_EVIDENCE_TTL_SECONDS
+                    ),
+                }
+                for identity, _proof, _capabilities, evidence, evidence_digest in proofs
+            ),
+        )
+        entries = tuple(
+            RuntimeCatalogEntry(
+                selector=identity.runtime_id,
+                runtime_id=identity.runtime_id,
+                build_id=identity.build_id,
+                capability_digest=verified.capability_digest,
+                gate_proof_digest=verified.proof_digest,
+                required_capabilities=capabilities,
             )
+            for (identity, _proof, capabilities, _evidence, _digest), verified in zip(
+                proofs, verified_proofs, strict=True
+            )
+        )
         return DevelopmentAdmissionImport(
             assignments=assignments,
-            catalog_entries=tuple(entries),
+            catalog_entries=entries,
             trust_status_by_runtime={
                 entry.runtime_id: "DEV_UNTRUSTED" for entry in entries
             },
@@ -1167,101 +825,8 @@ def load_development_admission(
         json.JSONDecodeError,
     ):
         return None
-
-
-def _read_verified_manifest(
-    output_dir: Path, *, trusted_time: float
-) -> dict[str, object] | None:
-    try:
-        output_state = output_dir.lstat()
-        if stat.S_ISLNK(output_state.st_mode) or not stat.S_ISDIR(
-            output_state.st_mode
-        ):
-            raise ValueError("development output directory is invalid")
-        document = _load_canonical_json(output_dir / FEDERATED_DEVELOPMENT_MANIFEST)
-        expected_fields = {
-            "schema",
-            "trust_status",
-            "signer_key_id",
-            "issued_at",
-            "expires_at",
-            "runtime_ids",
-            "runtimes",
-            "files",
-            "signature",
-        }
-        if set(document) != expected_fields:
-            raise ValueError("development manifest fields changed")
-        if document["schema"] != _MANIFEST_SCHEMA or document["trust_status"] != "DEV_UNTRUSTED":
-            raise ValueError("development manifest schema changed")
-        issued_at = _timestamp(document["issued_at"], "issued_at")
-        expires_at = _timestamp(document["expires_at"], "expires_at")
-        if expires_at - issued_at != DEVELOPMENT_PROOF_TTL_SECONDS:
-            raise ValueError("development manifest expiry changed")
-        if trusted_time < issued_at or trusted_time > expires_at:
-            raise ValueError("development manifest expired")
-        runtime_ids = _runtime_ids(document["runtime_ids"])
-        runtimes = document["runtimes"]
-        files = document["files"]
-        if (
-            not isinstance(runtimes, dict)
-            or set(runtimes) != set(runtime_ids)
-            or not isinstance(files, dict)
-            or FEDERATED_DEVELOPMENT_PUBLIC_KEY not in files
-        ):
-            raise ValueError("development manifest is incomplete")
-        for name, digest in files.items():
-            if (
-                not isinstance(name, str)
-                or not name
-                or Path(name).name != name and name != "python-term-test-workspace/README.md"
-                or _DIGEST.fullmatch(digest) is None
-            ):
-                raise ValueError("development manifest file entry is invalid")
-            target = output_dir.joinpath(*name.split("/"))
-            opened = target.lstat()
-            if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
-                raise ValueError("development manifest file is not regular")
-            if _sha256(target.read_bytes()) != digest:
-                raise ValueError("development manifest file changed")
-        public_key = _read_public_key(output_dir / FEDERATED_DEVELOPMENT_PUBLIC_KEY)
-        if document["signer_key_id"] != _key_id(public_key):
-            raise ValueError("development signer identity changed")
-        signature = base64.b64decode(document["signature"], validate=True)
-        payload = {name: value for name, value in document.items() if name != "signature"}
-        Ed25519PublicKey.from_public_bytes(public_key).verify(
-            signature, _MANIFEST_DOMAIN + _canonical_bytes(payload)
-        )
-        return document
-    except (
-        AttributeError,
-        InvalidSignature,
-        KeyError,
-        OSError,
-        TypeError,
-        ValueError,
-        binascii.Error,
-        json.JSONDecodeError,
-    ):
-        return None
-
-
-def _load_canonical_json(path: Path) -> dict[str, object]:
-    opened = path.lstat()
-    if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
-        raise ValueError("development artifact is not a regular file")
-    raw = path.read_bytes()
-    document = json.loads(raw)
-    if not isinstance(document, dict) or raw != _canonical_line(document):
-        raise ValueError("development artifact is not canonical")
-    return document
-
-
-def _read_public_key(path: Path) -> bytes:
-    opened = path.lstat()
-    if stat.S_ISLNK(opened.st_mode) or not stat.S_ISREG(opened.st_mode):
-        raise ValueError("development public key is not a regular file")
-    return base64.b64decode(path.read_text(encoding="ascii").strip(), validate=True)
+    finally:
+        os.close(directory_fd)
 
 
 def _runtime_ids(
@@ -1280,8 +845,7 @@ def _runtime_ids(
         or len(set(values)) != len(values)
     ):
         raise ValueError("runtime_ids are invalid")
-    ordered = tuple(item for item in SUPPORTED_RUNTIME_IDS if item in values)
-    return ordered  # type: ignore[return-value]
+    return tuple(item for item in SUPPORTED_RUNTIME_IDS if item in values)  # type: ignore[return-value]
 
 
 def _repository_root() -> Path:
@@ -1326,19 +890,16 @@ def _runtime_build_identity(
 
 
 __all__ = [
-    "ComposedRuntimeReceipt",
     "DevelopmentAdmissionImport",
     "DevelopmentEnvironmentResult",
     "FEDERATED_DEVELOPMENT_MANIFEST",
     "FEDERATED_DEVELOPMENT_PUBLIC_KEY",
+    "LIVE_EVIDENCE_TTL_SECONDS",
     "LiveEndpointEvidenceV1",
     "RuntimeDevelopmentIdentity",
     "SUPPORTED_RUNTIME_IDS",
-    "collect_runtime_live_endpoint_evidence",
-    "compose_runtime_receipt",
+    "canonical_live_evidence_id",
     "load_development_admission",
-    "prepare_development_environment",
     "require_live_endpoint_binding",
     "runtime_capabilities_for",
-    "verify_runtime_live_endpoint",
 ]

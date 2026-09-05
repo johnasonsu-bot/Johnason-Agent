@@ -128,6 +128,7 @@ class ProviderGrantRouteV1(FrozenGrantModel):
 
     protocol: OpaqueIdentifier
     base_url: str = Field(min_length=1, max_length=2048)
+    credential_mode: Literal["reference", "none"] = "reference"
     metadata_headers: tuple[tuple[str, str], ...] = ()
     thinking_enabled: bool
     reasoning_effort: Literal["high", "max"]

@@ -23,6 +23,16 @@ def _admission_module():
     return importlib.import_module("workbench.runtime.development_admission")
 
 
+def _signer_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/federated_runtime_dev_signer.py"
+    spec = importlib.util.spec_from_file_location("integration_external_signer", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class _Assignments:
     def require(self, command_id: str) -> object:
         raise AssertionError(f"fixture must be rejected before execution: {command_id}")
@@ -64,12 +74,8 @@ async def test_process_local_http_fixture_cannot_generate_live_go_evidence() -> 
         base_url=f"http://127.0.0.1:{server.server_port}",
     )
     try:
-        with pytest.raises(ValueError, match="real endpoint evidence required"):
-            await admission.verify_runtime_live_endpoint(
-                executor=executor,
-                execution_snapshot={},
-                profile=profile,
-            )
+        del executor, profile
+        assert not hasattr(admission, "verify_runtime_live_endpoint")
     finally:
         server.shutdown()
         server.server_close()
@@ -81,46 +87,21 @@ async def test_process_local_http_fixture_cannot_generate_live_go_evidence() -> 
 @pytest.mark.asyncio
 async def test_non_federated_executor_cannot_generate_live_evidence() -> None:
     admission = _admission_module()
-    profile = ProviderProfileRecord.deepseek(
-        id="deepseek-primary",
-        secret_id="provider/deepseek-primary",
-    )
-
-    with pytest.raises(TypeError, match="FederatedConversationExecutor"):
-        await admission.verify_runtime_live_endpoint(
-            executor=object(),
-            execution_snapshot={},
-            profile=profile,
-        )
+    assert not hasattr(admission, "verify_runtime_live_endpoint")
+    assert not hasattr(admission, "collect_runtime_live_endpoint_evidence")
 
 
 @pytest.mark.asyncio
 async def test_live_verifier_rejects_unexpected_snapshot_fields_before_execution() -> None:
-    admission = _admission_module()
-    profile = ProviderProfileRecord.deepseek(
-        id="deepseek-primary",
-        secret_id="provider/deepseek-primary",
+    signer = _signer_module()
+    parameters = set(
+        importlib.import_module("inspect")
+        .signature(signer.prepare_development_environment)
+        .parameters
     )
-    snapshot = admission._build_live_execution_snapshot(
-        runtime_id="goose",
-        build_id="goose-host-v2:fixture-wrapper-r2",
-        host_generation="7",
-        profile=profile,
-        now=1_800_000_000.0,
-    )
-    snapshot["unexpected_secret"] = "must-not-cross-the-verifier"
-    executor = FederatedConversationExecutor(
-        assignments=_Assignments(),
-        supervisor=_NoRuntimeCalls(),
-        coordinator=_NoRuntimeCalls(),
-    )
-
-    with pytest.raises(ValueError, match="snapshot fields changed"):
-        await admission.verify_runtime_live_endpoint(
-            executor=executor,
-            execution_snapshot=snapshot,
-            profile=profile,
-        )
+    assert "executor" not in parameters
+    assert "execution_snapshot" not in parameters
+    assert "live_evidence" not in parameters
 
 
 @pytest.mark.asyncio
@@ -137,17 +118,20 @@ async def test_saved_fixture_profile_is_rejected_before_sidecar_or_artifacts(
             name="Local Fixture",
             protocol="lmstudio",
             base_url="http://127.0.0.1:1234",
-            secret_id="provider/fixture-provider",
+            credential_mode="none",
+            secret_id=None,
             model_aliases={"default": "fixture-model"},
         )
     )
 
+    signer = _signer_module()
     with pytest.raises(ValueError, match="real endpoint evidence required"):
-        await admission.collect_runtime_live_endpoint_evidence(
-            runtime_id="goose",
+        await signer.prepare_development_environment(
+            runtime_ids=("goose",),
             provider_profile_id="fixture-provider",
             runtime_dir=runtime_dir,
-            vault=VaultService(runtime_dir / "credentials.vault"),
+            output_dir=runtime_dir / "published",
+            vault_password=None,
         )
 
     assert not (runtime_dir / "federated-runtime-live-goose.sqlite").exists()
@@ -218,6 +202,47 @@ def test_external_preparer_cli_is_reference_only_and_fails_closed_without_profil
     assert not (output_dir / "federated-runtime-dev-manifest.json").exists()
 
 
+def test_external_preparer_returns_stable_error_for_corrupt_profile_database(
+    tmp_path: Path,
+) -> None:
+    script = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/prepare_federated_runtime_dev_environment.py"
+    )
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    (runtime_dir / "workbench.sqlite").write_bytes(b"not a sqlite database")
+    output_dir = tmp_path / "published"
+
+    blocked = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--runtime",
+            "goose",
+            "--provider-profile-id",
+            "deepseek-primary",
+            "--runtime-dir",
+            str(runtime_dir),
+            "--output-dir",
+            str(output_dir),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert blocked.returncode == 1
+    assert blocked.stdout == ""
+    assert blocked.stderr == (
+        '{"reason": "live_endpoint_verification_failed", "status": "blocked"}\n'
+    )
+    assert "Traceback" not in blocked.stderr
+    assert str(runtime_dir) not in blocked.stderr
+    assert not (output_dir / "federated-runtime-dev-manifest.json").exists()
+
+
 @pytest.mark.asyncio
 async def test_external_preparer_preserves_symlink_path_for_core_rejection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -238,8 +263,8 @@ async def test_external_preparer_preserves_symlink_path_for_core_rejection(
     output_link.symlink_to(outside, target_is_directory=True)
     captured: dict[str, Path] = {}
 
-    def prepare(_runtime_ids: object, output_dir: Path, **_kwargs: object) -> object:
-        captured["output_dir"] = output_dir
+    async def prepare(**kwargs: object) -> object:
+        captured["output_dir"] = kwargs["output_dir"]  # type: ignore[assignment]
         return object()
 
     monkeypatch.setattr(preparer, "prepare_development_environment", prepare)
@@ -247,7 +272,7 @@ async def test_external_preparer_preserves_symlink_path_for_core_rejection(
     await preparer._prepare(
         SimpleNamespace(
             runtime_ids=["python-term"],
-            provider_profile_id=None,
+            provider_profile_id="profile",
             vault_password_stdin=False,
             runtime_dir=runtime_dir,
             output_dir=output_link,

@@ -763,7 +763,7 @@ def build_app(
     provider_available = {
         "python-term": bool(enabled_profiles),
         "goose": any(
-            profile.secret_id is not None
+            (profile.credential_mode == "none" or profile.secret_id is not None)
             and profile.protocol
             in {
                 "deepseek",
@@ -775,7 +775,8 @@ def build_app(
             for profile in enabled_profiles
         ),
         "dsh": any(
-            profile.secret_id is not None
+            profile.credential_mode == "reference"
+            and profile.secret_id is not None
             and profile.protocol == "deepseek"
             and not profile.headers
             for profile in enabled_profiles

@@ -131,6 +131,35 @@ async def test_socket_delivery_sends_secret_separately_and_returns_bound_ack() -
 
 @pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair unavailable")
 @pytest.mark.asyncio
+async def test_no_credential_route_sends_an_explicit_zero_length_payload() -> None:
+    delivery, peer = open_provider_grant_socketpair(clock=lambda: 120.0)
+    binding = _binding().model_copy(
+        update={
+            "route": ProviderGrantRouteV1(
+                protocol="lmstudio",
+                base_url="http://127.0.0.1:1234/v1",
+                credential_mode="none",
+                metadata_headers=(),
+                thinking_enabled=False,
+                reasoning_effort="high",
+            )
+        }
+    )
+    secret = bytearray()
+    try:
+        receiver = asyncio.create_task(asyncio.to_thread(_receive_grant_and_ack, peer))
+        ack = await delivery.deliver(binding, memoryview(secret))
+        header, observed_secret = await receiver
+        assert header["binding"]["route"]["credential_mode"] == "none"
+        assert observed_secret == b""
+        assert ack.grant_digest == canonical_grant_digest(binding)
+    finally:
+        peer.close()
+        await delivery.aclose()
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair unavailable")
+@pytest.mark.asyncio
 async def test_invalid_ack_fails_closed_and_delivery_cannot_be_retried() -> None:
     delivery, peer = open_provider_grant_socketpair(clock=lambda: 120.0)
     binding = _binding()

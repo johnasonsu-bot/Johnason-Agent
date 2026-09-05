@@ -540,6 +540,7 @@ def _run_protocol_path(binary: Path, *, scenario: str) -> list[dict[str, Any]]:
         "route": {
             "protocol": "deepseek",
             "base_url": "https://api.deepseek.com",
+            "credential_mode": "reference",
             "metadata_headers": [],
             "thinking_enabled": True,
             "reasoning_effort": "high",

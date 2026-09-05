@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 import os
 from pathlib import Path
 import socket
 from secrets import token_urlsafe
 import sys
+import threading
 
 import pytest
 
@@ -431,3 +434,160 @@ async def test_coordinator_delivers_private_grant_before_real_supervised_query(
         await supervisor.aclose()
 
     assert events[-1].payload == {"status": "completed"}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private descriptor is POSIX-only")
+@pytest.mark.asyncio
+async def test_coordinator_delivers_empty_grant_to_real_goose_local_route(
+    tmp_path: Path,
+) -> None:
+    """Exercise Broker→socket→Goose with an explicit no-credential route."""
+    from workbench.runtime.provider_grants import canonical_provider_profile_digest
+
+    captured: dict[str, object] = {}
+    response_body = (
+        'data: {"id":"local-1","object":"chat.completion.chunk",'
+        '"created":1,"model":"local-model","choices":[{"index":0,'
+        '"delta":{"role":"assistant","content":"local response"},'
+        '"finish_reason":null}]}\n\n'
+        'data: {"id":"local-2","object":"chat.completion.chunk",'
+        '"created":1,"model":"local-model","choices":[{"index":0,'
+        '"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,'
+        '"completion_tokens":2,"total_tokens":3}}\n\n'
+        "data: [DONE]\n\n"
+    ).encode()
+
+    class LocalProviderHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+            length = int(self.headers.get("Content-Length", "0"))
+            captured["path"] = self.path
+            captured["authorization"] = self.headers.get("Authorization")
+            captured["body"] = json.loads(self.rfile.read(length))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(response_body)))
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, _format, *_args) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), LocalProviderHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    try:
+        messages = (
+            RuntimeMessageInputV2(
+                message_id="message-local-1",
+                role="user",
+                content="local no-credential query",
+            ),
+        )
+        prompt_sections = ()
+        runtime_input = RuntimeQueryInputV2(
+            messages=messages,
+            message_snapshot_digest=canonical_runtime_input_digest(messages),
+            context_items=(),
+            context_snapshot_digest=canonical_runtime_input_digest(()),
+            prompt_sections=prompt_sections,
+            prompt_manifest_digest=canonical_runtime_input_digest(prompt_sections),
+        )
+        database = tmp_path / "goose-local-coordinator.sqlite"
+        providers = ProviderRepository(database)
+        _, profile = providers.upsert(
+            ProviderProfileRecord(
+                id="local-primary",
+                name="Local Runtime",
+                protocol="lmstudio",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                credential_mode="none",
+                model_aliases={"default": "local-model"},
+                thinking_enabled=False,
+            )
+        )
+        envelope = run_envelope(
+            runtime_id="goose",
+            command_id="command-goose-local-coordinator",
+            host_generation="1",
+            overrides={
+                "runtime": {
+                    "runtime_id": "goose",
+                    "build_id": "goose-host-v2:fixture-wrapper-r2",
+                    "config_digest": "c" * 64,
+                    "host_generation": "1",
+                },
+                "provider_ref": "provider-profile:local-primary",
+                "model": "local-model",
+                "context_budget": {
+                    "max_input_tokens": 4096,
+                    "reserved_output_tokens": 0,
+                    "protected_message_ids": ("message-local-1",),
+                    "protected_prompt_section_ids": (),
+                    "compaction_policy": "none",
+                    "summary_ref": None,
+                },
+                "tool_manifest": (),
+                "skill_pins": (),
+                "plugin_pins": (),
+                "message_snapshot_digest": runtime_input.message_snapshot_digest,
+                "context.snapshot_digest": runtime_input.context_snapshot_digest,
+                "prompt_manifest_digest": runtime_input.prompt_manifest_digest,
+                "extensions": {
+                    "provider_profile_digest": canonical_provider_profile_digest(
+                        profile
+                    ),
+                    "resolved_model": "local-model",
+                },
+            },
+        )
+        capabilities = runtime_capabilities(
+            "goose",
+            build_id="goose-host-v2:fixture-wrapper-r2",
+            query=True,
+            model=False,
+            streaming=True,
+            event_cursor=True,
+        )
+        assignments, assignment = admitted_assignment(database, envelope, capabilities)
+        binary = (
+            Path(__file__).resolve().parents[2]
+            / "runtime-hosts/goose-host-v2/target/release/goose-host-v2"
+        )
+        supervisor = SidecarSupervisor(
+            runtimes=(RuntimeProcessConfig(runtime_id="goose", argv=(str(binary),)),),
+            registry=RuntimeRegistryV2(RuntimeV2Repository(database)),
+            assignments=assignments,
+            runtime_dir=tmp_path,
+            app_instance_id="app-instance-goose-local",
+            lease_seconds=30.0,
+        )
+        broker = ProviderGrantBroker(
+            database=database,
+            providers=providers,
+            vault=VaultService(tmp_path / "uninitialized-local.vault"),
+            authority=supervisor,
+        )
+        coordinator = FederatedRuntimeCoordinator(broker)
+        await supervisor.start()
+        handle = await supervisor.acquire_initial(assignment)
+        try:
+            events = [
+                event
+                async for event in coordinator.run_query(
+                    handle,
+                    envelope,
+                    runtime_input=runtime_input,
+                )
+            ]
+        finally:
+            await supervisor.aclose()
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert events[-1].payload == {"status": "completed"}
+    assert captured["path"] == "/v1/chat/completions"
+    assert captured["authorization"] is None
+    assert captured["body"]["model"] == "local-model"

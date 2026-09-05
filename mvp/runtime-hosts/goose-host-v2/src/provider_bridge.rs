@@ -109,9 +109,14 @@ async fn stream_provider_with(
             return Err("provider Grant secret is not valid UTF-8".to_owned());
         }
     };
+    let auth = if material.credential_mode() == "none" {
+        AuthMethod::NoAuth
+    } else {
+        AuthMethod::BearerToken(secret)
+    };
     let mut client = ApiClient::with_timeout_and_tls(
         material.base_url().to_owned(),
-        AuthMethod::BearerToken(secret),
+        auth,
         Duration::from_secs(600),
         None,
     )
@@ -316,6 +321,7 @@ mod tests {
         let material = ProviderMaterial::for_test(
             "deepseek",
             format!("http://{address}"),
+            "reference",
             vec![("X-Title".into(), "Johnason Agent".into())],
             true,
             "high",

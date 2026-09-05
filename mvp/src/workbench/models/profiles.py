@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from collections.abc import Mapping
+import ipaddress
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, Self
 from urllib.parse import urlsplit, urlunsplit
@@ -105,6 +106,7 @@ class ProviderProfileRecord(BaseModel):
     name: str
     protocol: str
     base_url: str
+    credential_mode: Literal["reference", "none"] = "reference"
     secret_id: str | None = None
     headers: SafeHeaders = Field(default_factory=SafeHeaders)
     model_aliases: dict[str, str] = Field(default_factory=dict)
@@ -140,6 +142,8 @@ class ProviderProfileRecord(BaseModel):
     @classmethod
     def reject_credential_headers(cls, headers: object) -> SafeHeaders:
         """Ensure durable metadata cannot embed a credential by header name."""
+        if isinstance(headers, SafeHeaders):
+            return headers
         if not isinstance(headers, Mapping):
             raise ValueError("provider metadata headers must be a mapping")
         return SafeHeaders(headers)
@@ -149,9 +153,32 @@ class ProviderProfileRecord(BaseModel):
         return dict(headers)
 
     @model_validator(mode="after")
-    def require_deepseek_thinking(self) -> ProviderProfileRecord:
+    def require_safe_provider_authority(self) -> ProviderProfileRecord:
         if self.protocol == "deepseek" and not self.thinking_enabled:
             raise ValueError("DeepSeek profiles require thinking to remain enabled")
+        if self.credential_mode == "none":
+            parsed = urlsplit(self.base_url)
+            host = (parsed.hostname or "").casefold().rstrip(".")
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                address = None
+            loopback = host == "localhost" or (
+                address is not None and address.is_loopback
+            )
+            if (
+                self.secret_id is not None
+                or self.protocol not in {
+                    "lmstudio",
+                    "openai_chat",
+                    "openai_compatible",
+                }
+                or parsed.scheme != "http"
+                or not loopback
+            ):
+                raise ValueError(
+                    "no-credential profiles require an allowlisted loopback endpoint"
+                )
         return self
 
     def model_copy(

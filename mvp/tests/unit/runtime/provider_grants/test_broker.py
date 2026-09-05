@@ -789,6 +789,58 @@ def test_issue_accepts_supported_goose_provider_routes(
 
 
 @pytest.mark.asyncio
+async def test_broker_delivers_explicit_no_credential_route_without_vault_access(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "goose-local.sqlite"
+    providers = ProviderRepository(database)
+    _, profile = providers.upsert(
+        ProviderProfileRecord(
+            id="local-provider",
+            name="Local Provider",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234/v1",
+            credential_mode="none",
+            model_aliases={"default": "local-model"},
+        )
+    )
+    assert profile.secret_id is None
+    target = _target(runtime_id="goose")
+    clock = [100.0]
+    broker = ProviderGrantBroker(
+        database=database,
+        providers=providers,
+        vault=VaultService(tmp_path / "uninitialized.vault"),
+        authority=_Authority(target),
+        clock=lambda: clock[0],
+    )
+    envelope = run_envelope(
+        runtime_id="goose",
+        host_generation="7",
+        overrides={
+            "runtime.build_id": "goose-build-001",
+            "provider_ref": "provider-profile:local-provider",
+            "model": "local-model",
+            "extensions": {
+                "provider_profile_digest": canonical_provider_profile_digest(profile),
+                "resolved_model": "local-model",
+            },
+        },
+    )
+    offer = broker.issue(envelope, target=target)
+    delivery = _DigestOnlyDelivery()
+    clock[0] = 110.0
+
+    receipt = await broker.deliver(offer, target=target, delivery=delivery)
+
+    assert receipt.state == "consumed"
+    assert delivery.binding.route.credential_mode == "none"
+    assert delivery.view is not None
+    assert len(delivery.view) == 0
+    assert delivery.received_digest == hashlib.sha256(b"").hexdigest()
+
+
+@pytest.mark.asyncio
 async def test_locked_vault_does_not_consume_offer(tmp_path: Path) -> None:
     target = _target()
     broker, _, vault, _, clock, envelope, _ = _services(tmp_path, target=target)

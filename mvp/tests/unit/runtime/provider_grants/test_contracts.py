@@ -84,8 +84,9 @@ def test_grant_digest_is_stable_and_secret_free() -> None:
     binding = _binding()
 
     assert canonical_grant_digest(binding) == (
-        "ffcef05b1f5c3dc7c31d29098c8e27977c8de9efdcfdf8709df2164bc23a4c27"
+        "44bc20fe22ecaca8ccb91d7e39b79e955b0207790e456ba1b20498c7f4c8f4c9"
     )
+    assert binding.route.credential_mode == "reference"
     serialized = binding.model_dump_json()
     assert "instance-nonce-plaintext" not in serialized
     assert "secret" not in serialized.casefold()

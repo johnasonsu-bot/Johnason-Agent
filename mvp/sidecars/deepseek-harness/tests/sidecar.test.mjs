@@ -84,6 +84,7 @@ function privateGrant(
     route: {
       protocol: "deepseek",
       base_url: "https://api.deepseek.com",
+      credential_mode: "reference",
       metadata_headers: [],
       thinking_enabled: true,
       reasoning_effort: "high",
@@ -107,6 +108,7 @@ function providerRoute() {
   return {
     protocol: "deepseek",
     base_url: "https://api.deepseek.com",
+    credential_mode: "reference",
     metadata_headers: [],
     thinking_enabled: true,
     reasoning_effort: "high",
@@ -432,6 +434,7 @@ test("real provider query streams through the pinned DeepSeek Harness adapter", 
     route: {
       protocol: "deepseek",
       base_url: `http://127.0.0.1:${address.port}`,
+      credential_mode: "reference",
       metadata_headers: [],
       thinking_enabled: true,
       reasoning_effort: "high",
@@ -522,6 +525,7 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
         route: {
           protocol: "deepseek",
           base_url: `http://127.0.0.1:${address.port}`,
+          credential_mode: "reference",
           metadata_headers: [],
           thinking_enabled: true,
           reasoning_effort: "high",
@@ -587,6 +591,7 @@ test("real provider query can be cancelled after the DeepSeek Harness request is
     route: {
       protocol: "deepseek",
       base_url: `http://127.0.0.1:${address.port}`,
+      credential_mode: "reference",
       metadata_headers: [],
       thinking_enabled: true,
       reasoning_effort: "high",

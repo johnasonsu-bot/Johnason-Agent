@@ -5,6 +5,7 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -30,18 +31,34 @@ def _admission_module():
 
 def _valid_live_evidence(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
+        "verification_challenge_digest": "4" * 64,
         "runtime_id": "goose",
         "build_id": "goose-host-v2:fixture-wrapper-r2",
         "provider_profile_digest": "1" * 64,
         "model": "deepseek-chat",
         "endpoint_kind": "cloud",
         "observed_at": 1_800_000_000.0,
+        "verified_at": 1_800_000_001.0,
+        "expires_at": 1_800_003_600.0,
         "latency_ms": 250,
         "terminal": "completed",
         "output_digest": "2" * 64,
     }
     value.update(changes)
+    if "evidence_id" not in changes:
+        admission = _admission_module()
+        value["evidence_id"] = admission.canonical_live_evidence_id(value)
     return value
+
+
+def _signer_module():
+    path = Path(__file__).resolve().parents[3] / "scripts/federated_runtime_dev_signer.py"
+    spec = importlib.util.spec_from_file_location("test_external_runtime_signer", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_live_evidence_is_bound_to_runtime_provider_model_and_build() -> None:
@@ -60,7 +77,7 @@ def test_live_evidence_is_bound_to_runtime_provider_model_and_build() -> None:
 
 
 def test_live_execution_snapshot_freezes_profile_model_and_runtime_without_secrets() -> None:
-    admission = _admission_module()
+    signer = _signer_module()
     from workbench.models.profiles import ProviderProfileRecord
     from workbench.runtime.provider_grants import canonical_provider_profile_digest
 
@@ -69,7 +86,7 @@ def test_live_execution_snapshot_freezes_profile_model_and_runtime_without_secre
         secret_id="provider/0123456789abcdef0123456789abcdef",
     )
 
-    snapshot = admission._build_live_execution_snapshot(
+    snapshot = signer._build_live_execution_snapshot(
         runtime_id="goose",
         build_id="goose-host-v2:fixture-wrapper-r2",
         host_generation="7",
@@ -84,6 +101,8 @@ def test_live_execution_snapshot_freezes_profile_model_and_runtime_without_secre
         canonical_provider_profile_digest(profile)
     )
     assert snapshot["resolved_model"] == "deepseek-v4-flash"
+    assert len(snapshot["verification_challenge"]) >= 32
+    assert envelope["extensions"]["verification_challenge_digest"]
     assert envelope["runtime"]["host_generation"] == "7"
     assert envelope["provider_ref"] == "provider-profile:deepseek-primary"
     serialized = json.dumps(snapshot, sort_keys=True).casefold()
@@ -94,7 +113,7 @@ def test_live_execution_snapshot_freezes_profile_model_and_runtime_without_secre
 def test_live_runtime_process_rejects_an_in_tree_executable_symlink(
     tmp_path: Path,
 ) -> None:
-    admission = _admission_module()
+    signer = _signer_module()
     root = tmp_path.resolve()
     target = root / "actual-goose"
     target.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -106,7 +125,7 @@ def test_live_runtime_process_rejects_an_in_tree_executable_symlink(
     executable.symlink_to(target)
 
     with pytest.raises(ValueError, match="executable"):
-        admission._live_runtime_process("goose", root)
+        signer._live_runtime_process("goose", root)
 
 
 @pytest.mark.parametrize(
@@ -132,14 +151,10 @@ def test_live_evidence_rejects_unbound_or_noncanonical_values(
 
 def test_fixture_evidence_cannot_publish_model_capability() -> None:
     admission = _admission_module()
-    fixture_evidence = admission.LiveEndpointEvidenceV1.model_validate(
-        _valid_live_evidence()
-    )
+    admission.LiveEndpointEvidenceV1.model_validate(_valid_live_evidence())
 
-    with pytest.raises(ValueError, match="real endpoint evidence required"):
-        admission.compose_runtime_receipt(
-            runtime="goose", evidence=fixture_evidence
-        )
+    assert not hasattr(admission, "compose_runtime_receipt")
+    assert not hasattr(admission, "prepare_development_environment")
 
 
 @pytest.mark.parametrize("runtime_id", ("goose", "dsh"))
@@ -150,10 +165,7 @@ def test_prepare_refuses_a_model_runtime_without_process_local_live_evidence(
     output_dir = (tmp_path / "runtime").resolve()
     output_dir.mkdir()
 
-    with pytest.raises(ValueError, match="real endpoint evidence required"):
-        admission.prepare_development_environment(
-            (runtime_id,), output_dir, now=1_800_000_000.0
-        )
+    assert not hasattr(admission, "prepare_development_environment")
 
     assert not (output_dir / "federated-runtime-dev-manifest.json").exists()
 
@@ -161,37 +173,10 @@ def test_prepare_refuses_a_model_runtime_without_process_local_live_evidence(
 def test_python_term_preparation_is_atomic_secret_free_and_importable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    del monkeypatch
     admission = _admission_module()
-    revision = "mvp-build:" + "7" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
     output_dir = (tmp_path / "runtime").resolve()
     output_dir.mkdir()
-    sentinel = output_dir / "workbench.sqlite.keep"
-    sentinel.write_text("preserve", encoding="utf-8")
-
-    prepared = admission.prepare_development_environment(
-        ("python-term",), output_dir, now=1_800_000_000.0
-    )
-
-    assert prepared.status == "prepared"
-    assert sentinel.read_text(encoding="utf-8") == "preserve"
-    manifest_path = output_dir / "federated-runtime-dev-manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["trust_status"] == "DEV_UNTRUSTED"
-    assert manifest["runtime_ids"] == ["python-term"]
-    assert set(manifest["runtimes"]) == {"python-term"}
-    public_text = "\n".join(
-        path.read_text(encoding="utf-8", errors="ignore")
-        for path in output_dir.rglob("*")
-        if path.is_file() and path != sentinel
-    ).casefold()
-    assert "private_key" not in public_text
-    assert "api_key" not in public_text
-
     database = tmp_path / "admission.sqlite"
     registry = RuntimeRegistryV2(RuntimeV2Repository(database))
     registry.register(admission.runtime_capabilities_for("python-term"))
@@ -202,128 +187,51 @@ def test_python_term_preparation_is_atomic_secret_free_and_importable(
         trusted_time=1_800_000_001.0,
     )
 
-    assert imported is not None
-    assert [entry.selector for entry in imported.catalog_entries] == ["python-term"]
-    assert imported.trust_status_by_runtime == {"python-term": "DEV_UNTRUSTED"}
-    assert imported.catalog_entries[0].required_capabilities == (
-        "query",
-        "model",
-        "tools",
-        "workspace",
-        "checkpoints",
-        "streaming",
-        "event_cursor",
-    )
+    assert imported is None
+    assert not hasattr(admission, "prepare_development_environment")
 
 
 def test_repreparation_replaces_a_valid_bundle_after_source_identity_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    del monkeypatch
     admission = _admission_module()
-    revision = ["mvp-build:" + "1" * 40]
-    monkeypatch.setattr(
-        admission, "python_term_gate_source_revision", lambda: revision[0]
-    )
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision[0],
-    )
     output_dir = (tmp_path / "runtime").resolve()
     output_dir.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), output_dir, now=1_800_000_000.0
-    )
-    first_manifest = (output_dir / admission.FEDERATED_DEVELOPMENT_MANIFEST).read_bytes()
-    revision[0] = "mvp-build:" + "0" * 40
-
-    prepared = admission.prepare_development_environment(
-        ("python-term",), output_dir, now=1_800_000_001.0
-    )
-
-    assert prepared.status == "prepared"
-    assert (
-        output_dir / admission.FEDERATED_DEVELOPMENT_MANIFEST
-    ).read_bytes() != first_manifest
-    database = tmp_path / "admission.sqlite"
-    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
-    registry.register(admission.runtime_capabilities_for("python-term"))
-    assert (
-        admission.load_development_admission(
-            database=database,
-            output_dir=output_dir,
-            registry=registry,
-            trusted_time=1_800_000_002.0,
-        )
-        is not None
-    )
+    assert not (output_dir / admission.FEDERATED_DEVELOPMENT_MANIFEST).exists()
+    assert not hasattr(admission, "prepare_development_environment")
 
 
 def test_preparation_rejects_nested_publish_directory_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    del monkeypatch
     admission = _admission_module()
-    revision = "mvp-build:" + "6" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
-    output_dir = (tmp_path / "runtime").resolve()
-    outside = (tmp_path / "outside").resolve()
-    output_dir.mkdir()
-    outside.mkdir()
-    (output_dir / "python-term-test-workspace").symlink_to(
-        outside, target_is_directory=True
-    )
-
-    with pytest.raises(ValueError, match="publish directory"):
-        admission.prepare_development_environment(
-            ("python-term",), output_dir, now=1_800_000_000.0
-        )
-
-    assert not (outside / "README.md").exists()
-    assert not (output_dir / "federated-runtime-dev-manifest.json").exists()
+    with pytest.raises(ValueError, match="artifact name"):
+        admission._artifact_name("nested/runtime-proof.json")
 
 
 def test_preparation_rejects_top_level_symlink_even_for_an_existing_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    admission = _admission_module()
-    revision = "mvp-build:" + "4" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
+    del monkeypatch
+    signer = _signer_module()
     real_output = (tmp_path / "real-runtime").resolve()
     real_output.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), real_output, now=1_800_000_000.0
-    )
     output_link = tmp_path / "linked-runtime"
     output_link.symlink_to(real_output, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="output_dir"):
-        admission.prepare_development_environment(
-            ("python-term",), output_link.absolute(), now=1_800_000_001.0
-        )
+    with pytest.raises(OSError):
+        signer._open_publish_directory(output_link.absolute())
 
 
 def test_import_reader_rejects_a_top_level_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     admission = _admission_module()
-    revision = "mvp-build:" + "2" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
+    del monkeypatch
     real_output = (tmp_path / "real-runtime").resolve()
     real_output.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), real_output, now=1_800_000_000.0
-    )
     output_link = tmp_path / "linked-runtime"
     output_link.symlink_to(real_output, target_is_directory=True)
 
@@ -339,19 +247,12 @@ def test_import_fails_closed_when_any_published_file_drifts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     admission = _admission_module()
-    revision = "mvp-build:" + "8" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
+    del monkeypatch
     output_dir = (tmp_path / "runtime").resolve()
     output_dir.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), output_dir, now=1_800_000_000.0
+    (output_dir / admission.FEDERATED_DEVELOPMENT_MANIFEST).write_text(
+        '{"schema":"drifted"}\n', encoding="utf-8"
     )
-    proof = output_dir / "runtime-admission-dev-signed-proof.json"
-    proof.write_bytes(proof.read_bytes() + b"\n")
     database = tmp_path / "admission.sqlite"
     registry = RuntimeRegistryV2(RuntimeV2Repository(database))
     registry.register(admission.runtime_capabilities_for("python-term"))
@@ -370,65 +271,23 @@ def test_import_fails_closed_when_any_published_file_drifts(
 def test_import_rejects_runtime_record_path_traversal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    del tmp_path, monkeypatch
     admission = _admission_module()
-    revision = "mvp-build:" + "5" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
-    output_dir = (tmp_path / "runtime").resolve()
-    output_dir.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), output_dir, now=1_800_000_000.0
-    )
-    original_reader = admission._read_verified_manifest
-    manifest = original_reader(output_dir, trusted_time=1_800_000_001.0)
-    assert manifest is not None
-    manifest["runtimes"]["python-term"]["proof_path"] = (
-        "../runtime/runtime-admission-dev-signed-proof.json"
-    )
-    monkeypatch.setattr(admission, "_read_verified_manifest", lambda *_args, **_kwargs: manifest)
-    database = tmp_path / "admission.sqlite"
-    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
-    registry.register(admission.runtime_capabilities_for("python-term"))
-
-    assert (
-        admission.load_development_admission(
-            database=database,
-            output_dir=output_dir,
-            registry=registry,
-            trusted_time=1_800_000_001.0,
-        )
-        is None
-    )
+    with pytest.raises(ValueError, match="artifact name"):
+        admission._artifact_name("../runtime-proof.json")
 
 
 def test_manifest_commit_marker_must_be_a_regular_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    del monkeypatch
     admission = _admission_module()
-    revision = "mvp-build:" + "3" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
     source_dir = (tmp_path / "source-runtime").resolve()
     copied_dir = (tmp_path / "copied-runtime").resolve()
     source_dir.mkdir()
     copied_dir.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), source_dir, now=1_800_000_000.0
-    )
     manifest_name = admission.FEDERATED_DEVELOPMENT_MANIFEST
-    for source in source_dir.rglob("*"):
-        relative = source.relative_to(source_dir)
-        destination = copied_dir / relative
-        if source.is_dir():
-            destination.mkdir()
-        elif relative.as_posix() != manifest_name:
-            destination.write_bytes(source.read_bytes())
+    (source_dir / manifest_name).write_text('{"schema":"untrusted"}\n')
     (copied_dir / manifest_name).symlink_to(source_dir / manifest_name)
 
     assert (
@@ -443,17 +302,9 @@ def test_import_fails_closed_on_registered_build_or_capability_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     admission = _admission_module()
-    revision = "mvp-build:" + "9" * 40
-    monkeypatch.setattr(admission, "python_term_gate_source_revision", lambda: revision)
-    monkeypatch.setattr(
-        "workbench.runtime.python_term.dev_environment.python_term_gate_source_revision",
-        lambda: revision,
-    )
+    del monkeypatch
     output_dir = (tmp_path / "runtime").resolve()
     output_dir.mkdir()
-    admission.prepare_development_environment(
-        ("python-term",), output_dir, now=1_800_000_000.0
-    )
     database = tmp_path / "admission.sqlite"
     registry = RuntimeRegistryV2(RuntimeV2Repository(database))
     registry.register(
