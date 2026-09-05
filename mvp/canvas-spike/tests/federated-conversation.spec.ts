@@ -3,12 +3,12 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 // An Electron-owned HTTP boundary fixture, not a Runtime/model live-GO test.
-async function launch(root: string) {
+async function launch(root: string, initialState: Record<string, unknown> = {}) {
   await mkdir(root, { recursive: true });
   const executable = path.join(root, "backend.mjs");
   const stateFile = path.join(root, "state.json");
   const logFile = path.join(root, "requests.jsonl");
-  await writeFile(stateFile, JSON.stringify({ events: [], reject: false }));
+  await writeFile(stateFile, JSON.stringify({ events: [], reject: false, ...initialState }));
   await writeFile(executable, `#!/usr/bin/env node
 import http from 'node:http'; import fs from 'node:fs';
 let input = ''; let started = false; let messageSequence = 0;
@@ -30,7 +30,11 @@ const server=http.createServer((req,res)=>{let raw='';req.on('data',c=>raw+=c);r
  if(p==='/api/vault/lock')return send(200,{status:'locked'});
  if(p==='/api/providers') {if(req.method==='POST'){profiles=profiles.map(v=>v.id===body.id?{...v,...body}:v);if(!profiles.some(v=>v.id===body.id))profiles.push({...body,headers:{},credential_status:'not_required'});return send(201,profiles.find(v=>v.id===body.id));}return send(200,profiles);}
  if(p.endsWith('/models'))return send(200,{status:'online',models:['local-agent','discovered-model'],error_code:null});
- if(p==='/api/agents')return send(200,[{agent_id:'cloud',display_name:'Cloud',role:'worker',provider_id:'custom-cloud',model:'stale-model',enabled:true,tool_ids:[],skill_refs:[],version:1,created_at:1},{agent_id:'bad',display_name:'Bad',role:'worker',provider_id:'deepseek',model:'bad-model',enabled:true,tool_ids:[],skill_refs:[],version:1,created_at:1}]);
+ if(p==='/api/agents') {
+   const reply=()=>{send(200,[{agent_id:'cloud',display_name:'Cloud',role:'worker',provider_id:'custom-cloud',model:'stale-model',enabled:true,tool_ids:[],skill_refs:[],version:1,created_at:1},{agent_id:'bad',display_name:'Bad',role:'worker',provider_id:'deepseek',model:'bad-model',enabled:true,tool_ids:[],skill_refs:[],version:1,created_at:1}]);fs.appendFileSync(${JSON.stringify(logFile)},JSON.stringify({path:'fixture-agents'})+'\\n');};
+   if(state.holdAgents){const timer=setInterval(()=>{const current=JSON.parse(fs.readFileSync(${JSON.stringify(stateFile)},'utf8'));if(!current.holdAgents){clearInterval(timer);reply();}},20);return;}
+   return reply();
+ }
  if(p==='/api/v1/engine-host')return send(200,{v2:{enabled:true,protocol:'2.0',runtimes:['python-term','goose','dsh','unknown-runtime'].map(selector=>({runtime_id:selector,selector,build_id:'test',state:'ready',capabilities:[],selectable_for_new_commands:!state.reject,admission_state:state.reject?'blocked':'ready',trust_status:'DEV_UNTRUSTED',admission_reason:state.reject?'proof_revoked':null}))}});
  if(p.includes('/runtime-admissions/'))return send(200,{state:'ready',selector:'goose'});
  if(p.endsWith('/messages')) {
@@ -235,6 +239,32 @@ test("federated review matching running supersedes POST paused ACK without unloc
     await expect(f.page.getByTestId("conversation-status")).toContainText("执行中");
     await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
     await expect(f.page.getByLabel("当前运行模式")).toHaveValue("goose");
+    await expect(f.page.getByLabel("当前模型")).toBeDisabled();
+  } finally { await f.app.close(); }
+});
+
+test("federated review late Agent loading preserves explicit draft and frozen choices", async ({}, info) => {
+  const f = await launch(info.outputPath("backend"), {holdAgents:true,postStatus:"paused"});
+  try {
+    await f.page.getByLabel("当前运行模式").selectOption("goose");
+    await f.page.getByLabel("当前模型").selectOption("standalone/local-agent");
+    await f.state({events:[],postStatus:"paused"});
+    await expect.poll(async () => (await f.requests()).filter(r=>r.path==='fixture-agents').length).toBe(1);
+    // Arrival of a new Agent record proves the late response has reached React.
+    await f.page.getByLabel("当前角色 产品经理").click();
+    await expect(f.page.getByRole("menuitem", {name:"Cloud",exact:true})).toBeVisible();
+    await f.page.getByLabel("当前角色 产品经理").click();
+    await expect(f.page.getByLabel("当前运行模式")).toHaveValue("goose");
+    await expect(f.page.getByLabel("当前模型")).toHaveValue("standalone/local-agent");
+    await f.page.getByLabel("会话消息").fill("late Agent metadata");
+    await f.page.getByLabel("发送", {exact:true}).click();
+    await expect(f.page.getByTestId("conversation-status")).toContainText("已暂停");
+    expect((await f.requests()).find(r=>r.path.endsWith('/messages')).body).toEqual({content:"late Agent metadata",runtime:"goose",provider_id:"standalone",model:"local-agent"});
+    await f.state({events:[{cursor:"late-q",eventId:"late-q",name:"turn_queued",value:{command_id:"command-1"}},{cursor:"late-r",eventId:"late-r",name:"runtime.status.changed",value:{status:"running"}}]});
+    await expect(f.page.getByTestId("conversation-status")).toContainText("执行中");
+    await expect(f.page.getByLabel("当前运行模式")).toHaveValue("goose");
+    await expect(f.page.getByLabel("当前模型")).toHaveValue("standalone/local-agent");
+    await expect(f.page.getByLabel("当前运行模式")).toBeDisabled();
     await expect(f.page.getByLabel("当前模型")).toBeDisabled();
   } finally { await f.app.close(); }
 });

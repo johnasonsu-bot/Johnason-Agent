@@ -180,6 +180,7 @@ function compatibleProvider(runtime: RuntimeSelector, provider: ProviderProfile 
 }
 
 type FrozenSelection = { runtime: "" | RuntimeSelector; providerId: string; model: string; pending: boolean; commandId?: string; ackPaused?: boolean };
+type DraftSelection = Pick<FrozenSelection, "runtime" | "providerId" | "model">;
 type OptimisticMessage = { entry: TimelineEntry; commandId?: string };
 
 export function ConversationWorkspace() {
@@ -208,6 +209,7 @@ export function ConversationWorkspace() {
   const activeSessionRef = useRef(sessionId);
   activeSessionRef.current = sessionId;
   const selectionsRef = useRef<Record<string, FrozenSelection>>({});
+  const draftSelectionsRef = useRef<Record<string, DraftSelection>>({});
   const projectionsRef = useRef<Record<string, ConversationStatusProjection>>({});
   const commandStatesRef = useRef<Record<string, Map<string, ConversationStatusProjection>>>({});
   const confirmedUsersRef = useRef<Record<string, Set<string>>>({});
@@ -383,10 +385,13 @@ export function ConversationWorkspace() {
 
   useEffect(() => {
     const frozen = selectionsRef.current[sessionId];
-    if (frozen?.pending) {
-      setSelectedRuntime(frozen.runtime);
-      setSelectedModel(frozen.model);
-      setSelectedProviderId(frozen.providerId);
+    // Metadata loading may replace activeProfile after a user already chose
+    // a route. Defaults only initialize untouched drafts, never explicit input.
+    const chosen = frozen?.pending ? frozen : draftSelectionsRef.current[sessionId];
+    if (chosen) {
+      setSelectedRuntime(chosen.runtime);
+      setSelectedModel(chosen.model);
+      setSelectedProviderId(chosen.providerId);
       return;
     }
     setSelectedRuntime("");
@@ -396,13 +401,25 @@ export function ConversationWorkspace() {
 
   const changeRuntime = (runtime: "" | RuntimeSelector) => {
     if (pending) return;
-    setSelectedRuntime(runtime);
-    if (!runtime) return;
-    const compatible = allModelOptions.filter(option => compatibleProvider(runtime, providers.find(p => p.id === option.providerId), option.model));
-    if (!compatible.some(option => option.providerId === selectedProviderId && option.model === selectedModel) && compatible[0]) {
-      setSelectedProviderId(compatible[0].providerId);
-      setSelectedModel(compatible[0].model);
+    const next: DraftSelection = { runtime, providerId: selectedProviderId, model: selectedModel };
+    if (runtime) {
+      const compatible = allModelOptions.filter(option => compatibleProvider(runtime, providers.find(p => p.id === option.providerId), option.model));
+      if (!compatible.some(option => option.providerId === next.providerId && option.model === next.model) && compatible[0]) {
+        next.providerId = compatible[0].providerId;
+        next.model = compatible[0].model;
+      }
     }
+    draftSelectionsRef.current[sessionId] = next;
+    setSelectedRuntime(runtime);
+    setSelectedProviderId(next.providerId);
+    setSelectedModel(next.model);
+  };
+
+  const changeModel = (providerId: string, model: string) => {
+    if (pending) return;
+    draftSelectionsRef.current[sessionId] = { runtime: selectedRuntime, providerId, model };
+    setSelectedProviderId(providerId);
+    setSelectedModel(model);
   };
 
   const createGroup = (roles: string[], mode: "single" | "multi") => {
@@ -533,7 +550,7 @@ export function ConversationWorkspace() {
         <GraphRun state={research} onResume={resumeResearch} sessionId={sessionId} />
       </div>
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
-      <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={(providerId, model) => { if (!pending) { setSelectedProviderId(providerId); setSelectedModel(model); } }} runtime={selectedRuntime} runtimeOptions={runtimeOptions} onRuntimeChange={changeRuntime} />
+      <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={changeModel} runtime={selectedRuntime} runtimeOptions={runtimeOptions} onRuntimeChange={changeRuntime} />
     </main>
     {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header>{htmlArtifact ? <HtmlArtifactPreview artifactId={htmlArtifact.artifactId} /> : <><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section></>}<section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>当前结果 · 历史 Attempt · 审核证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
   </section>;
