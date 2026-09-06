@@ -31,7 +31,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimeEventV2,
     RuntimeQueryInputV2,
 )
-from workbench.runtime.engine_host.v2.mapper import map_runtime_event
+from workbench.runtime.engine_host.v2.mapper import map_runtime_event, map_buffered_assistant_text
 from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.supervisor import (
     SupervisorFatalError,
@@ -133,6 +133,7 @@ class RuntimeEventProjection:
     domain_events: tuple[DomainEvent, ...]
     assistant_message: str | None = None
     terminal_status: TerminalRuntimeStatus | None = None
+    text_state: dict[str, object] | None = None
 
 
 class FederatedConversationExecutor:
@@ -345,6 +346,7 @@ def project_runtime_event(
     *,
     after_cursor: int = 0,
     projected_digests: Mapping[str, str] | None = None,
+    text_state: Mapping[str, object] | None = None,
 ) -> RuntimeEventProjection | None:
     """Project one validated Host-v2 event through the shared public mapper."""
     if not isinstance(event, RuntimeEventV2):
@@ -385,7 +387,13 @@ def project_runtime_event(
         if status in _TERMINAL_STATUSES:
             terminal_status = status
     try:
-        domain_events = map_runtime_event(event)
+        next_text_state = None
+        if text_state is None:
+            domain_events = map_runtime_event(event)
+        else:
+            domain_events, next_text_state = map_buffered_assistant_text(event, text_state)
+            if terminal_status == "completed" and next_text_state["text"]:
+                assistant_message = next_text_state["text"]
     except (TypeError, ValueError) as error:
         raise FederatedConversationProtocolError(
             "runtime event cannot be projected"
@@ -396,6 +404,7 @@ def project_runtime_event(
         domain_events=domain_events,
         assistant_message=assistant_message,
         terminal_status=terminal_status,
+        text_state=next_text_state,
     )
 
 

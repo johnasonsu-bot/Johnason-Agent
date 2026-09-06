@@ -230,7 +230,7 @@ def map_domain_event(event: DomainEvent) -> list[dict[str, Any]]:
     if event_type == "run.failed":
         result["message"] = payload.get("message", "Run failed")
     elif event_type == "agent.message.delta":
-        if source == "engine_host.v2" and _v2_public_text(payload, "content", 4096) is None:
+        if source == "engine_host.v2" and _v2_public_text(payload, "content", 65536) is None:
             return []
         result["messageId"] = message_id
         result["delta"] = payload.get("content", "")

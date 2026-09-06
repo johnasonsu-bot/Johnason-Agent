@@ -1290,6 +1290,11 @@ class ConversationAPI:
         projected_cursor = turn.state.get("runtime_projected_cursor", 0)
         accumulated = turn.state.get("runtime_projected_result", [])
         projected_digests = turn.state.get("runtime_projected_event_digests", {})
+        # Pre-buffer turns with an advanced cursor must keep token projection:
+        # their already-public text cannot safely be reconstructed or re-emitted.
+        text_state = turn.state.get(
+            "runtime_text_state", {} if projected_cursor == 0 else None
+        )
         assistant_message = turn.state.get("runtime_assistant_message")
         terminal_outcome = turn.state.get("runtime_terminal_outcome")
         if (
@@ -1340,6 +1345,42 @@ class ConversationAPI:
                     )
                 projected_cursor = terminal_cursor
                 projected_digests[str(terminal_cursor)] = terminal_digest
+                # A terminal cursor can flush several domain events before its
+                # snapshot is saved. Rebuild their durable public effects rather
+                # than rerunning a runtime whose terminal is already committed.
+                accumulated = []
+                for event in self.events.read_stream(f"run:{turn.session_id}"):
+                    if (
+                        event.causation_id != reservation_id
+                        or not isinstance(event.correlation_id, str)
+                        or not event.correlation_id.startswith("runtime-event-digest:")
+                    ):
+                        continue
+                    accumulated.extend(map_domain_event(event))
+                    if event.event_type == "agent.message.completed":
+                        content = event.payload.get("content")
+                        if (
+                            not isinstance(content, str)
+                            or not content
+                            or (assistant_message is not None and assistant_message != content)
+                        ):
+                            raise TurnSnapshotCorruption("conflicting durable assistant messages")
+                        assistant_message = content
+                        if text_state is not None:
+                            text_state = {
+                                "text": content, "emitted": len(content), "completed": True,
+                            }
+                if assistant_message is not None:
+                    persisted_message = self.conversations.append_message(
+                        ConversationMessage(
+                            session_id=turn.session_id,
+                            command_id=f"{turn.command_id}:assistant",
+                            role="assistant",
+                            content=assistant_message,
+                        )
+                    )
+                    if persisted_message.content != assistant_message:
+                        raise TurnSnapshotCorruption("persisted assistant message identity changed")
         if terminal_outcome is not None:
             self._finish_federated_runtime_turn(
                 turn,
@@ -1347,6 +1388,7 @@ class ConversationAPI:
                 projected_cursor=projected_cursor,
                 accumulated=accumulated,
                 projected_digests=projected_digests,
+                text_state=text_state,
                 assistant_message=assistant_message,
                 outcome=terminal_outcome,
             )
@@ -1373,6 +1415,7 @@ class ConversationAPI:
                         runtime_event,
                         after_cursor=projected_cursor,
                         projected_digests=projected_digests,
+                        text_state=text_state,
                     )
                     if projection is None:
                         continue
@@ -1380,12 +1423,15 @@ class ConversationAPI:
                         raise FederatedConversationProtocolError(
                             "runtime event appeared after terminal"
                         )
-                    for domain_event in projection.domain_events:
+                    for part_index, domain_event in enumerate(projection.domain_events):
+                        projection_key = f"{turn.command_id}:runtime:{projection.cursor}"
+                        if part_index:
+                            projection_key += f":part:{part_index}"
                         appended = self._append(
                             turn.session_id,
                             domain_event.event_type,
                             dict(domain_event.payload),
-                            f"{turn.command_id}:runtime:{projection.cursor}",
+                            projection_key,
                             ordinal=domain_event.sequence,
                             correlation_id="runtime-event-digest:" + event_digest,
                             causation_id=reservation_id,
@@ -1415,6 +1461,7 @@ class ConversationAPI:
                             )
                     terminal_status = projection.terminal_status or terminal_status
                     projected_cursor = projection.cursor
+                    text_state = projection.text_state
                     projected_digests[str(projected_cursor)] = event_digest
                     projected_outcome = (
                         self._federated_terminal_outcome(terminal_status)
@@ -1427,6 +1474,7 @@ class ConversationAPI:
                             "runtime_projected_cursor": projected_cursor,
                             "runtime_projected_result": accumulated,
                             "runtime_projected_event_digests": projected_digests,
+                            "runtime_text_state": text_state,
                             **(
                                 {"runtime_assistant_message": assistant_message}
                                 if assistant_message is not None
@@ -1460,6 +1508,7 @@ class ConversationAPI:
                         "runtime_projected_cursor": projected_cursor,
                         "runtime_projected_result": accumulated,
                         "runtime_projected_event_digests": projected_digests,
+                        "runtime_text_state": text_state,
                     }
                 )
                 self._apply_federated_retry_backoff(retry_state)
@@ -1476,6 +1525,7 @@ class ConversationAPI:
                 projected_cursor=projected_cursor,
                 accumulated=accumulated,
                 projected_digests=projected_digests,
+                text_state=text_state,
                 assistant_message=assistant_message,
                 outcome=error.category,
             )
@@ -1487,6 +1537,7 @@ class ConversationAPI:
                 projected_cursor=projected_cursor,
                 accumulated=accumulated,
                 projected_digests=projected_digests,
+                text_state=text_state,
                 assistant_message=assistant_message,
                 outcome="runtime_failed",
             )
@@ -1507,6 +1558,7 @@ class ConversationAPI:
             projected_cursor=projected_cursor,
             accumulated=accumulated,
             projected_digests=projected_digests,
+            text_state=text_state,
             assistant_message=assistant_message,
             outcome=outcome,
         )
@@ -1567,6 +1619,7 @@ class ConversationAPI:
         projected_cursor: int,
         accumulated: list[dict[str, Any]],
         projected_digests: dict[str, str],
+        text_state: dict[str, object] | None,
         assistant_message: str | None,
         outcome: PublicFederatedFailure | Literal["completed"],
     ) -> None:
@@ -1587,6 +1640,7 @@ class ConversationAPI:
                 "runtime_projected_cursor": projected_cursor,
                 "runtime_projected_result": accumulated,
                 "runtime_projected_event_digests": projected_digests,
+                "runtime_text_state": text_state,
                 "runtime_terminal_outcome": outcome,
                 **(
                     {"runtime_assistant_message": assistant_message}
@@ -1641,6 +1695,7 @@ class ConversationAPI:
                 "runtime_projected_cursor": projected_cursor,
                 "runtime_projected_result": accumulated,
                 "runtime_projected_event_digests": projected_digests,
+                "runtime_text_state": text_state,
                 "runtime_terminal_outcome": outcome,
                 **(
                     {"runtime_assistant_message": assistant_message}

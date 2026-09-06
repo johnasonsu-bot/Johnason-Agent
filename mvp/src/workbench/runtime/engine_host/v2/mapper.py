@@ -171,12 +171,9 @@ def is_opaque_identifier(value: Any) -> bool:
 
 def validate_public_text(value: Any, *, maximum: int) -> str:
     """Validate the one text policy shared by runtime and AG-UI boundaries."""
+    _validate_pending_text(value, maximum=maximum)
     if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > maximum
-        or _CONTROL.search(value)
-        or _contains_private_public_label(value)
+        _contains_private_public_label(value)
         or _contains_credential_value(value)
         or _DIGEST_VALUE.search(value)
         or is_local_path(value)
@@ -184,6 +181,94 @@ def validate_public_text(value: Any, *, maximum: int) -> str:
     ):
         raise ValueError("value must be bounded public text")
     return value
+
+
+def _validate_pending_text(value: Any, *, maximum: int) -> str:
+    """Bound a private unfinished body without guessing its lexical ending.
+
+    This does not authorize publication. Every emitted block is subsequently
+    checked with validate_public_text, including its local-path policy.
+    """
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or _CONTROL.search(value)
+    ):
+        raise ValueError("value must be bounded public text")
+    return value
+
+
+def map_buffered_assistant_text(
+    event: RuntimeEventV2, state: Mapping[str, Any]
+) -> tuple[tuple[DomainEvent, ...], dict[str, Any]]:
+    """Frame transport tokens into complete lines without altering raw cursors.
+
+    Both the buffered body and emitted boundary must be durably saved by the
+    consumer with the cursor. No caller-owned state is mutated on rejection.
+    """
+    if not isinstance(state, Mapping) or set(state) - {"text", "emitted", "completed"}:
+        raise ValueError("invalid assistant text state")
+    text = state.get("text", "")
+    emitted = state.get("emitted", 0)
+    completed = state.get("completed", False)
+    if (
+        not isinstance(text, str) or len(text) > _MAX_ASSISTANT_MESSAGE_CHARS
+        or type(emitted) is not int or not 0 <= emitted <= len(text)
+        or type(completed) is not bool
+        or (completed and emitted != len(text))
+        or (not completed and emitted and text[emitted - 1] != "\n")
+    ):
+        raise ValueError("invalid assistant text state")
+    if text:
+        _validate_pending_text(text, maximum=_MAX_ASSISTANT_MESSAGE_CHARS)
+    if emitted:
+        validate_public_text(text[:emitted], maximum=_MAX_ASSISTANT_MESSAGE_CHARS)
+    identity = _identity(event)
+    payload = _payload(event)
+    result: list[DomainEvent] = []
+    final_events: tuple[DomainEvent, ...] = ()
+    terminal_events: tuple[DomainEvent, ...] = ()
+    if event.type == "assistant.delta":
+        _allow_only(payload, "text", "content")
+        if "text" in payload and "content" in payload and payload["text"] != payload["content"]:
+            raise ValueError("ambiguous assistant text aliases")
+        # Validate the envelope and non-text data now, but never interpret an
+        # arbitrary '/Delta' transport fragment as an independent filesystem path.
+        for key, value in payload.items():
+            _validate_pending_text(value, maximum=4096)
+        fragment = payload.get("text") or payload.get("content")
+        if not isinstance(fragment, str) or completed:
+            raise ValueError("invalid assistant text fragment")
+        text += fragment
+        _validate_pending_text(text, maximum=_MAX_ASSISTANT_MESSAGE_CHARS)
+        boundary = text.rfind("\n") + 1
+    elif event.type == "assistant.message":
+        final_events = map_runtime_event(event)
+        final_text = payload["content"]
+        if not final_text.startswith(text) or (completed and final_text != text):
+            raise ValueError("assistant final content conflicts with streamed body")
+        text = final_text
+        boundary = len(text)
+        completed = True
+    else:
+        if event.type == "runtime.status" and payload.get("status") == "completed" and text and not completed:
+            terminal_events = map_runtime_event(event)
+            boundary = len(text)
+            completed = True
+            final_events = (_domain_event(identity, "agent.message.completed", {"content": text}),)
+        else:
+            return map_runtime_event(event), {"text": text, "emitted": emitted, "completed": completed}
+    if boundary > emitted:
+        # Validate the semantic prefix AND the standalone block before publishing.
+        validate_public_text(text[:boundary], maximum=_MAX_ASSISTANT_MESSAGE_CHARS)
+        _reject_sensitive_payload({"content": text[:boundary]})
+        block = validate_public_text(text[emitted:boundary], maximum=_MAX_ASSISTANT_MESSAGE_CHARS)
+        result.append(_domain_event(identity, "agent.message.delta", {"content": block}))
+        emitted = boundary
+    result.extend(final_events)
+    result.extend(terminal_events)
+    return tuple(result), {"text": text, "emitted": emitted, "completed": completed}
 
 
 def _normalized_words(value: str) -> tuple[str, ...]:
