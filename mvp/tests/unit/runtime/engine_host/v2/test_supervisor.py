@@ -11,8 +11,14 @@ from tests.fixtures.assignment_v2 import admitted_assignment
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     CorruptAssignmentState,
+    RuntimeAssignmentInput,
 )
-from tests.fixtures.host_v2 import run_envelope, runtime_capabilities, runtime_event
+from tests.fixtures.host_v2 import (
+    fake_v2_command,
+    run_envelope,
+    runtime_capabilities,
+    runtime_event,
+)
 from workbench.runtime.engine_host.v2.assignment import LeaseConflict
 from workbench.runtime.engine_host.v2.client import (
     RuntimeClientObservation,
@@ -28,6 +34,7 @@ from workbench.runtime.engine_host.v2.registry import (
     RuntimeRegistryIntegrityError,
     RuntimeRegistryV2,
 )
+from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.repository import RuntimeV2Repository
 from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
 from workbench.runtime.engine_host.v2.supervisor import SupervisorShutdownError
@@ -1096,6 +1103,106 @@ async def test_stream_close_cancels_and_durably_recovers_without_waiting_for_exp
     assert clients[0].cancel_count == 1
     assert assignments.active_leases(runtime_ids=("goose",)) == ()
     assert supervisor.snapshot()[0].host_generation == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "consumer_exit", ["aclose", "projection_error", "cancel_waiter", "cancel_before_accept"]
+)
+async def test_consumer_exit_preserves_health_and_allows_a_new_assignment(
+    tmp_path: Path, consumer_exit: str,
+) -> None:
+    """A consumer ending a real client stream must not poison its replacement."""
+    database = tmp_path / "consumer-exit.sqlite"
+    capabilities = runtime_capabilities(
+        "fake-v2", build_id="python:test-build", query=True, model=True,
+        tools=True, skills=True, plugins=True, workspace=True,
+        interventions=True, pause_resume=True, compaction=True, checkpoints=True,
+        streaming=True, plan=True, todo=True, prompt_sections=True,
+        tool_interceptors=True, event_cursor=True,
+    )
+    envelope = run_envelope(command_id="consumer-exit-first", host_generation="1")
+    assignments, assignment = admitted_assignment(database, envelope, capabilities)
+    registry = RuntimeRegistryV2(RuntimeV2Repository(database))
+
+    supervisor = SidecarSupervisor(
+        runtimes=(
+            RuntimeProcessConfig(runtime_id="fake-v2", argv=fake_v2_command("cancel")),
+        ),
+        registry=registry,
+        assignments=assignments,
+        runtime_dir=tmp_path,
+        app_instance_id="consumer-exit-test",
+        clock=lambda: 10.0,
+    )
+    await supervisor.start()
+    handle = await supervisor.acquire_for_execution(assignment)
+    stream = handle.run_query(envelope)
+    try:
+        if consumer_exit != "cancel_before_accept":
+            assert (await asyncio.wait_for(anext(stream), timeout=2.0)).payload == {
+                "status": "running"
+            }
+        if consumer_exit == "cancel_before_accept":
+            async with supervisor._slots["fake-v2"].lock:
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                pending.cancel()
+                await asyncio.sleep(0)
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=2.0)
+        elif consumer_exit == "projection_error":
+            with pytest.raises(ValueError, match="downstream projection failed"):
+                await asyncio.wait_for(
+                    stream.athrow(ValueError("downstream projection failed")),
+                    timeout=2.0,
+                )
+        elif consumer_exit == "cancel_waiter":
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=2.0)
+        else:
+            await asyncio.wait_for(stream.aclose(), timeout=2.0)
+
+        await asyncio.wait_for(handle.wait_recovery(), timeout=2.0)
+        assert supervisor.snapshot()[0].state == "ready"
+        assert registry.snapshot()[0].state == "ready"
+        assert supervisor._fatal_error is None
+        assert assignments.active_leases(runtime_ids=("fake-v2",)) == ()
+
+        next_envelope = run_envelope(
+            command_id="consumer-exit-second", host_generation="2"
+        )
+        next_assignment = assignments.admit_assignment(
+            RuntimeAssignmentInput(
+                session_id=next_envelope.session_id,
+                command_id=next_envelope.command_id,
+                envelope_identity_digest=canonical_envelope_identity(
+                    next_envelope
+                ).identity_digest,
+                runtime_id=assignment.runtime_id,
+                build_id=assignment.build_id,
+                capability_snapshot_digest=assignment.capability_snapshot_digest,
+                gate_proof_digest=assignment.gate_proof_digest,
+                admission_epoch=1,
+            ),
+            trusted_time=10.0,
+        )
+        next_handle = await supervisor.acquire_for_execution(next_assignment)
+        next_stream = next_handle.run_query(next_envelope)
+        assert (await asyncio.wait_for(anext(next_stream), timeout=2.0)).payload == {
+            "status": "running"
+        }
+        await next_handle.cancel()
+        events = [event async for event in next_stream]
+        assert events[-1].type == "runtime.status"
+        assert events[-1].payload["status"] == "cancelled"
+        assert supervisor.snapshot()[0].state == "ready"
+    finally:
+        await stream.aclose()
+        await supervisor.aclose()
 
 
 @pytest.mark.asyncio

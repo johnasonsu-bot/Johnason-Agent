@@ -27,8 +27,8 @@
     },
     {
       "path": "tests/**/*.py",
-      "sha256": "7e5e63e8c1857b19b33f438ffb8e0acb43a118f4ae66ad8adfc5290bc76449dc",
-      "size": 2175145
+      "sha256": "80b8f1625c86e3a650ff8157857ce4cb1c1277abf96e6e1ff4746f561d2f7780",
+      "size": 2188304
     },
     {
       "path": "uv.lock",
@@ -144,8 +144,8 @@
     },
     {
       "path": "api/conversations.py",
-      "sha256": "ece3b32036884ac514f2858da46f864694979f6e3f9c486a9a60885fbdfb8fd0",
-      "size": 131311
+      "sha256": "f6bf257c04b679986507b63a2f24af02d22594ffaac3dd349853364c77fce7c7",
+      "size": 131824
     },
     {
       "path": "api/engine_host.py",
@@ -473,6 +473,11 @@
       "size": 2128
     },
     {
+      "path": "runtime/async_stream.py",
+      "sha256": "791d0a1a7716e2d2921600f281360099739431337dffea5d1d6b73731e816294",
+      "size": 935
+    },
+    {
       "path": "runtime/conversation_execution.py",
       "sha256": "6ac18aec4d51286775bcaeff03dc8e48510c9efd25a8f558be1cf74f5e054bb1",
       "size": 7735
@@ -559,8 +564,8 @@
     },
     {
       "path": "runtime/engine_host/v2/mapper.py",
-      "sha256": "7f27611e850c628add92d6e7e2727722bec8c3e05cf5c9cdf066951293d9f734",
-      "size": 27839
+      "sha256": "863cb7ef888b9b3e632971f9b92e0638f2f731e16512d4601245fda0635f65cd",
+      "size": 29169
     },
     {
       "path": "runtime/engine_host/v2/process_guard.py",
@@ -594,13 +599,13 @@
     },
     {
       "path": "runtime/engine_host/v2/supervisor.py",
-      "sha256": "64b2e0cc1fbf789390bbd86c41840c972f24587e2f0b2377eb970b11ed24494f",
-      "size": 90142
+      "sha256": "0030e8d96cc876537436853b65f37771b0c4c91d37d231eeca06c39a1b2b215a",
+      "size": 90788
     },
     {
       "path": "runtime/federated_conversation.py",
-      "sha256": "00e9ba1b4138c834178179707a1ef2efec866540167015f81ae84dd169135b10",
-      "size": 19740
+      "sha256": "7989a44b79f52f4800ca78567fd40f6e41f46fc827b82e88299f98dacc2fa2f6",
+      "size": 19908
     },
     {
       "path": "runtime/goose/__init__.py",
@@ -649,8 +654,8 @@
     },
     {
       "path": "runtime/provider_grants/coordinator.py",
-      "sha256": "18a7b9988c03ae682a919a838b67df76612a568af398d25ac82cc0a237c26202",
-      "size": 7641
+      "sha256": "6ba179516f472510166f2d3d386379f239c5f19675e0e4960c04b446f0d5c77f",
+      "size": 7763
     },
     {
       "path": "runtime/provider_grants/delivery.py",

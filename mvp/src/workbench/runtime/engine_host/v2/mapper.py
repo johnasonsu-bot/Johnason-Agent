@@ -59,6 +59,10 @@ _PATH_BOUNDARY_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./\\-"
 )
 _PATH_SEPARATORS = frozenset("/\\")
+_CJK_SLASH_FRAGMENT = re.compile(r"/[\u3400-\u9fff]+\Z")
+# A completed answer is an aggregate, not a single transport delta. Keep it
+# bounded separately so multi-section reports can finish after streaming.
+_MAX_ASSISTANT_MESSAGE_CHARS = 65_536
 _TRACEBACK = re.compile(r"\btraceback\s*\(", re.IGNORECASE)
 _SENSITIVE_ROOTS = (
     ("reasoning",),
@@ -340,6 +344,12 @@ def is_local_path(value: Any) -> bool:
     """Return whether text contains a local path outside an HTTP(S) URL."""
     if not isinstance(value, str):
         return False
+    # Tokenization can split 国资委/集团 immediately before /集团. A bare
+    # slash plus one Chinese word is ambiguous, so treat that whole fragment as
+    # prose. Labels, file extensions and multi-component paths are not exempt.
+    # This lexical policy is not a cross-chunk secret scanner.
+    if _CJK_SLASH_FRAGMENT.fullmatch(value.strip()):
+        return False
     url_spans = _http_url_spans(value)
 
     def outside_http_url(position: int) -> bool:
@@ -357,11 +367,23 @@ def is_local_path(value: Any) -> bool:
         at_boundary = (
             index == 0
             or any(end == index for _, end in url_spans)
-            or value[index - 1] not in _PATH_BOUNDARY_CHARS
+            or (
+                value[index - 1] not in _PATH_BOUNDARY_CHARS
+                and not value[index - 1].isalnum()
+            )
         )
         if not at_boundary:
             continue
         if character in _PATH_SEPARATORS:
+            # A forward slash on its own (a common streamed punctuation token)
+            # or followed by whitespace is prose punctuation, not a rooted path.
+            # Backslashes, UNC paths and slash-prefixed path components retain
+            # the existing checks. Unicode words have the same boundaries as
+            # English words: 国资委/集团 is a relative phrase, like team/project.
+            if character == "/" and (
+                index + 1 == len(value) or value[index + 1].isspace()
+            ):
+                continue
             return True
         if (
             character.isascii()
@@ -704,7 +726,11 @@ def _project_assistant_delta(payload: Mapping[str, Any]) -> tuple[str, dict[str,
 
 def _project_assistant_message(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     _allow_only(payload, "content")
-    return "agent.message.completed", {"content": _public_text(payload, "content", required=True)}
+    return "agent.message.completed", {
+        "content": _public_text(
+            payload, "content", required=True, maximum=_MAX_ASSISTANT_MESSAGE_CHARS
+        )
+    }
 
 
 def _project_reasoning_delta(payload: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:

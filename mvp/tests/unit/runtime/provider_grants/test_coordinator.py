@@ -264,6 +264,33 @@ def _fixture(
 
 
 @pytest.mark.asyncio
+async def test_closing_coordinator_closes_held_lease_stream_without_gc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, lease, envelope, runtime_input, _, order = _fixture(tmp_path)
+    coordinator = FederatedRuntimeCoordinator(broker, clock=lambda: 101.0)
+    stopped = asyncio.Event()
+
+    async def query():
+        try:
+            yield runtime_event("runtime.status", payload={"status": "running"})
+        finally:
+            stopped.set()
+
+    # Retain the iterator so garbage collection cannot hide a missing close.
+    held_stream = query()
+    monkeypatch.setattr(lease, "run_query", lambda *a, **kw: held_stream)
+    stream = coordinator.run_query(lease, envelope, runtime_input=runtime_input)
+    try:
+        await anext(stream)
+        await stream.aclose()
+        assert stopped.is_set()
+        assert order == ["target", "delivery", "ack"]
+    finally:
+        await held_stream.aclose()
+
+
+@pytest.mark.asyncio
 async def test_invalid_target_closes_lease_before_any_grant_or_query(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

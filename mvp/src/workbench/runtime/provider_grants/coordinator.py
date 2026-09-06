@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Callable
 import time
 from typing import Protocol
 
+from workbench.runtime.async_stream import managed_async_iterator
 from workbench.runtime.engine_host.v2.contracts import (
     RunEnvelopeV2,
     RuntimeEventV2,
@@ -129,11 +130,11 @@ class FederatedRuntimeCoordinator:
             await lease.aclose()
             raise
 
-        async for event in lease.run_query(
-            envelope,
-            runtime_input=runtime_input,
-        ):
-            yield event
+        async with managed_async_iterator(
+            lease.run_query(envelope, runtime_input=runtime_input)
+        ) as stream:
+            async for event in stream:
+                yield event
 
     async def _deliver_or_cancel(
         self,

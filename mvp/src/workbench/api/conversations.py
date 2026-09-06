@@ -44,6 +44,7 @@ from workbench.providers.repository import ProviderRepository
 from workbench.orchestration.development_jobs import DevelopmentJobRepository
 from workbench.protocol.events import DomainEvent
 from workbench.runtime.agent_loop import AgentEvent, RunAgentTurn
+from workbench.runtime.async_stream import managed_async_iterator
 from workbench.runtime.engine_host.client import (
     HostExecutionError,
     HostRunRejected,
@@ -1353,94 +1354,97 @@ class ConversationAPI:
         terminal_status: str | None = None
         stream_cursor: int | None = None
         try:
-            async for runtime_event in self.federated_executor.execute(snapshot):
-                if stream_cursor is not None:
-                    if runtime_event.cursor < stream_cursor:
-                        raise FederatedConversationProtocolError(
-                            "runtime cursor regressed"
-                        )
-                    if runtime_event.cursor > stream_cursor + 1:
-                        raise FederatedConversationProtocolError(
-                            "runtime cursor has a gap"
-                        )
-                stream_cursor = runtime_event.cursor
-                event_digest = canonical_runtime_event_digest(runtime_event)
-                projection = project_runtime_event(
-                    runtime_event,
-                    after_cursor=projected_cursor,
-                    projected_digests=projected_digests,
-                )
-                if projection is None:
-                    continue
-                if terminal_status is not None:
-                    raise FederatedConversationProtocolError(
-                        "runtime event appeared after terminal"
+            async with managed_async_iterator(
+                self.federated_executor.execute(snapshot)
+            ) as stream:
+                async for runtime_event in stream:
+                    if stream_cursor is not None:
+                        if runtime_event.cursor < stream_cursor:
+                            raise FederatedConversationProtocolError(
+                                "runtime cursor regressed"
+                            )
+                        if runtime_event.cursor > stream_cursor + 1:
+                            raise FederatedConversationProtocolError(
+                                "runtime cursor has a gap"
+                            )
+                    stream_cursor = runtime_event.cursor
+                    event_digest = canonical_runtime_event_digest(runtime_event)
+                    projection = project_runtime_event(
+                        runtime_event,
+                        after_cursor=projected_cursor,
+                        projected_digests=projected_digests,
                     )
-                for domain_event in projection.domain_events:
-                    appended = self._append(
+                    if projection is None:
+                        continue
+                    if terminal_status is not None:
+                        raise FederatedConversationProtocolError(
+                            "runtime event appeared after terminal"
+                        )
+                    for domain_event in projection.domain_events:
+                        appended = self._append(
+                            turn.session_id,
+                            domain_event.event_type,
+                            dict(domain_event.payload),
+                            f"{turn.command_id}:runtime:{projection.cursor}",
+                            ordinal=domain_event.sequence,
+                            correlation_id="runtime-event-digest:" + event_digest,
+                            causation_id=reservation_id,
+                        )
+                        if appended:
+                            accumulated.append(appended)
+                    if projection.assistant_message is not None:
+                        if (
+                            assistant_message is not None
+                            and assistant_message != projection.assistant_message
+                        ):
+                            raise FederatedConversationProtocolError(
+                                "runtime emitted conflicting assistant messages"
+                            )
+                        assistant_message = projection.assistant_message
+                        persisted_message = self.conversations.append_message(
+                            ConversationMessage(
+                                session_id=turn.session_id,
+                                command_id=f"{turn.command_id}:assistant",
+                                role="assistant",
+                                content=assistant_message,
+                            )
+                        )
+                        if persisted_message.content != assistant_message:
+                            raise TurnSnapshotCorruption(
+                                "persisted assistant message identity changed"
+                            )
+                    terminal_status = projection.terminal_status or terminal_status
+                    projected_cursor = projection.cursor
+                    projected_digests[str(projected_cursor)] = event_digest
+                    projected_outcome = (
+                        self._federated_terminal_outcome(terminal_status)
+                        if terminal_status is not None
+                        else None
+                    )
+                    projected_state = dict(turn.state)
+                    projected_state.update(
+                        {
+                            "runtime_projected_cursor": projected_cursor,
+                            "runtime_projected_result": accumulated,
+                            "runtime_projected_event_digests": projected_digests,
+                            **(
+                                {"runtime_assistant_message": assistant_message}
+                                if assistant_message is not None
+                                else {}
+                            ),
+                            **(
+                                {"runtime_terminal_outcome": projected_outcome}
+                                if projected_outcome is not None
+                                else {}
+                            ),
+                        }
+                    )
+                    self.conversations.save_turn_state(
                         turn.session_id,
-                        domain_event.event_type,
-                        dict(domain_event.payload),
-                        f"{turn.command_id}:runtime:{projection.cursor}",
-                        ordinal=domain_event.sequence,
-                        correlation_id="runtime-event-digest:" + event_digest,
-                        causation_id=reservation_id,
+                        turn.command_id,
+                        owner_id=turn.owner_id or "",
+                        state=projected_state,
                     )
-                    if appended:
-                        accumulated.append(appended)
-                if projection.assistant_message is not None:
-                    if (
-                        assistant_message is not None
-                        and assistant_message != projection.assistant_message
-                    ):
-                        raise FederatedConversationProtocolError(
-                            "runtime emitted conflicting assistant messages"
-                        )
-                    assistant_message = projection.assistant_message
-                    persisted_message = self.conversations.append_message(
-                        ConversationMessage(
-                            session_id=turn.session_id,
-                            command_id=f"{turn.command_id}:assistant",
-                            role="assistant",
-                            content=assistant_message,
-                        )
-                    )
-                    if persisted_message.content != assistant_message:
-                        raise TurnSnapshotCorruption(
-                            "persisted assistant message identity changed"
-                        )
-                terminal_status = projection.terminal_status or terminal_status
-                projected_cursor = projection.cursor
-                projected_digests[str(projected_cursor)] = event_digest
-                projected_outcome = (
-                    self._federated_terminal_outcome(terminal_status)
-                    if terminal_status is not None
-                    else None
-                )
-                projected_state = dict(turn.state)
-                projected_state.update(
-                    {
-                        "runtime_projected_cursor": projected_cursor,
-                        "runtime_projected_result": accumulated,
-                        "runtime_projected_event_digests": projected_digests,
-                        **(
-                            {"runtime_assistant_message": assistant_message}
-                            if assistant_message is not None
-                            else {}
-                        ),
-                        **(
-                            {"runtime_terminal_outcome": projected_outcome}
-                            if projected_outcome is not None
-                            else {}
-                        ),
-                    }
-                )
-                self.conversations.save_turn_state(
-                    turn.session_id,
-                    turn.command_id,
-                    owner_id=turn.owner_id or "",
-                    state=projected_state,
-                )
         except asyncio.CancelledError:
             raise
         except FederatedConversationSnapshotError as error:

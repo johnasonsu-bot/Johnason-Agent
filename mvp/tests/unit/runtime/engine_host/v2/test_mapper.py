@@ -650,6 +650,48 @@ def test_runtime_public_boundary_allows_relative_text_with_path_separators() -> 
     assert mapper_module.validate_public_text(text, maximum=4096) == text
 
 
+@pytest.mark.parametrize("text", ["/", " / ", "国资委/集团", "项目总监 / 业务架构师", "研究/比较/检查", "équipe/projet"])
+def test_assistant_prose_separators_survive_both_public_boundaries(text: str) -> None:
+    """A slash token or Unicode role separator is not a rooted filesystem path."""
+    from workbench.agui.mapper import map_domain_event
+
+    event = map_runtime_event(runtime_event("assistant.delta", payload={"text": text}))[0]
+    assert event.payload["content"] == text
+    assert map_domain_event(event)[0]["delta"] == text
+    final = map_runtime_event(runtime_event("assistant.message", payload={"content": text}))[0]
+    assert final.payload["content"] == text
+
+
+def test_chinese_role_separator_survives_every_two_chunk_split() -> None:
+    from workbench.agui.mapper import map_domain_event
+
+    text = "国资委/集团"
+    for cut in range(1, len(text)):
+        chunks = (text[:cut], text[cut:])
+        projected = []
+        for chunk in chunks:
+            event = map_runtime_event(runtime_event("assistant.delta", payload={"text": chunk}))[0]
+            projected.append(map_domain_event(event)[0]["delta"])
+        assert "".join(projected) == text
+
+
+@pytest.mark.parametrize("text", ["/Users/test/report", "路径：/私有/文件", "路径=/私有/文件", "路径：C:/私有/文件", "路径：/集团", "路径=/集团", "/集团.json", "/集团/文件"])
+def test_unicode_prose_support_still_rejects_rooted_paths(text: str) -> None:
+    with pytest.raises(ValueError):
+        map_runtime_event(runtime_event("assistant.delta", payload={"text": text}))
+
+
+def test_completed_assistant_report_is_not_limited_to_one_stream_chunk() -> None:
+    """An ordinary multi-role report can exceed the 4096-character delta limit."""
+    text = "项目总监负责统筹，业务架构师负责业务建模。\n" * 300
+    mapped = map_runtime_event(runtime_event("assistant.message", payload={"content": text}))
+    assert mapped[0].payload["content"] == text
+    with pytest.raises(ValueError):
+        map_runtime_event(runtime_event("assistant.delta", payload={"text": text}))
+    with pytest.raises(ValueError):
+        map_runtime_event(runtime_event("assistant.message", payload={"content": "中" * 65537}))
+
+
 @pytest.mark.parametrize(
     ("runtime_code", "public_code"),
     [

@@ -353,6 +353,38 @@ def _authority_for(snapshot: dict[str, object]) -> _Assignments:
 
 
 @pytest.mark.asyncio
+async def test_closing_executor_closes_held_coordinator_stream_without_gc() -> None:
+    snapshot = _snapshot("goose")
+    stopped = asyncio.Event()
+
+    async def query():
+        try:
+            yield runtime_event("runtime.status", payload={"status": "running"})
+        finally:
+            stopped.set()
+
+    held_stream = query()
+
+    class Coordinator:
+        def run_query(self, *args, **kwargs):
+            return held_stream
+
+    executor = FederatedConversationExecutor(
+        assignments=_authority_for(snapshot),
+        supervisor=_RecoverySupervisor(_RecoverableLease()),
+        coordinator=Coordinator(),
+    )
+    stream = executor.execute(snapshot)
+    try:
+        await anext(stream)
+        await stream.aclose()
+        assert stopped.is_set()
+        assert executor.active_command("session-1") is None
+    finally:
+        await held_stream.aclose()
+
+
+@pytest.mark.asyncio
 async def test_executor_replays_only_supervisor_approved_read_only_retry() -> None:
     snapshot = _snapshot("goose")
     retry = _RecoverableLease()

@@ -16,6 +16,7 @@ import time
 from typing import Any, Awaitable, Callable, Literal
 from uuid import uuid4
 
+from workbench.runtime.async_stream import managed_async_iterator
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentRepository,
     LeaseConflict,
@@ -1375,6 +1376,9 @@ class SidecarSupervisor:
                         trusted_time=now,
                     )
                 handle._replace_lease(lease)
+        except asyncio.CancelledError:
+            # A cancelled consumer is not a shared control-plane failure.
+            raise
         except LeaseConflict:
             raise
         except BaseException as error:
@@ -1392,17 +1396,22 @@ class SidecarSupervisor:
                     runtime_input=runtime_input,
                     observer=observer,
                 )
-            async for event in stream:
-                terminal = (
-                    event.type == "runtime.status"
-                    and event.payload.get("status")
-                    in {"completed", "failed", "cancelled"}
-                )
-                if terminal:
-                    handle._mark_terminal_proof()
-                if handle._is_retiring():
-                    continue
-                yield event
+            async with managed_async_iterator(stream):
+                async for event in stream:
+                    terminal = (
+                        event.type == "runtime.status"
+                        and event.payload.get("status")
+                        in {"completed", "failed", "cancelled"}
+                    )
+                    if terminal:
+                        handle._mark_terminal_proof()
+                    if handle._is_retiring():
+                        continue
+                    yield event
+        except (GeneratorExit, asyncio.CancelledError):
+            # The lease wrapper retires this run after delegated stream cleanup.
+            # Do not poison healthy slots when downstream consumption ends.
+            raise
         except RuntimeClientError:
             await self._recover_failed_handle(handle)
             raise
@@ -2086,12 +2095,15 @@ class SupervisedRuntimeLease:
         controlled = self.__supervisor._controlled_envelope(self, envelope)
         self.__run_identity = controlled.run_id
         try:
-            async for event in self.__supervisor._run_handle_query(
-                self,
-                controlled,
-                runtime_input=runtime_input,
-            ):
-                yield event
+            async with managed_async_iterator(
+                self.__supervisor._run_handle_query(
+                    self,
+                    controlled,
+                    runtime_input=runtime_input,
+                )
+            ) as stream:
+                async for event in stream:
+                    yield event
         finally:
             if not self.__closed and not self.__retiring:
                 await self.__supervisor._close_handle(self)

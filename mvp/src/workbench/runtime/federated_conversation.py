@@ -10,6 +10,7 @@ import json
 from typing import Literal, Protocol
 
 from workbench.protocol.events import DomainEvent
+from workbench.runtime.async_stream import managed_async_iterator
 from workbench.runtime.engine_host.v2.assignment import (
     AssignmentConflict,
     CorruptAssignmentState,
@@ -208,16 +209,17 @@ class FederatedConversationExecutor:
         try:
             while True:
                 try:
-                    async for event in self._coordinator.run_query(
-                        lease,
-                        envelope,
-                        runtime_input=runtime_input,
-                    ):
-                        if not isinstance(event, RuntimeEventV2):
-                            raise FederatedConversationProtocolError(
-                                "federated coordinator yielded an invalid runtime event"
-                            )
-                        yield event
+                    async with managed_async_iterator(
+                        self._coordinator.run_query(
+                            lease, envelope, runtime_input=runtime_input
+                        )
+                    ) as stream:
+                        async for event in stream:
+                            if not isinstance(event, RuntimeEventV2):
+                                raise FederatedConversationProtocolError(
+                                    "federated coordinator yielded an invalid runtime event"
+                                )
+                            yield event
                     return
                 except RuntimeReconciliationRequired:
                     raise FederatedConversationExecutionError(

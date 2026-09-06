@@ -377,6 +377,64 @@ def test_service_message_path_is_idempotent_conflict_safe_and_restart_durable(
     assert first_executor.calls == 1
 
 
+def test_projection_failure_closes_accepted_stream_before_next_turn(
+    tmp_path: Path,
+) -> None:
+    """A rejected projection is deterministic regression evidence, not live GO."""
+
+    class HeldRuntime:
+        def __init__(self):
+            self.streams = []
+            self.busy = False
+            self.commands = []
+            self.closed = []
+
+        def execute(self, snapshot):
+            async def query():
+                assert not self.busy, "previous accepted stream was not closed"
+                self.busy = True
+                command_id = snapshot["envelope"]["command_id"]
+                self.commands.append(command_id)
+                try:
+                    if len(self.commands) == 1:
+                        yield _runtime_event(
+                            snapshot,
+                            "assistant.delta",
+                            1,
+                            {"text": "path=/private/state"},
+                        )
+                    else:
+                        yield _runtime_event(
+                            snapshot, "runtime.status", 1, {"status": "running"}
+                        )
+                    yield _runtime_event(
+                        snapshot, "runtime.status", 2, {"status": "completed"}
+                    )
+                finally:
+                    self.busy = False
+                    self.closed.append(command_id)
+
+            stream = query()
+            self.streams.append(stream)  # Keep GC from closing a forgotten iterator.
+            return stream
+
+    executor = HeldRuntime()
+    database = tmp_path / "projection-cleanup.sqlite"
+    payload = _message_payload("dsh")
+    with TestClient(_service_app(database, executor)) as client:
+        _create_session(client, "session-cleanup")
+        failed = _wait_for_terminal(client, "session-cleanup", "rejected", payload)
+        assert failed["status"] == "failed"
+        assert not executor.busy
+        assert len(executor.closed) == 1
+        repeated = _wait_for_terminal(client, "session-cleanup", "rejected", payload)
+        assert repeated == failed
+        completed = _wait_for_terminal(client, "session-cleanup", "next", payload)
+        assert completed["status"] == "completed"
+        assert len(executor.commands) == len(executor.closed) == 2
+        assert len(set(executor.commands)) == 2
+
+
 def test_service_cancel_path_has_one_cancelled_terminal(tmp_path: Path) -> None:
     """Catches cancellation that misses the active command or seals twice."""
     database = tmp_path / "cancel.sqlite"
