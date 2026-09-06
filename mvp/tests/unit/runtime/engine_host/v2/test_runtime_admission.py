@@ -154,6 +154,17 @@ def _admit(coordinator: RuntimeAdmissionCoordinator, *, command_id: str = "comma
     )
 
 
+def test_admission_rejects_mismatched_session_before_persisting_intent(tmp_path: Path) -> None:
+    coordinator, intents, _, _, _ = _admission_system(tmp_path / "state.sqlite")
+    envelope = run_envelope(runtime_id="python-term", command_id="command-1")
+    with pytest.raises(RuntimeAdmissionConflict):
+        coordinator.admit(
+            selector="python-term", session_id="different-session",
+            command_id=envelope.command_id, envelope=envelope,
+        )
+    assert intents.get("different-session", envelope.command_id) is None
+
+
 def test_request_time_probe_reports_ready_then_revoked_without_creating_admission(
     tmp_path: Path,
 ) -> None:
@@ -416,6 +427,7 @@ def test_ready_intent_without_turn_reuses_frozen_dev_envelope_after_revocation(
     )
 
     first = router.route_conversation_query(admission=admission)
+    assert first.execution_snapshot["envelope"]["session_id"] == admission.session_id
     assignments.revoke_key("python-term", key.key_id, trusted_time=31.0)
     replay = router.route_conversation_query(admission=admission)
 

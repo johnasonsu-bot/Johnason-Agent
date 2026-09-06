@@ -661,7 +661,7 @@ class RuntimeAdmissionCoordinator:
     ) -> RuntimeAdmissionResult:
         if not isinstance(envelope, RunEnvelopeV2):
             raise TypeError("envelope must be a RunEnvelopeV2")
-        if envelope.command_id != command_id:
+        if envelope.command_id != command_id or envelope.session_id != session_id:
             raise RuntimeAdmissionConflict()
         identity_digest = canonical_envelope_identity(envelope).identity_digest
         intent = self.intents.get(session_id, command_id)

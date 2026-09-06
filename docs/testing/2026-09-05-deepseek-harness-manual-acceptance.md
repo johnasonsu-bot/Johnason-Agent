@@ -106,6 +106,16 @@
 
 ## 故障原因与修复记录
 
+### 2026-09-06 新会话排队与执行前失败
+
+- 用户新命令已持久化，但最早的历史 LM Studio 重试一直抢占单 Worker。调度改为按最后更新时间轮转候选任务，并保留同会话的 enqueue 顺序约束；进程重启后仍保持公平性。
+- 在原 31 条 DeepSeek 暂停记录之外，通过正式 `hold_turn` 接口暂停 9 个历史本地队头，合计 40 条活动暂停记录。历史数据未删除，同会话后续任务继续受 FIFO 约束；不会为了新测试自动恢复旧任务。
+- 解除队头阻塞后，用户命令在 11:27:38（北京时间）进入执行并记录 `runtime_failed`，发生于 Provider Grant 签发前，不能视为云端 API 失败。控制面 Assignment 保存原始会话 ID，Query Envelope 却带 `conversation-session:` 前缀，触发 Host 身份校验。
+- 修复 Envelope 使用原始会话 ID，命名空间只保留在上下文 Snapshot 引用；准入时提前拒绝会话 ID 不一致，避免持久化无效 Assignment。Grant Target 解析失败也关闭租约，避免遗留执行句柄。
+- 新增回归先复现失败再修复；队列/准入/Grant 相关组 **113 passed**，主装配/Federated Executor/Supervisor/冷启动组 **112 passed**。这些是代码回归，不替代真实云端端到端验收。
+- 原消息与失败事件保留，不改写旧冻结 Envelope 或 Assignment、不回退聊天模式。重新发送必须使用新命令身份；可沿用原消息内容，不需重新编写需求。
+- 此次客户端重启仍需当前有效的正式开发证据以及用户在界面解锁 Vault。已过期证据不延长、不重签旧结果。修复后的真实发送结果另行记录；在此之前不宣称端到端通过。
+
 用户截图中的 `catalog_unavailable` 不等于模型 API 不支持，也不代表 Vault 密码错误。正式目录在 `build_app` 时加载，早于 Supervisor 启动；新的 Registry 实例对持久化记录尚无本次进程的 advertisement，因此返回 `unavailable`。旧加载器要求记录已经 `ready`，导致重启时丢弃目录；后续 Host 握手成功也不会恢复该目录。之前只检查 SQLite 中的 `ready` 不足以证明 UI 可选择。
 
 修复：对已明确配置的 Goose / DSH，允许身份和能力摘要匹配的冷启动记录导入**已验证且未过期**的目录；仍由实时 Admission Probe 在当前握手成功后开放选择。禁用、未配置冷记录、构建/能力漂移、过期证据仍拒绝，不自动降级为聊天模式。

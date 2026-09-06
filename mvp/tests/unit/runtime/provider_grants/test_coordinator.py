@@ -264,6 +264,24 @@ def _fixture(
 
 
 @pytest.mark.asyncio
+async def test_invalid_target_closes_lease_before_any_grant_or_query(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, lease, envelope, runtime_input, _, order = _fixture(tmp_path)
+    coordinator = FederatedRuntimeCoordinator(broker, clock=lambda: 101.0)
+
+    def invalid_target(envelope):
+        raise RuntimeError("session identity mismatch")
+
+    monkeypatch.setattr(lease, "provider_grant_target", invalid_target)
+    with pytest.raises(RuntimeError, match="session identity mismatch"):
+        async for _ in coordinator.run_query(lease, envelope, runtime_input=runtime_input):
+            pytest.fail("invalid target must not execute")
+    assert lease.closed is True
+    assert order == ["close"]
+
+
+@pytest.mark.asyncio
 async def test_coordinator_requires_private_ack_before_public_query(
     tmp_path: Path,
 ) -> None:

@@ -99,8 +99,8 @@ class FederatedRuntimeCoordinator:
         if _pre_query_cancel_requested(lease):
             await lease.aclose()
             raise FederatedRuntimeCancelled()
-        target = lease.provider_grant_target(envelope)
         try:
+            target = lease.provider_grant_target(envelope)
             delivery = lease.provider_grant_delivery(envelope, target=target)
             offer = self._broker.issue(envelope, target=target)
         except ProviderGrantUnavailable:

@@ -49,6 +49,35 @@ def test_only_one_worker_claims_a_queued_turn(tmp_path: Path) -> None:
     assert second is None
 
 
+def test_repeated_retry_yields_to_other_sessions_without_breaking_fifo(tmp_path: Path) -> None:
+    database = tmp_path / "fair-queue.sqlite"
+    repository = ConversationRepository(database)
+    _enqueue(repository, command_id="old-head")
+    _enqueue(repository, command_id="old-following")
+    repository.enqueue_turn(
+        session_id="new-session", command_id="new-message", run_id="new-run",
+        provider_id="deepseek", model="test-model", prompt="new message",
+        initial_state={"phase": "before_model", "messages": [], "events": []},
+    )
+    first = repository.claim_next_turn(owner_id="worker")
+    assert first.command_id == "old-head"
+    repository.mark_retryable(
+        first.session_id, first.command_id, owner_id="worker", state=first.state,
+    )
+    # Fairness must survive process restart, not rely on an in-memory skip list.
+    repository = ConversationRepository(database)
+    second = repository.claim_next_turn(owner_id="worker")
+    assert second.command_id == "new-message"
+    repository.finish_turn(
+        second.session_id, second.command_id, owner_id="worker",
+        status="completed", state=second.state, result=[],
+    )
+    third = repository.claim_next_turn(owner_id="worker")
+    assert third.command_id == "old-head"
+    # Its own following message must still wait for the retrying predecessor.
+    assert repository.claim_next_turn(owner_id="another-worker") is None
+
+
 def test_host_retry_waits_for_new_generation_and_preserves_session_fifo(
     tmp_path: Path,
 ) -> None:

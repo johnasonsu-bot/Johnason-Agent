@@ -394,7 +394,7 @@ class RuntimeQueryRouter:
                     ),
                     "host_generation": "conversation-control-plane-v2",
                 },
-                "session_id": session_ref,
+                "session_id": admission.session_id,
                 "run_id": run_ref,
                 "term_id": f"conversation-term-{identity[:32]}",
                 "step_id": f"conversation-step-{identity[:32]}",

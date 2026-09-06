@@ -405,7 +405,7 @@ class ConversationRepository:
     def claim_next_turn(
         self, *, owner_id: str, lease_seconds: float = 30
     ) -> TurnStatus | None:
-        """Atomically claim the oldest queued/retryable turn."""
+        """Claim the least recently scheduled eligible turn, preserving session FIFO."""
         now = time.time()
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -454,7 +454,7 @@ class ConversationRepository:
                         'completed', 'failed', 'reconciliation_required'
                       )
                   )
-                ORDER BY candidate.enqueue_sequence
+                ORDER BY candidate.updated_at, candidate.enqueue_sequence
                 LIMIT 1
                 """,
                 (now, self.host_generation, self.host_generation, now),
