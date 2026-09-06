@@ -680,10 +680,20 @@ def load_development_admission(
             ):
                 raise ValueError("runtime build identity drift")
             snapshot = snapshots.get(runtime_id)
+            # A restarted sidecar has durable identity metadata but no live
+            # advertisement until Supervisor starts. Import its verified catalog
+            # now; RuntimeAdmissionProbe still requires a current ready handshake
+            # before any selection/execution. Disabled policy is never relaxed.
+            cold_configured_sidecar = (
+                runtime_id in configured
+                and runtime_id in {"goose", "dsh"}
+                and snapshot is not None
+                and snapshot.state == "unavailable"
+            )
             if snapshot is not None and (
                 snapshot.build_id != identity.build_id
                 or tuple(snapshot.capabilities) != capabilities
-                or snapshot.state != "ready"
+                or (snapshot.state != "ready" and not cold_configured_sidecar)
             ):
                 raise ValueError("runtime registration identity drift")
             if snapshot is None and (
