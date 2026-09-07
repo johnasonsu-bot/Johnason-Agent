@@ -107,14 +107,20 @@ def create_app(settings: AppSettings) -> FastAPI:
     agent_profiles = AgentProfileRepository(settings.database)
     sequential_processor = settings.sequential_processor
     owns_sequential_processor = False
-    if sequential_processor is None and callable(
-        getattr(settings.runner, "run_turn", None)
+    if sequential_processor is None and (
+        callable(getattr(settings.runner, "run_turn", None))
+        or callable(
+            getattr(settings.runtime_router, "route_sequential_node_query", None)
+        )
     ):
         from workbench.orchestration.processor import DurableSequentialProcessor
 
         sequential_processor = DurableSequentialProcessor(
             database=settings.database,
             runner=settings.runner,
+            runtime_router=settings.runtime_router,
+            python_term_executor=settings.python_term_executor,
+            federated_executor=settings.federated_executor,
         )
         owns_sequential_processor = True
     conversation_api = ConversationAPI(

@@ -1,4 +1,4 @@
-import type { AgentProfileInput, AgentProfileRecord } from "../api";
+import type { AgentProfileInput, AgentProfileRecord, RuntimeSelector } from "../api";
 
 export type ProviderId = string;
 export type AgentRole = "worker" | "supervisor" | "verifier";
@@ -10,6 +10,7 @@ export type AgentModelProfile = {
   roleLabel: string;
   providerId: ProviderId;
   model: string;
+  runtimeId: RuntimeSelector | null;
   enabled: boolean;
   version: number;
   toolIds: string[];
@@ -25,12 +26,12 @@ export const providerLabels: Record<string, string> = {
 };
 
 export const defaultAgentModelProfiles: AgentModelProfile[] = [
-  { id: "product-manager", name: "产品经理", role: "worker", roleLabel: "需求拆解与内容创作", providerId: "lmstudio", model: "local-agent", enabled: true, version: 0, toolIds: [], skillRefs: [] },
-  { id: "supervisor", name: "Supervisor", role: "supervisor", roleLabel: "审核与返工决策", providerId: "deepseek-primary", model: "deepseek-v4-flash", enabled: true, version: 0, toolIds: [], skillRefs: [] },
-  { id: "architect", name: "架构师", role: "worker", roleLabel: "方案设计与 Artifact 生成", providerId: "deepseek-primary", model: "deepseek-v4-flash", enabled: true, version: 0, toolIds: [], skillRefs: [] },
-  { id: "verifier", name: "Verifier", role: "verifier", roleLabel: "终局验证与证据检查", providerId: "deepseek-primary", model: "deepseek-v4-flash", enabled: true, version: 0, toolIds: [], skillRefs: [] },
-  { id: "engineer", name: "工程师", role: "worker", roleLabel: "实现与工具执行", providerId: "lmstudio", model: "local-agent", enabled: true, version: 0, toolIds: [], skillRefs: [] },
-  { id: "qa-engineer", name: "测试工程师", role: "verifier", roleLabel: "验证与回归", providerId: "deepseek-primary", model: "deepseek-v4-flash", enabled: true, version: 0, toolIds: [], skillRefs: [] },
+  { id: "product-manager", name: "产品经理", role: "worker", roleLabel: "需求拆解与内容创作", providerId: "lmstudio", model: "local-agent", runtimeId: null, enabled: true, version: 0, toolIds: [], skillRefs: [] },
+  { id: "supervisor", name: "Supervisor", role: "supervisor", roleLabel: "审核与返工决策", providerId: "deepseek-primary", model: "deepseek-v4-flash", runtimeId: null, enabled: true, version: 0, toolIds: [], skillRefs: [] },
+  { id: "architect", name: "架构师", role: "worker", roleLabel: "方案设计与 Artifact 生成", providerId: "deepseek-primary", model: "deepseek-v4-flash", runtimeId: null, enabled: true, version: 0, toolIds: [], skillRefs: [] },
+  { id: "verifier", name: "Verifier", role: "verifier", roleLabel: "终局验证与证据检查", providerId: "deepseek-primary", model: "deepseek-v4-flash", runtimeId: null, enabled: true, version: 0, toolIds: [], skillRefs: [] },
+  { id: "engineer", name: "工程师", role: "worker", roleLabel: "实现与工具执行", providerId: "lmstudio", model: "local-agent", runtimeId: null, enabled: true, version: 0, toolIds: [], skillRefs: [] },
+  { id: "qa-engineer", name: "测试工程师", role: "verifier", roleLabel: "验证与回归", providerId: "deepseek-primary", model: "deepseek-v4-flash", runtimeId: null, enabled: true, version: 0, toolIds: [], skillRefs: [] },
 ];
 
 export function fromAgentRecord(record: AgentProfileRecord): AgentModelProfile {
@@ -42,6 +43,7 @@ export function fromAgentRecord(record: AgentProfileRecord): AgentModelProfile {
     roleLabel: known?.roleLabel ?? record.role,
     providerId: record.provider_id,
     model: record.model,
+    runtimeId: record.runtime_id ?? null,
     enabled: record.enabled,
     version: record.version,
     toolIds: record.tool_ids,
@@ -58,7 +60,7 @@ export function mergeAgentRecords(records: AgentProfileRecord[]): AgentModelProf
 }
 
 export function toAgentInput(profile: AgentModelProfile): AgentProfileInput {
-  return { agent_id: profile.id, display_name: profile.name, role: profile.role, provider_id: profile.providerId, model: profile.model, enabled: profile.enabled, tool_ids: profile.toolIds, skill_refs: profile.skillRefs };
+  return { agent_id: profile.id, display_name: profile.name, role: profile.role, provider_id: profile.providerId, model: profile.model, runtime_id: profile.runtimeId, enabled: profile.enabled, tool_ids: profile.toolIds, skill_refs: profile.skillRefs };
 }
 
 export function loadAgentModelProfiles(): AgentModelProfile[] {

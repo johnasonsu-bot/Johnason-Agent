@@ -91,12 +91,17 @@ test("persists credential-free Agent versions through the backend API", async ({
   try {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "Agent 配置" }).click();
+    for (const selector of await page.getByRole("combobox", { name: /运行模式/ }).all()) {
+      await selector.selectOption("goose");
+    }
     await page.getByRole("button", { name: "保存 Agent 配置" }).click();
-    await expect(page.getByRole("status")).toContainText("已保存到本地运行时");
+    await expect(page.getByRole("status")).toHaveText("Agent 配置已保存");
+    await expect(page.getByRole("status")).not.toContainText("运行时");
     await page.reload();
     await page.getByRole("button", { name: "Agent 配置" }).click();
     await expect(page.getByText("需求拆解与内容创作 · v1")).toBeVisible();
     await expect(page.getByText("审核与返工决策 · v1")).toBeVisible();
+    await expect(page.getByLabel("产品经理 运行模式")).toHaveValue("goose");
     await page.getByLabel("产品经理 Model").fill("local-agent-v2");
     await page.getByRole("button", { name: "保存 Agent 配置" }).click();
     await expect(page.getByText("需求拆解与内容创作 · v2")).toBeVisible();

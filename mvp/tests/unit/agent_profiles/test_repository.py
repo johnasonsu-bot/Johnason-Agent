@@ -1,7 +1,9 @@
-from pathlib import Path
+import json
 import sqlite3
+from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from workbench.agents.models import AgentProfileRecord, AgentProfileWrite
 from workbench.agents.repository import (
@@ -10,6 +12,7 @@ from workbench.agents.repository import (
     UnknownProvider,
 )
 from workbench.models.profiles import ProviderProfileRecord
+from workbench.orchestration.compiler import MentionSequenceCompiler
 from workbench.providers.repository import ProviderRepository
 
 
@@ -101,3 +104,59 @@ def test_list_enabled_excludes_disabled_profiles(tmp_path: Path) -> None:
     assert [item.agent_id for item in repository.list_enabled()] == [
         "product-manager"
     ]
+
+
+def test_runtime_id_survives_repository_reopen_and_snapshot(tmp_path: Path) -> None:
+    database = tmp_path / "workbench.sqlite"
+    provider(database)
+    AgentProfileRepository(database).create(profile(runtime_id="goose"))
+
+    reopened = AgentProfileRepository(database)
+    plan = MentionSequenceCompiler().compile(
+        "@产品经理 写验收标准", (reopened.snapshot("product-manager"),)
+    )
+    reopened.replace(
+        "product-manager",
+        expected_version=1,
+        replacement=profile(runtime_id="dsh"),
+    )
+
+    assert reopened.get("product-manager").runtime_id == "dsh"
+    assert reopened.get("product-manager", version=1).runtime_id == "goose"
+    assert reopened.snapshot("product-manager").runtime_id == "dsh"
+    assert plan.nodes[0].binding.runtime_id == "goose"
+
+
+def test_legacy_record_without_runtime_id_loads_as_unspecified(tmp_path: Path) -> None:
+    database = tmp_path / "workbench.sqlite"
+    repository = AgentProfileRepository(database)
+    legacy_record = {
+        **profile().model_dump(mode="json", exclude={"runtime_id"}),
+        "version": 1,
+        "created_at": 1.0,
+    }
+    assert "runtime_id" not in legacy_record
+    with repository.store.connect() as connection:
+        connection.execute(
+            "INSERT INTO agent_profiles(agent_id, current_version) VALUES (?, 1)",
+            ("product-manager",),
+        )
+        connection.execute(
+            """INSERT INTO agent_profile_versions(
+                agent_id, version, record_json, created_at
+            ) VALUES (?, 1, ?, ?)""",
+            ("product-manager", json.dumps(legacy_record), 1.0),
+        )
+
+    reopened = AgentProfileRepository(database)
+
+    assert reopened.get("product-manager").runtime_id is None
+    assert reopened.snapshot("product-manager").runtime_id is None
+
+
+def test_profile_rejects_runtime_outside_the_human_selectable_set() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        profile(runtime_id="automatic")
+
+    assert exc_info.value.errors()[0]["loc"] == ("runtime_id",)
+    assert exc_info.value.errors()[0]["type"] == "literal_error"

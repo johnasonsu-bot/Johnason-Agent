@@ -31,8 +31,9 @@ def binding(
     *,
     enabled: bool = True,
     profile_version: int = 1,
+    runtime_id: str | None = None,
 ) -> AgentBindingSnapshot:
-    return AgentBindingSnapshot(
+    values = dict(
         agent_id=agent_id,
         display_name=display_name,
         role=role,
@@ -41,6 +42,9 @@ def binding(
         profile_version=profile_version,
         enabled=enabled,
     )
+    if runtime_id is not None:
+        values["runtime_id"] = runtime_id
+    return AgentBindingSnapshot(**values)
 
 
 @pytest.fixture
@@ -150,6 +154,51 @@ def test_binding_and_plan_are_frozen(bindings) -> None:
         plan.nodes[0].binding.model = "changed"
     with pytest.raises(ValidationError):
         plan.nodes += plan.nodes
+
+
+def test_compiler_freezes_the_explicit_runtime_in_each_node_binding() -> None:
+    source = binding("writer", "作者", "worker", runtime_id="goose")
+
+    plan = MentionSequenceCompiler().compile("@作者 写故事", (source,))
+    later_configuration = source.model_copy(update={"runtime_id": "dsh"})
+    unspecified = MentionSequenceCompiler().compile(
+        "@作者 写故事", (binding("writer", "作者", "worker"),)
+    )
+
+    assert plan.nodes[0].binding.runtime_id == "goose"
+    assert later_configuration.runtime_id == "dsh"
+    assert plan.nodes[0].binding is not later_configuration
+    assert plan.plan_id != unspecified.plan_id
+
+
+def test_unspecified_runtime_preserves_the_pre_runtime_binding_identity() -> None:
+    plan = MentionSequenceCompiler().compile(
+        "@作者 写故事", (binding("writer", "作者", "worker"),)
+    )
+
+    assert plan.plan_id == "plan.3dd3f9ea572916376b64672d2737e70c"
+    assert plan.nodes[0].node_id == "node.e7358a62-5870-5295-b61b-264a7ecac71b"
+
+
+def test_unspecified_runtime_keeps_the_legacy_binding_serialization_shape() -> None:
+    unspecified = binding("writer", "作者", "worker")
+    explicit = binding("writer", "作者", "worker", runtime_id="goose")
+
+    assert "runtime_id" not in unspecified.model_dump(mode="json")
+    assert '"runtime_id"' not in unspecified.model_dump_json()
+    assert explicit.model_dump(mode="json")["runtime_id"] == "goose"
+
+
+def test_historical_plan_without_runtime_id_loads_as_unspecified() -> None:
+    plan = MentionSequenceCompiler().compile(
+        "@作者 写故事", (binding("writer", "作者", "worker"),)
+    )
+    historical_document = plan.model_dump(mode="json")
+
+    restored = ExecutionPlanDraft.model_validate(historical_document)
+
+    assert restored.plan_id == plan.plan_id
+    assert restored.nodes[0].binding.runtime_id is None
 
 
 def test_plan_rejects_an_unknown_review_target_with_contract_error(bindings) -> None:

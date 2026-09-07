@@ -11,6 +11,7 @@ from workbench.orchestration.contracts import (
     OpaqueReference,
     PublicSummary,
 )
+from workbench.orchestration.sequential_contracts import AgentRuntimeId
 
 
 class _FrozenProfile(BaseModel):
@@ -23,6 +24,7 @@ class AgentProfileWrite(_FrozenProfile):
     role: Literal["worker", "supervisor", "verifier"]
     provider_id: OpaqueIdentifier
     model: OpaqueIdentifier
+    runtime_id: AgentRuntimeId | None = None
     enabled: bool = True
     tool_ids: tuple[OpaqueIdentifier, ...] = ()
     skill_refs: tuple[OpaqueReference, ...] = ()

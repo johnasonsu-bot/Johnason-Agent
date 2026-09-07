@@ -25,8 +25,24 @@ test("opens Agent configuration for cross-model routing", async () => {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "Agent 配置" }).click();
     await expect(page.getByRole("heading", { name: "Agent 配置 · Agent routing" })).toBeVisible();
+    await expect(page.getByText("运行模式仅作为已保存配置，尚未接入节点执行；接线将在 R4 集成后生效。")).toBeVisible();
     await expect(page.getByLabel("产品经理 Provider")).toBeVisible();
     await expect(page.getByLabel("产品经理 Model")).toBeVisible();
+    const runtime = page.getByLabel("产品经理 运行模式");
+    await expect(runtime).toBeVisible();
+    await expect(runtime.locator("option")).toHaveText([
+      "请选择运行模式",
+      "Agent-步进执行模式（Codex Harness）",
+      "Agent-寻路模式（Claude Harness）",
+      "Agent-事件驱动模式（DeepSeek Harness）",
+    ]);
+    await page.getByRole("button", { name: "保存 Agent 配置" }).click();
+    await expect(page.getByRole("status")).toContainText("请为产品经理明确选择运行模式");
+    await runtime.selectOption("goose");
+    await expect(runtime).toHaveValue("goose");
+    for (const selector of await page.getByRole("combobox", { name: /运行模式/ }).all()) {
+      await selector.selectOption("goose");
+    }
     await page.getByLabel("产品经理 Provider").selectOption("deepseek");
     await page.getByLabel("产品经理 Model").fill("deepseek-v4-flash");
     await page.getByRole("button", { name: "保存 Agent 配置" }).click();

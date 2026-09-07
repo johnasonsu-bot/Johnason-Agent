@@ -157,6 +157,7 @@ class AgentProfileRepository:
             role=record.role,
             provider_id=record.provider_id,
             model=record.model,
+            runtime_id=record.runtime_id,
             profile_version=record.version,
             enabled=record.enabled,
             tool_ids=record.tool_ids,

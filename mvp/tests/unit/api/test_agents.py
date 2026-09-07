@@ -95,3 +95,29 @@ def test_agent_api_rejects_unknown_provider_and_stale_replace(tmp_path: Path) ->
         json=payload(expected_version=0),
     )
     assert stale.status_code == 409
+
+
+def test_agent_api_round_trips_explicit_runtime_id(tmp_path: Path) -> None:
+    api = client(tmp_path)
+
+    created = api.post("/api/agents", json=payload(runtime_id="python-term"))
+    listed = api.get("/api/agents")
+    replaced = api.put(
+        "/api/agents/product-manager",
+        json=payload(expected_version=1, runtime_id="dsh"),
+    )
+
+    assert created.status_code == 201
+    assert created.json()["runtime_id"] == "python-term"
+    assert listed.json()[0]["runtime_id"] == "python-term"
+    assert replaced.status_code == 200
+    assert replaced.json()["runtime_id"] == "dsh"
+
+
+def test_agent_api_rejects_an_unknown_runtime_id(tmp_path: Path) -> None:
+    response = client(tmp_path).post(
+        "/api/agents", json=payload(runtime_id="automatic")
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid Agent profile"}

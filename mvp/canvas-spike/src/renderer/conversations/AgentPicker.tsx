@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { runtimeLabels } from "../api";
 import { providerLabels, type AgentModelProfile } from "../models/agentConfig";
 
 export type AgentProfile = {
@@ -28,7 +29,7 @@ export function AgentPicker({ open, onClose, onCreate, profiles }: { open: boole
   const [mode, setMode] = useState<"single" | "multi">("single");
   const [query, setQuery] = useState("");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const available = useMemo(() => profiles?.filter((profile) => profile.enabled).map((profile, index) => ({ id: profile.id, name: profile.name, role: profile.roleLabel, provider: `${providerLabels[profile.providerId] ?? profile.providerId} / ${profile.model}`, color: ["blue", "purple", "green", "orange", "teal", "dark"][index % 6], glyph: profile.name.slice(0, 1) })) ?? agents, [profiles]);
+  const available = useMemo(() => profiles?.filter((profile) => profile.enabled).map((profile, index) => ({ id: profile.id, name: profile.name, role: profile.roleLabel, provider: `${providerLabels[profile.providerId] ?? profile.providerId} / ${profile.model} · 配置模式：${profile.runtimeId ? runtimeLabels[profile.runtimeId] : "未指定"}`, color: ["blue", "purple", "green", "orange", "teal", "dark"][index % 6], glyph: profile.name.slice(0, 1) })) ?? agents, [profiles]);
   const selected = selectedIds.map((id) => available.find((agent) => agent.id === id)).filter((agent): agent is AgentProfile => Boolean(agent));
   const visible = useMemo(() => available.filter((agent) => `${agent.name} ${agent.role} ${agent.provider}`.toLowerCase().includes(query.toLowerCase())), [available, query]);
 
@@ -68,7 +69,7 @@ export function AgentPicker({ open, onClose, onCreate, profiles }: { open: boole
             </div>)}
           </div>
         </section>
-        <aside className="agent-selection-summary"><h3>已选择 <span>{selected.length}</span> 个</h3><p>{canCreate ? "可以创建会话。" : mode === "single" ? "先选择一个 Agent。" : "至少选择两个 Agent。"}</p><div className="selected-agent-list">{selected.length ? selected.map((agent) => <div className="selected-agent" key={agent.id}><span className={`agent-avatar agent-avatar-${agent.color}`}>{agent.glyph}</span><span><strong>{agent.name}</strong><small>{agent.role}</small></span><button type="button" className="quiet" aria-label={`移除 ${agent.name}`} onClick={() => toggle(agent.id)}>×</button></div>) : <div className="selected-empty">点击左侧 Agent 加入会话</div>}</div><p className="agent-selection-note">多人会话会为每个 Agent 保留独立上下文，并由 supervisor 汇总状态。</p></aside>
+        <aside className="agent-selection-summary"><h3>已选择 <span>{selected.length}</span> 个</h3><p>{canCreate ? "可以创建会话。" : mode === "single" ? "先选择一个 Agent。" : "至少选择两个 Agent。"}</p><div className="selected-agent-list">{selected.length ? selected.map((agent) => <div className="selected-agent" key={agent.id}><span className={`agent-avatar agent-avatar-${agent.color}`}>{agent.glyph}</span><span><strong>{agent.name}</strong><small>{agent.role}</small></span><button type="button" className="quiet" aria-label={`移除 ${agent.name}`} onClick={() => toggle(agent.id)}>×</button></div>) : <div className="selected-empty">点击左侧 Agent 加入会话</div>}</div><p className="agent-selection-note">运行模式显示的是已保存配置，尚未接入节点执行；接线将在 R4 集成后生效。</p></aside>
       </div>
       <footer className="agent-picker-foot"><button type="button" className="quiet" onClick={resetAndClose}>取消</button><button type="button" disabled={!canCreate} onClick={() => { onCreate({ mode, selected }); resetAndClose(); }}>创建会话</button></footer>
     </section>

@@ -38,6 +38,10 @@ from workbench.orchestration.project_context import (
     ProjectContextEntry,
     ProjectContextVersion,
 )
+from workbench.orchestration.runtime_dispatch import (
+    RuntimeNodeDispatcher,
+    RuntimeNodeExecutionError,
+)
 from workbench.orchestration.sequential_contracts import (
     ExecutionPlanDraft,
     Handoff,
@@ -168,6 +172,7 @@ class _DurableExecutionPort:
         conversations: ConversationRepository,
         artifacts: ArtifactStore,
         project_context: ProjectContextVersion,
+        runtime_dispatcher: RuntimeNodeDispatcher | None = None,
     ) -> None:
         self.draft = draft
         self.graph_run_id = graph_run_id
@@ -181,6 +186,8 @@ class _DurableExecutionPort:
             output_publisher=_ArtifactOutputPublisher(
                 graph_run_id=graph_run_id, store=artifacts
             ),
+            runtime_dispatcher=runtime_dispatcher,
+            project_context=project_context,
         )
 
     async def execute_node(
@@ -213,7 +220,10 @@ class _DurableExecutionPort:
             rework,
             attempt=attempt,
         )
-        result = await self.executor.execute(node, attempt, context)
+        try:
+            result = await self.executor.execute(node, attempt, context)
+        except RuntimeNodeExecutionError as error:
+            raise error.for_node(node.node_id, attempt) from None
         self.conversations.save_sequential_result(
             self.graph_run_id,
             node_id,
@@ -295,6 +305,9 @@ class DurableSequentialProcessor:
         runner: TurnRunner,
         checkpoint_path: Path | None = None,
         artifact_root: Path | None = None,
+        runtime_router: object | None = None,
+        python_term_executor: object | None = None,
+        federated_executor: object | None = None,
     ) -> None:
         self.database = database
         self.runner = runner
@@ -304,6 +317,18 @@ class DurableSequentialProcessor:
         )
         self.checkpointer = open_graph_checkpointer(
             checkpoint_path or database.with_name(f"{database.stem}.graphs.sqlite")
+        )
+        self.runtime_dispatcher = (
+            RuntimeNodeDispatcher(
+                database=database,
+                router=runtime_router,  # type: ignore[arg-type]
+                python_term_executor=python_term_executor,  # type: ignore[arg-type]
+                federated_executor=federated_executor,  # type: ignore[arg-type]
+            )
+            if callable(
+                getattr(runtime_router, "route_sequential_node_query", None)
+            )
+            else None
         )
 
     async def process(
@@ -321,6 +346,7 @@ class DurableSequentialProcessor:
             conversations=self.conversations,
             artifacts=self.artifacts,
             project_context=project_context,
+            runtime_dispatcher=self.runtime_dispatcher,
         )
         graph = build_sequential_graph(self.checkpointer, port)
         config = graph_config(thread_id, 1)
@@ -347,9 +373,26 @@ class DurableSequentialProcessor:
                 acquire_graph_execution_fence, self.checkpointer, thread_id
             )
             try:
-                after_values = await asyncio.to_thread(
-                    invoke_sequential_to_boundary, graph, value, config
-                )
+                try:
+                    after_values = await asyncio.to_thread(
+                        invoke_sequential_to_boundary, graph, value, config
+                    )
+                except RuntimeNodeExecutionError as error:
+                    return SequentialProcessResult(
+                        status="failed",
+                        events=(
+                            SequentialProcessEvent(
+                                event_type="orchestration.warning",
+                                payload={
+                                    "graph_run_id": graph_run_id,
+                                    "node_id": error.node_id,
+                                    "attempt": error.attempt,
+                                    "status": "failed",
+                                    "category": error.category,
+                                },
+                            ),
+                        ),
+                    )
             finally:
                 fence.release()
         return self._result(before_values, after_values)

@@ -151,12 +151,57 @@ class RuntimeQueryRouter:
         admission: PythonTermConversationAdmission,
     ) -> RuntimeConversationRoute:
         """Resolve one catalog selector before creating any Conversation turn."""
+        return self._route_conversation_query(
+            selector=selector,
+            admission=admission,
+            required_runtime_id=None,
+            required_build_id=None,
+            require_current_execution=False,
+        )
+
+    def route_sequential_node_query(
+        self,
+        *,
+        selector: str,
+        admission: PythonTermConversationAdmission,
+        required_runtime_id: str | None = None,
+        required_build_id: str | None = None,
+    ) -> RuntimeConversationRoute:
+        """Route a node attempt while enforcing its first-attempt runtime pin."""
+        if (required_runtime_id is None) != (required_build_id is None):
+            raise RuntimeAdmissionConflict()
+        return self._route_conversation_query(
+            selector=selector,
+            admission=admission,
+            required_runtime_id=required_runtime_id,
+            required_build_id=required_build_id,
+            require_current_execution=True,
+        )
+
+    def _route_conversation_query(
+        self,
+        *,
+        selector: str,
+        admission: PythonTermConversationAdmission,
+        required_runtime_id: str | None,
+        required_build_id: str | None,
+        require_current_execution: bool,
+    ) -> RuntimeConversationRoute:
         if self._registry is None:
             if selector == "python-term":
                 raise PythonTermRuntimeUnavailable()
             raise RuntimeAdmissionUnavailable()
+        if require_current_execution and self._admission_coordinator is None:
+            # Sequential execution must have catalog/proof authority available
+            # for every invocation, including an idempotent command restart.
+            raise RuntimeAdmissionUnavailable()
         try:
             selected = self._runtime_identity(selector, admission)
+            if required_runtime_id is not None and (
+                selected.runtime_id,
+                selected.build_id,
+            ) != (required_runtime_id, required_build_id):
+                raise RuntimeAdmissionConflict()
             command, envelope, runtime_input = self._conversation_query(
                 admission=admission,
                 runtime_id=selected.runtime_id,
@@ -169,13 +214,23 @@ class RuntimeQueryRouter:
                     command, envelope, gate_proof=self.__gate_proof
                 )
             else:
-                admitted = self._admission_coordinator.admit(
+                admit = (
+                    self._admission_coordinator.admit_sequential
+                    if require_current_execution
+                    else self._admission_coordinator.admit
+                )
+                admitted = admit(
                     selector=selector,
                     session_id=admission.session_id,
                     command_id=admission.runtime_command_id,
                     envelope=envelope,
                 )
                 selected = admitted.selection
+            if required_runtime_id is not None and (
+                selected.runtime_id,
+                selected.build_id,
+            ) != (required_runtime_id, required_build_id):
+                raise RuntimeAdmissionConflict()
         except (
             RuntimeAdmissionBlocked,
             RuntimeAdmissionConflict,

@@ -166,7 +166,7 @@ export const engineHostApi = {
 
 export type ConversationEvent = { type?: string; name?: string; delta?: string; result?: string; toolCallName?: string; value?: Record<string, unknown>; runId?: string; sequence?: number; eventId?: string; cursor?: string };
 
-export type AgentProfileRecord = { agent_id: string; display_name: string; role: "worker" | "supervisor" | "verifier"; provider_id: string; model: string; enabled: boolean; tool_ids: string[]; skill_refs: string[]; version: number; created_at: number };
+export type AgentProfileRecord = { agent_id: string; display_name: string; role: "worker" | "supervisor" | "verifier"; provider_id: string; model: string; runtime_id: RuntimeSelector | null; enabled: boolean; tool_ids: string[]; skill_refs: string[]; version: number; created_at: number };
 export type AgentProfileInput = Omit<AgentProfileRecord, "version" | "created_at">;
 
 export const agentApi = {

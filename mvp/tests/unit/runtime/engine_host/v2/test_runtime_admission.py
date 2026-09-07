@@ -154,6 +154,143 @@ def _admit(coordinator: RuntimeAdmissionCoordinator, *, command_id: str = "comma
     )
 
 
+def _conversation_admission(command_id: str) -> PythonTermConversationAdmission:
+    session_id = "session-1"
+    return PythonTermConversationAdmission(
+        session_id=session_id,
+        command_id=command_id,
+        runtime_command_id=python_term_command_id(session_id, command_id),
+        provider=ProviderProfileRecord(
+            id="provider-1",
+            name="Provider",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234",
+            model_aliases={"default": "configured-model"},
+        ),
+        model="configured-model",
+        agent_profiles=(),
+        project_context=None,
+        messages=(
+            ConversationMessage(
+                message_id=f"message-{command_id}",
+                session_id=session_id,
+                command_id=f"{command_id}:user",
+                sequence=1,
+                role="user",
+                content="execute the frozen node attempt",
+            ),
+        ),
+    )
+
+
+def test_sequential_node_retry_requires_the_first_attempt_runtime_build(
+    tmp_path: Path,
+) -> None:
+    coordinator, _, registry, _, _ = _admission_system(tmp_path / "state.sqlite")
+    router = main.RuntimeQueryRouter(
+        registry,
+        _admission_coordinator=coordinator,
+    )
+
+    first = router.route_sequential_node_query(
+        selector="python-term",
+        admission=_conversation_admission("node-attempt-1"),
+    )
+    retry = router.route_sequential_node_query(
+        selector="python-term",
+        admission=_conversation_admission("node-attempt-2"),
+        required_runtime_id=first.runtime_id,
+        required_build_id=first.build_id,
+    )
+
+    assert (retry.runtime_id, retry.build_id) == (
+        "python-term",
+        "python-term:test",
+    )
+    assert registry.repository.get_pin(retry.runtime_command_id).runtime_build_id == (
+        "python-term:test"
+    )
+
+
+def test_sequential_node_retry_rejects_build_drift_before_creating_a_pin(
+    tmp_path: Path,
+) -> None:
+    coordinator, intents, registry, _, _ = _admission_system(
+        tmp_path / "state.sqlite"
+    )
+    router = main.RuntimeQueryRouter(
+        registry,
+        _admission_coordinator=coordinator,
+    )
+    admission = _conversation_admission("node-attempt-2")
+
+    with pytest.raises(RuntimeAdmissionConflict):
+        router.route_sequential_node_query(
+            selector="python-term",
+            admission=admission,
+            required_runtime_id="python-term",
+            required_build_id="python-term:older-build",
+        )
+
+    assert intents.get(admission.session_id, admission.runtime_command_id) is None
+    assert registry.repository.get_pin(admission.runtime_command_id) is None
+
+
+@pytest.mark.parametrize("failure", ["expired_proof", "disabled_registry"])
+def test_sequential_same_attempt_restart_rechecks_current_runtime_eligibility(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    coordinator, _, registry, _, _ = _admission_system(tmp_path / "state.sqlite")
+    router = main.RuntimeQueryRouter(
+        registry,
+        _admission_coordinator=coordinator,
+    )
+    admission = _conversation_admission("node-attempt-1")
+    first = router.route_sequential_node_query(
+        selector="python-term",
+        admission=admission,
+    )
+
+    if failure == "expired_proof":
+        coordinator._trusted_time = lambda: 101.0
+    else:
+        registry.disable("python-term")
+
+    with pytest.raises(RuntimeAdmissionUnavailable):
+        router.route_sequential_node_query(
+            selector="python-term",
+            admission=admission,
+            required_runtime_id=first.runtime_id,
+            required_build_id=first.build_id,
+        )
+
+    # Ordinary Conversation replay deliberately preserves its historical
+    # ready-intent recovery semantics; only the sequential execution path is
+    # subject to a fresh execution-eligibility check.
+    replay = router.route_conversation_query(
+        selector="python-term",
+        admission=admission,
+    )
+    assert (replay.runtime_id, replay.build_id) == (
+        "python-term",
+        "python-term:test",
+    )
+
+
+def test_sequential_route_fails_closed_without_catalog_admission(
+    tmp_path: Path,
+) -> None:
+    _, _, registry, _, _ = _admission_system(tmp_path / "state.sqlite")
+    router = main.RuntimeQueryRouter(registry)
+
+    with pytest.raises(RuntimeAdmissionUnavailable):
+        router.route_sequential_node_query(
+            selector="python-term",
+            admission=_conversation_admission("node-attempt-1"),
+        )
+
+
 def test_admission_rejects_mismatched_session_before_persisting_intent(tmp_path: Path) -> None:
     coordinator, intents, _, _, _ = _admission_system(tmp_path / "state.sqlite")
     envelope = run_envelope(runtime_id="python-term", command_id="command-1")

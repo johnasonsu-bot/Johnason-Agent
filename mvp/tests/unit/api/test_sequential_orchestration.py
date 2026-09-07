@@ -1,6 +1,8 @@
 from pathlib import Path
 import time
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from workbench.adapters.hermes.runner import AgentStepResult
@@ -15,6 +17,8 @@ from workbench.models.profiles import ProviderProfileRecord
 from workbench.providers.repository import ProviderRepository
 from workbench.conversations.repository import ConversationRepository
 from workbench.workflow.event_store import EventStore
+from workbench.runtime.conversation_execution import RuntimeConversationRoute
+from tests.fixtures.host_v2 import runtime_event
 
 
 EXACT_PROMPT = (
@@ -28,6 +32,60 @@ EXACT_PROMPT = (
 class NoopRunner:
     async def execute_step(self, run_id: str, step_id: str) -> AgentStepResult:
         return AgentStepResult()
+
+
+class ForbiddenLegacyRunner(NoopRunner):
+    async def run_turn(self, command):
+        raise AssertionError("explicit Agent runtime fell back to the legacy runner")
+
+
+class PythonTermNodeRouter:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def route_sequential_node_query(
+        self,
+        *,
+        selector,
+        admission,
+        required_runtime_id=None,
+        required_build_id=None,
+    ):
+        self.calls.append((selector, admission))
+        return RuntimeConversationRoute(
+            runtime_id="python-term",
+            build_id="python-term:build-1",
+            runtime_command_id=admission.runtime_command_id,
+            execution_snapshot={
+                "command": {},
+                "envelope": {},
+                "agents": [],
+                "handoffs": [],
+                "model_messages": [],
+                "conversation_context": {},
+                "project_context": {},
+                "work_state": {},
+                "permission_policy": {},
+                "environment_allowlist": [],
+                "effect_scope": {},
+                "runtime_input": {
+                    "messages": [
+                        {"role": "user", "content": admission.messages[-1].content}
+                    ]
+                },
+            },
+        )
+
+
+class PythonTermNodeExecutor:
+    def __init__(self) -> None:
+        self.prompts = []
+
+    async def execute_snapshot(self, snapshot):
+        self.prompts.append(snapshot["model_messages"][-1]["content"])
+        return SimpleNamespace(
+            status="completed", events=(), final_output="runtime node result"
+        )
 
 
 def configure(database: Path) -> None:
@@ -57,6 +115,188 @@ def configure(database: Path) -> None:
                 model=model,
             )
         )
+
+
+def configure_runtime_agent(
+    database: Path, runtime_id: str = "python-term"
+) -> None:
+    ProviderRepository(database).save(
+        ProviderProfileRecord(
+            id="lmstudio",
+            name="LM Studio",
+            protocol="lmstudio",
+            base_url="http://127.0.0.1:1234/v1",
+            credential_mode="none",
+            model_aliases={"default": "local-agent"},
+        )
+    )
+    AgentProfileRepository(database).create(
+        AgentProfileWrite(
+            agent_id="writer",
+            display_name="Writer",
+            role="worker",
+            provider_id="lmstudio",
+            model="local-agent",
+            runtime_id=runtime_id,
+        )
+    )
+
+
+def test_app_wires_explicit_agent_mode_to_python_term_node_executor(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "workbench.sqlite"
+    configure_runtime_agent(database)
+    router = PythonTermNodeRouter()
+    executor = PythonTermNodeExecutor()
+    settings = AppSettings(
+        database=database,
+        runner=ForbiddenLegacyRunner(),
+        owner_id="test",
+        runtime_router=router,
+        python_term_executor=executor,
+    )
+
+    with TestClient(create_app(settings)) as api:
+        api.post("/api/sessions", json={"session_id": "s1"})
+        accepted = api.post(
+            "/api/sessions/s1/messages",
+            headers={"Idempotency-Key": "cmd-1"},
+            json={
+                "content": "@Writer write a runtime-routed answer",
+                "agent_bindings": [
+                    {"agent_id": "writer", "expected_version": 1}
+                ],
+            },
+        )
+        assert accepted.status_code == 202
+        wait_for_status(database, "completed")
+
+    assert [call[0] for call in router.calls] == ["python-term"]
+    assert len(executor.prompts) == 1
+    assert "write a runtime-routed answer" in executor.prompts[0]
+
+
+class FederatedNodeRouter:
+    def __init__(self, runtime_id: str) -> None:
+        self.runtime_id = runtime_id
+        self.calls = []
+
+    def route_sequential_node_query(
+        self,
+        *,
+        selector,
+        admission,
+        required_runtime_id=None,
+        required_build_id=None,
+    ):
+        self.calls.append((selector, admission.messages[-1].content))
+        return RuntimeConversationRoute(
+            runtime_id=self.runtime_id,
+            build_id=f"{self.runtime_id}:build-1",
+            runtime_command_id=admission.runtime_command_id,
+            execution_snapshot={
+                "runtime_id": self.runtime_id,
+                "build_id": f"{self.runtime_id}:build-1",
+            },
+        )
+
+
+class FederatedNodeExecutor:
+    def __init__(self) -> None:
+        self.snapshots = []
+
+    async def execute(self, snapshot):
+        self.snapshots.append(dict(snapshot))
+        yield runtime_event(
+            "assistant.message", cursor=1, payload={"content": "federated result"}
+        )
+        yield runtime_event(
+            "runtime.status", cursor=2, payload={"status": "completed"}
+        )
+
+
+@pytest.mark.parametrize("runtime_id", ["goose", "dsh"])
+def test_app_wires_explicit_agent_mode_to_federated_node_executor(
+    tmp_path: Path, runtime_id: str
+) -> None:
+    database = tmp_path / f"{runtime_id}.sqlite"
+    configure_runtime_agent(database, runtime_id)
+    router = FederatedNodeRouter(runtime_id)
+    executor = FederatedNodeExecutor()
+    settings = AppSettings(
+        database=database,
+        runner=ForbiddenLegacyRunner(),
+        owner_id="test",
+        runtime_router=router,
+        federated_executor=executor,
+    )
+
+    with TestClient(create_app(settings)) as api:
+        api.post("/api/sessions", json={"session_id": "s1"})
+        accepted = api.post(
+            "/api/sessions/s1/messages",
+            headers={"Idempotency-Key": "cmd-1"},
+            json={
+                "content": "@Writer write a runtime-routed answer",
+                "agent_bindings": [
+                    {"agent_id": "writer", "expected_version": 1}
+                ],
+            },
+        )
+        assert accepted.status_code == 202
+        wait_for_status(database, "completed")
+
+    assert router.calls[0][0] == runtime_id
+    assert len(executor.snapshots) == 1
+    assert executor.snapshots[0]["runtime_id"] == runtime_id
+
+
+def test_explicit_agent_mode_unavailable_stops_node_without_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "unavailable.sqlite"
+    configure_runtime_agent(database, "goose")
+    settings = AppSettings(
+        database=database,
+        runner=ForbiddenLegacyRunner(),
+        owner_id="test",
+        runtime_router=FederatedNodeRouter("goose"),
+        federated_executor=None,
+    )
+
+    with TestClient(create_app(settings)) as api:
+        api.post("/api/sessions", json={"session_id": "s1"})
+        accepted = api.post(
+            "/api/sessions/s1/messages",
+            headers={"Idempotency-Key": "cmd-1"},
+            json={
+                "content": "@Writer write a runtime-routed answer",
+                "agent_bindings": [
+                    {"agent_id": "writer", "expected_version": 1}
+                ],
+            },
+        )
+        assert accepted.status_code == 202
+        wait_for_status(database, "failed")
+
+    events = EventStore(database).read_stream("run:s1")
+    failures = [
+        event
+        for event in events
+        if event.event_type == "orchestration.warning"
+        and event.payload.get("status") == "failed"
+    ]
+    assert [event.payload["category"] for event in failures] == [
+        "runtime_unavailable"
+    ]
+    assert not any(
+        event.event_type in {
+            "orchestration.handoff.published",
+            "orchestration.artifact.published",
+        }
+        for event in events
+    )
 
 
 def bindings() -> list[dict[str, object]]:
@@ -243,12 +483,16 @@ class InterruptThenCompleteProcessor:
 def wait_for_status(database: Path, expected: str) -> None:
     repository = ConversationRepository(database)
     deadline = time.monotonic() + 3
+    turn = None
     while time.monotonic() < deadline:
         turn = repository.load_turn_status("s1", "cmd-1")
         if turn is not None and turn.status == expected:
             return
         time.sleep(0.02)
-    raise AssertionError(f"turn did not reach {expected}")
+    raise AssertionError(
+        f"turn did not reach {expected}; last status="
+        f"{None if turn is None else turn.status}"
+    )
 
 
 def test_interrupt_survives_restart_and_resume_emits_one_parent_terminal(

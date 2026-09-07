@@ -12,6 +12,8 @@ from workbench.orchestration.contracts import (
     PublicSummary,
 )
 
+AgentRuntimeId = Literal["python-term", "goose", "dsh"]
+
 
 class _FrozenContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -25,6 +27,9 @@ class AgentBindingSnapshot(_FrozenContract):
     role: Literal["worker", "supervisor", "verifier"]
     provider_id: OpaqueIdentifier
     model: OpaqueIdentifier
+    runtime_id: AgentRuntimeId | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     profile_version: int = Field(ge=1)
     enabled: bool = True
     tool_ids: tuple[OpaqueIdentifier, ...] = ()

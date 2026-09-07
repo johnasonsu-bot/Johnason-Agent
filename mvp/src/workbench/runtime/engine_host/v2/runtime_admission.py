@@ -770,6 +770,48 @@ class RuntimeAdmissionCoordinator:
         ):
             raise RuntimeAdmissionUnavailable() from None
 
+    def admit_sequential(
+        self,
+        *,
+        selector: str,
+        session_id: str,
+        command_id: str,
+        envelope: RunEnvelopeV2,
+    ) -> RuntimeAdmissionResult:
+        """Admit an executable node attempt against current trusted runtime state.
+
+        Ordinary Conversation replay may recover a previously-ready intent after
+        its build stops accepting new work.  A sequential node attempt is an
+        execution boundary, so even an idempotent restart must prove that its
+        frozen catalog build is still registered, capable, and currently trusted.
+        """
+        result = self.admit(
+            selector=selector,
+            session_id=session_id,
+            command_id=command_id,
+            envelope=envelope,
+        )
+        intent = result.intent
+        if intent is None:
+            raise RuntimeAdmissionUnavailable()
+        entry = self._new_entry(selector, envelope)
+        if (
+            entry.runtime_id,
+            entry.build_id,
+            entry.capability_digest,
+            entry.gate_proof_digest,
+            entry.required_capabilities,
+        ) != (
+            intent.runtime_id,
+            intent.build_id,
+            intent.capability_digest,
+            intent.gate_proof_digest,
+            intent.required_capabilities,
+        ):
+            raise RuntimeAdmissionConflict()
+        self._require_proof(entry, self._trusted_time())
+        return result
+
     def _new_entry(
         self, selector: str, envelope: RunEnvelopeV2
     ) -> RuntimeCatalogEntry:
