@@ -211,6 +211,19 @@ impl QueryMachine {
         Ok(event)
     }
 
+    pub fn finish_real(
+        &mut self,
+        native_result: Result<(), String>,
+    ) -> Result<Vec<InternalEvent>, String> {
+        match native_result {
+            Ok(()) => match self.complete_real() {
+                Ok(events) => Ok(events),
+                Err(_) => Ok(vec![self.fail_real("empty_output")?]),
+            },
+            Err(_) => Ok(vec![self.fail_real("provider_failed")?]),
+        }
+    }
+
     pub fn cancel(&mut self, run_id: &str) -> Result<InternalEvent, String> {
         let identity = self.active.take().ok_or("no active Goose query")?;
         if identity.run_id != run_id {
@@ -691,5 +704,76 @@ mod tests {
                 InternalEvent::Completed { cursor: 4 }
             ]
         ));
+    }
+
+    #[test]
+    fn native_empty_outcome_is_sealed_as_empty_output_failure() {
+        let mut real_envelope = envelope();
+        real_envelope["provider_ref"] = json!("provider-profile:deepseek");
+        real_envelope["model"] = json!("deepseek-chat-alias");
+        let mut machine = QueryMachine::default();
+        machine
+            .start_real(&real_envelope, &shared_runtime_input())
+            .expect("real query start");
+
+        let events = machine
+            .finish_real(Ok(()))
+            .expect("native empty outcome");
+
+        assert!(matches!(
+            events.as_slice(),
+            [InternalEvent::Failed { reason, .. }] if reason == "empty_output"
+        ));
+        assert_eq!(machine.terminal().expect("terminal").2, "failed");
+    }
+
+    #[test]
+    fn native_first_frame_failure_is_sealed_as_provider_failure() {
+        let mut real_envelope = envelope();
+        real_envelope["provider_ref"] = json!("provider-profile:deepseek");
+        real_envelope["model"] = json!("deepseek-chat-alias");
+        let mut machine = QueryMachine::default();
+        machine
+            .start_real(&real_envelope, &shared_runtime_input())
+            .expect("real query start");
+
+        let events = machine
+            .finish_real(Err("Goose native provider failed".into()))
+            .expect("native provider failure");
+
+        assert!(matches!(
+            events.as_slice(),
+            [InternalEvent::Failed { reason, .. }] if reason == "provider_failed"
+        ));
+        assert_eq!(machine.terminal().expect("terminal").2, "failed");
+    }
+
+    #[test]
+    fn native_partial_then_failure_never_completes() {
+        let mut real_envelope = envelope();
+        real_envelope["provider_ref"] = json!("provider-profile:deepseek");
+        real_envelope["model"] = json!("deepseek-chat-alias");
+        let mut machine = QueryMachine::default();
+        machine
+            .start_real(&real_envelope, &shared_runtime_input())
+            .expect("real query start");
+        let partial = machine
+            .push_real(ProviderStreamEvent::OutputToken("partial".into()))
+            .expect("partial native event")
+            .expect("partial public event");
+
+        let terminal = machine
+            .finish_real(Err("Goose native provider failed after partial".into()))
+            .expect("native provider failure");
+
+        assert!(matches!(partial, InternalEvent::OutputToken { .. }));
+        assert!(matches!(
+            terminal.as_slice(),
+            [InternalEvent::Failed { reason, .. }] if reason == "provider_failed"
+        ));
+        assert!(!terminal
+            .iter()
+            .any(|event| matches!(event, InternalEvent::Completed { .. })));
+        assert_eq!(machine.terminal().expect("terminal").2, "failed");
     }
 }

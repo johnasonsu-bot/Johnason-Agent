@@ -1,21 +1,100 @@
 mod event_mapper;
 mod grant_channel;
+mod native_agent;
 mod protocol;
 mod provider_bridge;
 mod query;
+mod tool_transport;
 
 use std::env;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use event_mapper::map_event;
+use native_agent::{NativeRunIdentity, PlatformToolManifest, stream_native_agent_to};
 use protocol::{ControlFrame, response};
-use provider_bridge::{ProviderRequest, ProviderStreamEvent, stream_provider_to};
+use provider_bridge::{ProviderRequest, ProviderStreamEvent};
 use query::QueryMachine;
+use tool_transport::ToolTransport;
+
+struct ActiveTask {
+    run_id: String,
+    cancel: CancellationToken,
+    task: JoinHandle<Result<(), String>>,
+    transport: Arc<ToolTransport>,
+    cancellation_requested: bool,
+    terminal_allowed: bool,
+    deferred_cancel_command_id: Option<String>,
+}
+
+impl ActiveTask {
+    fn new(
+        run_id: String,
+        cancel: CancellationToken,
+        task: JoinHandle<Result<(), String>>,
+        transport: Arc<ToolTransport>,
+    ) -> Self {
+        Self {
+            run_id,
+            cancel,
+            task,
+            transport,
+            cancellation_requested: false,
+            terminal_allowed: true,
+            deferred_cancel_command_id: None,
+        }
+    }
+
+    fn signal_cancel(&mut self) {
+        self.cancellation_requested = true;
+        self.cancel.cancel();
+    }
+
+    fn request_query_cancel(&mut self, command_id: String) -> Result<(), String> {
+        if self.deferred_cancel_command_id.is_some() {
+            return Err("Goose query cancellation is already pending".into());
+        }
+        self.deferred_cancel_command_id = Some(command_id);
+        self.signal_cancel();
+        Ok(())
+    }
+
+    fn deferred_cancel_command_id(&self) -> Option<&str> {
+        self.deferred_cancel_command_id.as_deref()
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancellation_requested
+    }
+
+    fn request_input_loss_shutdown(&mut self) {
+        self.terminal_allowed = false;
+        self.signal_cancel();
+        self.transport.close(
+            "Goose tool transport input closed before settlement; effect state is unknown",
+        );
+    }
+
+    fn may_publish_terminal(&self) -> bool {
+        self.terminal_allowed
+    }
+
+    #[cfg(test)]
+    fn task_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    #[cfg(test)]
+    fn abort_for_test_cleanup(&self) {
+        self.task.abort();
+    }
+}
 
 const BUILD_ID: &str = if MODEL_HOST { "goose-host-v2:model-host-r1" } else { "goose-host-v2:fixture-wrapper-r2" };
 const ALLOWED_PROCESS_ENVIRONMENT_NAMES: &[&str] = &[
@@ -85,8 +164,9 @@ async fn run() -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     let mut machine = QueryMachine::default();
     let mut input_open = true;
-    let mut active_task: Option<(String, JoinHandle<Result<(), String>>)> = None;
+    let mut active_task: Option<ActiveTask> = None;
     let mut active_events: Option<mpsc::UnboundedReceiver<ProviderStreamEvent>> = None;
+    let mut active_tool_requests: Option<mpsc::UnboundedReceiver<Value>> = None;
     loop {
         if !input_open && active_task.is_none() {
             break;
@@ -95,6 +175,9 @@ async fn run() -> Result<(), String> {
             line = stdin.next_line(), if input_open => {
                 let Some(line) = line.map_err(|_| "Host v2 input failed")? else {
                     input_open = false;
+                    if let Some(active) = active_task.as_mut() {
+                        active.request_input_loss_shutdown();
+                    }
                     continue;
                 };
                 let command = ControlFrame::parse(line.as_bytes())?;
@@ -183,6 +266,8 @@ async fn run() -> Result<(), String> {
                         }
                     }
                 } else {
+                    let native_identity = NativeRunIdentity::from_envelope(envelope)?;
+                    PlatformToolManifest::from_envelope(envelope)?;
                     let material = private_grant.into_provider_material(
                         &command.command_id,
                         run_id,
@@ -203,11 +288,34 @@ async fn run() -> Result<(), String> {
                             write_frame(&mut stdout, &map_event(running, run_id, term_id, step_id))?;
                             let (sender, receiver) = mpsc::unbounded_channel();
                             let task_run_id = run_id.to_owned();
+                            let native_envelope = envelope.clone();
+                            let cancel = CancellationToken::new();
+                            let task_cancel = cancel.clone();
+                            let (tool_sender, tool_receiver) = mpsc::unbounded_channel();
+                            let transport = Arc::new(ToolTransport::new(
+                                native_identity,
+                                tool_sender,
+                            ));
+                            let task_transport = transport.clone();
                             let task = tokio::spawn(async move {
-                                stream_provider_to(material, prompt, sender).await
+                                stream_native_agent_to(
+                                    material,
+                                    prompt,
+                                    native_envelope,
+                                    Some(task_transport),
+                                    task_cancel,
+                                    sender,
+                                )
+                                .await
                             });
-                            active_task = Some((task_run_id, task));
+                            active_task = Some(ActiveTask::new(
+                                task_run_id,
+                                cancel,
+                                task,
+                                transport,
+                            ));
                             active_events = Some(receiver);
+                            active_tool_requests = Some(tool_receiver);
                         }
                         Err(_) => {
                             write_frame(
@@ -228,13 +336,12 @@ async fn run() -> Result<(), String> {
                     .get("run_id")
                     .and_then(Value::as_str)
                     .ok_or("cancel run_id is missing")?;
-                if active_task
-                    .as_ref()
-                    .is_some_and(|(active_run_id, _)| active_run_id == run_id)
-                {
-                    let (_, task) = active_task.take().expect("active task was checked");
-                    task.abort();
-                    active_events = None;
+                if let Some(active) = active_task.as_mut() {
+                    if active.run_id != run_id {
+                        return Err("cancel run id does not match the active query".into());
+                    }
+                    active.request_query_cancel(command.command_id)?;
+                    continue;
                 }
                 let event = machine.cancel(run_id)?;
                 write_frame(
@@ -255,6 +362,17 @@ async fn run() -> Result<(), String> {
                         &identity.step_id,
                     ),
                 )?;
+            }
+            "tool.result" => {
+                let active = active_task
+                    .as_ref()
+                    .ok_or("Goose tool.result has no active query")?;
+                active.transport.deliver_result(&json!({
+                    "kind":"command",
+                    "type":"tool.result",
+                    "command_id":command.command_id,
+                    "payload":command.payload,
+                }))?;
             }
             "query.status" => {
                 let (identity, cursor, _) =
@@ -297,6 +415,19 @@ async fn run() -> Result<(), String> {
             }
                 }
             }
+            frame = async {
+                active_tool_requests
+                    .as_mut()
+                    .expect("active tool request receiver")
+                    .recv()
+                    .await
+            }, if active_tool_requests.is_some() => {
+                if let Some(frame) = frame {
+                    write_frame(&mut stdout, &frame)?;
+                } else {
+                    active_tool_requests = None;
+                }
+            }
             event = async {
                 active_events
                     .as_mut()
@@ -317,22 +448,40 @@ async fn run() -> Result<(), String> {
                     }
                 } else {
                     active_events = None;
-                    let (_, task) = active_task
+                    active_tool_requests = None;
+                    let active = active_task
                         .take()
                         .ok_or("Goose provider task is unavailable")?;
                     let identity = machine
                         .active_identity()
                         .cloned()
                         .ok_or("Goose provider completed without an active query")?;
-                    let result = task
+                    let cancellation_requested = active.cancellation_requested();
+                    let terminal_allowed = active.may_publish_terminal();
+                    let cancel_command_id = active.deferred_cancel_command_id().map(str::to_owned);
+                    let result = active.task
                         .await
                         .map_err(|_| "Goose provider task failed".to_owned())?;
-                    let events = match result {
-                        Ok(()) => match machine.complete_real() {
-                            Ok(events) => events,
-                            Err(_) => vec![machine.fail_real("empty_output")?],
-                        },
-                        Err(_) => vec![machine.fail_real("provider_failed")?],
+                    if !terminal_allowed {
+                        return Err(
+                            "Goose Host input closed with an unsettled query; terminal is unknown"
+                                .into(),
+                        );
+                    }
+                    let events = if cancellation_requested {
+                        write_frame(
+                            &mut stdout,
+                            &response(
+                                "query.cancel",
+                                cancel_command_id.as_deref().ok_or(
+                                    "Goose cancelled query has no deferred cancel command",
+                                )?,
+                                json!({"accepted":true}),
+                            ),
+                        )?;
+                        vec![machine.cancel(&identity.run_id)?]
+                    } else {
+                        machine.finish_real(result)?
                     };
                     for event in events {
                         write_frame(
@@ -352,7 +501,13 @@ async fn run() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_argv, validate_process_environment};
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ActiveTask, validate_argv, validate_process_environment};
+    use crate::native_agent::NativeRunIdentity;
+    use crate::tool_transport::ToolTransport;
 
     #[test]
     fn argv_cannot_carry_provider_material() {
@@ -383,5 +538,72 @@ mod tests {
         ] {
             assert!(validate_process_environment(vec![(name.into(), "secret".into())]).is_err());
         }
+    }
+
+    // Break caught: query.cancel must signal the running native Session without
+    // aborting its task before a pending platform write can settle.
+    #[tokio::test]
+    async fn active_query_cancellation_keeps_the_native_task_alive_for_settlement() {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            std::future::pending::<Result<(), String>>().await
+        });
+        let (outgoing, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Arc::new(ToolTransport::new(
+            NativeRunIdentity {
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                term_id: "term-1".into(),
+                step_id: "step-1".into(),
+                command_id: "command-1".into(),
+                agent_id: "agent-1".into(),
+                agent_role: "worker".into(),
+            },
+            outgoing,
+        ));
+        let mut active = ActiveTask::new("run-1".into(), cancel, task, transport);
+
+        active
+            .request_query_cancel("cancel-command-1".into())
+            .expect("request cancellation");
+        tokio::task::yield_now().await;
+
+        assert!(active.cancellation_requested());
+        assert_eq!(
+            active.deferred_cancel_command_id(),
+            Some("cancel-command-1")
+        );
+        assert!(!active.task_finished());
+        active.abort_for_test_cleanup();
+    }
+
+    // Break caught: treating stdin EOF like query.cancel could publish a false
+    // cancelled/completed seal while an effectful tool outcome is still unknown.
+    #[tokio::test]
+    async fn input_loss_never_allows_a_query_terminal_to_be_published() {
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(std::future::pending::<Result<(), String>>());
+        let (outgoing, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Arc::new(ToolTransport::new(
+            NativeRunIdentity {
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                term_id: "term-1".into(),
+                step_id: "step-1".into(),
+                command_id: "command-1".into(),
+                agent_id: "agent-1".into(),
+                agent_role: "worker".into(),
+            },
+            outgoing,
+        ));
+        let mut active = ActiveTask::new("run-1".into(), cancel, task, transport);
+
+        active.request_input_loss_shutdown();
+
+        assert!(active.cancellation_requested());
+        assert!(!active.may_publish_terminal());
+        active.abort_for_test_cleanup();
     }
 }

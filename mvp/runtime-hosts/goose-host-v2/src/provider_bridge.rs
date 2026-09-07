@@ -1,13 +1,17 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::StreamExt;
 use goose_providers::api_client::{ApiClient, AuthMethod};
 use goose_providers::base::Provider;
-use goose_providers::conversation::message::{Message, MessageContentBlock};
 use goose_providers::model::ModelConfig;
 use goose_providers::openai_compatible::OpenAiCompatibleProvider;
 use serde_json::Value;
+
+#[cfg(test)]
+use futures::StreamExt;
+#[cfg(test)]
+use goose_providers::conversation::message::{Message, MessageContentBlock};
 
 use crate::grant_channel::ProviderMaterial;
 
@@ -83,71 +87,13 @@ pub(crate) async fn stream_provider(
     Ok(events)
 }
 
-pub(crate) async fn stream_provider_to(
-    material: ProviderMaterial,
-    prompt: ProviderPrompt,
-    sender: tokio::sync::mpsc::UnboundedSender<ProviderStreamEvent>,
-) -> Result<(), String> {
-    stream_provider_with(material, prompt, move |event| {
-        sender
-            .send(event)
-            .map_err(|_| "Goose provider event receiver is unavailable".to_owned())
-    })
-    .await
-}
-
+#[cfg(test)]
 async fn stream_provider_with(
-    mut material: ProviderMaterial,
+    material: ProviderMaterial,
     prompt: ProviderPrompt,
     mut emit: impl FnMut(ProviderStreamEvent) -> Result<(), String>,
 ) -> Result<(), String> {
-    let secret = match String::from_utf8(material.take_secret()) {
-        Ok(secret) => secret,
-        Err(error) => {
-            let mut bytes = error.into_bytes();
-            bytes.fill(0);
-            return Err("provider Grant secret is not valid UTF-8".to_owned());
-        }
-    };
-    let auth = if material.credential_mode() == "none" {
-        AuthMethod::NoAuth
-    } else {
-        AuthMethod::BearerToken(secret)
-    };
-    let mut client = ApiClient::with_timeout_and_tls(
-        material.base_url().to_owned(),
-        auth,
-        Duration::from_secs(600),
-        None,
-    )
-    .map_err(|_| "Goose provider client could not be created".to_owned())?;
-    for (name, value) in material.metadata_headers() {
-        client = client
-            .with_header(name, value)
-            .map_err(|_| "Goose provider metadata header is invalid".to_owned())?;
-    }
-    client = if material.base_url().starts_with("http://") {
-        client
-            .with_loopback_http_only()
-            .map_err(|_| "Goose provider transport policy is invalid".to_owned())?
-    } else {
-        client
-            .with_https_only()
-            .map_err(|_| "Goose provider transport policy is invalid".to_owned())?
-    };
-
-    let prefix = completion_prefix(material.protocol(), material.base_url())?;
-    let provider = OpenAiCompatibleProvider::new("workbench".into(), client, prefix);
-    let mut model = ModelConfig::new(material.model());
-    if material.thinking_enabled() {
-        model = model.with_merged_request_params(HashMap::from([
-            ("thinking".into(), serde_json::json!({"type":"enabled"})),
-            (
-                "reasoning_effort".into(),
-                serde_json::json!(material.reasoning_effort()),
-            ),
-        ]));
-    }
+    let (provider, model) = provider_from_material(material)?;
     let messages: Vec<Message> = prompt
         .messages
         .into_iter()
@@ -196,6 +142,59 @@ async fn stream_provider_with(
         }
     }
     Ok(())
+}
+
+pub(crate) fn provider_from_material(
+    mut material: ProviderMaterial,
+) -> Result<(Arc<dyn Provider>, ModelConfig), String> {
+    let secret = match String::from_utf8(material.take_secret()) {
+        Ok(secret) => secret,
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.fill(0);
+            return Err("provider Grant secret is not valid UTF-8".to_owned());
+        }
+    };
+    let auth = if material.credential_mode() == "none" {
+        AuthMethod::NoAuth
+    } else {
+        AuthMethod::BearerToken(secret)
+    };
+    let mut client = ApiClient::with_timeout_and_tls(
+        material.base_url().to_owned(),
+        auth,
+        Duration::from_secs(600),
+        None,
+    )
+    .map_err(|_| "Goose provider client could not be created".to_owned())?;
+    for (name, value) in material.metadata_headers() {
+        client = client
+            .with_header(name, value)
+            .map_err(|_| "Goose provider metadata header is invalid".to_owned())?;
+    }
+    client = if material.base_url().starts_with("http://") {
+        client
+            .with_loopback_http_only()
+            .map_err(|_| "Goose provider transport policy is invalid".to_owned())?
+    } else {
+        client
+            .with_https_only()
+            .map_err(|_| "Goose provider transport policy is invalid".to_owned())?
+    };
+
+    let prefix = completion_prefix(material.protocol(), material.base_url())?;
+    let provider = OpenAiCompatibleProvider::new("workbench".into(), client, prefix);
+    let mut model = ModelConfig::new(material.model());
+    if material.thinking_enabled() {
+        model = model.with_merged_request_params(HashMap::from([
+            ("thinking".into(), serde_json::json!({"type":"enabled"})),
+            (
+                "reasoning_effort".into(),
+                serde_json::json!(material.reasoning_effort()),
+            ),
+        ]));
+    }
+    Ok((Arc::new(provider), model))
 }
 
 fn completion_prefix(protocol: &str, base_url: &str) -> Result<String, String> {

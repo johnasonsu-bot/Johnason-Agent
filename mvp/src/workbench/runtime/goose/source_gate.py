@@ -53,8 +53,8 @@ _WRAPPER_MANIFEST_PATH = f"{_WRAPPER_ROOT}/Cargo.toml"
 _WRAPPER_LOCKFILE_PATH = f"{_WRAPPER_ROOT}/Cargo.lock"
 _WRAPPER_ROOT_FILES = (".gitignore", "Cargo.toml", "Cargo.lock")
 _WRAPPER_SOURCE_FILES = (
-    "event_mapper.rs", "grant_channel.rs", "host.rs", "live.rs", "main.rs", "protocol.rs",
-    "provider_bridge.rs", "query.rs",
+    "event_mapper.rs", "grant_channel.rs", "host.rs", "live.rs", "main.rs",
+    "native_agent.rs", "protocol.rs", "provider_bridge.rs", "query.rs", "tool_transport.rs",
 )
 _WRAPPER_OPTIONAL_GENERATED_DIRECTORIES = ("target",)
 _WRAPPER_INPUTS = (
@@ -69,6 +69,8 @@ _WRAPPER_INPUTS = (
     f"{_WRAPPER_ROOT}/src/event_mapper.rs",
     f"{_WRAPPER_ROOT}/src/provider_bridge.rs",
     f"{_WRAPPER_ROOT}/src/grant_channel.rs",
+    f"{_WRAPPER_ROOT}/src/native_agent.rs",
+    f"{_WRAPPER_ROOT}/src/tool_transport.rs",
 )
 _QUERY_SMOKE_EVIDENCE_PATH = (
     f"{_WRAPPER_ROOT}/target/release/goose-host-v2.build-evidence.json"
