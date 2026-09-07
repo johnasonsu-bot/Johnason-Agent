@@ -19,7 +19,11 @@ from workbench.runtime.engine_host.v2.assignment import (
     RuntimeAssignmentInput,
     SecurityReviewBlocked,
 )
-from workbench.runtime.engine_host.v2.contracts import RunEnvelopeV2
+from workbench.runtime.engine_host.v2.contracts import (
+    QueryCommandV2,
+    RunEnvelopeV2,
+    RuntimeQueryInputV2,
+)
 from workbench.runtime.engine_host.v2.identity import canonical_envelope_identity
 from workbench.runtime.engine_host.v2.registry import (
     NoConformantRuntime,
@@ -46,6 +50,266 @@ _CAPABILITIES = frozenset(
         "event_cursor",
     }
 )
+_EXECUTION_SNAPSHOT_FIELDS = frozenset(
+    {
+        "selector",
+        "runtime_id",
+        "build_id",
+        "provider_profile_digest",
+        "resolved_model",
+        "command",
+        "envelope",
+        "runtime_input",
+        "agents",
+        "handoffs",
+        "model_messages",
+        "conversation_context",
+        "project_context",
+        "work_state",
+        "permission_policy",
+        "environment_allowlist",
+        "effect_scope",
+    }
+)
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _digest_json(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _require_exact_mapping(
+    value: object, fields: frozenset[str], *, name: str
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"runtime execution {name} is incomplete")
+    return value
+
+
+def _validated_execution_snapshot(
+    snapshot: Mapping[str, object],
+) -> tuple[dict[str, object], RunEnvelopeV2, str, str]:
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("runtime execution snapshot must be a mapping")
+    try:
+        encoded = _canonical_json(snapshot)
+        document = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "runtime execution snapshot must contain JSON values"
+        ) from error
+    if not isinstance(document, dict) or set(document) != _EXECUTION_SNAPSHOT_FIELDS:
+        raise ValueError("runtime execution snapshot fields changed")
+    command = QueryCommandV2.model_validate(document["command"])
+    envelope = RunEnvelopeV2.model_validate(document["envelope"])
+    runtime_input = RuntimeQueryInputV2.model_validate(document["runtime_input"])
+    if command.type != "query.start" or command.command_id != envelope.command_id:
+        raise ValueError("runtime execution command does not match envelope")
+    if (
+        document["selector"] != envelope.runtime.runtime_id
+        or document["runtime_id"] != envelope.runtime.runtime_id
+        or document["build_id"] != envelope.runtime.build_id
+        or document["resolved_model"] != envelope.model
+        or runtime_input.message_snapshot_digest != envelope.message_snapshot_digest
+        or runtime_input.context_snapshot_digest != envelope.context.snapshot_digest
+        or runtime_input.prompt_manifest_digest != envelope.prompt_manifest_digest
+    ):
+        raise ValueError("runtime execution snapshot does not match envelope")
+    if (
+        _digest_json(
+            tuple(item.model_dump(mode="json") for item in envelope.tool_manifest)
+        )
+        != envelope.tool_manifest_digest
+        or _digest_json(
+            tuple(item.model_dump(mode="json") for item in envelope.skill_pins)
+        )
+        != envelope.skill_manifest_digest
+        or _digest_json(
+            tuple(item.model_dump(mode="json") for item in envelope.plugin_pins)
+        )
+        != envelope.plugin_manifest_digest
+    ):
+        raise ValueError("runtime execution envelope manifest digest changed")
+    extensions = envelope.extensions
+    provider_digest = document["provider_profile_digest"]
+    if (
+        not isinstance(provider_digest, str)
+        or _DIGEST.fullmatch(provider_digest) is None
+        or extensions.get("provider_profile_digest") != provider_digest
+        or extensions.get("resolved_model") != document["resolved_model"]
+    ):
+        raise ValueError("runtime execution provider authority changed")
+
+    conversation = _require_exact_mapping(
+        document["conversation_context"],
+        frozenset({"session_id", "snapshot_ref", "snapshot_digest", "version"}),
+        name="conversation context",
+    )
+    if conversation != {
+        "session_id": envelope.session_id,
+        "snapshot_ref": envelope.context.snapshot_ref,
+        "snapshot_digest": envelope.context.snapshot_digest,
+        "version": envelope.context.version,
+    }:
+        raise ValueError("runtime execution conversation context changed")
+    project = _require_exact_mapping(
+        document["project_context"],
+        frozenset({"project_id", "version", "snapshot_digest"}),
+        name="project context",
+    )
+    project_ref = extensions.get("project_context_ref")
+    default_project = (
+        project_ref is None
+        and project["project_id"] == "conversation-project"
+        and project["version"] == 0
+        and project["snapshot_digest"] == _digest_json(None)
+    )
+    frozen_project = (
+        isinstance(project_ref, str)
+        and project["version"] != 0
+        and project_ref
+        == f"project-context:{project['project_id']}:{project['version']}"
+    )
+    if (
+        "project_context_ref" not in extensions
+        or not isinstance(project["project_id"], str)
+        or not project["project_id"]
+        or type(project["version"]) is not int
+        or project["version"] < 0
+        or not isinstance(project["snapshot_digest"], str)
+        or _DIGEST.fullmatch(project["snapshot_digest"]) is None
+        or extensions.get("project_context_digest") != project["snapshot_digest"]
+        or not (default_project or frozen_project)
+    ):
+        raise ValueError("runtime execution project context changed")
+    work_state = _require_exact_mapping(
+        document["work_state"],
+        frozenset({"term_id", "agent_id", "root_ref", "metadata_digest"}),
+        name="work state",
+    )
+    if (
+        work_state["term_id"] != envelope.term_id
+        or work_state["agent_id"] != envelope.agent_id
+        or work_state["root_ref"] != f".runtime/terms/{envelope.term_id}"
+        or not isinstance(work_state["metadata_digest"], str)
+        or _DIGEST.fullmatch(work_state["metadata_digest"]) is None
+    ):
+        raise ValueError("runtime execution work state changed")
+    permission = _require_exact_mapping(
+        document["permission_policy"],
+        frozenset({"tool_policy", "filesystem_policy"}),
+        name="permission policy",
+    )
+    permission_values = {"allow", "deny", "ask", "supervisor_approval"}
+    if (
+        permission["tool_policy"] not in permission_values
+        or permission["filesystem_policy"] not in permission_values
+        or _digest_json(permission) != envelope.permission_policy_digest
+    ):
+        raise ValueError("runtime execution permission policy changed")
+    environment = document["environment_allowlist"]
+    if (
+        not isinstance(environment, list)
+        or len(environment) != len(set(environment))
+        or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[A-Z_][A-Z0-9_]*", item) is None
+            for item in environment
+        )
+    ):
+        raise ValueError("runtime execution environment allowlist is invalid")
+    effect_scope = _require_exact_mapping(
+        document["effect_scope"],
+        frozenset({"scope_id", "write_effects", "allowed_tool_ids"}),
+        name="effect scope",
+    )
+    allowed_tools = effect_scope["allowed_tool_ids"]
+    manifested_tools = {item.tool_id for item in envelope.tool_manifest}
+    if (
+        not isinstance(effect_scope["scope_id"], str)
+        or not effect_scope["scope_id"]
+        or type(effect_scope["write_effects"]) is not bool
+        or not isinstance(allowed_tools, list)
+        or len(allowed_tools) != len(set(allowed_tools))
+        or any(
+            not isinstance(item, str) or item not in manifested_tools
+            for item in allowed_tools
+        )
+    ):
+        raise ValueError("runtime execution effect scope is invalid")
+    messages = document["model_messages"]
+    expected_messages = [
+        {"role": item.role, "content": item.content}
+        for item in runtime_input.messages
+    ]
+    if messages != expected_messages:
+        raise ValueError("runtime execution model messages changed")
+    agents = document["agents"]
+    if not isinstance(agents, list) or not agents:
+        raise ValueError("runtime execution agents are incomplete")
+    agent_ids: list[str] = []
+    for agent in agents:
+        item = _require_exact_mapping(
+            agent,
+            frozenset({"agent_id", "name", "provider_ref", "model", "instructions"}),
+            name="agent",
+        )
+        if any(
+            not isinstance(item[field], str) or not item[field]
+            for field in ("agent_id", "name", "provider_ref", "model")
+        ) or not (
+            item["instructions"] is None
+            or isinstance(item["instructions"], str)
+        ):
+            raise ValueError("runtime execution agent is invalid")
+        agent_ids.append(item["agent_id"])
+    if len(agent_ids) != len(set(agent_ids)) or envelope.agent_id not in agent_ids:
+        raise ValueError("runtime execution active agent is unavailable")
+    handoffs = document["handoffs"]
+    if not isinstance(handoffs, list):
+        raise ValueError("runtime execution handoffs are invalid")
+    handoff_ids: list[str] = []
+    for handoff in handoffs:
+        item = _require_exact_mapping(
+            handoff,
+            frozenset({"handoff_id", "source_agent_id", "target_agent_id", "summary"}),
+            name="handoff",
+        )
+        if any(
+            not isinstance(item[field], str) or not item[field]
+            for field in ("handoff_id", "source_agent_id", "target_agent_id", "summary")
+        ) or any(
+            item[field] not in agent_ids
+            for field in ("source_agent_id", "target_agent_id")
+        ):
+            raise ValueError("runtime execution handoff is invalid")
+        handoff_ids.append(item["handoff_id"])
+    if len(handoff_ids) != len(set(handoff_ids)):
+        raise ValueError("runtime execution handoff IDs are not unique")
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return document, envelope, encoded, digest
+
+
+def _restore_execution_snapshot_shape(
+    document: dict[str, object],
+) -> dict[str, object]:
+    """Preserve the existing public snapshot tuple/list contract after JSON load."""
+    restored = dict(document)
+    for field in ("agents", "handoffs", "model_messages", "environment_allowlist"):
+        restored[field] = tuple(restored[field])  # type: ignore[arg-type]
+    effect_scope = dict(restored["effect_scope"])  # type: ignore[arg-type]
+    effect_scope["allowed_tool_ids"] = tuple(effect_scope["allowed_tool_ids"])
+    restored["effect_scope"] = effect_scope
+    return restored
 
 
 class RuntimeAdmissionUnavailable(RuntimeError):
@@ -73,6 +337,18 @@ class RuntimeAdmissionBlocked(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__(self.public_detail)
+
+
+class RuntimeExecutionSnapshotConflict(RuntimeError):
+    """One command key was reused with different frozen execution facts."""
+
+
+class CorruptRuntimeExecutionSnapshot(RuntimeError):
+    """Persisted execution snapshot evidence failed canonical verification."""
+
+
+class RuntimeExecutionSnapshotUnavailable(RuntimeError):
+    """No exact frozen execution snapshot exists for this envelope."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +734,150 @@ def _runtime_available(
 class RuntimeAdmissionRepository:
     def __init__(self, database: Path) -> None:
         self.store = WorkflowStore(database)
+        self._ensure_execution_snapshot_schema()
+
+    def freeze_execution_snapshot(
+        self, snapshot: Mapping[str, object]
+    ) -> None:
+        """Append or idempotently reuse one complete runtime-neutral snapshot."""
+        document, envelope, encoded, digest = _validated_execution_snapshot(snapshot)
+        envelope_json = _canonical_json(envelope.model_dump(mode="json"))
+        envelope_digest = hashlib.sha256(envelope_json.encode("utf-8")).hexdigest()
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM runtime_execution_snapshots "
+                    "WHERE session_id=? AND command_id=?",
+                    (envelope.session_id, envelope.command_id),
+                ).fetchone()
+                if row is not None:
+                    persisted = self._execution_snapshot_from_row(row)
+                    if _canonical_json(persisted) != encoded:
+                        raise RuntimeExecutionSnapshotConflict(
+                            "runtime execution snapshot identity changed"
+                        )
+                    connection.commit()
+                    return
+                connection.execute(
+                    "INSERT INTO runtime_execution_snapshots("
+                    "session_id,command_id,envelope_json,envelope_digest,"
+                    "snapshot_json,snapshot_digest,created_at"
+                    ") VALUES(?,?,?,?,?,?,unixepoch('subsec'))",
+                    (
+                        envelope.session_id,
+                        envelope.command_id,
+                        envelope_json,
+                        envelope_digest,
+                        encoded,
+                        digest,
+                    ),
+                )
+                connection.commit()
+                return
+            except Exception:
+                connection.rollback()
+                raise
+
+    def load_execution_snapshot(
+        self, envelope: RunEnvelopeV2
+    ) -> dict[str, object]:
+        """Read only the snapshot bound to this exact, retry-local envelope."""
+        if not isinstance(envelope, RunEnvelopeV2):
+            raise TypeError("envelope must be a RunEnvelopeV2")
+        document = self.get_execution_snapshot(
+            envelope.session_id, envelope.command_id
+        )
+        if document is None:
+            raise RuntimeExecutionSnapshotUnavailable(
+                "runtime execution snapshot is unavailable"
+            )
+        persisted_envelope = RunEnvelopeV2.model_validate(document["envelope"])
+        requested = _canonical_json(envelope.model_dump(mode="json"))
+        persisted = _canonical_json(persisted_envelope.model_dump(mode="json"))
+        if requested != persisted:
+            raise RuntimeExecutionSnapshotConflict(
+                "runtime execution envelope identity changed"
+            )
+        return document
+
+    def get_execution_snapshot(
+        self, session_id: str, command_id: str
+    ) -> dict[str, object] | None:
+        """Load canonical snapshot facts by command key without rebuilding them."""
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(command_id, str)
+            or not command_id
+        ):
+            raise ValueError("runtime execution snapshot key is invalid")
+        with self.store.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_execution_snapshots "
+                "WHERE session_id=? AND command_id=?",
+                (session_id, command_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._execution_snapshot_from_row(row)
+
+    def _ensure_execution_snapshot_schema(self) -> None:
+        with self.store.connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_execution_snapshots (
+                    session_id TEXT NOT NULL,
+                    command_id TEXT NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    envelope_digest TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    snapshot_digest TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(session_id, command_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS runtime_execution_snapshots_no_update
+                BEFORE UPDATE ON runtime_execution_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'runtime execution snapshots are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS runtime_execution_snapshots_no_delete
+                BEFORE DELETE ON runtime_execution_snapshots
+                BEGIN
+                    SELECT RAISE(ABORT, 'runtime execution snapshots are append-only');
+                END;
+                """
+            )
+
+    @staticmethod
+    def _execution_snapshot_from_row(row: sqlite3.Row) -> dict[str, object]:
+        try:
+            snapshot_json = row["snapshot_json"]
+            snapshot_digest = hashlib.sha256(
+                snapshot_json.encode("utf-8")
+            ).hexdigest()
+            document, envelope, encoded, digest = _validated_execution_snapshot(
+                json.loads(snapshot_json)
+            )
+            envelope_json = _canonical_json(envelope.model_dump(mode="json"))
+            envelope_digest = hashlib.sha256(
+                envelope_json.encode("utf-8")
+            ).hexdigest()
+            if (
+                encoded != snapshot_json
+                or digest != snapshot_digest
+                or digest != row["snapshot_digest"]
+                or envelope_json != row["envelope_json"]
+                or envelope_digest != row["envelope_digest"]
+                or envelope.session_id != row["session_id"]
+                or envelope.command_id != row["command_id"]
+            ):
+                raise ValueError
+            return _restore_execution_snapshot_shape(document)
+        except Exception as error:
+            raise CorruptRuntimeExecutionSnapshot(
+                "runtime execution snapshot evidence is corrupt"
+            ) from error
 
     def get(self, session_id: str, command_id: str) -> RuntimeAdmissionIntent | None:
         with self.store.connect() as connection:
