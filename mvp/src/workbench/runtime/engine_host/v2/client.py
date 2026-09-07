@@ -26,6 +26,11 @@ from .contracts import (
     RuntimeQueryInputV2,
 )
 from .security import validate_runtime_argv
+from .tool_transport import (
+    PlatformToolBridge,
+    PlatformToolExecutor,
+    ToolTransportError,
+)
 from workbench.runtime.provider_grants.delivery import ProviderGrantDelivery
 from workbench.runtime.provider_grants.private_transport import (
     ProviderGrantTransportError,
@@ -151,6 +156,7 @@ class _QueryStream:
     unfinished_write_effects: set[str] = field(default_factory=set)
     active_tool_calls: dict[str, _ObservedToolCall] = field(default_factory=dict)
     observer: Callable[[RuntimeClientObservation], None] | None = None
+    tool_bridge: PlatformToolBridge | None = None
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -195,6 +201,7 @@ class EngineHostV2Client:
         containment_generation: str | None = None,
         provider_grant_transport: bool = False,
         provider_grant_clock: Callable[[], float] = time.time,
+        tool_executor: PlatformToolExecutor | None = None,
     ) -> None:
         command = validate_runtime_argv(command)
         if request_timeout <= 0 or shutdown_timeout <= 0:
@@ -220,6 +227,13 @@ class EngineHostV2Client:
         self._containment_generation = containment_generation
         self._provider_grant_transport_enabled = provider_grant_transport
         self._provider_grant_clock = provider_grant_clock
+        if tool_executor is not None and not callable(tool_executor):
+            raise TypeError("tool_executor must be callable")
+        self._tool_executor = tool_executor
+        self._tool_bridges: list[PlatformToolBridge] = []
+        self._tool_close_task: asyncio.Task[None] | None = None
+        self._tool_cleanup_confirmed: bool | None = True
+        self._tool_cleanup_error: RuntimeClientError | None = None
         self._provider_grant_delivery: SocketProviderGrantDelivery | None = None
         self.request_timeout = request_timeout
         self.shutdown_timeout = shutdown_timeout
@@ -281,6 +295,10 @@ class EngineHostV2Client:
 
     @property
     def cleanup_confirmed(self) -> bool | None:
+        if self._cleanup_confirmed is False:
+            return False
+        if self._tool_cleanup_confirmed is not True:
+            return False
         return self._cleanup_confirmed
 
     @property
@@ -554,6 +572,8 @@ class EngineHostV2Client:
                 raise RuntimeControlError(
                     "runtime input prompt section set does not match pinned sections"
                 )
+        if self._closed:
+            raise RuntimeUnavailableError("engine-host v2 client is closed")
         if self._state != "ready":
             raise RuntimeControlError("engine-host v2 must be ready before query")
         if self._active is not None:
@@ -576,6 +596,12 @@ class EngineHostV2Client:
         self._interventions.clear()
         self._last_control = None
         self._active = stream
+        if self._tool_executor is not None:
+            stream.tool_bridge = PlatformToolBridge(
+                envelope, self._tool_executor, self._write,
+                on_failure=lambda error: self._tool_execution_failed(stream, error),
+            )
+            self._tool_bridges.append(stream.tool_bridge)
         self._transition("accepting", expected={"ready"})
         try:
             try:
@@ -789,6 +815,8 @@ class EngineHostV2Client:
         self, stream: _QueryStream, run_id: str | None, reason: str
     ) -> None:
         resolved_run_id = stream.envelope.run_id if run_id is None else run_id
+        if stream.tool_bridge is not None:
+            stream.tool_bridge.cancel_all()
         try:
             response = await self._request(
                 "query.cancel", {"run_id": resolved_run_id, "reason": reason}
@@ -920,11 +948,86 @@ class EngineHostV2Client:
 
     async def aclose(self) -> None:
         """Cancel active work, close every pipe/task, and reap the child once."""
+        self._closed = True
+        tool_close_task = self._ensure_tool_close_task()
         task = await self._ensure_close_task(cancel_start=True)
         await asyncio.shield(task)
         await self._reclaim_control_tasks()
+        try:
+            async with asyncio.timeout(self.shutdown_timeout):
+                await asyncio.shield(tool_close_task)
+        except TimeoutError as error:
+            failure = self._tool_close_failure(
+                "engine-host v2 tool executor cleanup was not confirmed"
+            )
+            self._mark_tool_cleanup_unconfirmed(failure)
+            raise failure from error
+        if self._tool_cleanup_error is not None:
+            raise self._tool_cleanup_error
         if self._cleanup_error is not None:
             raise self._cleanup_error
+
+    def _ensure_tool_close_task(self) -> asyncio.Task[None]:
+        task = self._tool_close_task
+        if task is not None:
+            return task
+        bridges = tuple(self._tool_bridges)
+        if bridges:
+            self._tool_cleanup_confirmed = None
+        for bridge in bridges:
+            bridge.cancel_all()
+        task = asyncio.create_task(self._close_tool_bridges(bridges))
+        self._tool_close_task = task
+        task.add_done_callback(self._tool_close_completed)
+        return task
+
+    async def _close_tool_bridges(
+        self, bridges: tuple[PlatformToolBridge, ...]
+    ) -> None:
+        results = await asyncio.gather(
+            *(bridge.aclose() for bridge in bridges), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            failure = self._tool_close_failure(
+                "engine-host v2 tool executor settlement failed"
+            )
+            self._mark_tool_cleanup_unconfirmed(failure)
+            raise failure from failures[0]
+        if self._tool_cleanup_confirmed is not False:
+            self._tool_cleanup_confirmed = True
+
+    def _tool_close_completed(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            failure = self._tool_close_failure(
+                "engine-host v2 tool executor cleanup was abandoned"
+            )
+            self._mark_tool_cleanup_unconfirmed(failure)
+            return
+        task.exception()
+
+    def _tool_close_failure(self, message: str) -> RuntimeClientError:
+        stream = self._active
+        if (
+            (stream is not None and stream.unfinished_write_effects)
+            or any(bridge.has_pending_write for bridge in self._tool_bridges)
+        ):
+            return RuntimeReconciliationRequired(
+                "engine-host v2 write effect outcome is unknown"
+            )
+        return RuntimeUnavailableError(message)
+
+    def _mark_tool_cleanup_unconfirmed(self, failure: RuntimeClientError) -> None:
+        self._tool_cleanup_confirmed = False
+        if (
+            self._tool_cleanup_error is None
+            or self._failure_priority(failure)
+            > self._failure_priority(self._tool_cleanup_error)
+        ):
+            self._tool_cleanup_error = failure
+        stream = self._active
+        if stream is not None:
+            self._fail_stream(stream, failure)
 
     async def _reclaim_control_tasks(self) -> None:
         current = asyncio.current_task()
@@ -1171,6 +1274,8 @@ class EngineHostV2Client:
                     self._route_response(frame)
                 elif kind == "event":
                     await self._route_event(frame)
+                elif kind == "request":
+                    self._route_tool_request(frame)
                 else:
                     raise RuntimeProtocolError("unknown engine-host v2 frame kind")
         except asyncio.IncompleteReadError as error:
@@ -1195,6 +1300,29 @@ class EngineHostV2Client:
             )
         except asyncio.CancelledError:
             raise
+
+    def _route_tool_request(self, frame: Mapping[str, Any]) -> None:
+        stream = self._active
+        if stream is None or not stream.accepted or stream.terminal is not None or stream.failure is not None:
+            raise RuntimeProtocolError("tool request has no active accepted query")
+        if stream.tool_bridge is None:
+            raise RuntimeProtocolError("platform tool executor is not configured")
+        try:
+            stream.tool_bridge.handle(frame)
+        except ToolTransportError as error:
+            raise RuntimeProtocolError(str(error)) from error
+
+    def _tool_execution_failed(self, stream: _QueryStream, error: Exception) -> None:
+        if self._active is not stream or stream.failure is not None:
+            return
+        failure = self._classify_interruption(
+            stream, "platform tool execution failed",
+            RuntimeProtocolError("platform tool execution failed"),
+        )
+        self._fail_stream(stream, failure)
+        if stream.tool_bridge is not None:
+            stream.tool_bridge.cancel_all()
+        self._schedule_reader_close()
 
     def _route_response(self, frame: Mapping[str, Any]) -> None:
         command_id = frame.get("command_id")
@@ -1290,7 +1418,9 @@ class EngineHostV2Client:
             self._fail_stream(stream, effect_failure)
             return
         if self._is_terminal(event):
-            if stream.unfinished_write_effects:
+            if stream.unfinished_write_effects or (
+                stream.tool_bridge is not None and stream.tool_bridge.has_pending_write
+            ):
                 self._fail_stream(
                     stream,
                     RuntimeReconciliationRequired(
@@ -1298,7 +1428,9 @@ class EngineHostV2Client:
                     ),
                 )
                 return
-            if stream.active_tool_calls:
+            if stream.active_tool_calls or (
+                stream.tool_bridge is not None and stream.tool_bridge.has_pending
+            ):
                 self._fail_stream(
                     stream,
                     RuntimeProtocolError(
@@ -1546,6 +1678,8 @@ class EngineHostV2Client:
     def _reader_failed(self, error: Exception) -> None:
         self._terminated.set()
         stream = self._active
+        if stream is not None and stream.tool_bridge is not None:
+            stream.tool_bridge.cancel_all()
         if stream is not None and stream.terminal is None:
             failure = self._classify_interruption(stream, str(error), error)
             self._fail_stream(stream, failure)
@@ -1586,7 +1720,9 @@ class EngineHostV2Client:
         message: str,
         error: Exception | None = None,
     ) -> RuntimeClientError:
-        if stream.unfinished_write_effects:
+        if stream.unfinished_write_effects or (
+            stream.tool_bridge is not None and stream.tool_bridge.has_pending_write
+        ):
             return RuntimeReconciliationRequired(
                 "engine-host v2 write effect outcome is unknown"
             )
@@ -1595,13 +1731,19 @@ class EngineHostV2Client:
         return RuntimeUnavailableError(message)
 
     def _fail_stream(self, stream: _QueryStream, failure: Exception) -> None:
+        bridge = stream.tool_bridge
         if (
-            stream.unfinished_write_effects
+            (
+                stream.unfinished_write_effects
+                or (bridge is not None and bridge.has_pending_write)
+            )
             and not isinstance(failure, RuntimeReconciliationRequired)
         ):
             failure = RuntimeReconciliationRequired(
                 "engine-host v2 write effect outcome is unknown"
             )
+        if bridge is not None:
+            bridge.cancel_all()
         if (
             stream.failure is not None
             and self._failure_priority(failure)
