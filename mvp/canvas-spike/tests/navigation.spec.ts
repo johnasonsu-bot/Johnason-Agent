@@ -1,8 +1,9 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import path from "node:path";
+import { launchTestElectron } from "./support/electron-launch";
 
 test("switches between V4 navigation pages without opening a modal by default", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     await expect(page.getByRole("dialog", { name: "新建会话" })).toHaveCount(0);
@@ -19,7 +20,7 @@ test("switches between V4 navigation pages without opening a modal by default", 
 });
 
 test("opens Agent configuration for cross-model routing", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "Agent 配置" }).click();

@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -78,7 +79,7 @@ test("backend liveness pipe stays open through normal startup", async ({}, testI
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"));
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: {
       ...process.env,
@@ -105,7 +106,7 @@ test("engine host JSON settings cross the sanitized backend environment unchange
   const v2Runtimes = JSON.stringify([
     { runtime_id: "fake-v2", argv: ["C:\\Program Files\\Fake\\runtime.exe", "--stdio"] },
   ]);
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: {
       ...process.env,
@@ -144,7 +145,7 @@ test("startup and activate share one backend launch", async ({}, testInfo) => {
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 1_500);
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
   });
@@ -165,7 +166,7 @@ test("invalid handshake cleans up its backend before Electron exits", async ({},
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, true, 300, false);
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
   });
@@ -180,7 +181,7 @@ test("parent-control EOF terminates the backend fixture", async ({}, testInfo) =
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"));
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: {
       ...process.env,
@@ -198,7 +199,7 @@ test("window creation failure stops the started backend before Electron exits", 
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, false, 300, false);
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: {
       ...process.env,
@@ -218,7 +219,7 @@ test("unexpected backend exit completes before Electron closes", async ({}, test
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, false, 0, false, 100);
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
   });
@@ -231,7 +232,7 @@ test("quit during pending startup stops its child before Electron exits", async 
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 1_500, false, 300, false, 500);
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
   });
@@ -248,7 +249,7 @@ test("close then activate waits for backend stop before quit", async ({}, testIn
   const executable = await writeLivenessBackend(testInfo.outputPath("fixture"), 50, false, 300, false);
   const runtimeDir = testInfo.outputPath("runtime");
   const events = path.join(runtimeDir, "backend-events.log");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: runtimeDir },
   });

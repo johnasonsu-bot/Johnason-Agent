@@ -1,8 +1,9 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import path from "node:path";
+import { launchTestElectron } from "./support/electron-launch";
 
 test("manual verification requests reach the owned backend without exposing arbitrary IPC routes", async ({}, testInfo) => {
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: { ...process.env, HERMES_PYTHON: path.resolve("../.venv/bin/python"), HERMES_RUNTIME_DIR: testInfo.outputPath("runtime") },
   });

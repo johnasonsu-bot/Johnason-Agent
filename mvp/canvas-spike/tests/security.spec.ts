@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -38,7 +39,7 @@ function ownedEnvironment(runtimeDir: string, fakeBase: string) {
 
 test("owns a random-port backend and ignores a fixed-port squatter", async ({}, testInfo) => {
   const fake = await squatter();
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(testInfo.outputPath("runtime"), fake.base),
   });
@@ -58,7 +59,7 @@ test("owns a random-port backend and ignores a fixed-port squatter", async ({}, 
 
 test("rejects IPC from an untrusted frame even when it has the preload", async ({}, testInfo) => {
   const fake = await squatter();
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(testInfo.outputPath("runtime"), fake.base),
   });
@@ -98,7 +99,7 @@ test("rejects IPC from an untrusted frame even when it has the preload", async (
 
 test("blocks unexpected navigation and window creation and ships a strict CSP", async ({}, testInfo) => {
   const fake = await squatter();
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(testInfo.outputPath("runtime"), fake.base),
   });
@@ -124,7 +125,7 @@ test("renderer crash terminates the backend and releases the vault writer", asyn
   const runtime = testInfo.outputPath("crash-runtime");
   const password = `runtime-${randomUUID()}`;
   const environment = ownedEnvironment(runtime, "http://127.0.0.1:1");
-  const first = await electron.launch({ args: [path.resolve(".")], env: environment });
+  const first = await launchTestElectron({ args: [path.resolve(".")], env: environment, isolationDirectory: runtime });
   const page = await first.firstWindow();
   await page.getByRole("link", { name: "模型供应商" }).click();
   await page.getByLabel("主密码").fill(password);
@@ -137,7 +138,7 @@ test("renderer crash terminates the backend and releases the vault writer", asyn
   });
   await closed;
 
-  const second = await electron.launch({ args: [path.resolve(".")], env: environment });
+  const second = await launchTestElectron({ args: [path.resolve(".")], env: environment, isolationDirectory: runtime });
   try {
     const restarted = await second.firstWindow();
     await restarted.getByRole("link", { name: "模型供应商" }).click();

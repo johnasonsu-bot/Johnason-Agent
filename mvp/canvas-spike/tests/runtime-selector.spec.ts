@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { execFileSync } from "node:child_process";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -90,7 +91,7 @@ async function requests(runtimeDir: string) {
 async function launchFixture(testRoot: string, mode: FixtureMode, rejectExplicit = false, terminalEvents = false) {
   const runtimeDir = path.join(testRoot, "runtime");
   const executable = await createOwnedBackendFixture(testRoot, mode, rejectExplicit, terminalEvents);
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: {
       ...process.env,
@@ -258,7 +259,7 @@ test("real prepared Python Term environment supports the Electron-owned acceptan
     HERMES_RUNTIME_DIR: runtimeDir,
     HERMES_LMSTUDIO_BASE_URL: provider.baseUrl,
   };
-  const bootstrap = await electron.launch({ args: [path.resolve(".")], env: baseEnvironment });
+  const bootstrap = await launchTestElectron({ args: [path.resolve(".")], env: baseEnvironment, isolationDirectory: runtimeDir });
   try {
     const bootstrapPage = await bootstrap.firstWindow();
     const configured = await bootstrapPage.evaluate((baseUrl) => (window as any).workbenchBridge.apiRequest({
@@ -282,7 +283,8 @@ test("real prepared Python Term environment supports the Electron-owned acceptan
     await bootstrap.close();
   }
 
-  const app = await electron.launch({
+  const app = await launchTestElectron({
+    isolationDirectory: runtimeDir,
     args: [path.resolve(".")],
     env: {
       ...baseEnvironment,

@@ -1,8 +1,9 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import path from "node:path";
+import { launchTestElectron } from "./support/electron-launch";
 
 test("opens the V4 conversation workbench with composer and artifacts context", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     await expect(page.getByRole("button", { name: "◌ 会话" })).toHaveAttribute("aria-current", "page");
@@ -17,7 +18,7 @@ test("opens the V4 conversation workbench with composer and artifacts context", 
 });
 
 test("creates a multi-agent session from the picker", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "新建会话" }).click();
@@ -35,7 +36,7 @@ test("creates a multi-agent session from the picker", async () => {
 });
 
 test("inserts one mention token and adds context to the composer", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     const input = page.getByRole("textbox", { name: "会话消息" });
@@ -52,7 +53,7 @@ test("inserts one mention token and adds context to the composer", async () => {
 });
 
 test("keeps the user turn visible while the Task3 request runs", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     const input = page.getByRole("textbox", { name: "会话消息" });
@@ -66,7 +67,7 @@ test("keeps the user turn visible while the Task3 request runs", async () => {
 });
 
 test("supports the story-to-animation multi-agent scenario", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     const scenario = "@产品经理 写一篇200字小说 @架构师 改写成一个动画html";
@@ -81,7 +82,7 @@ test("supports the story-to-animation multi-agent scenario", async () => {
 });
 
 test("keeps a newly created session in the sidebar after reloading the workbench", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "新建会话" }).click();

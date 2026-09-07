@@ -1,8 +1,9 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import path from "node:path";
+import { launchTestElectron } from "./support/electron-launch";
 
 test("shows the Artifacts pane and keeps renderer isolation", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   const page = await app.firstWindow();
 
   await expect(page.getByRole("complementary", { name: "智能画布 · Artifacts" })).toBeVisible();

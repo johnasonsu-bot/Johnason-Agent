@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -60,7 +61,7 @@ async function runtimeFiles(root: string): Promise<string[]> {
 }
 
 test("uses a narrow IPC bridge for the Electron-owned backend", async ({}, testInfo) => {
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(testInfo.outputPath("runtime")),
   });
@@ -82,7 +83,7 @@ test("real Workbench backend completes the Batch 1 Provider Center lifecycle", a
   const runtime = testInfo.outputPath("workbench-runtime");
   const password = `runtime-${randomUUID()}`;
   const credential = `runtime-${randomUUID()}`;
-  const launch = () => electron.launch({
+  const launch = () => launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(runtime, upstream.base),
   });
@@ -192,7 +193,7 @@ test("explicitly recovers an incomplete vault through the real UI", async ({}, t
   const runtime = testInfo.outputPath("recovery-runtime");
   await mkdir(runtime, { recursive: true });
   await writeFile(path.join(runtime, "credentials.vault"), "");
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(runtime),
   });

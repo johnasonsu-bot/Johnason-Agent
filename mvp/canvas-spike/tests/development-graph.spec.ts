@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -80,7 +81,7 @@ store.append(DomainEvent.new("development.interrupt.required", "fixture", {
 test("development graph shows isolated branches and waits for release approval", async ({}, testInfo) => {
   const runtimeDir = testInfo.outputPath("runtime");
   installDevelopmentGraphFixtures(runtimeDir);
-  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
   try {
     const page = await app.firstWindow();
     await page.evaluate(() => localStorage.clear());
@@ -106,7 +107,7 @@ test("development graph shows isolated branches and waits for release approval",
 test("development branch review approves only IDs supplied by the current interrupt", async ({}, testInfo) => {
   const runtimeDir = testInfo.outputPath("runtime-current-scope");
   installDevelopmentGraphFixtures(runtimeDir, "branch_review");
-  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
   try {
     const page = await app.firstWindow();
     await page.evaluate(() => localStorage.clear());

@@ -1,5 +1,6 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import path from "node:path";
+import { launchTestElectron } from "./support/electron-launch";
 
 function ownedEnvironment(runtimeDir: string) {
   return {
@@ -10,7 +11,7 @@ function ownedEnvironment(runtimeDir: string) {
 }
 
 test("shows the read-only Engine Host contract state", async ({}, testInfo) => {
-  const app = await electron.launch({
+  const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: ownedEnvironment(testInfo.outputPath("runtime")),
   });

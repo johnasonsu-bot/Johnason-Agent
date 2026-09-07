@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -63,7 +64,7 @@ function installProviderFixtures(runtimeDir: string): void {
 test("shows sequential reviews, rework, recovery and html preview", async ({}, testInfo) => {
   const runtimeDir = testInfo.outputPath("runtime");
   installSequentialFixtures(runtimeDir);
-  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
   try {
     const page = await app.firstWindow();
     await page.evaluate(() => localStorage.clear());
@@ -86,7 +87,7 @@ test("shows sequential reviews, rework, recovery and html preview", async ({}, t
 test("persists credential-free Agent versions through the backend API", async ({}, testInfo) => {
   const runtimeDir = testInfo.outputPath("agent-runtime");
   installProviderFixtures(runtimeDir);
-  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
   try {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "Agent 配置" }).click();

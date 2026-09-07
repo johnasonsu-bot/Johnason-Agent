@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -49,7 +50,7 @@ const server=http.createServer((req,res)=>{let raw='';req.on('data',c=>raw+=c);r
 });});server.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({service:'hermes-workbench',instance_id:identity.instance_id,port:server.address().port})));});
 `);
   await chmod(executable, 0o755);
-  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: path.join(root, "runtime") } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: path.join(root, "runtime") }, isolationDirectory: root });
   const page = await app.firstWindow();
   return { app, page, state: async (value: object) => {
     // Publish atomically: the owned backend polls this file concurrently.

@@ -1,4 +1,5 @@
-import { _electron as electron, expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { launchTestElectron } from "./support/electron-launch";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -76,7 +77,7 @@ process.stdin.on("data", chunk => {
 `;
   await writeFile(executable, source, "utf8");
   await chmod(executable, 0o755);
-  const app = await electron.launch({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: path.join(root, "runtime") } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: executable, HERMES_RUNTIME_DIR: path.join(root, "runtime") }, isolationDirectory: root });
   const page = await app.firstWindow();
   await page.getByRole("link", { name: "模型供应商" }).click();
   return { app, page, panel: page.getByRole("region", { name: "DeepSeek Harness 人工验收" }) };

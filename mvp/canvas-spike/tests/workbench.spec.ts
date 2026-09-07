@@ -1,8 +1,9 @@
-import { _electron as electron, expect, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import path from "node:path";
+import { launchTestElectron } from "./support/electron-launch";
 
 test("keeps V4 navigation and the provider center available without exposing Node", async () => {
-  const app = await electron.launch({ args: [path.resolve(".")] });
+  const app = await launchTestElectron({ args: [path.resolve(".")] });
   try {
     const page = await app.firstWindow();
     await expect(page.getByRole("button", { name: "设置" })).toBeVisible();
