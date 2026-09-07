@@ -20,6 +20,7 @@ from workbench.runtime.engine_host.v2.contracts import (
 from workbench.runtime.provider_grants.broker import (
     canonical_provider_profile_digest,
 )
+from workbench.runtime.engine_host.v2.artifact_tools import ARTIFACT_TOOL_MANIFEST
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +148,14 @@ def build_runtime_execution_snapshot(
         if development_smoke
         else {"tool_policy": "deny", "filesystem_policy": "deny"}
     )
+    artifact_tools = (
+        envelope.runtime.runtime_id in {"goose", "dsh"}
+        and envelope.tool_manifest == ARTIFACT_TOOL_MANIFEST
+        and not envelope.workspace_grant.readable_paths
+        and not envelope.workspace_grant.writable_paths
+    )
+    if artifact_tools:
+        permission_policy = {"tool_policy": "allow", "filesystem_policy": "deny"}
     if not isinstance(runtime_input, RuntimeQueryInputV2):
         raise TypeError("runtime_input must be a RuntimeQueryInputV2")
     if runtime_input.message_snapshot_digest != envelope.message_snapshot_digest:
@@ -193,9 +202,10 @@ def build_runtime_execution_snapshot(
         "environment_allowlist": (),
         "effect_scope": {
             "scope_id": f"conversation-scope-{envelope.term_id[-32:]}",
-            "write_effects": False,
+            "write_effects": artifact_tools,
             "allowed_tool_ids": (
-                ("workspace.read",) if development_smoke else ()
+                tuple(tool.tool_id for tool in ARTIFACT_TOOL_MANIFEST)
+                if artifact_tools else (("workspace.read",) if development_smoke else ())
             ),
         },
     }

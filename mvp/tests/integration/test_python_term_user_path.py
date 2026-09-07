@@ -159,7 +159,10 @@ def test_real_build_app_worker_reads_fixed_workspace_and_projects_public_tool_ev
             pytest.fail("Python Term worker did not reach a terminal state")
 
         assert turn is not None
-        envelope = turn.state["python_term_execution"]["envelope"]
+        from workbench.runtime.conversation_execution import read_runtime_execution
+        execution = read_runtime_execution(turn.state)
+        assert execution is not None
+        envelope = execution["envelope"]
         term_id = envelope["term_id"]
         runtime_repository = PythonTermRepository(runtime_dir / "workbench.sqlite")
         calls_before_retry = sum(

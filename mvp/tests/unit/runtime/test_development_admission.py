@@ -682,6 +682,7 @@ def test_build_app_passes_runtime_specific_readiness_to_admission_probe(
         lambda **_kwargs: SimpleNamespace(
             assignments=AssignmentRepository.production(database),
             catalog=RuntimeCatalog(()),
+            intents=main.RuntimeAdmissionRepository(database),
         ),
     )
     monkeypatch.setattr(main, "SidecarSupervisor", lambda **_kwargs: _Lifecycle())

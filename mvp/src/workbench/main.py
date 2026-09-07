@@ -36,6 +36,10 @@ from workbench.models.lmstudio import LMStudioProvider
 from workbench.models.openai_compatible import OpenAICompatibleProvider
 from workbench.providers.repository import ProviderRepository
 from workbench.runtime.engine_host.client import EngineHostClient
+from workbench.runtime.engine_host.v2.client import EngineHostV2Client
+from workbench.runtime.engine_host.v2.artifact_tools import ARTIFACT_TOOL_MANIFEST
+from workbench.runtime.engine_host.v2.platform_tool_context import PlatformToolContextFactory
+from workbench.runtime.engine_host.v2.platform_tool_pool import PlatformToolPool
 from workbench.runtime.engine_host.selector import RunnerSelector
 from workbench.runtime.engine_host.v2.registry import (
     NoConformantRuntime,
@@ -59,6 +63,8 @@ from workbench.runtime.engine_host.v2.runtime_admission import (
     RuntimeCatalog,
     RuntimeCatalogEntry,
     RuntimeAdmissionProbe,
+    RuntimeExecutionSnapshotConflict,
+    CorruptRuntimeExecutionSnapshot,
 )
 from workbench.runtime.engine_host.v2.supervisor import SidecarSupervisor
 from workbench.runtime.engine_host.v2.assignment import (
@@ -71,6 +77,7 @@ from workbench.runtime.engine_host.v2.contracts import (
     QueryCommandV2,
     RunEnvelopeV2,
     ToolManifestEntryV2,
+    RuntimeQueryInputV2,
 )
 from workbench.runtime.conversation_execution import (
     RuntimeConversationRoute,
@@ -112,11 +119,13 @@ class RuntimeQueryRouter:
         _gate_proof: object | None = None,
         _admission_coordinator: RuntimeAdmissionCoordinator | None = None,
         _admission_probe: RuntimeAdmissionProbe | None = None,
+        _platform_tools_enabled: bool = False,
     ) -> None:
         self._registry = registry
         self.__gate_proof = _gate_proof
         self._admission_coordinator = _admission_coordinator
         self._admission_probe = _admission_probe
+        self._platform_tools_enabled = _platform_tools_enabled
 
     def route_new_query(
         self, command: QueryCommandV2, envelope: RunEnvelopeV2
@@ -207,6 +216,30 @@ class RuntimeQueryRouter:
                 runtime_id=selected.runtime_id,
                 build_id=selected.build_id,
             )
+            snapshot = None
+            if self._admission_coordinator is not None:
+                snapshot = self._admission_coordinator.intents.get_execution_snapshot(
+                    admission.session_id, admission.runtime_command_id
+                )
+                if snapshot is not None:
+                    frozen = RunEnvelopeV2.model_validate(snapshot["envelope"])
+                    # Reuse the original tool/policy snapshot after upgrades, but
+                    # never allow new intent or Provider state under its identity.
+                    if (
+                        frozen.runtime != envelope.runtime
+                        or frozen.extensions.get("admission_identity_digest")
+                        != envelope.extensions.get("admission_identity_digest")
+                        or frozen.extensions.get("provider_profile_digest")
+                        != envelope.extensions.get("provider_profile_digest")
+                        or frozen.extensions.get("resolved_model")
+                        != envelope.extensions.get("resolved_model")
+                        or snapshot["runtime_input"] != runtime_input.model_dump(mode="json")
+                        or frozen.model != envelope.model
+                    ):
+                        raise RuntimeAdmissionConflict()
+                    envelope = frozen
+                    command = QueryCommandV2.model_validate(snapshot["command"])
+                    runtime_input = RuntimeQueryInputV2.model_validate(snapshot["runtime_input"])
             if self._admission_coordinator is None:
                 if selector != "python-term":
                     raise RuntimeAdmissionUnavailable()
@@ -231,12 +264,21 @@ class RuntimeQueryRouter:
                 selected.build_id,
             ) != (required_runtime_id, required_build_id):
                 raise RuntimeAdmissionConflict()
+            if snapshot is None:
+                snapshot = build_runtime_execution_snapshot(admission, command, envelope, runtime_input)
+            if self._admission_coordinator is not None:
+                self._admission_coordinator.intents.freeze_execution_snapshot(snapshot)
         except (
             RuntimeAdmissionBlocked,
             RuntimeAdmissionConflict,
             RuntimeAdmissionUnavailable,
         ):
             raise
+        except (
+            RuntimeExecutionSnapshotConflict,
+            CorruptRuntimeExecutionSnapshot,
+        ):
+            raise RuntimeAdmissionConflict() from None
         except (
             CommandAttemptRegression,
             CommandCapabilityUnavailable,
@@ -257,9 +299,7 @@ class RuntimeQueryRouter:
             runtime_id=selected.runtime_id,
             build_id=selected.build_id,
             runtime_command_id=admission.runtime_command_id,
-            execution_snapshot=build_runtime_execution_snapshot(
-                admission, command, envelope, runtime_input
-            ),
+            execution_snapshot=snapshot,
         )
 
     def _runtime_identity(
@@ -387,11 +427,25 @@ class RuntimeQueryRouter:
             },
         )
         tool_manifest = (workspace_manifest,) if development_smoke else ()
+        artifact_tools = (
+            self._platform_tools_enabled
+            and runtime_id in {"goose", "dsh"}
+            and self._registry is not None
+            and any(
+                item.runtime_id == runtime_id and item.build_id == build_id
+                and item.state == "ready" and "tools" in item.capabilities
+                for item in self._registry.snapshot()
+            )
+        )
+        if artifact_tools:
+            tool_manifest = ARTIFACT_TOOL_MANIFEST
         permission_policy = (
             {"tool_policy": "allow", "filesystem_policy": "allow"}
             if development_smoke
             else {"tool_policy": "deny", "filesystem_policy": "deny"}
         )
+        if artifact_tools:
+            permission_policy = {"tool_policy": "allow", "filesystem_policy": "deny"}
         workspace_grant = (
             {
                 "grant_id": "python-term-dev-smoke",
@@ -783,13 +837,32 @@ def build_app(
         if runtime_admission_coordinator is not None
         else AssignmentRepository.production(resolved.database)
     )
+    host_instance_id = service_instance_id or str(uuid4())
+    platform_tool_pool = (
+        PlatformToolPool(
+            database=resolved.database,
+            artifact_root=resolved.artifact_root,
+            vault=vault,
+            context_factory=PlatformToolContextFactory(runtime_admission_coordinator.intents),
+            owner_id=host_instance_id,
+        )
+        if runtime_admission_coordinator is not None and resolved.engine_host_v2_runtimes
+        else None
+    )
     sidecar_supervisor = (
         SidecarSupervisor(
             runtimes=resolved.engine_host_v2_runtimes,
             registry=runtime_registry_v2,
             assignments=runtime_assignments,
             runtime_dir=resolved.runtime_dir,
-            app_instance_id=service_instance_id or str(uuid4()),
+            app_instance_id=host_instance_id,
+            client_factory=lambda config, generation, containment_lock: EngineHostV2Client(
+                config.argv,
+                containment_lock=containment_lock,
+                containment_generation=str(generation),
+                provider_grant_transport=True,
+                tool_executor=platform_tool_pool,
+            ),
         )
         if runtime_registry_v2 is not None and resolved.engine_host_v2_runtimes
         else None
@@ -862,6 +935,7 @@ def build_app(
         _gate_proof=python_term_gate_proof,
         _admission_coordinator=runtime_admission_coordinator,
         _admission_probe=runtime_admission_probe,
+        _platform_tools_enabled=platform_tool_pool is not None,
     )
     app = create_app(
         AppSettings(
@@ -901,6 +975,7 @@ def build_app(
     app.state.execution_runner = selected_runner
     app.state.runtime_registry_v2 = runtime_registry_v2
     app.state.sidecar_supervisor = sidecar_supervisor
+    app.state.platform_tool_pool = platform_tool_pool
     app.state.runtime_admission_coordinator = runtime_admission_coordinator
     app.state.python_term_runtime = python_term_runtime
     app.state.provider_grant_broker = provider_grant_broker
