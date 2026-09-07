@@ -501,10 +501,11 @@ Provider/Model attestation 缺口与相关 Gate 继续 `HOLD`。
 用户已接受本轮文本结果，进入 Task 5 验收收口。最后核验的历史暂停数为 41，未自动续跑。
 原请求没有生成 Word 文件，只返回可复制正文，不能计为文件产物验收。
 最近开发准入证据已于 2026-09-06 18:00:29（北京时间）过期，历史通过不等于新的准入。
-前端测试隔离已完成：45 个 Electron 启动点使用测试自有 runtime/userData，串行全量结果为
-**88 passed / 2 failed / 90 total**，不能宣称全绿。当前下一增量为有界调查 `research-graph`
-中 Artifacts 画布拦截“批准并执行”点击；三通道当前构建真实取消/幂等/恢复及精确执行证明仍需补齐，
+前端测试隔离已完成；其首次串行结果 **88 passed / 2 failed / 90 total** 保留为历史记录。
+后续有界修复已关闭 `research-graph` 的 Artifacts 点击拦截，最终串行前端为 **92 passed / 0 failed**。
+三通道当前构建真实取消/幂等/恢复、精确执行证明及同内容独立会话一致性验收仍需补齐，
 上述三个 GO 均保持 `HOLD`。完整命令和边界见
+[P0 前端回归状态](../docs/testing/2026-09-07-p0-regression-status.md)与
 [DSH 人工验收记录](../docs/testing/2026-09-05-deepseek-harness-manual-acceptance.md)。
 
 ### 10.7 Electron/Playwright

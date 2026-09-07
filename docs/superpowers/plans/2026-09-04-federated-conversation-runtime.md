@@ -26,8 +26,8 @@
 用户已接受上一轮 DSH 连续文本会话结果，允许进入下一阶段。Task 1–4 已有实现和逐项审核；当前接续 **Task 5 验收收口**，不是重做 Task 1–4，也不是提前启动 P1。
 
 1. Electron/Playwright 的 45 个启动点已统一隔离 runtime/userData，并清除继承的 live 标志与凭据；普通测试不会连接用户本地模型。
-2. 隔离后的串行全量前端回归为 **88 passed / 2 failed / 90 total**，不能记为全绿：`lifecycle` 关闭超时在 focused 复跑中通过，`research-graph` 的“批准并执行”被 Artifacts 画布持续拦截且 focused 可重复。
-3. 当前下一增量为有界调查 `research-graph` pointer interception；之后仍需补齐当前构建的三通道真实取消、幂等、执行恢复与故障隔离证据，以及 command-scoped Provider/Model/no-fallback 执行证明的设计与实现。
+2. 隔离后的首次串行 **88 passed / 2 failed / 90 total** 保留为历史；有界布局修复以实际几何和正常点击关闭 Artifacts 拦截，最终串行前端为 **92 passed / 0 failed**。详见 [P0 前端回归状态](../../testing/2026-09-07-p0-regression-status.md)。
+3. 当前下一门槛仍是当前构建的三通道真实取消、幂等、执行恢复与故障隔离证据、command-scoped Provider/Model/no-fallback 执行证明，以及同内容独立会话一致性验收。
 4. 保持既定优先级：P0 联邦运行时 → P1 五项架构特性 → P2 产品/前端；真实文件产物生成、登记和下载缺口不能由文本回复替代。
 
 DSH 真实连续会话证据、验收边界和过期准入说明见 [人工验收记录](../../testing/2026-09-05-deepseek-harness-manual-acceptance.md)。用户接受本轮文本结果不等于授予 `GO_DSH_PLUGIN_SMOKE` 或 `GO_RUNTIME_FEDERATION`。
@@ -325,7 +325,7 @@ Run: `cd mvp && python -m pytest -q`
 
 Run: `cd mvp/canvas-spike && npm run build && npx playwright test`
 
-Observed: Python 回归为 `90 passed, 3 skipped`；隔离后的串行前端为 `88 passed, 2 failed, 90 total`。前端不宣称 PASS；`research-graph` pointer interception 是当前有界调查项，live 跳过项不计 Runtime GO。
+Observed: Python 回归为 `90 passed, 3 skipped`；隔离后的首次串行前端 `88 passed, 2 failed, 90 total` 是历史记录，布局修复后的最终串行为 `92 passed, 0 failed`。live 跳过项与本地前端全绿均不计 Runtime GO。
 
 - [ ] **Step 3: 启动用户可操作环境并显式执行真实端点验收**
 

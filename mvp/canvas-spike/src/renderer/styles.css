@@ -65,7 +65,7 @@ h1, h2, h3, p { margin-top: 0; }
 .role-menu hr { width: 100%; border: 0; border-top: 1px solid #e9ebee; margin: 4px 0; }
 .history-popover { position: absolute; z-index: 22; top: 74px; right: 18px; width: 310px; padding: 15px; border: 1px solid #d8dee8; border-radius: 10px; background: #fff; box-shadow: 0 12px 30px rgba(31,43,65,.15); }
 .history-head { display: flex; justify-content: space-between; align-items: center; }
-.conversation-main { min-width: 0; display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; background: #fff; }
+.conversation-main { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; background: #fff; }
 .conversation-header { display: flex; justify-content: space-between; gap: 16px; padding: 16px 20px 12px; border-bottom: 1px solid #e9ebee; }
 .conversation-header h2 { margin: 0; font-size: 19px; }
 .conversation-header p { margin: 4px 0 0; color: #788296; font-size: 11px; }

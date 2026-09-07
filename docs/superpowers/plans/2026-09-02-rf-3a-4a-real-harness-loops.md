@@ -38,8 +38,8 @@
 ## Task 4：用户可操作验收与联邦证据
 
 - [x] 四模式、保存 Provider 和不回显密钥的入口已实现；Goose 被延迟 `/agents` 响应覆盖的选择问题已由 `0393bd8` 修复并通过定向回归。此项不代表全量前端回归已通过。
-- [x] 全部 45 个 Electron 启动点已统一使用测试自有 runtime/userData，并清除继承的 live 标志与凭据；串行全量前端回归为 **88 passed / 2 failed / 90 total**，不能记为全绿。`lifecycle` 的 2 秒关闭超时在 focused 复跑中通过；`research-graph` 的“批准并执行”持续被 Artifacts 画布拦截点击，可重复失败。
-- [ ] 当前下一增量为有界调查 `research-graph` pointer interception；不得通过强制点击或削弱断言掩盖问题。
+- [x] 全部 45 个 Electron 启动点已统一使用测试自有 runtime/userData；首次串行 **88 passed / 2 failed / 90 total** 保留为历史。后续有界布局修复通过实际几何与正常点击关闭 `research-graph` pointer interception，最终串行 **92 passed / 0 failed**，详见 [P0 前端回归状态](../../testing/2026-09-07-p0-regression-status.md)。
+- [ ] 当前下一门槛为当前构建三通道真实取消/幂等/恢复、精确执行证明及同内容独立会话一致性验收；不得以本地前端全绿替代 Runtime GO。
 - [ ] 三通道分别验证流式文本、Provider/模型精确绑定、错误诊断、取消、重复命令、进程重启与独立结果。
 - [ ] 任一通道失败只阻塞自身 GO；只有三通道和共享合同均通过时，才另行评估 `GO_RUNTIME_FEDERATION`。
 

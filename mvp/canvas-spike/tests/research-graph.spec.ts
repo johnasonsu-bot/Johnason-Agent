@@ -1,10 +1,39 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { launchTestElectron } from "./support/electron-launch";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
 const python = path.resolve("../.venv/bin/python");
+
+type ApprovalGeometry = {
+  viewportWidth: number;
+  button: { left: number; right: number };
+  main: { left: number; right: number };
+  canvas: { left: number; right: number } | null;
+  hitTarget: string | null;
+  hitIsApproval: boolean;
+  mainColumns: string;
+};
+
+async function approvalGeometry(page: Page, button: Locator): Promise<ApprovalGeometry> {
+  await button.scrollIntoViewIfNeeded();
+  return button.evaluate((element) => {
+    const buttonRect = element.getBoundingClientRect();
+    const main = document.querySelector(".conversation-main")!.getBoundingClientRect();
+    const canvas = document.querySelector(".artifacts-canvas")?.getBoundingClientRect();
+    const hit = document.elementFromPoint(buttonRect.left + buttonRect.width / 2, buttonRect.top + buttonRect.height / 2);
+    return {
+      viewportWidth: innerWidth,
+      button: { left: buttonRect.left, right: buttonRect.right },
+      main: { left: main.left, right: main.right },
+      canvas: canvas ? { left: canvas.left, right: canvas.right } : null,
+      hitTarget: hit ? `${hit.tagName.toLowerCase()}.${String(hit.className)}` : null,
+      hitIsApproval: hit === element || Boolean(hit && element.contains(hit)),
+      mainColumns: getComputedStyle(document.querySelector(".conversation-main")!).gridTemplateColumns,
+    };
+  });
+}
 
 function installResearchFixtures(runtimeDir: string): void {
   fs.mkdirSync(runtimeDir, { recursive: true });
@@ -65,7 +94,18 @@ test("approves a plan then shows parallel review and arbitration", async ({}, te
     const plan = page.getByRole("region", { name: "执行计划" });
     await expect(plan).toContainText("4 个并行 Worker");
     await expect(plan).toContainText("待批准临时 Agent");
-    await page.getByRole("button", { name: "批准并执行" }).click();
+    const approve = page.getByRole("button", { name: "批准并执行" });
+    const desktopGeometry = await approvalGeometry(page, approve);
+    await page.setViewportSize({ width: 1101, height: 768 });
+    const narrowGeometry = await approvalGeometry(page, approve);
+    console.log("APPROVAL_GEOMETRY", JSON.stringify({ desktopGeometry, narrowGeometry }));
+    for (const geometry of [desktopGeometry, narrowGeometry]) {
+      expect(geometry.canvas).not.toBeNull();
+      expect(geometry.button.left).toBeGreaterThanOrEqual(geometry.main.left);
+      expect(geometry.button.right).toBeLessThanOrEqual(geometry.main.right);
+      expect(geometry.hitIsApproval, `${geometry.viewportWidth}px hit target was ${geometry.hitTarget}`).toBe(true);
+    }
+    await approve.click();
     await expect(plan).toContainText("已批准");
     const graph = page.getByRole("region", { name: "研究图运行" });
     await expect(graph.getByText(/局部审核未通过/)).toBeVisible();

@@ -236,7 +236,7 @@ DSH 修复 `b599e06` 后，同一用户会话实际完成 JD 正文、依赖上�
 - 这不是 Word 文件验收：首轮仅返回可复制正文，未生成可下载文件。
 - 历史 hold 最后核验为 41 条；不自动续跑，也不凭旧快照断言现在的 Vault/Runtime 状态。
 - 开发准入 proof 已于 2026-09-06 18:00:29（北京时间）过期，历史成功不能转换为新请求准入。
-- Task 5 的 Electron runtime/userData 隔离已完成；串行前端回归为 **88 passed / 2 failed / 90 total**，不得宣称全绿。当前下一增量是有界调查 `research-graph` 中 Artifacts 画布拦截“批准并执行”点击；随后继续当前构建真实取消/幂等/执行恢复与故障隔离、command-scoped 精确执行证明。Goose/Python Term 当前构建真实证据独立补齐；不复制 DSH 的结论。
+- Task 5 的 Electron runtime/userData 隔离已完成；首次串行 **88 passed / 2 failed / 90 total** 保留为历史。有界布局修复已通过实际几何和正常点击关闭 Artifacts 拦截，最终串行 **92 passed / 0 failed**，详见 [P0 前端回归状态](../../testing/2026-09-07-p0-regression-status.md)。下一门槛仍是当前构建真实取消/幂等/执行恢复与故障隔离、command-scoped 精确执行证明及同内容独立会话一致性验收；Goose/Python Term 真实证据独立补齐，不复制 DSH 的结论。
 - `GO_GOOSE_QUERY_SMOKE`、`GO_DSH_PLUGIN_SMOKE`、`GO_RUNTIME_FEDERATION` 仍为 `HOLD`。P0 优先级不变，P1/P2 不抢先。
 
 ## 9. 明确不在本批范围
