@@ -1,6 +1,6 @@
 # 联邦 Runtime 正式会话接入设计
 
-**状态：** 部分用户验收（2026-09-05）；DSH 单模型真实完成，联合 Gate 保持 HOLD
+**状态：** 部分用户验收（更新至 2026-09-07）；DSH 连续文本会话已获用户接受，Task 5 验收收口进行中，联合 Gate 保持 HOLD
 **阶段：** P0 / RF-3A、RF-4A 用户可操作验收  
 **适用模式：** 聊天、Agent-步进执行、Agent-寻路、Agent-事件驱动
 
@@ -181,7 +181,9 @@ Python Term 保留其已有的 Tool/Effect/Checkpoint 执行器；Goose 与 Deep
 - 任一单通道 GO 不等于 `GO_RUNTIME_FEDERATION`。
 - 只有共享合同、三通道、重启恢复与前端验收全部通过后，才单独评估 `GO_RUNTIME_FEDERATION`。
 
-### 8.1 2026-09-05 验收快照
+### 8.1 2026-09-05 历史验收快照
+
+本节为当时快照，后续状态以 8.2 为准；其中 ready、待解锁、31 条 hold 等均不是当前运行状态声明。
 
 | 项目 | 状态 | 决策依据 |
 |---|---|---|
@@ -226,6 +228,16 @@ turn（20 queued、11 retryable，覆盖 3 个 session）。操作前后全部 t
 235 turns / 248 messages / 22,073 events 总量不变；重开 repository 后 31 个 hold 保留。
 这只证明历史任务暂停与数据不变性，不补足精确 Provider/Model attestation，相关 Gate
 继续 `HOLD`。
+
+### 8.2 2026-09-07 接续判定
+
+DSH 修复 `b599e06` 后，同一用户会话实际完成 JD 正文、依赖上一轮内容的追问、`Hudi/Delta/Iceberg` 精确输出三条 GUI 云端命令，均持久化 assistant 回复且终态 completed；用户已接受该文本会话结果。详细命令与证据见 [人工验收记录](../../testing/2026-09-05-deepseek-harness-manual-acceptance.md)。
+
+- 这不是 Word 文件验收：首轮仅返回可复制正文，未生成可下载文件。
+- 历史 hold 最后核验为 41 条；不自动续跑，也不凭旧快照断言现在的 Vault/Runtime 状态。
+- 开发准入 proof 已于 2026-09-06 18:00:29（北京时间）过期，历史成功不能转换为新请求准入。
+- Task 5 继续完成前端隔离回归、当前构建真实取消/幂等/执行恢复与故障隔离、command-scoped 精确执行证明。Goose/Python Term 当前构建真实证据独立补齐；不复制 DSH 的结论。
+- `GO_GOOSE_QUERY_SMOKE`、`GO_DSH_PLUGIN_SMOKE`、`GO_RUNTIME_FEDERATION` 仍为 `HOLD`。P0 优先级不变，P1/P2 不抢先。
 
 ## 9. 明确不在本批范围
 

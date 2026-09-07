@@ -21,6 +21,17 @@
 - Goose/DSH 本批只开放 `model`；Tool、Skill、Workspace、Intervention 继续 fail closed。
 - P0/P1/P2 完成前不执行广泛安全扫描；这里只检查功能合同中明确禁止的凭据载体和隐式回退。
 
+## 2026-09-07 接续状态
+
+用户已接受上一轮 DSH 连续文本会话结果，允许进入下一阶段。Task 1–4 已有实现和逐项审核；当前接续 **Task 5 验收收口**，不是重做 Task 1–4，也不是提前启动 P1。
+
+1. 先隔离 Electron/Playwright 的 runtime 和 userData，防止自动化测试写入用户真实会话或续跑历史任务；这是 Step 2 全量前端回归的前置修复。
+2. 隔离后执行前端回归，分别记录四模式选择、历史恢复、连续执行和既有失败；离线结果不计为真实 Runtime GO。
+3. 后续补齐当前构建的三通道真实取消、幂等、执行恢复与故障隔离证据，以及 command-scoped Provider/Model/no-fallback 执行证明的设计与实现。
+4. 保持既定优先级：P0 联邦运行时 → P1 五项架构特性 → P2 产品/前端；真实文件产物生成、登记和下载缺口不能由文本回复替代。
+
+DSH 真实连续会话证据、验收边界和过期准入说明见 [人工验收记录](../../testing/2026-09-05-deepseek-harness-manual-acceptance.md)。用户接受本轮文本结果不等于授予 `GO_DSH_PLUGIN_SMOKE` 或 `GO_RUNTIME_FEDERATION`。
+
 ---
 
 ### Task 1: 冻结统一模式合同与 Runtime-neutral 执行快照

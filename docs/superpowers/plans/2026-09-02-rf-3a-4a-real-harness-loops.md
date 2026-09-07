@@ -37,7 +37,8 @@
 
 ## Task 4：用户可操作验收与联邦证据
 
-- [ ] 前端/测试入口已实现四模式、保存 Provider 和不回显密钥，但最近一次全量前端回归仍出现 Goose 模式恢复为空的失败，关闭前不标记完成。
+- [x] 四模式、保存 Provider 和不回显密钥的入口已实现；Goose 被延迟 `/agents` 响应覆盖的选择问题已由 `0393bd8` 修复并通过定向回归。此项不代表全量前端回归已通过。
+- [ ] 隔离全部 Electron 测试的 runtime/userData，再执行全量前端回归；原全量结果曾被并行定向运行覆盖，不能作为可靠的汇总 PASS。
 - [ ] 三通道分别验证流式文本、Provider/模型精确绑定、错误诊断、取消、重复命令、进程重启与独立结果。
 - [ ] 任一通道失败只阻塞自身 GO；只有三通道和共享合同均通过时，才另行评估 `GO_RUNTIME_FEDERATION`。
 
@@ -56,7 +57,9 @@
 - [x] commit `9fd5626` 已为真实用户旧会话 `ui-session-0` 实现不删除用户历史的有界分页；focused 验证与真实 SQLite 的 15,341 frame、20 页逐字节匹配均通过。
 - [x] 实际客户端 session `88583` 已经由 Task 3 REST/SSE cursor 读回 `ui-session-0` 旧流式回复和 248 条可见 timeline items，未再出现 too-large/“等待本地服务”；真实 GUI 历史重启读取复验通过，但不代表新模型请求、取消或整体 GO。
 - [x] `manual_hold` guard 独立复审通过后，根 repository API 已精确 hold 31 个 DeepSeek 历史 turn：20 queued、11 retryable、覆盖 3 个 session；前后全部 target row hash 一致，235 turns / 248 messages / 22,073 events 总量不变，重开 repository 后 31 个 hold 保留。
-- [ ] 当前客户端数据库为 DSH `ready`、`cloud_running=0`、`active_holds=31`；Provider 主密码框仍待用户解锁，新会话模型发送尚未实测。DSH proof 已于北京时间 19:25:13 按既定 TTL 到期且不延长，精确 Provider/Model attestation 与相关 Gate 继续 `HOLD`。
+- [x] 上述“31 条暂停/待解锁”是 2026-09-05 的历史快照。2026-09-06 修复 `b599e06` 后，DSH 同一会话三条 GUI 云端命令 completed，保存正文及连续追问，最后核验的历史暂停数为 41；详见 [人工验收记录](../../testing/2026-09-05-deepseek-harness-manual-acceptance.md)。
+- [x] 2026-09-07 用户接受连续文本会话并允许接续 Task 5；不将其计为 Word 文件生成或三通道联合 GO。
+- [ ] 最近开发 proof 已于北京时间 2026-09-06 18:00:29 到期，不能继续用于准入；新模型命令取消/幂等/执行恢复、精确执行 attestation 和另外两通道当前构建证据仍待补齐。离线开发不因此等待重新解锁。
 
 回归记录：Task 5 review focused 为 `19 passed, 3 skipped`；从 revision `cb40882` 启动的唯一
 一次全量 Python `pytest -q` 在 898.60 秒上限中断，当时 `17 passed, 2 skipped`，

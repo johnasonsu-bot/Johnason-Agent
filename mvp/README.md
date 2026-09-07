@@ -462,7 +462,7 @@ secret-free 的签名证据和用户人工验收；未来最小补强是提供 c
 将冻结的 Provider digest、resolved model、Runtime build 与签名 proof identity 关联起来，
 而不是回显凭据或把请求字段当成执行结果。
 
-截至 2026-09-05 的证据台账：
+2026-09-05 历史证据台账（后续更新见表后）：
 
 | 通道/决策 | 当前状态 | 可用证据与缺口 |
 |---|---|---|
@@ -491,9 +491,19 @@ cursor 读回 `ui-session-0` 的旧流式回复和 248 条可见 timeline items�
 `manual_hold` guard 独立复审通过后，根 repository API 已将精确匹配的 31 个 DeepSeek
 历史 turn 成功置为 hold（20 queued、11 retryable，分布于 3 个 session）。操作前后全部
 target row hash 一致，数据库总量保持 235 turns / 248 messages / 22,073 events；重开
-repository 后 31 个 hold 仍保留。当前数据库为 DSH `ready`、`cloud_running=0`、
+repository 后 31 个 hold 仍保留。当时数据库为 DSH `ready`、`cloud_running=0`、
 `active_holds=31`。Provider 主密码框仍等待用户解锁，新会话模型发送尚未实测；精确
 Provider/Model attestation 缺口与相关 Gate 继续 `HOLD`。
+
+**2026-09-07 更新：** 上述“待解锁/31 条暂停”是历史状态，不是当前客户端状态。
+修复 `b599e06` 后，同一 DSH 用户会话完成三条真实 GUI 云端命令：JD 正文（2,179 字）、
+基于上文的追问（139 字）、精确术语输出（18 字），均保存 assistant 回复且 completed。
+用户已接受本轮文本结果，进入 Task 5 验收收口。最后核验的历史暂停数为 41，未自动续跑。
+原请求没有生成 Word 文件，只返回可复制正文，不能计为文件产物验收。
+最近开发准入证据已于 2026-09-06 18:00:29（北京时间）过期，历史通过不等于新的准入。
+当前接续前端测试隔离和回归；三通道当前构建真实取消/幂等/恢复及精确执行证明仍需补齐，
+上述三个 GO 均保持 `HOLD`。完整命令和边界见
+[DSH 人工验收记录](../docs/testing/2026-09-05-deepseek-harness-manual-acceptance.md)。
 
 ### 10.7 Electron/Playwright
 
