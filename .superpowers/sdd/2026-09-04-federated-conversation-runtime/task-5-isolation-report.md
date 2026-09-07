@@ -9,7 +9,7 @@ DONE_WITH_CONCERNS. The frontend regression prerequisite is implemented at basel
 - Added `tests/support/electron-launch.ts` as the only direct `_electron.launch` owner.
 - Each launch gets a test-owned Electron `userData` directory and a separate test-owned Workbench runtime directory.
 - Independent launches receive independent temporary roots by default. A caller can supply `isolationDirectory` to intentionally preserve Electron state across restarts.
-- Inherited `HERMES_*`, `WORKBENCH_*`, and credential-like variables (`API_KEY`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, `SECRET`) are stripped. Only values that differ from the inherited environment are treated as deliberate unsafe-key overrides.
+- Inherited `HERMES_*`, `WORKBENCH_*`, and credential-like variables (`API_KEY`, `TOKEN`, `PASSWORD`, `CREDENTIAL`, `SECRET`) are stripped. Launch-call `env` objects contain only deliberate per-test overrides, which are applied unconditionally after sanitization.
 - The default Python executable is the repository virtual environment. The default LM Studio URL is `http://127.0.0.1:1`, preventing plain UI tests from reaching a user's local model. Test-owned fixture executables, runtime directories, flags, and loopback endpoints remain explicit overrides.
 - Migrated every direct launch in the 15 Electron spec files. `rg -n "electron\\.launch|_electron as electron" mvp/canvas-spike/tests` now returns only the shared helper.
 
@@ -70,3 +70,27 @@ Non-failing warnings: npm/nvm reported the user's global prefix configuration; V
 - Direct-launch search confirmed there is no bypass outside the helper.
 - Restarting with the same isolation root preserves userData and runtime; independent roots do not share state.
 - Concern: the full frontend suite is not green because of the two failures categorized above. The reproducible research-graph pointer interception needs a separately authorized production/UI or test-layout investigation; this increment intentionally did not weaken the click or alter production.
+
+## Review fix round 1
+
+The review correctly identified an environment-dependent contract bug: the initial helper inferred whether an unsafe key was deliberate by comparing its value with the inherited environment. An explicit same-value override was therefore silently removed. All Electron launch callers now omit `...process.env`; the helper owns inherited-environment sanitization and applies every key supplied by a caller unconditionally.
+
+TDD RED command:
+
+`npx playwright test tests/electron-launch-isolation.spec.ts -g "equals the inherited value" --workers=1`
+
+Result: 1 failed. Expected `WORKBENCH_ENGINE_HOST_V2_ENABLED` to remain `"true"`, received `undefined`.
+
+TDD GREEN command after the fix:
+
+`npx playwright test tests/electron-launch-isolation.spec.ts -g "equals the inherited value" --workers=1`
+
+Result: 1/1 passed in 310ms.
+
+Focused affected regression command:
+
+`npx playwright test tests/electron-launch-isolation.spec.ts tests/lifecycle.spec.ts tests/providers.spec.ts tests/runtime-selector.spec.ts tests/federated-conversation.spec.ts --grep "(launch|environment|backend liveness|engine host JSON|narrow IPC|default Runtime preserves|four fixed modes)" --workers=1`
+
+Result: 12/12 passed in 34.8s, including same-value override, isolation/restart behavior, custom backend flags, custom model endpoint, and the prepared Python Term path. Per review instruction, the full suite was not rerun; its recorded result remains 88 passed / 2 failed / 90 total.
+
+The five controller status documents now mark Electron isolation complete, state the non-green frontend totals and both failure categories, and identify a bounded `research-graph` pointer-interception investigation as the current next increment. The real current-build cancellation, idempotency, execution recovery, fault-isolation, and command-scoped attestation gates remain pending; no GO status changed.

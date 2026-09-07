@@ -94,7 +94,6 @@ async function launchFixture(testRoot: string, mode: FixtureMode, rejectExplicit
   const app = await launchTestElectron({
     args: [path.resolve(".")],
     env: {
-      ...process.env,
       HERMES_PYTHON: executable,
       HERMES_RUNTIME_DIR: runtimeDir,
       WORKBENCH_PYTHON_TERM_DEVELOPMENT_TRUST: "true",
@@ -254,7 +253,6 @@ test("real prepared Python Term environment supports the Electron-owned acceptan
   const provider = await createDeterministicModelProvider();
   prepareRealRuntime(runtimeDir);
   const baseEnvironment = {
-    ...process.env,
     HERMES_PYTHON: path.resolve("../.venv/bin/python"),
     HERMES_RUNTIME_DIR: runtimeDir,
     HERMES_LMSTUDIO_BASE_URL: provider.baseUrl,

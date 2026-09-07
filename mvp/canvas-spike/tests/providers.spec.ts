@@ -40,7 +40,6 @@ async function fakeLmStudio() {
 
 function ownedEnvironment(runtimeDir: string, lmStudioBase = "http://127.0.0.1:1234") {
   return {
-    ...process.env,
     HERMES_PYTHON: path.resolve("../.venv/bin/python"),
     HERMES_RUNTIME_DIR: runtimeDir,
     HERMES_LMSTUDIO_BASE_URL: lmStudioBase,

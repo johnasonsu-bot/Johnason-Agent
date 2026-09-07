@@ -5,7 +5,7 @@ import { launchTestElectron } from "./support/electron-launch";
 test("manual verification requests reach the owned backend without exposing arbitrary IPC routes", async ({}, testInfo) => {
   const app = await launchTestElectron({
     args: [path.resolve(".")],
-    env: { ...process.env, HERMES_PYTHON: path.resolve("../.venv/bin/python"), HERMES_RUNTIME_DIR: testInfo.outputPath("runtime") },
+    env: { HERMES_PYTHON: path.resolve("../.venv/bin/python"), HERMES_RUNTIME_DIR: testInfo.outputPath("runtime") },
   });
   try {
     const page = await app.firstWindow();

@@ -4,7 +4,6 @@ import { launchTestElectron } from "./support/electron-launch";
 
 function ownedEnvironment(runtimeDir: string) {
   return {
-    ...process.env,
     HERMES_PYTHON: path.resolve("../.venv/bin/python"),
     HERMES_RUNTIME_DIR: runtimeDir,
   };

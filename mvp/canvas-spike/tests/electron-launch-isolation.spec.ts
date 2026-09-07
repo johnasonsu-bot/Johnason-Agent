@@ -48,6 +48,15 @@ test("launch environment strips inherited live flags and credentials but accepts
   expect(environment.OPENAI_API_KEY).toBeUndefined();
 });
 
+test("an explicit override is preserved when it equals the inherited value", ({}, testInfo) => {
+  const environment = isolatedElectronEnvironment(testInfo.outputPath("same-value"), {
+    WORKBENCH_ENGINE_HOST_V2_ENABLED: "true",
+  }, {
+    WORKBENCH_ENGINE_HOST_V2_ENABLED: "true",
+  });
+  expect(environment.WORKBENCH_ENGINE_HOST_V2_ENABLED).toBe("true");
+});
+
 test("relaunching the same isolation directory preserves its Electron state", async ({}, testInfo) => {
   const isolationDirectory = testInfo.outputPath("restart");
   let app = await launchTestElectron({ isolationDirectory });

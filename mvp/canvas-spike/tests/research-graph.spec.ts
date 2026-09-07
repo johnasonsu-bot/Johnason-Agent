@@ -56,7 +56,7 @@ for index, (kind, payload) in enumerate(events): store.append(DomainEvent.new(ki
 test("approves a plan then shows parallel review and arbitration", async ({}, testInfo) => {
   const runtimeDir = testInfo.outputPath("runtime");
   installResearchFixtures(runtimeDir);
-  const app = await launchTestElectron({ args: [path.resolve(".")], env: { ...process.env, HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
+  const app = await launchTestElectron({ args: [path.resolve(".")], env: { HERMES_PYTHON: python, HERMES_RUNTIME_DIR: runtimeDir } });
   try {
     const page = await app.firstWindow();
     await page.evaluate(() => localStorage.clear());

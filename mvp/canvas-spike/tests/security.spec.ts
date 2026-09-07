@@ -30,7 +30,6 @@ async function squatter() {
 
 function ownedEnvironment(runtimeDir: string, fakeBase: string) {
   return {
-    ...process.env,
     HERMES_PYTHON: path.resolve("../.venv/bin/python"),
     HERMES_RUNTIME_DIR: runtimeDir,
     HERMES_API_BASE: fakeBase,

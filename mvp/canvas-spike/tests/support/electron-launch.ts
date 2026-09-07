@@ -18,15 +18,12 @@ export function isolatedElectronEnvironment(
   const environment = Object.fromEntries(
     Object.entries(inherited).filter(([name]) => !unsafeEnvironmentName.test(name)),
   );
-  const deliberateOverrides = Object.fromEntries(Object.entries(overrides).filter(
-    ([name, value]) => !unsafeEnvironmentName.test(name) || value !== inherited[name],
-  ));
   return {
     ...environment,
     HERMES_PYTHON: path.resolve("../.venv/bin/python"),
     HERMES_RUNTIME_DIR: path.join(isolationDirectory, "runtime"),
     HERMES_LMSTUDIO_BASE_URL: "http://127.0.0.1:1",
-    ...deliberateOverrides,
+    ...overrides,
   };
 }
 
