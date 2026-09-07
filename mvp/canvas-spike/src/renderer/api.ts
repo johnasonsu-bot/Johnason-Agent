@@ -176,8 +176,50 @@ export const agentApi = {
 };
 
 export type ArtifactContent = { artifact_id: string; media_type: string; content: string; digest: string };
+export type RuntimeArtifactLink = {
+  link_id: string;
+  session_id: string;
+  run_id: string;
+  term_id: string;
+  step_id: string;
+  command_id: string;
+  agent_id: string;
+  attempt: number;
+  artifact_id: string;
+  filename: string;
+  media_type: string;
+};
+export type ArtifactDownload = {
+  content: string;
+  filename: string;
+  media_type: string;
+};
+
+async function downloadArtifact(link: RuntimeArtifactLink): Promise<ArtifactDownload> {
+  let response: { status: number; body: unknown; text?: string };
+  try {
+    response = await (window as unknown as Window & { workbenchBridge: ApiBridge }).workbenchBridge.apiRequest({
+      method: "GET",
+      path: `/artifacts/${encodeURIComponent(link.artifact_id)}/download?link_id=${encodeURIComponent(link.link_id)}`,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(message && message !== "Error" ? message : "无法连接到本地 Hermes 服务");
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new ApiRequestError(`本地服务请求失败（${response.status}）`, response.status);
+  }
+  return {
+    content: response.text ?? (typeof response.body === "string" ? response.body : ""),
+    filename: link.filename,
+    media_type: link.media_type,
+  };
+}
+
 export const artifactApi = {
+  list: (sessionId: string) => request<RuntimeArtifactLink[]>(`/artifacts?session_id=${encodeURIComponent(sessionId)}`),
   read: (artifactId: string) => request<ArtifactContent>(`/artifacts/${encodeURIComponent(artifactId)}`),
+  download: downloadArtifact,
 };
 
 export type AgentBinding = { agent_id: string; expected_version: number };

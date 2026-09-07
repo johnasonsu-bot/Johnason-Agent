@@ -17,3 +17,14 @@ test("event byte budget is explicitly bounded and restricted to the events route
   expect(guard({ ...request, path: "/v1/engine-host", headers: { "X-Event-Page-Bytes": "262144" } })).toBe(false);
   expect(guard({ ...request, headers: { "Last-Event-ID": "2:19\r\nX: y" } })).toBe(false);
 });
+
+test("runtime artifact listing and publication download use the real bridge", () => {
+  const list = { method: "GET", path: "/artifacts?session_id=ui-session-1" };
+  const download = { method: "GET", path: `/artifacts/sha256%3A${"a".repeat(64)}/download?link_id=${"b".repeat(64)}` };
+  expect(guard(list)).toBe(true);
+  expect(guard(download)).toBe(true);
+  expect(guard({ ...download, path: download.path.split("?")[0] })).toBe(false);
+  expect(guard({ ...list, method: "POST" })).toBe(false);
+  expect(guard({ ...list, path: "/artifacts?session_id=ui-session-1&path=/tmp" })).toBe(false);
+  expect(guard({ ...download, body: {} })).toBe(false);
+});

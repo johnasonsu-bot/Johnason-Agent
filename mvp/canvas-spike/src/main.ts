@@ -61,7 +61,8 @@ function isApiRequest(value: unknown): value is ApiRequest {
     const runtimeAdmissionPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/runtime-admissions\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
     const orchestrationResumePath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/orchestrations\/[A-Za-z0-9_-]{1,128}\/resume$/.exec(request.path);
     const agentPath = /^\/agents(?:\/[A-Za-z0-9_-]{1,64})?$/.exec(request.path);
-    const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}$/i.exec(request.path);
+    const artifactPath = /^\/artifacts\/sha256%3A[a-f0-9]{64}(?:\/download\?link_id=[a-f0-9]{64})?$/i.exec(request.path)
+      || /^\/artifacts\?session_id=[A-Za-z0-9_-]{1,64}$/.exec(request.path);
     const graphPlanPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/plans(?:\/[A-Za-z0-9._:-]{1,128}\/versions\/\d+(?:\/(approve|replan))?)?$/.exec(request.path);
     const graphInterruptPath = /^\/graph-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
     const developmentInterruptPath = /^\/sessions\/[A-Za-z0-9_-]{1,64}\/development-runs\/[A-Za-z0-9._:-]{1,128}\/interrupts\/[A-Za-z0-9._:-]{1,128}$/.exec(request.path);
@@ -76,7 +77,7 @@ function isApiRequest(value: unknown): value is ApiRequest {
         || (operation === "replan" && request.method === "POST")
         || (/\/plans$/.test(request.path) && request.method === "POST");
     }
-    if (artifactPath) return request.method === "GET";
+    if (artifactPath) return request.method === "GET" && request.body === undefined;
     if (agentPath) {
       return (request.path === "/agents" && ["GET", "POST"].includes(request.method))
         || (request.path !== "/agents" && request.method === "PUT");

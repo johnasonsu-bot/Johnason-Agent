@@ -14,6 +14,7 @@ import { emptySequentialState, reduceSequentialEvent } from "./sequentialReducer
 import { PlanApproval } from "./PlanApproval";
 import { GraphRun } from "./GraphRun";
 import { emptyResearchGraphState, reduceResearchEvent } from "./graphReducer";
+import { RuntimeArtifactList } from "./RuntimeArtifactList";
 
 const seededTitles: Record<string, string> = {
   "ui-session-0": "Jira 看板配置修复指引",
@@ -136,6 +137,15 @@ function statusForEvent(event: ConversationEvent): ConversationStatusProjection 
   return null;
 }
 
+function shouldRefreshArtifacts(event: ConversationEvent): boolean {
+  if (`${event.name ?? ""} ${event.type ?? ""}`.toLowerCase().includes("artifact")) return true;
+  const phase = statusForEvent(event)?.phase;
+  return phase === "completed"
+    || phase === "failed"
+    || phase === "cancelled"
+    || phase === "reconciliation_required";
+}
+
 export function reduceConversationStatus(
   current: ConversationStatusProjection | undefined,
   event: ConversationEvent,
@@ -195,6 +205,7 @@ export function ConversationWorkspace() {
   const [pending, setPending] = useState(false);
   const [paused, setPaused] = useState(false);
   const [artifactId, setArtifactId] = useState("markdown");
+  const [artifactRefreshSignal, setArtifactRefreshSignal] = useState(0);
   const [canvasOpen, setCanvasOpen] = useState(true);
   const [modelProfiles, setModelProfiles] = useState<AgentModelProfile[]>(loadAgentModelProfiles);
   const [sequential, setSequential] = useState(emptySequentialState);
@@ -353,6 +364,9 @@ export function ConversationWorkspace() {
             void engineHostApi.v2Status().then(setRuntimeDiagnostic).catch(() => setRuntimeDiagnostic(null));
           }
         }
+        if (fresh.some(shouldRefreshArtifacts)) {
+          setArtifactRefreshSignal((value) => value + 1);
+        }
         if (firstSnapshot || fresh.length) publishProjection(sessionId);
         setSource("Task 3 REST/SSE · cursor");
         if (historyFailure) {
@@ -491,6 +505,7 @@ export function ConversationWorkspace() {
       const confirmedLocalIds = reconcileOptimisticMessages(sessionId);
       publishProjection(sessionId);
       if (activeSessionRef.current !== sessionId) return;
+      if (result.status === "completed") setArtifactRefreshSignal((value) => value + 1);
       if (confirmedLocalIds.size) setEntries(current => current.filter(entry => !confirmedLocalIds.has(entry.id)));
       setSource("Task 3 REST/SSE · queued");
       // Only consumed SSE events advance the read cursor. The POST cursor is
@@ -565,6 +580,6 @@ export function ConversationWorkspace() {
       <Timeline entries={entries} group={group} provider={selectedProviderLabel} model={selectedModel} status={status} />
       <Composer onSend={send} onIntervene={intervene} pending={pending} paused={paused} model={selectedModel} providerId={selectedProviderId} modelOptions={modelOptions} onModelChange={changeModel} runtime={selectedRuntime} runtimeOptions={runtimeOptions} onRuntimeChange={changeRuntime} />
     </main>
-    {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header>{htmlArtifact ? <HtmlArtifactPreview artifactId={htmlArtifact.artifactId} /> : <><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section></>}<section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>当前结果 · 历史 Attempt · 审核证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
+    {canvasOpen ? <aside className="artifacts-canvas" aria-label="智能画布 · Artifacts"><header><strong>智能画布 · Artifacts</strong><button type="button" className="quiet" aria-label="折叠画布" onClick={() => setCanvasOpen(false)}>折叠</button></header><RuntimeArtifactList key={sessionId} sessionId={sessionId} refreshSignal={artifactRefreshSignal} fallback={htmlArtifact ? <HtmlArtifactPreview artifactId={htmlArtifact.artifactId} /> : <><nav aria-label="Artifacts 列表">{artifacts.map((item) => <button key={item.id} type="button" className="quiet" aria-pressed={artifactId === item.id} onClick={() => setArtifactId(item.id)}>{item.title}</button>)}</nav><section className="artifact-preview"><small>version v3 · {artifact.mimeType}</small><h3>{artifact.title}</h3><Renderer artifact={artifact} /></section></>} /><section className="artifact-version-card"><strong>版本卡片 · Version cards</strong><p>当前结果 · 历史 Attempt · 审核证据</p></section></aside> : <button type="button" className="quiet canvas-reopen" aria-label="打开画布" onClick={() => setCanvasOpen(true)}>打开画布</button>}
   </section>;
 }
