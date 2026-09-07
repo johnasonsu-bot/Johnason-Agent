@@ -25,7 +25,7 @@ test("opens Agent configuration for cross-model routing", async () => {
     const page = await app.firstWindow();
     await page.getByRole("button", { name: "Agent 配置" }).click();
     await expect(page.getByRole("heading", { name: "Agent 配置 · Agent routing" })).toBeVisible();
-    await expect(page.getByText("运行模式仅作为已保存配置，尚未接入节点执行；接线将在 R4 集成后生效。")).toBeVisible();
+    await expect(page.getByText("新任务按每个 Agent 保存的模式和模型执行；重试与返工保留原绑定，不会自动换模式。")).toBeVisible();
     await expect(page.getByLabel("产品经理 Provider")).toBeVisible();
     await expect(page.getByLabel("产品经理 Model")).toBeVisible();
     const runtime = page.getByLabel("产品经理 运行模式");

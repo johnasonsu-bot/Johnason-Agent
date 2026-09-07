@@ -58,7 +58,7 @@ export function AgentCenter() {
     </header>
     {message && <p role="status" className="notice">{message}</p>}
     <EngineHostStatus />
-    <div className="agent-center-note"><strong>配置说明</strong><span>运行模式仅作为已保存配置，尚未接入节点执行；接线将在 R4 集成后生效。Provider 需要先配置并启用；此处不保存 API Key。</span></div>
+<div className="agent-center-note"><strong>配置说明</strong><span>新任务按每个 Agent 保存的模式和模型执行；重试与返工保留原绑定，不会自动换模式。Provider 需要先配置并启用；此处不保存 API Key。</span></div>
     <div className="agent-config-grid">{profiles.map((profile) => <article className="agent-config-card" key={profile.id}>
       <div className="agent-config-card-heading"><span className="agent-avatar agent-avatar-blue">{profile.name.slice(0, 1)}</span><div><h2>{profile.name}</h2><p>{profile.roleLabel} · v{profile.version || "new"}</p></div><label className="agent-enabled"><input type="checkbox" checked={profile.enabled} onChange={(event) => update(profile.id, { enabled: event.target.checked })} />启用</label></div>
       <label>{profile.name} Provider<select aria-label={`${profile.name} Provider`} value={profile.providerId} onChange={(event) => update(profile.id, { providerId: event.target.value as ProviderId })}>{providerOptions.map((provider) => <option key={provider} value={provider}>{providerLabels[provider]} · {provider}</option>)}</select></label>

@@ -25,7 +25,7 @@ test("creates a multi-agent session from the picker", async () => {
     await expect(page.getByRole("dialog", { name: "新建会话" })).toBeVisible();
     await page.getByRole("button", { name: "多 Agent" }).click();
     const dialog = page.getByRole("dialog", { name: "新建会话" });
-    await expect(dialog.getByText("运行模式显示的是已保存配置，尚未接入节点执行；接线将在 R4 集成后生效。")).toBeVisible();
+    await expect(dialog.getByText("新任务使用成员保存的模式和模型；运行时不可用会显示原因，不会自动切换。修改配置不影响已开始的任务。")).toBeVisible();
     await dialog.getByRole("button", { name: "产品经理", exact: true }).click();
     await dialog.getByRole("button", { name: "架构师", exact: true }).click();
     await dialog.getByRole("button", { name: "创建会话", exact: true }).click();
