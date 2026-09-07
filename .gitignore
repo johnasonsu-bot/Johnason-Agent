@@ -16,4 +16,5 @@ docs/.vitepress/dist/
 mvp/canvas-spike/dist/
 mvp/canvas-spike/dist-electron/
 mvp/canvas-spike/test-results/
+mvp/canvas-spike/task5-full-results/
 *.bak_*
