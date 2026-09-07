@@ -1,5 +1,7 @@
 # Runtime-First 开发排期
 
+> **2026-09-07 范围修订：** 当前 P0 剩余工作以 [人类指定 Agent 模式的八个交付包](2026-09-07-p0-human-assigned-agent-scope.md) 为准。协作主体是 Agent，人类为每个 Agent 指定模式；不做自动选择或运行中切换引擎。取消独立工具平台、独立跨模式接力工程和新签名执行证明系统；必要工具回传和 Agent 绑定/成果交接并入运行时与多 Agent 功能。以下早期状态和工期不代表当前剩余量。
+
 **基准：** Task 8 已完成。
 **资源假设：** 一个公共合同/集成流，加 Codex-compatible Python、Goose、
 DeepSeek Harness 三条独立 Runtime 泳道；四条泳道可并行开发和迭代，集成流统一
@@ -19,7 +21,7 @@ DeepSeek Harness 三条独立 Runtime 泳道；四条泳道可并行开发和迭
 | RF-3B | Goose Plan/Todo/Intervention/compact/checkpoint/tools/effects | 8–12 | `GO_GOOSE_QUERY_RUNTIME` |
 | RF-4A | DSH source/build/bootstrap/Prompt/Provider Smoke | 6–9 | `GO_DSH_PLUGIN_SMOKE` |
 | RF-4B | DSH Tool waterfall/Event/checkpoint/plugin Gate | 8–12 | `GO_DSH_PLUGIN_RUNTIME` |
-| RF-5 | 跨 Runtime assignment/Handoff/recovery/Artifact 联合验收 | 6–9 | `GO_RUNTIME_FEDERATION` |
+| RF-5 | 按人类指定的 Agent 模式完成协作、Handoff、审核返工、恢复和 Artifact（见当前 R1/R4–R8） | 历史估计不再用于当前排期 | `GO_RUNTIME_FEDERATION` |
 | AR-1 | Spec/TDD Verifier + 公共四级门控合同 | 7–10 | `GO_SPEC_TDD_HARNESS` |
 | AR-2 | Context phase/budget/tiering、Skill disclosure、atomic compaction | 10–15 | `GO_CONTEXT_TIERING` |
 | AR-3 | Effect 2PC/bitemporal/causal audit + Gate/rewind 因果事件 | 7–10 | `GO_EFFECT_BITEMPORAL` |
@@ -29,7 +31,7 @@ DeepSeek Harness 三条独立 Runtime 泳道；四条泳道可并行开发和迭
 
 安全专项不嵌入 P0/P1/P2 的普通 Task 或修复轮次。P2 完成后统一执行 `FINAL_SECURITY_AUDIT` 与 `FAULT_INJECTION_GATE`；审计发现的问题进入独立整改批次，不与功能开发轮混在一起。
 
-P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Context Phase/Probe 和跨批因果证据，调整为 45–67 个工作日。该估算不包含等待外部 CI/KMS 签名、真实 Provider 账号或上游兼容修复的时间。
+历史全量估算为 P0 53–83 个工作日、P1 与联合验收 45–67 个工作日，不包含外部等待。该估算不是当前剩余工期；P0 已按 2026-09-07 的八个交付包收敛，按可操作闭环推进，不沿用历史数字重新排期。
 
 ## 2. 依赖与可并行项
 
@@ -48,6 +50,8 @@ P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Conte
 - UX 只实现 Runtime 选择、健康、进度、错误和测试证据；其余视觉与 Agent 市场功能后移。
 
 ## 3. 下一批可执行任务
+
+本节为早期执行记录。当前执行顺序已由 R1 配置绑定、R2/R3 并行运行时、R4–R7 协作/控制/产物/界面、R8 真实验收取代，不再以本节旧状态反复重开已实现任务。
 
 当前 RF-1、RF-2A、RF-2B 已完成，RF-2C 基础能力通过但纠正门尚未关闭。下一批不再按 Goose → DeepSeek Harness 串行推进，而是同时启动 RF-3A 与 RF-4A 的 lane-local Adapter；集成泳道并行修复 Supervisor live-target、fenced containment receipt、Provider Grant 私有 transport fixture 和完整泄漏验收。任一 Runtime 的开发失败只阻塞该 Runtime 的 GO，不冻结另一条泳道；两条真实凭据 Smoke 都等待 RF-2C GO。
 

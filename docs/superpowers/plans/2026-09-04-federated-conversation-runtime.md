@@ -1,5 +1,7 @@
 # 联邦 Runtime 正式会话接入 Implementation Plan
 
+> **当前范围覆盖：** 本文保留 model-only 接入批次的实现记录。2026-09-07 之后的 P0 剩余工作按 [八个交付包](2026-09-07-p0-human-assigned-agent-scope.md) 执行：人类配置每个 Agent 的模式，系统按流程协作；不增加自动跨模式调度或独立签名执行证据系统。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将聊天、Codex-compatible Python Term、Goose 和 DeepSeek Harness 作为四种正式会话模式接入同一持久化、准入、Vault/Grant、Host v2 与 AG-UI 链路，并用真实 DeepSeek 云端或本地 API 完成独立验收。
@@ -27,7 +29,7 @@
 
 1. Electron/Playwright 的 45 个启动点已统一隔离 runtime/userData，并清除继承的 live 标志与凭据；普通测试不会连接用户本地模型。
 2. 隔离后的首次串行 **88 passed / 2 failed / 90 total** 保留为历史；有界布局修复以实际几何和正常点击关闭 Artifacts 拦截，最终串行前端为 **92 passed / 0 failed**。详见 [P0 前端回归状态](../../testing/2026-09-07-p0-regression-status.md)。
-3. 当前下一门槛仍是当前构建的三通道真实取消、幂等、执行恢复与故障隔离证据、command-scoped Provider/Model/no-fallback 执行证明，以及同内容独立会话一致性验收。
+3. 当前下一步按修订范围补齐工具执行、Agent 模式绑定、审核返工、控制/恢复与产物，再运行三模式同任务及人类配置的多 Agent 团队真实验收；复用现有执行记录，不增加独立签名执行证明系统。
 4. 保持既定优先级：P0 联邦运行时 → P1 五项架构特性 → P2 产品/前端；真实文件产物生成、登记和下载缺口不能由文本回复替代。
 
 DSH 真实连续会话证据、验收边界和过期准入说明见 [人工验收记录](../../testing/2026-09-05-deepseek-harness-manual-acceptance.md)。用户接受本轮文本结果不等于授予 `GO_DSH_PLUGIN_SMOKE` 或 `GO_RUNTIME_FEDERATION`。

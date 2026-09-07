@@ -18,6 +18,6 @@
 
 ## Task 5 后续门槛
 
-- Task 5 布局回归已关闭，但 P0 仍需当前构建的取消、幂等、执行恢复、故障隔离及 command-scoped Provider/Model/no-fallback 证据。
+- Task 5 布局回归已关闭，但 P0 仍需工具、多 Agent 运行时绑定、审核返工、产物、当前构建的取消/幂等/恢复与真实调用验证。2026-09-07 范围修订取消独立签名执行证明系统；复用现有执行记录，不把请求字段或 Grant ACK 当实际上游调用证明。剩余清单见 [八个交付包](../superpowers/plans/2026-09-07-p0-human-assigned-agent-scope.md)。
 - Python Term / Goose / DSH 使用同一内容、同一实际常用 Provider/Model、独立会话和独立上下文副本的三模式验收仍是未来门槛；以 [三模式一致性验收记录](2026-09-07-p0-three-mode-parity-acceptance.md) 为准，本次结果不得替代该验收。
 - `GO_PYTHON_TERM_RUNTIME`、`GO_GOOSE_QUERY_SMOKE`、`GO_DSH_PLUGIN_SMOKE`、`GO_RUNTIME_FEDERATION` 的既有 HOLD/边界不变。

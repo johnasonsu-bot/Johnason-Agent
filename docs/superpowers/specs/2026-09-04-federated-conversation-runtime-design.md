@@ -1,5 +1,7 @@
 # 联邦 Runtime 正式会话接入设计
 
+> **2026-09-07 最新范围：** 本文的 model-only 限制描述既有接入批次，不是整个 P0 的终点。后续按 [P0 人类指定 Agent 模式范围](../plans/2026-09-07-p0-human-assigned-agent-scope.md) 扩展工具、审核、恢复和产物。人类分别配置 Agent 的角色、模型和模式；每个节点冻结配置，重试/返工沿用原绑定，成员可使用相同或不同模式。不做自动模式选择或执行中换引擎。取消独立签名执行证明系统；保留已有准入、凭据管理、执行日志和真实调用核验。
+
 **状态：** 部分用户验收（更新至 2026-09-07）；DSH 连续文本会话已获用户接受，Task 5 验收收口进行中，联合 Gate 保持 HOLD
 **阶段：** P0 / RF-3A、RF-4A 用户可操作验收  
 **适用模式：** 聊天、Agent-步进执行、Agent-寻路、Agent-事件驱动
@@ -204,9 +206,10 @@ Vault 密码，普通离线回归缺少 live opt-in 时必须报告 `SKIPPED`。
 跟随 redirect；结果必须精确命中 marker，并将 admission build 与调用者提供的预期 build
 相等。该用例分类为 `LIMITED_COMPLETION_CHECK`：当前公共 Conversation API 不提供实际执行
 使用的 Provider Profile digest、resolved model 或 fallback attestation，所以它不能证明
-Provider/Model 精确绑定且无 fallback。最小后续设计是新增 secret-free、command-scoped 的
-签名执行 attestation，把冻结的 Provider digest、resolved model、Runtime build 与正式
-proof identity 关联起来；不得回显凭据，也不得以 queued request 字段替代执行证据。
+Provider/Model 精确绑定且无 fallback。此前提出的新增 command-scoped 签名执行
+attestation 已被 2026-09-07 范围修订取消，不再作为 P0 独立开发或阻塞项。
+真实验收复用已有绑定、运行时执行记录和上游可观测结果；未能观测的模型信息明确标为未知，
+不得回显凭据，也不得以 queued request 字段或 Grant ACK 替代实际调用观察。
 
 当前用户 Runtime 数据库只读核验显示 DSH registration 为 `ready`，build
 `dsh:model-host-v2-r1`，只发布 `model/query/streaming/event_cursor/prompt_sections=true`，
@@ -236,7 +239,7 @@ DSH 修复 `b599e06` 后，同一用户会话实际完成 JD 正文、依赖上�
 - 这不是 Word 文件验收：首轮仅返回可复制正文，未生成可下载文件。
 - 历史 hold 最后核验为 41 条；不自动续跑，也不凭旧快照断言现在的 Vault/Runtime 状态。
 - 开发准入 proof 已于 2026-09-06 18:00:29（北京时间）过期，历史成功不能转换为新请求准入。
-- Task 5 的 Electron runtime/userData 隔离已完成；首次串行 **88 passed / 2 failed / 90 total** 保留为历史。有界布局修复已通过实际几何和正常点击关闭 Artifacts 拦截，最终串行 **92 passed / 0 failed**，详见 [P0 前端回归状态](../../testing/2026-09-07-p0-regression-status.md)。下一门槛仍是当前构建真实取消/幂等/执行恢复与故障隔离、command-scoped 精确执行证明及同内容独立会话一致性验收；Goose/Python Term 真实证据独立补齐，不复制 DSH 的结论。
+- Task 5 的 Electron runtime/userData 隔离已完成；首次串行 **88 passed / 2 failed / 90 total** 保留为历史。有界布局修复已通过实际几何和正常点击关闭 Artifacts 拦截，最终串行 **92 passed / 0 failed**，详见 [P0 前端回归状态](../../testing/2026-09-07-p0-regression-status.md)。后续完成八个交付包，覆盖工具、按人类配置的多 Agent 协作、控制/恢复、产物及真实验收；不再新增独立签名执行证明系统。Goose/Python Term 真实结果独立补齐，不复制 DSH 的结论。
 - `GO_GOOSE_QUERY_SMOKE`、`GO_DSH_PLUGIN_SMOKE`、`GO_RUNTIME_FEDERATION` 仍为 `HOLD`。P0 优先级不变，P1/P2 不抢先。
 
 ## 9. 明确不在本批范围
