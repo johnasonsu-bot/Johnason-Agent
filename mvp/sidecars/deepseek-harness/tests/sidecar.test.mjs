@@ -632,7 +632,7 @@ test("real provider query can be cancelled after the DeepSeek Harness request is
       queryCommand("provider-profile:deepseek-cancel").payload,
     );
     await requestStarted;
-    const cancelled = sidecar.cancel("run-wire");
+    const cancelled = await sidecar.cancel("run-wire");
     assert.deepEqual(cancelled.payload, { status: "cancelled" });
     assert.equal(cancelled.cursor, 2);
     releaseResponse();

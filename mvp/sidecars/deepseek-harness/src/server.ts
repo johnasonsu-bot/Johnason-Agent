@@ -12,6 +12,9 @@ const RUNTIME_INPUT_FIELDS = Object.freeze([
   "messages", "message_snapshot_digest", "context_items", "context_snapshot_digest",
   "prompt_sections", "prompt_manifest_digest",
 ]);
+const PLATFORM_RUN_IDENTITY_FIELDS = Object.freeze([
+  "session_id", "run_id", "term_id", "step_id", "command_id", "agent_id", "agent_role",
+]);
 
 
 function exactKeys(value, expected) {
@@ -107,6 +110,130 @@ function isFixedProvider(providerRef) {
 }
 
 
+function validRunIdentity(identity) {
+  return exactKeys(identity, PLATFORM_RUN_IDENTITY_FIELDS)
+    && PLATFORM_RUN_IDENTITY_FIELDS.every(
+      field => typeof identity[field] === "string" && identity[field].length !== 0,
+    );
+}
+
+
+function sameRunIdentity(actual, expected) {
+  return validRunIdentity(actual) && validRunIdentity(expected)
+    && PLATFORM_RUN_IDENTITY_FIELDS.every(field => actual[field] === expected[field]);
+}
+
+
+function createNdjsonToolTransport(output) {
+  let sequence = 0;
+  let closed = null;
+  const pending = new Map();
+  const writeRequest = frame => {
+    output.write(`${JSON.stringify(frame)}\n`);
+  };
+  return Object.freeze({
+    execute(call) {
+      if (!call || typeof call !== "object"
+          || !validRunIdentity(call.identity)
+          || typeof call.tool_call_id !== "string" || call.tool_call_id.length === 0
+          || typeof call.tool_id !== "string" || call.tool_id.length === 0
+          || call.arguments === null || typeof call.arguments !== "object"
+          || Array.isArray(call.arguments)
+          || !(call.signal instanceof AbortSignal)) {
+        throw new Error("DSH platform tool execution request is invalid");
+      }
+      if (closed !== null) throw closed;
+      const requestId = `dsh-tool-${++sequence}`;
+      const identity = Object.freeze(structuredClone(call.identity));
+      const toolCallId = call.tool_call_id;
+      const toolId = call.tool_id;
+      return new Promise((resolve, reject) => {
+        const entry = {
+          identity,
+          toolCallId,
+          toolId,
+          signal: call.signal,
+          resolve,
+          reject,
+          cancelSent: false,
+          onAbort: null,
+        };
+        entry.onAbort = () => {
+          if (entry.cancelSent || !pending.has(requestId)) return;
+          entry.cancelSent = true;
+          writeRequest({
+            kind: "request",
+            type: "tool.cancel",
+            request_id: requestId,
+            payload: {
+              identity,
+              tool_call_id: toolCallId,
+              tool_id: toolId,
+            },
+          });
+        };
+        pending.set(requestId, entry);
+        call.signal.addEventListener("abort", entry.onAbort, { once: true });
+        writeRequest({
+          kind: "request",
+          type: "tool.execute",
+          request_id: requestId,
+          payload: {
+            identity,
+            tool_call_id: toolCallId,
+            tool_id: toolId,
+            arguments: structuredClone(call.arguments),
+          },
+        });
+        if (call.signal.aborted) entry.onAbort();
+      });
+    },
+
+    deliver(command) {
+      if (!exactKeys(command, ["kind", "type", "command_id", "payload"])
+          || command.kind !== "command" || command.type !== "tool.result"
+          || typeof command.command_id !== "string" || command.command_id.length === 0) {
+        throw new Error("DSH platform tool result command is invalid");
+      }
+      const requestId = command.command_id;
+      const entry = pending.get(requestId);
+      if (!entry) {
+        throw new Error("DSH platform tool result is unknown or duplicate");
+      }
+      const payload = command.payload;
+      if (!exactKeys(payload, [
+        "identity", "tool_call_id", "tool_id", "status", "output", "effect_id",
+      ])
+          || !sameRunIdentity(payload.identity, entry.identity)
+          || payload.tool_call_id !== entry.toolCallId
+          || payload.tool_id !== entry.toolId
+          || !["completed", "failed"].includes(payload.status)
+          || !(payload.effect_id === null || typeof payload.effect_id === "string")) {
+        throw new Error("DSH platform tool result correlation is invalid");
+      }
+      pending.delete(requestId);
+      entry.signal.removeEventListener("abort", entry.onAbort);
+      entry.resolve(Object.freeze({
+        status: payload.status,
+        output: payload.output,
+        ...(typeof payload.effect_id === "string" && payload.effect_id.length !== 0
+          ? { effect_id: payload.effect_id } : {}),
+      }));
+    },
+
+    close(reason = new Error("DSH tool transport closed")) {
+      if (closed !== null) return;
+      closed = reason instanceof Error ? reason : new Error("DSH tool transport closed");
+      for (const entry of pending.values()) {
+        entry.signal.removeEventListener("abort", entry.onAbort);
+        entry.reject(closed);
+      }
+      pending.clear();
+    },
+  });
+}
+
+
 export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest }) {
   if (!grantChannel || typeof runtimeId !== "string" || typeof buildId !== "string") {
     throw new Error("DSH Host v2 bootstrap is invalid");
@@ -114,6 +241,9 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
   let terminal = null;
   let checkpoint = null;
   let active = null;
+  let toolTransport = null;
+  let shutdownPromise = null;
+  let closed = false;
 
   return Object.freeze({
     capabilities() {
@@ -140,11 +270,29 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
       });
     },
 
+    attachToolTransport(transport) {
+      if (toolTransport !== null || !transport
+          || typeof transport.execute !== "function"
+          || typeof transport.deliver !== "function"
+          || typeof transport.close !== "function") {
+        throw new Error("DSH tool transport attachment is invalid");
+      }
+      toolTransport = transport;
+    },
+
+    deliverToolResult(command) {
+      if (toolTransport === null) {
+        throw new Error("DSH tool transport is unavailable");
+      }
+      toolTransport.deliver(command);
+    },
+
     startQuery(payload, emit = () => {}) {
+      if (closed) throw new Error("DSH sidecar is shut down");
       if (active !== null) throw new Error("a DSH query is already active");
       const envelope = payload?.envelope;
       const runtimeInput = payload?.runtime_input;
-      if (!envelope || !runtimeInput) {
+      if (!envelope || !runtimeInput || !Array.isArray(envelope.tool_manifest)) {
         throw new Error("DSH query input is incomplete");
       }
       const materialized = materializeRuntimeInput(runtimeInput, envelope);
@@ -174,16 +322,28 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
           term_id: envelope.term_id,
           step_id: envelope.step_id,
         });
+        const runIdentity = Object.freeze({
+          session_id: envelope.session_id,
+          run_id: envelope.run_id,
+          term_id: envelope.term_id,
+          step_id: envelope.step_id,
+          command_id: envelope.command_id,
+          agent_id: envelope.agent_id,
+          agent_role: envelope.agent_role,
+        });
         const [running] = mapSessionEvents(identity, [
           { seq: 0, type: "turn/start", data: {} },
         ]);
         const controller = new AbortController();
-        active = {
+        const state = {
           identity,
           cursor: running.cursor,
           controller,
           events: [running],
+          completion: null,
+          cancelPromise: null,
         };
+        active = state;
         const completion = (async () => {
           try {
             const result = await runDeepSeekHarnessSession({
@@ -192,11 +352,19 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
               credential: () => credential,
               sessionId: envelope.session_id,
               signal: controller.signal,
+              toolManifest: envelope.tool_manifest,
+              runIdentity,
+              executeTool: call => {
+                if (toolTransport === null) {
+                  throw new Error("DSH platform tool transport is unavailable");
+                }
+                return toolTransport.execute(call);
+              },
               onEvent: nativeEvent => {
                 const chunk = nativeEvent.type === "assistant/chunk"
                   ? nativeEvent.data?.chunk
                   : null;
-                if (active === null || active.identity !== identity) return;
+                if (active !== state) return;
                 if (chunk?.type === "text-delta" && chunk.text.length !== 0) {
                   const [event] = mapSessionEvents(identity, [
                     { seq: 0, type: "assistant/delta", data: { content: chunk.text } },
@@ -207,7 +375,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
                 }
               },
             });
-            if (active === null || active.identity !== identity) return;
+            if (active !== state) return;
             const completed = mapSessionEvents(identity, [
               { seq: 0, type: "assistant/message", data: { content: result.content } },
               { seq: 1, type: "turn/end", data: { reason: "completed" } },
@@ -218,24 +386,30 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
             active = null;
             for (const event of completed) emit(event);
           } catch (error) {
-            if (active === null || active.identity !== identity || controller.signal.aborted) {
-              return;
-            }
-            const [failed] = mapSessionEvents(identity, [
+            if (active !== state) return;
+            const cancelled = controller.signal.aborted;
+            const [finalEvent] = mapSessionEvents(identity, [
               { seq: 0, type: "turn/end", data: {
-                reason: "failed",
-                ...(error instanceof DshSessionFailure ? error.publicFailure
-                  : { reason_code: "runtime_verification_failed", failure_stage: "session_execution" }),
+                reason: cancelled ? "cancelled" : "failed",
+                ...(!cancelled
+                  ? (error instanceof DshSessionFailure
+                    ? error.publicFailure
+                    : {
+                      reason_code: "runtime_verification_failed",
+                      failure_stage: "session_execution",
+                    })
+                  : {}),
               } },
             ], { cursorOffset: active.cursor });
-            terminal = failed;
+            terminal = finalEvent;
             checkpoint = null;
             active = null;
-            emit(failed);
+            if (!cancelled) emit(finalEvent);
           } finally {
             credential = "";
           }
         })();
+        state.completion = completion;
         return Object.freeze({
           accepted: true,
           events: Object.freeze([running]),
@@ -287,15 +461,28 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
       }
     },
 
-    cancel(runId) {
+    async cancel(runId) {
       if (active === null || active.identity.run_id !== runId) {
         throw new Error("cancel identity does not match an active DSH query");
       }
-      active.controller?.abort("Host v2 query.cancel");
+      const state = active;
+      if (state.controller) {
+        if (state.cancelPromise === null) {
+          state.cancelPromise = (async () => {
+            state.controller.abort(new Error("Host v2 query.cancel"));
+            await state.completion;
+            if (terminal === null || terminal.payload?.status !== "cancelled") {
+              throw new Error("DSH query cancellation did not settle");
+            }
+            return terminal;
+          })();
+        }
+        return state.cancelPromise;
+      }
       const [event] = mapSessionEvents(
-        active.identity,
+        state.identity,
         [{ seq: 0, type: "turn/end", data: { reason: "cancelled" } }],
-        { cursorOffset: active.cursor },
+        { cursorOffset: state.cursor },
       );
       active = null;
       terminal = event;
@@ -312,8 +499,23 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
       return checkpoint;
     },
 
-    shutdown() {
-      grantChannel.clear();
+    shutdown(reason = new Error("DSH NDJSON input closed")) {
+      if (shutdownPromise !== null) return shutdownPromise;
+      closed = true;
+      shutdownPromise = (async () => {
+        const state = active;
+        active = null;
+        toolTransport?.close(reason);
+        try {
+          if (state?.controller) {
+            state.controller.abort(reason);
+            await state.completion;
+          }
+        } finally {
+          grantChannel.clear();
+        }
+      })();
+      return shutdownPromise;
     },
   });
 }
@@ -325,11 +527,15 @@ export function serveNdjson(
   output = process.stdout,
   grantReady = Promise.resolve(),
 ) {
+  const toolTransport = createNdjsonToolTransport(output);
+  sidecar.attachToolTransport(toolTransport);
   const lines = createInterface({ input, crlfDelay: Infinity });
   let commands = Promise.resolve();
+  let inputClosed = false;
   const handleLine = async line => {
     let command;
     try {
+      if (inputClosed) return;
       command = JSON.parse(line);
       if (command?.kind !== "command" || typeof command.type !== "string") {
         throw new Error("invalid Host v2 command");
@@ -339,8 +545,11 @@ export function serveNdjson(
         payload = sidecar.capabilities();
       } else if (command.type === "query.start") {
         await grantReady;
+        if (inputClosed) return;
         const started = sidecar.startQuery(command.payload, event => {
-          output.write(`${JSON.stringify({ kind: "event", payload: event })}\n`);
+          if (!inputClosed) {
+            output.write(`${JSON.stringify({ kind: "event", payload: event })}\n`);
+          }
         });
         output.write(`${JSON.stringify({
           kind: "response",
@@ -353,7 +562,8 @@ export function serveNdjson(
         }
         return;
       } else if (command.type === "query.cancel") {
-        const event = sidecar.cancel(command.payload?.run_id);
+        const event = await sidecar.cancel(command.payload?.run_id);
+        if (inputClosed) return;
         output.write(`${JSON.stringify({
           kind: "response",
           type: command.type,
@@ -374,6 +584,7 @@ export function serveNdjson(
         payload,
       })}\n`);
     } catch (error) {
+      if (inputClosed) return;
       output.write(`${JSON.stringify({
         kind: "response",
         type: command?.type ?? "invalid",
@@ -383,10 +594,26 @@ export function serveNdjson(
     }
   };
   lines.on("line", line => {
+    let command;
+    try {
+      command = JSON.parse(line);
+    } catch {
+      // Preserve the existing invalid-command response path.
+    }
+    if (command?.type === "tool.result") {
+      try {
+        sidecar.deliverToolResult(command);
+      } catch {
+        // tool.result is one-way: invalid, mismatched, and duplicate deliveries
+        // are rejected without a response acknowledgement.
+      }
+      return;
+    }
     commands = commands.then(() => handleLine(line));
   });
   lines.on("close", () => {
-    void commands.finally(() => sidecar.shutdown());
+    inputClosed = true;
+    void sidecar.shutdown(new Error("DSH NDJSON input closed"));
   });
   return lines;
 }

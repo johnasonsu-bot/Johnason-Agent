@@ -138,6 +138,7 @@ def _write_host_v2_sidecar(root: Path) -> None:
         "bootstrap.mjs",
         "checkpoint.mjs",
         "deepseek-harness-host-v2.mjs",
+        "deepseek-harness-model-host-v2.mjs",
         "event-mapper.mjs",
         "grant-channel.mjs",
         "native-session.mjs",
