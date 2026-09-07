@@ -101,6 +101,7 @@ P0 预计 53–83 个工作日；P1 与联合验收因新增门控梯度、Conte
 - 安全威胁建模、秘密扫描、依赖供应链攻击面和漏洞注入统一放在 P2 完成后的最终安全专项中执行。
 - Fixture 只验证合同，不满足真实 Runtime Gate。
 - 每个 Smoke Gate 均需提供用户可操作环境；P0/P1 的 Final Gate 包含 crash/restart、duplicate command 和 Effect reconciliation。凭据不入库的红线持续有效，但专项 secret scan 只在 P2 后的 `FINAL_SECURITY_AUDIT` 执行。
+- **2026-09-07 用户新增 P0 终验要求：** P0 全部实现任务完成后，步进 `python-term`、寻路 `goose`、事件驱动 `dsh` 必须分别运行同一任务内容；固定相同 Provider/模型及初始上下文，使用独立会话/工作副本，经真实 API 检查完成、产物、持续上下文和恢复。三模式逐项报告，不能用一个通道通过代替其余通道；具体用例和判定见 [P0 三模式同任务真实验收](../../testing/2026-09-07-p0-three-mode-parity-acceptance.md)。该项执行前不能标记 P0 整体验收完成。
 
 ## 5. 最终安全专项
 
