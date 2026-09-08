@@ -64,3 +64,11 @@ API 错误保留原始错误类别、模型、会话与时间；不能统一改�
 加载锁定版原生 base + Web/headless 模式 bundle 和用户 overlay；base 仅 credentials 替换为 `@johnason/dsh-encrypted-base` 内的本地加密实现，完整保留其余原生条目，由 profile 结构测试核对。原生 Skill/MCP/plan/goal/subagent 的存在不代表全部成功验收。第三方插件是受信任本机代码，不受 Vault 的密钥隔离机制沙箱化。没有公网发布、旧平台迁移或旧任务重跑。
 
 本次实际 Web profile 清单是 `@johnason/dsh-encrypted-base`（由固定 pin 的 `@deepseek-ai/dsh-base@0.1.1-rc.2` 生成，仅凭据行替换）与 `@deepseek-ai/dsh-web-app@0.1.1-rc.2`。headless 模式 bundle 为 `@deepseek-ai/dsh-headless@0.1.1-rc.2`。测试 overlay 额外加载仓库内测试 profile 插件和固定 pin 的 mcp-client 源入口，不安装第三方远端依赖；可选 TUI、外部 MCP 账户、第三方 bundle 未验证。
+
+## 最终代码审核与当前服务状态
+
+- 刷新回归修复 `81b2ca1`：真实 Chrome `page.reload()`，同一 session / 模型 / idle 状态保持，32/32 测试通过；仅测试依赖锁定为 playwright-core1.62.1。
+- 最终分支审核唯一 Important 为 Vault Web 错误分类被合并；`723514d` 已用固定中文白名单提示与稳定 code 修复，认证失败仍保留密码或文件完整性两种可能，不自动删除或重置。RED4项3失败→GREEN4/4，最终全薄层34/34通过；原最终审核者定向复审 Approved，无剩余代码阻断项。
+- 14项真实负向探针在最终代码再次通过，隔离目录 `dsh-security-probe-kEbcDM`。不是重新进行全仓安全扫描，也不是上游完整认证。
+- 最后只读状态检查发现正式3080已 `initialized=true / locked=false`，说明用户已完成新保险箱设置；没有读取密码或Key，不能据此推断云模型已配置或验收通过。为不打断正在进行的配置，保留当前进程与解锁状态，**当前3080/3188尚未加载723514d的最新错误提示**。下次正常重启会加载修复并重新要求解锁，数据不删除。
+- 代码候选已提交到本地 `codex/dsh-standalone-agent`，未合并/推送；原开发分支及其未提交工作保留。后续在用户完成新模型配置后继续D2–D11，不能将本记录视为全功能验收通过。
