@@ -1,0 +1,16 @@
+{
+  "name": "@johnason/dsh-agent",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "johnason-dsh": "src/cli.mjs"
+  },
+  "scripts": {
+    "build:native": "node scripts/build.mjs",
+    "doctor": "node src/cli.mjs doctor",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}
