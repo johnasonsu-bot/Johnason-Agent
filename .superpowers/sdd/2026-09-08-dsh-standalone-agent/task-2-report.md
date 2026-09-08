@@ -57,3 +57,27 @@ The environment prints an existing nvm/npmrc compatibility advisory before comma
 - Lock release verifies its random ownership token and removes only the owner file and directory created by that acquisition.
 
 Passwords are copied into temporary byte buffers for derivation and those buffers are zero-filled. Passwords and derived keys are never persisted. No environment or `.env` credential fallback exists.
+
+## Review round 1
+
+Three regression tests were added first and observed failing:
+
+```text
+node --test tests/vault-store.test.mjs
+tests 9, pass 6, fail 3
+```
+
+The failures demonstrated that a non-string `ciphertext` leaked `ERR_INVALID_ARG_TYPE`, an in-flight `unlock()` ignored a subsequent `lock()`, and an update could still rename its prepared temporary file after `lock()`.
+
+After the fixes, the directed result is:
+
+```text
+node --test tests/vault-store.test.mjs
+tests 9, pass 9, fail 0
+```
+
+`initialize()` and `unlock()` now capture the instance generation synchronously at invocation. Any `lock()` before they install a candidate key invalidates that operation; the candidate key is zero-filled and the operation rejects with `VAULT_LOCKED`. Initialization also checks the generation before doing work and before its atomic commit.
+
+Atomic commit has an explicit linearization boundary: after the exclusive temporary file has been fully written, synced, and closed, the generation is checked immediately before `rename`. A `lock()` observed by that check prevents publication and removes only the owned temporary file. Once `rename` has been issued, the commit is linearized and cannot be retroactively withdrawn; a later `lock()` still clears instance access normally.
+
+Encoded envelope fields are type-checked and canonical-base64-checked before decoding. Fixed-size salt, nonce, and tag fields retain their length validation; malformed fields consistently produce `VAULT_FORMAT_ERROR`.

@@ -24,12 +24,12 @@ function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function decodeBase64(value, length) {
+function decodeBase64(value, length = null) {
   if (typeof value !== 'string' || value.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
     throw vaultError('VAULT_FORMAT_ERROR', 'Invalid vault envelope');
   }
   const buffer = Buffer.from(value, 'base64');
-  if (buffer.length !== length || buffer.toString('base64') !== value) {
+  if ((length !== null && buffer.length !== length) || buffer.toString('base64') !== value) {
     throw vaultError('VAULT_FORMAT_ERROR', 'Invalid vault envelope');
   }
   return buffer;
@@ -55,7 +55,7 @@ function parseEnvelope(contents) {
     salt: decodeBase64(envelope.salt, 16),
     nonce: decodeBase64(envelope.nonce, 12),
     tag: decodeBase64(envelope.tag, 16),
-    ciphertext: decodeBase64(envelope.ciphertext, Buffer.from(envelope.ciphertext ?? '', 'base64').length),
+    ciphertext: decodeBase64(envelope.ciphertext),
   };
 }
 
@@ -113,7 +113,7 @@ function encrypt(data, key, salt) {
   }
 }
 
-async function atomicWrite(path, contents) {
+async function atomicWrite(path, contents, beforeCommit = () => {}) {
   const temporary = `${path}.tmp-${process.pid}-${randomBytes(12).toString('hex')}`;
   let handle;
   try {
@@ -122,6 +122,7 @@ async function atomicWrite(path, contents) {
     await handle.sync();
     await handle.close();
     handle = undefined;
+    beforeCommit();
     await rename(temporary, path);
   } catch (error) {
     if (handle) await handle.close().catch(() => {});
@@ -152,10 +153,12 @@ export class VaultStore {
   }
 
   async initialize(password) {
+    const generation = this.#generation;
     await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
     const release = await acquireVaultLock(this.#path);
     let key;
     try {
+      this.#assertGeneration(generation);
       try {
         await stat(this.#path);
         throw vaultError('VAULT_EXISTS', 'Vault is already initialized');
@@ -164,7 +167,13 @@ export class VaultStore {
       }
       const salt = randomBytes(16);
       key = await deriveKey(password, salt);
-      await atomicWrite(this.#path, encrypt({ refs: {}, records: {} }, key, salt));
+      this.#assertGeneration(generation);
+      await atomicWrite(
+        this.#path,
+        encrypt({ refs: {}, records: {} }, key, salt),
+        () => this.#assertGeneration(generation),
+      );
+      this.#assertGeneration(generation);
       this.#replaceKey(key);
       key = null;
     } finally {
@@ -174,6 +183,7 @@ export class VaultStore {
   }
 
   async unlock(password) {
+    const generation = this.#generation;
     const envelope = parseEnvelope(await this.#readContents());
     const key = await deriveKey(password, envelope.salt);
     try {
@@ -183,6 +193,7 @@ export class VaultStore {
       } finally {
         plaintext.fill(0);
       }
+      this.#assertGeneration(generation);
       this.#replaceKey(key);
     } catch (error) {
       key.fill(0);
@@ -227,7 +238,11 @@ export class VaultStore {
       if (!isObject(data.refs) || !isObject(data.records)) {
         throw vaultError('VAULT_FORMAT_ERROR', 'Mutator produced invalid vault data');
       }
-      await atomicWrite(this.#path, encrypt(data, access.key, envelope.salt));
+      await atomicWrite(
+        this.#path,
+        encrypt(data, access.key, envelope.salt),
+        () => this.#assertAccess(access),
+      );
     } finally {
       await release();
     }
@@ -242,6 +257,10 @@ export class VaultStore {
     if (this.#key !== access.key || this.#generation !== access.generation) {
       throw vaultError('VAULT_LOCKED', 'Vault is locked');
     }
+  }
+
+  #assertGeneration(generation) {
+    if (this.#generation !== generation) throw vaultError('VAULT_LOCKED', 'Vault is locked');
   }
 
   #replaceKey(key) {

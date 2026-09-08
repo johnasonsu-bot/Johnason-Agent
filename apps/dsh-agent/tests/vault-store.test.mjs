@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -75,6 +75,41 @@ test('reports malformed envelopes without resetting the file', async () => {
   assert.deepEqual(await readFile(file), before);
 });
 
+test('reports non-string encoded envelope fields as a vault format error', async () => {
+  const file = await vaultPath('field-type');
+  await writeFile(file, JSON.stringify({
+    version: 1,
+    kdf: { name: 'scrypt', N: 16384, r: 8, p: 1 },
+    salt: 'AAAAAAAAAAAAAAAAAAAAAA==',
+    nonce: 'AAAAAAAAAAAAAAAA',
+    tag: 'AAAAAAAAAAAAAAAAAAAAAA==',
+    ciphertext: 42,
+  }), { mode: 0o600 });
+
+  await assert.rejects(() => new VaultStore(file).unlock('unit-test-passphrase'), {
+    code: 'VAULT_FORMAT_ERROR',
+  });
+});
+
+test('lock invalidates unlock and initialize operations already awaiting filesystem or KDF work', async () => {
+  const unlockFile = await vaultPath('unlock-generation');
+  const prepared = new VaultStore(unlockFile);
+  await prepared.initialize('unit-test-passphrase');
+  prepared.lock();
+
+  const unlocking = prepared.unlock('unit-test-passphrase');
+  prepared.lock();
+  await assert.rejects(() => unlocking, { code: 'VAULT_LOCKED' });
+  assert.deepEqual(await prepared.status(), { initialized: true, locked: true });
+
+  const initializeFile = await vaultPath('initialize-generation');
+  const initializingStore = new VaultStore(initializeFile);
+  const initializing = initializingStore.initialize('unit-test-passphrase');
+  initializingStore.lock();
+  await assert.rejects(() => initializing, { code: 'VAULT_LOCKED' });
+  assert.deepEqual(await initializingStore.status(), { initialized: false, locked: true });
+});
+
 test('serializes two instances and preserves asynchronous read-modify-write updates', async () => {
   const file = await vaultPath('instances');
   const first = new VaultStore(file);
@@ -137,4 +172,27 @@ test('locking during an update prevents commit and leaves the vault usable', asy
   await vault.unlock('unit-test-passphrase');
   assert.equal((await vault.read()).refs.RACE, undefined);
   assert.equal((await stat(file)).isFile(), true);
+});
+
+test('locking after update prepares its temporary file prevents the rename commit', async () => {
+  const file = await vaultPath('prepare-race');
+  const vault = new VaultStore(file);
+  await vault.initialize('unit-test-passphrase');
+  const directory = new URL('.', `file://${file}`).pathname;
+  const base = file.slice(file.lastIndexOf('/') + 1);
+
+  const update = vault.update(data => {
+    data.records.large = { padding: 'x'.repeat(48 * 1024 * 1024) };
+  });
+
+  const deadline = Date.now() + 5_000;
+  while (!(await readdir(directory)).some(name => name.startsWith(`${base}.tmp-`))) {
+    if (Date.now() >= deadline) assert.fail('update did not expose its prepared temporary file');
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  vault.lock();
+  await assert.rejects(() => update, { code: 'VAULT_LOCKED' });
+
+  await vault.unlock('unit-test-passphrase');
+  assert.equal((await vault.read()).records.large, undefined);
 });
