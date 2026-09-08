@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, open, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -174,23 +174,29 @@ test('locking during an update prevents commit and leaves the vault usable', asy
   assert.equal((await stat(file)).isFile(), true);
 });
 
-test('locking after update prepares its temporary file prevents the rename commit', async () => {
+test('locking after update prepares its temporary file prevents the rename commit', async t => {
   const file = await vaultPath('prepare-race');
   const vault = new VaultStore(file);
   await vault.initialize('unit-test-passphrase');
-  const directory = new URL('.', `file://${file}`).pathname;
-  const base = file.slice(file.lastIndexOf('/') + 1);
-
-  const update = vault.update(data => {
-    data.records.large = { padding: 'x'.repeat(48 * 1024 * 1024) };
+  // Pause after a real fsync, not on a scheduler-dependent large-file polling window.
+  // This test-only barrier preserves the real write/sync/close/rename behavior.
+  const handle = await open(file, 'r');
+  const prototype = Object.getPrototypeOf(handle);
+  const originalSync = prototype.sync;
+  await handle.close();
+  let entered, resume;
+  const prepared = new Promise(resolve => { entered = resolve; });
+  const released = new Promise(resolve => { resume = resolve; });
+  t.mock.method(prototype, 'sync', async function () {
+    await originalSync.call(this);
+    entered();
+    await released;
   });
-
-  const deadline = Date.now() + 5_000;
-  while (!(await readdir(directory)).some(name => name.startsWith(`${base}.tmp-`))) {
-    if (Date.now() >= deadline) assert.fail('update did not expose its prepared temporary file');
-    await new Promise(resolve => setImmediate(resolve));
-  }
+  t.after(() => resume());
+  const update = vault.update(data => { data.records.large = { padding: 'small deterministic fixture' }; });
+  await prepared;
   vault.lock();
+  resume();
   await assert.rejects(() => update, { code: 'VAULT_LOCKED' });
 
   await vault.unlock('unit-test-passphrase');

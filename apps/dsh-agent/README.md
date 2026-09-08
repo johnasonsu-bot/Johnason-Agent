@@ -10,7 +10,9 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 ## 环境要求
 
+- 实测平台：macOS、Node.js v22.20.0；Windows/Linux 尚未实测，不承诺相同的 TTY、目录选择器和信号行为。
 - Node.js 22.19+（仅 22.x），或 Node.js 24+
+- Git、Corepack 可用；首次安装依赖需要网络和磁盘空间。无需旧 Python/Go 服务。
 - 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
 - 构建工具固定为 `pnpm@11.7.0`，不下载 `latest`
 
@@ -19,8 +21,11 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 从仓库根目录运行：
 
 ```sh
+git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
 ```
+
+本次交付源码位于 `/Users/sushi/Downloads/Johnason-Agent/.worktrees/dsh-standalone-agent`，本地分支 `codex/dsh-standalone-agent` 尚未推送/合并。不要将它当作已有远端发行版。构建实际在该目录下的 `third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
 
 构建入口依次执行冻结 lockfile 安装和上游原生构建。两个步骤都显式设置 `CI=true`：上游的安装脚本会据此只跳过 Git hook 配置，避免子模块位于 linked worktree 时修改 Git 配置失败；构建前的依赖状态检查也因此使用非交互模式。依赖生命周期脚本及构建检查仍会运行。启动器不会修改子模块 Git 配置。
 
@@ -60,3 +65,30 @@ node --test apps/dsh-agent/tests/native-web.test.mjs
 ```
 
 定向集成测试在新临时目录启动真实原生 Web，检查原生首页、Vault、环境隔离及 SIGTERM 退出，不需要真实凭据，也不清理用户文件。OS 目录选择器、外部 MCP 服务和第三方账户的实际可用性仍取决于本机权限及用户配置。
+
+补充真实进程测试：
+
+```sh
+node --test apps/dsh-agent/tests/native-lifecycle.test.mjs
+```
+
+覆盖已占端口明确失败且不动原进程、正常重启后的工作区/会话标题恢复、Vault 重新锁定、本地 MCP 真实工具调用、原生 Skill 发现，以及 CLI 隔离 profile 的 `plugin list`。测试不请求模型，保留临时数据供检查；不代表云模型、Skill 自主调用、子 Agent 或所有 D1–D12 已通过。完整状态见[验收记录](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)。
+
+## 配置、停止与恢复
+
+1. 打开 [Vault](http://127.0.0.1:3080/vault) 初始化主密码，然后返回原生聊天页面，进入 Settings → Models。自定义 OpenAI-compatible 供应商需要协议 `openai-completions`、Base URL 和精确模型 ID；真实云 Key 只在 GUI 录入。测试本地服务允许无权限的占位值，不能拿旧 Vault 代替用户配置。
+2. 在原生界面添加并选择工作区后才可发任务。目录选择器需要本机 GUI；先用新建的隔离目录验证文件操作。刷新应恢复同一原生会话，正在运行时可点击“停止生成”。
+3. 从启动终端按 Ctrl-C，等待进程退出；不要结束未知 PID。端口被占用会明确报错，不自动改端口；确认占用者，或显式选择另一个端口。
+4. 使用同一 `--data-dir` 和同样命令重新启动，重新解锁 Vault。历史应保留，不自动重跑旧任务。网页与另一个 headless 进程不共享解锁状态。异常退出恢复与正常重启不是同一保证；不承诺任意步骤精确续跑或副作用 exactly-once。
+
+## 本地扩展夹具
+
+`tests/fixtures/acceptance-skill/SKILL.md` 可复制到隔离工作区的 `.dsh/skills/dsh-acceptance-marker/SKILL.md`。Skill 目录按原生 workspace / Git 根规则发现，因此不要把验收目录放在其他仓库内部。模型验收时明确要求读取该 Skill 并返回标记与来源路径。
+
+`tests/fixtures/mcp-server.mjs` 是无密钥 stdio MCP 服务，仅返回 `DSH_LOCAL_MCP_OK`，无文件/网络能力。原生 mcp-client 插件配置为 `transport: stdio`、`serverName: acceptance`、`command: <Node绝对路径>`、`args: [<该文件绝对路径>]`、`env: {}`、`cwd: <隔离目录>`，工具名是 `mcp__acceptance__marker`。
+
+`tests/fixtures/profile-plugin.mjs` 是受信任的测试插件，挂载固定本地测试路由调用上述工具；仅测试通过 `--patch` 显式加载，不在正式启动中默认启用。自动测试动态生成的 overlay 不含任何凭据。Web 使用原生 web profile 与 `--patch`；自定义 `--profile` 的 CLI 验证使用 `plugin`/`headless`，不要给 Web 添加原生不支持的 `--profile`。
+
+## 固定版本升级
+
+升级是明确维护动作，不自动追踪 `latest`。先停止自己启动的服务，备份整个独立数据根（含加密 Vault 与原生会话；不导出明文密钥），在新的维护分支/工作树中评估目标提交。一起更新子模块 gitlink、构建入口与启动校验中的固定 SHA；保留冻结 lockfile 和经验证的 pnpm 版本，必要时显式评审其升级。重新执行原生构建、doctor、全部薄层测试和 D1–D12 实测后再使用正式数据根。不要擅自覆盖子模块改动、重置旧分支或删除旧数据。

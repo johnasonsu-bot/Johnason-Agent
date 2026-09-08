@@ -11,7 +11,7 @@
     "build:native": "node scripts/build.mjs",
     "doctor": "node src/cli.mjs doctor",
     "test": "node --test tests/*.test.mjs",
-    "test:integration": "node --test tests/native-web.test.mjs"
+    "test:integration": "node --test tests/native-web.test.mjs tests/native-lifecycle.test.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

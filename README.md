@@ -1,5 +1,13 @@
 # Generic Agent Workbench
 
+## 新增独立 DSH Agent（本地验收分支）
+
+独立入口位于 [`apps/dsh-agent`](apps/dsh-agent/README.md)：固定版原生 DSH Web/CLI，加密凭据库，默认数据目录 `~/.johnason-dsh`。不启动下文旧 Workbench 的三引擎服务，不迁移或读取旧 Vault/任务队列。当前 `codex/dsh-standalone-agent` 尚未推送或合并，源码和构建位于本地 `.worktrees/dsh-standalone-agent`，不是已经发布的远端安装包。
+
+在该源码目录运行 `node apps/dsh-agent/src/cli.mjs doctor`，构建就绪后运行 `node apps/dsh-agent/src/cli.mjs web --port 3080 --no-open`。首次访问 [本机配置入口](http://127.0.0.1:3080/vault)，再到原生 Settings → Models 配置模型；真实云 Key 必须由用户在这个新界面录入。
+
+详见[安装、停止和恢复说明](apps/dsh-agent/README.md)与[D1–D12 实测记录](docs/testing/2026-09-08-dsh-standalone-acceptance.md)。当前仅部分能力验收，不能视为全部通过；下文仍是旧 Workbench 的说明。
+
 本仓库正在将 `hello-generic-agent` 教程工程演进为一个可本地运行、可连接本地或云端模型、具备持久会话和可恢复编排能力的桌面 Agent Workbench。
 
 当前分支：`feat/hermes-mvp-phase1`。当前可运行产品位于 [`mvp/`](mvp/)，根目录其余 `docs/` 内容保留了上游教程和项目演进文档。
