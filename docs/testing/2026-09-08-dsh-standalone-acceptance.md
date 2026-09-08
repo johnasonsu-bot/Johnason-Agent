@@ -23,8 +23,8 @@
 | D7 子 Agent | 未测 | 尚未观察真实委派、子结果与主汇总。 |
 | D8 Skill/MCP/插件 | 部分 | 原生 `skill.list` 发现 Skill；native profile overlay 加载测试插件，真实注册表调用 stdio MCP 返回来源标记；CLI 隔离 profile `plugin list` 成功。模型主动读取 Skill/选择 MCP、第三方插件安装未测。 |
 | D9 CLI | 部分 | Task3 真实 TTY 隐藏输入及非 TTY 提示、空 Vault `MISSING_CREDENTIAL`，本轮原生 plugin list 退出 0。headless 模型成功输出与持久会话待测，不能拿帮助页当执行成功。 |
-| D10 恢复 | 部分 | 真实 SIGTERM 正常退出，同端口重启后历史和工作区恢复、Vault 重新锁定且加密文件不变。异常杀进程恢复未测，不承诺 exactly-once。 |
-| D11 小说/动画 | 未完成 | 首次任务首 token 3m55s、7m29s 仍推理无文件，用户式停止；后续短版任务由控制器继续，不提前记通过。 |
+| D10 恢复 | 部分 | 真实 SIGTERM 后同端口重启恢复、Vault 重锁及密文不变通过。临时3188非预期退出后实测刷新仍保留原三轮消息、工具记录及模型选择、末轮显示已停止且未自动续跑；退出原因无足够日志归因。故障矩阵/强杀注入未全测，不承诺 exactly-once。 |
+| D11 小说/动画 | 未完成 | 首次任务首 token 3m55s、7m29s 仍推理无文件，用户式停止；后续短版任务未产出，临时服务随后不可达，重启后显示已停止。只有ready.txt已真实产出，不冒称小说或HTML通过。 |
 | D12 独立性/扩展 | 部分 | 独立根、环境隔离、无旧 credentials-local provider、原生 base 其余行结构相等；测试仅新临时目录。集中检查及 14 项负向检查通过，外部账户/可选 TUI 未测；不代表全上游认证。 |
 
 ## 可重复的无密钥验证
