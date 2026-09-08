@@ -2,11 +2,11 @@
 
 这是锁定版 DeepSeek Harness 的薄启动层。它使用独立数据目录，不启动原有三引擎服务，也不继承旧 DSH 数据或凭据环境变量。
 
-## 当前阶段
+## 使用
 
-目前仅完成参数解析、运行环境隔离、原生构建入口和 `doctor`。加密凭据 profile 尚未接入，`web`、`headless` 和 `plugin` 会以 `PROFILE_NOT_READY` 退出。这是安全门：在加密 provider 可用前，不会降级启动上游默认的明文凭据存储。
+Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计划及目标界面。先打开右下角「Vault 解锁 / 锁定」入口，首次设置两次相同的主密码；解锁后在原生 Models 页面录入 API Key。原生模型 adapter 不变，下一次请求会重新读取凭据。
 
-**当前不要录入 API Key、OAuth 记录或其他凭据。** 不要把凭据放入项目 `.env`、命令行参数或普通配置文件。后续加密 profile 与无回显解锁入口完成后，才会开放模型凭据录入。
+凭据引用与授权记录只保存到独立数据根的 `vault.enc`（scrypt + AES-256-GCM），不写明文配置。不要把主密码或 API Key 放进 `.env`、命令行参数或普通文件。忘记主密码无法恢复内容；错误密码不会删除已有数据。
 
 ## 环境要求
 
@@ -32,18 +32,31 @@ node apps/dsh-agent/scripts/build.mjs
 node apps/dsh-agent/src/cli.mjs doctor
 ```
 
-预留的运行形式如下；在加密 profile 接入前都会被安全门阻断：
+运行形式如下：
 
 ```sh
-node apps/dsh-agent/src/cli.mjs web --data-dir "/path/with spaces/data" --workspace "/path/to/work" --port 3080 --no-open
+node apps/dsh-agent/src/cli.mjs web --port 3080 --no-open
+node apps/dsh-agent/src/cli.mjs web --data-dir "/path/with spaces/data" --port 3081 --no-open
 node apps/dsh-agent/src/cli.mjs headless --workspace "/path/to/work" "完成任务"
+node apps/dsh-agent/src/cli.mjs headless --workspace "/path/to/work" --profile custom --patch "/path/to/extra.yml" "完成任务"
 node apps/dsh-agent/src/cli.mjs plugin --workspace "/path/to/work" --profile tui add package-name
 ```
 
-默认数据目录为 `~/.johnason-dsh`。`headless` 和 `plugin` 必须显式给出 `--workspace`；Web 未指定时由后续原生界面选择。子进程环境只保留操作系统运行所需的少量变量，并覆盖 `DSH_HOME`、禁用遥测；旧 `DSH_HOME` 和凭据类环境变量不会透传。
+默认数据目录为 `~/.johnason-dsh`。`headless` 和 `plugin` 必须显式给出 `--workspace`；Web 默认不选择工作目录，在原生界面添加和选择。CLI 密码输入无回显；非 TTY 会立即提示使用 Web 解锁入口，不等待不可见输入。Web 与独立 CLI 进程各自解锁，网页解锁不会解锁其他进程。锁定不删除历史、不取消正在运行的任务，但后续需要凭据的请求会被拒绝。
+
+子进程只继承少量操作系统环境变量，固定独立 `DSH_HOME`、禁用遥测，并固定上游 TypeScript 解析配置。启动器直接复用原生 `parseDshArgs` / `runProfile` / `runPlugin`，不调用会读取项目和用户 `.env` 的原生 bin。`plugin` 是原生 pnpm 插件管理入口，不代表默认已有终端聊天 TUI。相对插件路径保留原生的 workspace 锚定规则。
+
+## 原生组合边界
+
+该 pin 的 `name` patch 只是匹配保护，不支持替换实现。启动器从原生 base bundle 完整生成 `@johnason/dsh-encrypted-base`，仅替换 `credentials` 行；其余 base 条目及原生 Web/headless bundle 不裁剪。已有 profile 的 base 槽位改为此生成 bundle，其他插件和用户 patch 保留；最后的 `standalone-<profile>.patch.yml` 固定加密配置，执行前验证唯一 provider。这里不迁移旧用户目录、凭据或历史。
+
+Vault 使用原生 `webServer.register` 注册 `/vault` 和同源 API，通过 `tapIndex` 添加小型链接，不替换 React 应用。只接受回环地址、正确 Host、同源 JSON 写请求；请求体上限 16 KiB。页面提交后清空密码输入。第三方插件仍是受信任的本机代码，不应安装不可信插件。
 
 ## 测试
 
 ```sh
 node --test apps/dsh-agent/tests/*.test.mjs
+node --test apps/dsh-agent/tests/native-web.test.mjs
 ```
+
+定向集成测试在新临时目录启动真实原生 Web，检查原生首页、Vault、环境隔离及 SIGTERM 退出，不需要真实凭据，也不清理用户文件。OS 目录选择器、外部 MCP 服务和第三方账户的实际可用性仍取决于本机权限及用户配置。

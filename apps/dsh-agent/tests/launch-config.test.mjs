@@ -121,22 +121,30 @@ test('doctor reports absent and present native build artifacts', async () => {
   assert.deepEqual(present.diagnostics, [])
 })
 
-test('CLI blocks execution before an encrypted profile is available', () => {
+test('CLI non-TTY headless fails with visible unlock instructions and no secret', () => {
   const cli = fileURLToPath(new URL('../src/cli.mjs', import.meta.url))
-  const result = spawnSync(process.execPath, [cli, 'web'], {
+  const dataRoot = mkdtempSync(join(tmpdir(), 'dsh headless '))
+  const result = spawnSync(process.execPath, [cli, 'headless', '--data-dir', dataRoot, '--workspace', dataRoot, 'Say hello'], {
     encoding: 'utf8',
+    timeout: 30000,
     env: { PATH: process.env.PATH, HOME: '/tmp/user' },
   })
   assert.notEqual(result.status, 0)
-  assert.match(result.stderr, /PROFILE_NOT_READY/)
+  assert.match(result.stderr, /Web.*vault.*unlock|interactive terminal unlock/)
   assert.doesNotMatch(result.stderr, /synthetic-secret-do-not-use/)
 })
 
-test('CLI exposes the profile preparation boundary with a stable error code', async () => {
-  const { prepareProfile } = await import(new URL('../src/cli.mjs', import.meta.url))
-  assert.equal(typeof prepareProfile, 'function')
-  assert.throws(
-    () => prepareProfile({ mode: 'web' }),
-    error => error?.code === 'PROFILE_NOT_READY',
-  )
+test('headless preserves native profile, overlay and application flags', async () => {
+  const { resolveLaunch } = await loadLauncher()
+  const result = resolveLaunch(['headless', '--workspace', '/tmp/example', '--profile', 'custom', '--patch', '/tmp/extra.yml', '--model', 'local', 'hello'], baseOptions)
+  assert.deepEqual(result.args, ['--profile', 'headless', '--profile', 'custom', '--patch', '/tmp/extra.yml', '--model', 'local', 'hello'])
+})
+
+test('Web forwards overlays and native help without choosing a workspace', async () => {
+  const { resolveLaunch } = await loadLauncher()
+  const result = resolveLaunch(['web', '--patch', '/tmp/extra.yml', '--help'], baseOptions)
+  assert.equal(result.workspace, undefined)
+  assert.deepEqual(result.args, ['web', '--patch', '/tmp/extra.yml', '--help'])
+  const withPort = resolveLaunch(['web', '--port', '3188', '--patch', '/tmp/extra.yml', '--no-open'], baseOptions)
+  assert.deepEqual(withPort.args, ['web', '--patch', '/tmp/extra.yml', '--port', '3188', '--no-open'])
 })

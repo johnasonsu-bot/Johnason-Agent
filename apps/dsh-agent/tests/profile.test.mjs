@@ -1,0 +1,30 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { prepareProfile } from '../src/profile.mjs';
+
+test('native bundles survive encrypted overlay and duplicate providers fail closed', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-profile-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web', '--no-open'] };
+  const prepared = await prepareProfile(launch);
+  assert.equal(prepared.profile, 'web');
+  assert.deepEqual(prepared.args, ['--no-open']);
+  assert.equal(prepared.rows.filter(r => r.id === 'credentials').length, 1);
+  assert.equal(prepared.rows.some(r => r.name?.includes('credentials-local')), false);
+  const require = createRequire(join(upstreamRoot, 'apps/cli/package.json'));
+  const boot = await import(require.resolve('@deepseek-ai/dsh-app-boot'));
+  const native = boot.loadOverlayPatches('test', join(upstreamRoot, 'packages/bundle/base/cordis.patch.yml'));
+  const generated = boot.loadOverlayPatches('test', join(dataRoot, 'profiles/node_modules/@johnason/dsh-encrypted-base/cordis.patch.yml'));
+  const withoutCredential = patches => patches[0].insert.filter(row => row.id !== 'credentials');
+  assert.deepEqual(withoutCredential(generated), withoutCredential(native));
+  for (const id of ['ui-skill', 'ui-subagent', 'ui-plan', 'ui-goal', 'web-runtime']) assert.ok(prepared.rows.some(r => r.id === id), id);
+  const patchPath = join(dataRoot, 'profiles/web/cordis.patch.yml');
+  await writeFile(patchPath, JSON.stringify([{ insert: [{ id: 'bad-extra', name: '@deepseek-ai/dsh-credentials-local' }] }]));
+  await assert.rejects(prepareProfile(launch), /exactly one|credential provider/);
+  assert.match(await readFile(patchPath, 'utf8'), /bad-extra/);
+});

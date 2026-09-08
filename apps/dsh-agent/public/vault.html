@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH 凭据保险箱</title>
+<style>body{font:16px system-ui;max-width:480px;margin:80px auto;padding:24px;color:#17304a}input,button{font:inherit;padding:10px;margin:8px 0;box-sizing:border-box;width:100%}label{display:block}a{color:#17304a}#status{padding:16px;background:#f0f4f8}</style></head>
+<body><h1>凭据保险箱</h1><p>主密码只用于本进程解锁。API Key 请在原生 Models 页面录入，不要填在此处。</p><p id="status" role="status">正在读取状态…</p>
+<form id="form"><label>主密码<input id="password" type="password" autocomplete="off" required maxlength="4096"></label><label id="confirm-label">再次输入主密码<input id="confirmation" type="password" autocomplete="off" maxlength="4096"></label><button id="submit">解锁</button></form><button id="lock" type="button">锁定</button><p>锁定不会删除或取消历史任务，但后续需要凭据的请求将被拒绝。</p><a href="/">返回原生聊天</a>
+<script>
+let initialized=false;
+const status=document.getElementById('status'), form=document.getElementById('form'), password=document.getElementById('password'), confirmation=document.getElementById('confirmation');
+function show(s){initialized=s.initialized;status.textContent=s.locked?(initialized?'保险箱已锁定':'首次使用，请创建主密码'):'保险箱已解锁';form.hidden=!s.locked;document.getElementById('confirm-label').hidden=initialized;confirmation.required=!initialized;document.getElementById('submit').textContent=initialized?'解锁':'创建保险箱';document.getElementById('lock').hidden=s.locked;}
+async function action(name,data){try{const r=await fetch('/vault/'+name,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});const s=await r.json();if(!r.ok)throw Error(s.error);show(s);}catch(e){status.textContent=e.message;}finally{password.value='';confirmation.value='';}}
+form.addEventListener('submit',e=>{e.preventDefault();const data={password:password.value,confirmation:confirmation.value};password.value='';confirmation.value='';action(initialized?'unlock':'initialize',data);});
+document.getElementById('lock').onclick=()=>action('lock',{});fetch('/vault/status').then(r=>r.json()).then(show).catch(()=>status.textContent='无法读取保险箱状态');
+</script></body></html>

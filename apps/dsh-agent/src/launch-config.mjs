@@ -48,7 +48,10 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
 
   for (let index = 1; index < argv.length; index += 1) {
     const token = argv[index]
-    if (token === '--data-dir') {
+    if (token === '--') {
+      passthrough.push(...argv.slice(index))
+      break
+    } else if (token === '--data-dir') {
       dataRoot = resolve(takeValue(argv, index, token))
       index += 1
     } else if (token === '--workspace') {
@@ -65,7 +68,12 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     } else if (token === '--no-open') {
       if (mode !== 'web') throw new Error('--no-open is only valid in web mode')
       noOpen = true
-    } else if (token.startsWith('--') && mode !== 'plugin') {
+    } else if (mode === 'web' && token === '--patch') {
+      passthrough.push(token, takeValue(argv, index, token))
+      index += 1
+    } else if (mode === 'web' && ['--help', '--dump-config', '--dump-default-config'].includes(token)) {
+      passthrough.push(token)
+    } else if (token.startsWith('--') && mode !== 'plugin' && mode !== 'headless') {
       throw new Error(`Unknown option: ${token}`)
     } else {
       passthrough.push(token)
@@ -88,7 +96,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
 
   let args
   if (mode === 'web') {
-    args = ['web']
+    args = ['web', ...passthrough]
     if (port !== undefined) args.push('--port', port)
     if (noOpen) args.push('--no-open')
   } else if (mode === 'headless') {
