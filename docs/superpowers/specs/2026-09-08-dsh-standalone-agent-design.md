@@ -2,7 +2,7 @@
 
 日期：2026-09-08
 
-状态：方向已获同意；书面设计待确认；尚未实现或验收。
+状态：用户已确认并授权实施；Task 1–3 已实现并通过任务审查，Task 4 交付工程与测试已实现、待最终审查。网页环境已启动，本地模型工具闭环通过；云模型及完整原生能力验收尚未完成。
 
 ## BUSINESS POSTURE — 目标与范围
 
@@ -93,7 +93,7 @@ flowchart TB
 | 解锁入口 | Local UI/API extension | 原生界面的最小补充 | 初始化、解锁、锁定和错误提示 | 密码仅用于当前进程，锁定不清空历史 |
 | 状态存储 | Files | DSH 原生会话、设置、投影 | 刷新和重启后的历史恢复 | 不复制旧数据；配置只含凭据引用 |
 
-启动器准备独立 profile，通过最后一层 Cordis patch 替换上游 base bundle 的 `credentials` 插件项，保证只挂载一个凭据 provider。其他原生插件组合保持原样，不修改 Agent Loop；若组合验证不能证明替换成功，启动失败并说明原因，不降级到明文存储。
+启动器准备独立 profile，从锁定版本的原生 base patch 生成外置 encrypted-base bundle，只替换 `credentials` 条目的实现与配置；其他条目逐项保持相同，Web/headless 原生模式 bundle 不变。该 pin 的 Cordis patch 中 `name` 只是匹配保护，不能用最终 patch 改插件身份，这是实施核对后的集成修正。最终 overlay 固定加密 provider 配置，启动前验证只挂载一个凭据 provider。不修改 Agent Loop 或上游源码；若组合验证不能证明替换成功，启动失败并说明原因，不降级到明文存储。
 
 用户在 Web 解锁后，通过原生 Models 页面保存密钥。LLM adapter 在每次请求开始解析 `ctx.credentials`，保存后下一次请求生效。Web 与单独 CLI 进程共用加密数据但各自解锁，不能用“文件已经存在”当作解锁成功。CLI 的密码获取采用无回显交互；用户日常配置仍通过网页完成，不要求输入命令配置密钥。
 
