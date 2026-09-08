@@ -71,3 +71,28 @@ exit 0
 2. 浏览器真实本地模型尚有能力项在进行/未执行，不能把本地 MCP 无模型协议调用冒称 D8 模型验收完成。
 3. 最后一轮集中安全检查、全分支规格/质量复核由控制器拥有；本执行者未重复广审。
 4. 本地分支未推送、未合并、未删除 worktree，用户数据与控制器设计状态改动均保留。
+
+## Review fix round 1 — 真正浏览器刷新回归
+
+修复基线 `af3080f`；控制器并行提交 `c0225c4` / `a42e178` 的设计、安全及手工实测证据保留，未回滚。此次仅补回归保护和文档，生产代码及上游仍无改动。
+
+- 新增 `tests/native-browser.test.mjs`，加入默认 npm test 与 test:integration，并提供 test:browser。通过原生公共 API 在新隔离 Web 服务创建空白会话、设置持久标题和不同于默认值的 `deepseek-v4-pro`；真正 headless Google Chrome 进入原生 UI、完成首次声明，页面显示 `DeepSeek-V4-Pro`。执行 `page.reload()` 后断言浏览器 navigation entry 为 `reload`，新页面客户端仍请求同一 session、模型显示不变、原生历史标题不变、session 数量仍为 1 且 idle。前后均截图，没有把 API-only 请求当成页面刷新。
+- 范围明确：这是无模型请求的空白会话。原生 UI 按设计把空白会话显示为“新会话”，不显示其已保存标题；因此标题通过原生 history 检查，页面会话身份通过真实页面客户端 RPC 捕获核对。成功模型对话的刷新仍使用控制器手工浏览器证据，不把本测试当成 D2–D11 完整模型验收。
+- 固定的仅测试依赖 `playwright-core@1.62.1` + package-lock.json；没有传递依赖或浏览器下载。首次定向运行使用 Codex bundled 同版本库，随后实际 `npm ci --ignore-scripts --no-audit --no-fund` 安装本地锁定测试依赖，再不带 override 跑全套。浏览器为已安装 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，版本 `152.0.7977.76`；新独立 headless profile，不连接用户既有浏览器，不触碰 3080/3188。
+- 测试页面拦截/拒绝非本次 loopback 的请求，断言未发生外部 HTTP；没有初始化 Vault、没有模型调用。Chrome 与本次 Web 进程在测试后关闭。
+- README 用 `<repo-root>` / `<checkout>` 替换个人机器源码路径，实际位置留在日期报告；说明 npm ci、浏览器路径及测试范围。负向 build 测试捕获并验证预期 stderr，不再向全套测试输出预期失败文字；未改用户 npmrc。
+
+首次浏览器试运行因未完成引导、错误按钮名和对空白会话标题显示的错误预期失败；按实际原生 UI 行为修正测试准备和断言后通过。没有生产修复，因此不冒称生产 BUG 的 RED/GREEN。
+
+```text
+DSH_TEST_PLAYWRIGHT_PATH=<bundled-playwright-core/index.mjs> node --test apps/dsh-agent/tests/native-browser.test.mjs
+tests 1, pass 1, fail 0, duration_ms 5973.347917
+
+cd apps/dsh-agent
+npm ci --ignore-scripts --no-audit --no-fund
+added 1 package in 252ms
+npm test
+tests 32, pass 32, fail 0, duration_ms 12687.256291
+```
+
+最终浏览器证据目录 `/var/folders/68/l5qr2qt1181919d3fl38yhhw0000gn/T/dsh-browser-refresh-dMe7Vf`，内有 `before-refresh.png` 与 `after-refresh.png`；session `session-8c9b347c-b140-4f60-812c-01ae1b79462c`。前次定向通过的 after-refresh.png 已目视检查，原生页面与 Pro 模型选择可见。最后集中安全检查由控制器完成 14 项定向检查，不代表整个上游认证；控制器需将“无新增依赖”更新为“仅测试依赖”并做本轮范围复审。

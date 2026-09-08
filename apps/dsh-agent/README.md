@@ -25,7 +25,7 @@ git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
 ```
 
-本次交付源码位于 `/Users/sushi/Downloads/Johnason-Agent/.worktrees/dsh-standalone-agent`，本地分支 `codex/dsh-standalone-agent` 尚未推送/合并。不要将它当作已有远端发行版。构建实际在该目录下的 `third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
+以下命令假定当前目录是你的独立源码根 `<repo-root>`（例如 `<checkout>/.worktrees/dsh-standalone-agent`）；本次验收机器的实际路径只记录在[带日期的验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)。本地分支 `codex/dsh-standalone-agent` 尚未推送/合并，不是已有远端发行版。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
 
 构建入口依次执行冻结 lockfile 安装和上游原生构建。两个步骤都显式设置 `CI=true`：上游的安装脚本会据此只跳过 Git hook 配置，避免子模块位于 linked worktree 时修改 Git 配置失败；构建前的依赖状态检查也因此使用非交互模式。依赖生命周期脚本及构建检查仍会运行。启动器不会修改子模块 Git 配置。
 
@@ -59,10 +59,16 @@ Vault 使用原生 `webServer.register` 注册 `/vault` 和同源 API，通过 `
 
 ## 测试
 
+首次安装本启动器的测试依赖（仅 `playwright-core@1.62.1`，锁定于 package-lock.json；不会下载浏览器）后再运行。浏览器测试默认使用 macOS 已安装的 Google Chrome；其他位置通过 `DSH_TEST_BROWSER_PATH` 指定 Chromium/Chrome 可执行文件。没有浏览器时测试明确失败，不静默跳过。测试启动全新的隔离 headless 浏览器，不复用用户 profile。
+
 ```sh
+npm ci --prefix apps/dsh-agent --ignore-scripts
 node --test apps/dsh-agent/tests/*.test.mjs
 node --test apps/dsh-agent/tests/native-web.test.mjs
+node --test apps/dsh-agent/tests/native-browser.test.mjs
 ```
+
+可从 `apps/dsh-agent` 执行 `npm run test:integration`（含真实页面刷新）或 `npm run test:browser`。已有受信任工具运行时可以用 `DSH_TEST_PLAYWRIGHT_PATH` 指向其 `playwright-core/index.mjs`，不改变正式启动依赖。浏览器回归通过原生 API准备一个不发送模型请求的空白会话，在真正页面中查看模型、执行 `page.reload()`，检查新页面客户端继续读取同一会话，模型、历史标题和 idle 状态保持；前后截图写入新临时数据根。它不替代有真实模型消息的浏览器人工验收。
 
 定向集成测试在新临时目录启动真实原生 Web，检查原生首页、Vault、环境隔离及 SIGTERM 退出，不需要真实凭据，也不清理用户文件。OS 目录选择器、外部 MCP 服务和第三方账户的实际可用性仍取决于本机权限及用户配置。
 

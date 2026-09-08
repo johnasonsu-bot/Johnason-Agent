@@ -27,7 +27,7 @@ test('native build verifies the pinned checkout then installs and builds in orde
   assert.equal(calls[1].options.env.CI, 'true')
 })
 
-test('native build refuses an unpinned checkout before invoking corepack', async () => {
+test('native build refuses an unpinned checkout before invoking corepack', async t => {
   const { runNativeBuild } = await import(buildUrl)
   const calls = []
   const spawn = (command, args) => {
@@ -35,8 +35,11 @@ test('native build refuses an unpinned checkout before invoking corepack', async
     return { status: 0, stdout: '0000000000000000000000000000000000000000\n', stderr: '' }
   }
 
+  let stderr = ''
+  t.mock.method(process.stderr, 'write', chunk => { stderr += chunk; return true })
   assert.equal(runNativeBuild({ repoRoot: '/tmp/repo', spawn, env: {} }), 1)
   assert.equal(calls.length, 1)
+  assert.match(stderr, /DeepSeek Harness checkout is not pinned/)
 })
 
 test('native build preserves the failing command exit status and stops', async () => {
