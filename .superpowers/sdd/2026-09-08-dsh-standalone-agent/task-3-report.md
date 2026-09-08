@@ -84,3 +84,35 @@ At controller request, the manual 3188 process is intentionally still running fo
 Controller's current Qwen task `3957ab55-f789-4d6b-9a72-d3112b636844` reached native `request/header` and `request/context` with the configured local route. Native PID 42834 had an established connection to `127.0.0.1:1234`; no error or assistant/tool output had appeared when inspected. Real model task completion/performance remains controller-owned and is not claimed by this Task 3 report. No MCP external account or optional TUI installation is claimed tested.
 
 Third-party plugins and user composition remain trusted local code, as in native DSH. The encrypted store prevents ambient credential fallback through the credentials seam; it does not sandbox arbitrary user-installed code that the user authorizes. JavaScript strings cannot be reliably zeroized, although terminal/page references are dropped promptly and VaultStore clears key buffers.
+
+## Review fix round 1 — fragmented UTF-8 master passwords
+
+Implementation commit: `c15b04b` (`fix(dsh-agent): preserve fragmented UTF-8 vault passwords`).
+
+Independently reproduced the review finding in both real request handling and the actual provider terminal-unlock lifecycle. The HTTP regression creates a real local server, sends the first byte of a Chinese character, waits until the server receives that chunk, then sends the remaining bytes. The vault was initialized with the original Chinese password, so corrupting the HTTP input deterministically prevents unlocking. The terminal regression uses byte-fragmented input at the TTY stream boundary, runs the native provider's real initialization method, and validates its actual VaultStore unlock; it also checks carriage-return completion, Ctrl-C cancellation after an incomplete UTF-8 prefix, raw-mode restoration, and no password echo.
+
+RED before production changes:
+
+```text
+cd apps/dsh-agent
+node --test tests/vault-ui.test.mjs tests/credentials-plugin.test.mjs
+terminal regression: VAULT_UNLOCK_FAILED / Vault authentication failed
+HTTP regression: expected 200, actual 400
+tests 4, pass 2, fail 2
+duration_ms 517.892042
+```
+
+The Web handler now accumulates Buffers under the existing 16 KiB limit and decodes the concatenated bytes once. Terminal input now uses a stateful `StringDecoder('utf8')` and discards pending decoder state when the prompt completes or is cancelled.
+
+GREEN after the fix:
+
+```text
+node --test tests/vault-ui.test.mjs tests/credentials-plugin.test.mjs
+tests 4, pass 4, fail 0
+duration_ms 545.530792
+
+git diff --check
+exit 0
+```
+
+No upstream rebuild, broad security scan, or unrelated changes were made. The running 3188 acceptance service was neither stopped nor restarted; it still has the previously loaded modules until its next authorized restart.
