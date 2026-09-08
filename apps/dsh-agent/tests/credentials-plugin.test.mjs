@@ -4,9 +4,10 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
+import { PassThrough } from 'node:stream';
 import Provider from '../src/credentials-plugin.mjs';
 const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
-const { Context } = await import(require.resolve('@deepseek-ai/cordis'));
+const { Context, Service } = await import(require.resolve('@deepseek-ai/cordis'));
 
 test('locked resolution fails; changes are fresh and descriptions never reveal values', async () => {
   const ctx = new Context();
@@ -40,4 +41,51 @@ test('locked resolution fails; changes are fresh and descriptions never reveal v
   assert.deepEqual(recordEvents, ['llm-test/provider', 'llm-test/provider']);
   provider.vault.lock();
   await ctx.fiber.dispose();
+});
+
+test('terminal unlock preserves fragmented Chinese UTF-8 and handles enter and cancellation without echo', async t => {
+  const ctx = new Context();
+  const provider = new Provider(ctx, { path: join(await mkdtemp(join(tmpdir(), 'dsh-tty-utf8-')), 'vault.enc'), mode: 'headless' });
+  await provider.vault.initialize('中文口令');
+  provider.vault.lock();
+  const input = new PassThrough(), output = new PassThrough();
+  input.isTTY = output.isTTY = true;
+  input.isRaw = false;
+  input.setRawMode = value => { input.isRaw = value; };
+  const stdinDescriptor = Object.getOwnPropertyDescriptor(process, 'stdin');
+  const stderrDescriptor = Object.getOwnPropertyDescriptor(process, 'stderr');
+  Object.defineProperty(process, 'stdin', { configurable: true, value: input });
+  Object.defineProperty(process, 'stderr', { configurable: true, value: output });
+  t.after(async () => {
+    Object.defineProperty(process, 'stdin', stdinDescriptor);
+    Object.defineProperty(process, 'stderr', stderrDescriptor);
+    provider.vault.lock(); await ctx.fiber.dispose(); input.destroy(); output.destroy();
+  });
+  let captured = '';
+  let prompted = Promise.withResolvers();
+  output.on('data', chunk => { captured += chunk.toString(); if (captured.endsWith('password: ')) prompted.resolve(); });
+  const init = provider[Service.init]();
+  await init.next();
+  const activated = init.next();
+  await prompted.promise;
+  const passwordBytes = Buffer.from('中文口令');
+  for (const byte of passwordBytes) input.write(Buffer.from([byte]));
+  input.write('\r');
+  await activated;
+  assert.deepEqual(await provider.vault.status(), { initialized: true, locked: false });
+  assert.equal(input.isRaw, false);
+  assert.equal(captured, 'Vault master password: \n');
+  provider.vault.lock();
+  prompted = Promise.withResolvers();
+  const cancelledInit = provider[Service.init]();
+  await cancelledInit.next();
+  const cancelled = cancelledInit.next();
+  const rejection = assert.rejects(cancelled, /Unlock cancelled/);
+  await prompted.promise;
+  input.write(passwordBytes.subarray(0, 1));
+  input.write('\u0003');
+  await rejection;
+  assert.equal(input.isRaw, false);
+  assert.deepEqual(await provider.vault.status(), { initialized: true, locked: true });
+  assert.equal(captured, 'Vault master password: \nVault master password: \n');
 });

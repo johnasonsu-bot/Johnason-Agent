@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import { isDeepStrictEqual } from 'node:util';
+import { StringDecoder } from 'node:string_decoder';
 import { VaultStore } from './vault-store.mjs';
 import { installVaultUi } from './vault-ui.mjs';
 
@@ -129,14 +130,16 @@ async function passwordPrompt(label) {
   const wasRaw = input.isRaw;
   input.setRawMode(true); input.resume();
   return new Promise((resolve, reject) => {
+    const decoder = new StringDecoder('utf8');
     let value = '';
     const finish = (error) => {
       input.off('data', onData); input.setRawMode(wasRaw); input.pause(); output.write('\n');
+      decoder.end();
       if (error) reject(error); else resolve(value);
       value = '';
     };
     const onData = chunk => {
-      for (const char of chunk.toString('utf8')) {
+      for (const char of decoder.write(chunk)) {
         if (char === '\u0003' || char === '\u0004') { finish(new Error('Unlock cancelled')); return; }
         if (char === '\r' || char === '\n') { finish(); return; }
         if (char === '\u007f' || char === '\b') value = value.slice(0, -1);

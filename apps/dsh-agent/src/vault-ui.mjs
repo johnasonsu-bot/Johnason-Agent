@@ -23,14 +23,15 @@ export function createVaultHandler(vault) {
       if (req.method === 'GET' && path === '/vault/status') return send(200, await vault.status());
       if (req.method !== 'POST' || !paths.slice(2).includes(path)) return send(405, { error: 'Method not allowed' });
       if (req.headers.origin !== `http://${authority}` || req.headers['content-type']?.split(';')[0] !== 'application/json') return send(403, { error: 'Same-origin JSON required' });
-      let size = 0, body = '';
+      let size = 0;
+      const chunks = [];
       for await (const chunk of req) {
         size += chunk.length;
         if (size > 16384) return send(413, { error: 'Request too large' });
-        body += chunk.toString('utf8');
+        chunks.push(chunk);
       }
-      const data = JSON.parse(body);
-      body = '';
+      const data = JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+      chunks.length = 0;
       if (path === '/vault/lock') vault.lock();
       else {
         if (typeof data.password !== 'string' || !data.password.length || data.password.length > 4096) return send(400, { error: 'Password required (maximum 4096 characters)' });
