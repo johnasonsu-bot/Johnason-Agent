@@ -3,6 +3,17 @@ import { readFile } from 'node:fs/promises';
 const page = new URL('../public/vault.html', import.meta.url);
 const paths = ['/vault', '/vault/status', '/vault/initialize', '/vault/unlock', '/vault/lock'];
 const local = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
+const errorMessages = Object.freeze({
+  VAULT_UNLOCK_FAILED: '保险箱认证失败：密码可能不正确，或文件完整性可能受损。不会自动删除或重置保险箱。',
+  VAULT_DECRYPT_FAILED: '保险箱数据认证失败，文件可能已变化或受损。请锁定后重新解锁；不会自动删除或重置保险箱。',
+  VAULT_FORMAT_ERROR: '保险箱格式无效或不受支持。请检查文件或使用可靠备份恢复；修改密码无法修复格式问题。不会自动删除或重置保险箱。',
+  VAULT_BUSY: '保险箱正在被其他操作使用。请等待该操作完成后重试。',
+  VAULT_LOCKED: '保险箱已锁定，请先解锁再继续。',
+  VAULT_EXISTS: '保险箱已经初始化，请解锁已有保险箱；本次操作未覆盖它。',
+  VAULT_NOT_INITIALIZED: '保险箱尚未初始化，请先创建保险箱再解锁。',
+  VAULT_LOCK_OWNERSHIP_LOST: '保险箱操作锁的归属已变化。请停止并发操作后重试，不要删除锁或保险箱文件。',
+  VAULT_OPERATION_FAILED: '保险箱操作失败，请重试或检查本地保险箱状态。不会自动删除或重置保险箱。',
+});
 
 /** HTTP handler restricted to local same-origin requests; responses never include input or credentials. */
 export function createVaultHandler(vault) {
@@ -43,8 +54,10 @@ export function createVaultHandler(vault) {
         } finally { data.password = ''; data.confirmation = ''; }
       }
       return send(200, await vault.status());
-    } catch {
-      return send(400, { error: 'Vault operation failed. Check the password and vault state; existing data is preserved.' });
+    } catch (error) {
+      const code = typeof error?.code === 'string' && Object.hasOwn(errorMessages, error.code)
+        ? error.code : 'VAULT_OPERATION_FAILED';
+      return send(400, { code, error: errorMessages[code] });
     }
   };
 }
