@@ -11,7 +11,10 @@ import { EffectStore } from '../src/effect-store.mjs';
 const native = path => import(new URL(`../../../third_party/deepseek-harness/packages/${path}/lib/index.js`, import.meta.url));
 const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
 const { Context } = require('@deepseek-ai/cordis');
-const { default: Sessions } = await native('core/session');
+const { default: Sessions, KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek-ai/dsh-session').catch(cause => {
+  if (cause.code !== 'ERR_MODULE_NOT_FOUND') throw cause;
+  return native('core/session');
+});
 const { default: Tools } = await native('core/tools');
 const { default: Prompt } = await native('core/system-prompt');
 const { default: Llm, createUserMessage } = await native('llm/llm');
@@ -19,6 +22,7 @@ const { default: Agents } = await native('core/agent');
 const { default: Loop } = await native('core/agent-loop');
 const { default: Sandbox } = await native('sandbox/sandbox-local');
 const { default: Policy } = await native('sandbox/sandbox-policy');
+const { default: JsonlPersistence } = await native('session/session-persistence-jsonl');
 
 async function fixture(t, options = {}) {
   const root = mkdtempSync(join(homedir(), 'dsh-memory-runtime-'));
@@ -26,6 +30,7 @@ async function fixture(t, options = {}) {
   t.diagnostic(`Retained native integration fixture: ${root}`);
   const ctx = new Context();
   for (const plugin of [Llm, Sessions, Prompt, Tools, Agents]) await ctx.plugin(plugin);
+  if (options.persistence) await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none', packChunks: false });
   await ctx.plugin(Loop, { agents: [] });
   await ctx.plugin(Sandbox);
   await ctx.plugin(Policy, { mode: options.nativeMode ?? 'workspace-write', workspaceRoot });
@@ -243,6 +248,69 @@ test('restored native same-session config replays missing tail exactly and does 
   const derived = ctx.memoryRecovery.listMemories(restored.id).find(r => r.content.data?.memoryRecoveryDerived);
   assert.equal(Object.hasOwn(derived.content.data, 'content'), false);
   await ctx.sessions.flush(restored);
+});
+
+test('native catalog registration is reference counted and preserves preexisting entries', async t => {
+  const types = ['memory-recovery/config', 'memory-recovery/tool-io', 'memory-recovery/page-selection'];
+  const catalog = KNOWN_SESSION_EVENT_TYPES;
+  assert.equal(types.some(type => catalog.has(type)), false);
+  catalog.add(types[0]); // Simulate a preexisting native registration, which we do not own.
+  try {
+    const first = await fixture(t);
+    const second = await fixture(t);
+    assert.equal(types.every(type => catalog.has(type)), true);
+    await first.ctx.fiber.dispose();
+    assert.equal(types.every(type => catalog.has(type)), true);
+    await second.ctx.fiber.dispose();
+    assert.equal(catalog.has(types[0]), true);
+    assert.equal(catalog.has(types[1]), false);
+    assert.equal(catalog.has(types[2]), false);
+    assert.equal(catalog.has('user/message'), true);
+  } finally { catalog.delete(types[0]); }
+});
+
+test('native catalog implementation mismatch fails plugin initialization explicitly', async t => {
+  const f = await fixture(t);
+  await f.ctx.fiber.dispose();
+  const ctx = new Context();
+  for (const plugin of [Sessions, Prompt, Tools, Sandbox]) await ctx.plugin(plugin);
+  await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
+  t.after(() => ctx.fiber.dispose());
+  KNOWN_SESSION_EVENT_TYPES.add = () => { throw new Error('must not call unknown implementation'); };
+  try {
+    await assert.rejects(async () => { await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true }); }, { code: 'MEMORY_NATIVE_EVENT_CATALOG_UNSUPPORTED' });
+  } finally { delete KNOWN_SESSION_EVENT_TYPES.add; }
+});
+
+test('real native persistence reopens required memory events without allowing unrelated unknown types', async t => {
+  const f = await fixture(t, { persistence: true }); await f.configure();
+  await f.service.projectContext(f.agent.id);
+  assert.equal((await f.execute('memory_sandbox_run', { argv: [process.execPath, '-e', 'process.stdout.write("reopen-raw")'] }, 'persisted-call')).value.state, 'COMMITTED');
+  await f.service.barrier(f.agent.id);
+  const expectedTypes = ['memory-recovery/config', 'memory-recovery/page-selection', 'memory-recovery/tool-io'];
+  const expected = f.agent.session.events.filter(event => expectedTypes.includes(event.type));
+  assert.deepEqual(expected.map(event => event.type), expectedTypes);
+  const unknown = f.ctx.sessions.create('unknown-required', { meta: { cwd: f.workspaceRoot } });
+  unknown.append('memory-recovery/unregistered', { value: 'must reject' });
+  await f.ctx.sessions.flush(unknown);
+  await f.ctx.fiber.dispose();
+  const ctx = new Context();
+  for (const plugin of [Sessions, Prompt, Tools]) await ctx.plugin(plugin);
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
+  await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
+  t.after(() => ctx.fiber.dispose());
+  const prepared = await ctx.sessionPersistence.prepare(f.agent.id);
+  try {
+    const restored = prepared.session;
+    assert.deepEqual(restored.events.filter(event => expectedTypes.includes(event.type)), expected);
+    ctx.effect(() => ctx.sessions.enter(restored)); ctx.sessions.announce(restored);
+    await ctx.sessions.flush(restored);
+    assert.equal(ctx.memoryRecovery.getSessionConfig(restored.id).enabled, true);
+    assert.equal(ctx.memoryRecovery.listEffects(restored.id)[0].state, 'COMMITTED');
+    assert.equal(ctx.memoryRecovery.getMemory(restored.id, `event:${restored.id}:${expected[2].seq}`).content.data.value.stdout, 'reopen-raw');
+  } finally { prepared[Symbol.dispose](); }
+  await assert.rejects(ctx.sessionPersistence.prepare('unknown-required'), { name: 'SessionFormatUnsupportedError' });
 });
 
 test('trusted operator confirms a candidate but model operator impersonation and budget overflow fail closed', async t => {

@@ -11,6 +11,12 @@ import { installMemoryTools, MEMORY_TOOL_NAMES } from './memory-tools.mjs';
 const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
 const { Service } = await import(require.resolve('@deepseek-ai/cordis'));
 const { createUserMessage } = await import(new URL('../../../third_party/deepseek-harness/packages/llm/llm/lib/index.js', import.meta.url));
+// Match the reader's ESM resolution: the native Web launcher uses tsx source aliases.
+// Plain Node component hosts use the built package from the CLI dependency graph.
+const { KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek-ai/dsh-session').catch(cause => {
+  if (cause.code !== 'ERR_MODULE_NOT_FOUND' || !cause.message.includes("package '@deepseek-ai/dsh-session'")) throw cause;
+  return import(require.resolve('@deepseek-ai/dsh-session'));
+});
 export const name = 'johnason-memory-recovery';
 export const inject = ['sessions', 'tools', 'sandbox', 'sandboxPolicy'];
 const QUEUE_EVENTS = 512;
@@ -23,6 +29,32 @@ const error = (code, message = code) => Object.assign(new Error(message), { code
 const owned = event => event.type === 'user/message' && event.data.source?.kind === 'plugin' && event.data.source.plugin === name;
 const textOf = message => message.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') ?? '';
 const clean = data => sanitizeEvent({ seq: 0, type: IO_EVENT, time: Date.now(), data }).event.data;
+
+// Compatibility shim for the pinned native reader, not a stable registration API.
+// Replace with upstream's formal event registry when that extension seam exists.
+const MEMORY_EVENT_TYPES = [CONFIG_EVENT, IO_EVENT, 'memory-recovery/page-selection'];
+let catalogUsers = 0;
+let catalogAdded = [];
+function retainNativeEventCatalog() {
+  const catalog = KNOWN_SESSION_EVENT_TYPES;
+  if (!(catalog instanceof Set) || Object.getPrototypeOf(catalog) !== Set.prototype
+      || ['has', 'add', 'delete'].some(method => catalog[method] !== Set.prototype[method])) {
+    throw error('MEMORY_NATIVE_EVENT_CATALOG_UNSUPPORTED', 'Pinned native event catalog is no longer the supported Set implementation');
+  }
+  if (catalogUsers++ === 0) {
+    catalogAdded = MEMORY_EVENT_TYPES.filter(type => !catalog.has(type));
+    for (const type of catalogAdded) catalog.add(type);
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--catalogUsers === 0) {
+      for (const type of catalogAdded) catalog.delete(type);
+      catalogAdded = [];
+    }
+  };
+}
 
 // Database lock is not a renewable lease. Never steal from a live PID; ambiguous liveness
 // fails closed. The row remains on disk (no lock-file deletion or fixture cleanup).
@@ -58,14 +90,18 @@ class MemoryRecovery extends Service {
     this.#enabled = config.enabled;
     this.#store = new MemoryStore(config.path);
     this.#effects = new EffectStore(this.#store);
+    let releaseCatalog;
     try {
       acquireRuntime(this.#store.db, this.#owner);
       // The only recovery site: exclusive process startup, before any listener/tool dispatch.
       for (const scope of this.#store.db.prepare('SELECT DISTINCT project_id AS projectId, session_id AS sessionId, agent_id AS agentId FROM effect_identities').all()) this.#effects.recover(scope);
+      releaseCatalog = retainNativeEventCatalog();
     } catch (cause) {
       this.#store.db.prepare('UPDATE memory_runtime_owner SET pid=NULL, token=NULL WHERE id=1 AND token=?').run(this.#owner);
       this.#store.close(); throw cause;
     }
+    // Registered before observers, so their disposal completes before the final release.
+    ctx.effect(() => releaseCatalog);
     // Derived context is retained in native history, but cannot feed itself back into paging.
     const visible = record => record && !record.content?.data?.memoryRecoveryDerived;
     this.#pager = new MemoryPager({ db: this.#store.db,
