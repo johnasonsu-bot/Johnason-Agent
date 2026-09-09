@@ -14,6 +14,8 @@
 
 DSH session log 是会话权威；memory/recovery.sqlite 是三类记忆及 Effect 领域权威，不保存另一套可恢复聊天。情景记忆是 DSH 事件的带来源投影，源引用固定 session_id/seq，重复摄入幂等；游标和投影在同一事务提交。语义和规程修改为追加版本，可从领域记录重建索引。
 
+当前固定版本的 DSH 尚无下游事件类型注册 API。为使配置、工具原始数据和分页选择能够通过原生日志冷恢复，插件使用有界兼容适配，仅向原生导出的事件类型集合注册 `memory-recovery/config`、`memory-recovery/tool-io`、`memory-recovery/page-selection` 三种自有类型；不修改第三方文件或日志，不把必需事件标成可忽略。适配验证集合实现、按插件实例计数并在最后卸载时撤销自有注册；其他未知必需事件仍拒绝。此项依赖当前 pin 的实现，不宣称稳定原生扩展 API；升级 DSH 时必须验证或替换为正式注册接口。
+
 ## A1 三类记忆
 
 1. Episodic：按顺序保留获准记录的工具输入输出、执行结果与事件；大型数据存在底层记录，模型默认只见摘要句柄。过滤凭据字段和已识别秘密，不摄入 credentials/Vault 事件，不声明正则能识别任意秘密。
@@ -34,9 +36,9 @@ session/event 进入有界队列，按批增量持久化；session/flush、工�
 
 ## E1 提交协议与双时态
 
-每个执行操作绑定 effect_id、project/session/step、工具名、输入指纹、workspace 与 sandbox policy。只读或调用方明确支持幂等/事务的能力分类由适配器声明，不由模型一句话决定。
+每个纳入受控执行适配器的操作绑定 effect_id、project/session/step、工具名、输入指纹、workspace 与 sandbox policy。首个适配器为原生授权链下的 memory_sandbox_run；要求沙箱时，其他尚未证明符合策略的原生工具拒绝执行。只启用记忆、保留原生工具行为的会话必须标注 native-memory-only，不能宣称这些工具已经有 Effect 重放保护；操作页面默认使用受控沙箱。只读或调用方明确支持幂等/事务的能力分类由适配器声明，不由模型一句话决定。
 
-状态为 PREPARED → EXECUTING → COMMITTED / ABORTED / UNKNOWN。真正事务参与方支持 prepare/commit/abort 时执行两阶段协议：prepare durable 后允许 commit，结果 durable 后提交权威状态。任意 shell/API 不支持该协议，明确标记 reservation-execution-confirmation，不冒充分布式 2PC。执行开始前保存意图，执行结果丢失标 UNKNOWN；重启不自动重新执行写操作。
+状态为 PREPARED → EXECUTING → COMMITTED / ABORTED / UNKNOWN。本轮落地的是状态机的意图持久化、执行、结果确认两阶段边界；任意 shell/API 不支持外部事务协议，明确标记 reservation-execution-confirmation，不冒充分布式 2PC。真正参与方 prepare/commit/abort 适配器作为扩展点，未实现的协议明确拒绝，不能仅凭请求声明启用。执行开始前保存意图，执行结果丢失标 UNKNOWN；重启不自动重新执行写操作。
 
 同 effect_id+同输入重复请求返回已有状态/结果；不同输入冲突拒绝。并发 owner 用事务 compare-and-set 抢占，旧 owner 不可覆盖新结果；EXECUTING 不能被第二调用者重复派发。复用原生 callId 但加 session 作用域，不能凭内容相同把两个用户有意重复的操作合并。恢复中未完成 prepare 与已派发未知分开显示。
 

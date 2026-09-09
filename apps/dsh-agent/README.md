@@ -98,3 +98,15 @@ node --test apps/dsh-agent/tests/native-lifecycle.test.mjs
 ## 固定版本升级
 
 升级是明确维护动作，不自动追踪 `latest`。先停止自己启动的服务，备份整个独立数据根（含加密 Vault 与原生会话；不导出明文密钥），在新的维护分支/工作树中评估目标提交。一起更新子模块 gitlink、构建入口与启动校验中的固定 SHA；保留冻结 lockfile 和经验证的 pnpm 版本，必要时显式评审其升级。重新执行原生构建、doctor、全部薄层测试和 D1–D12 实测后再使用正式数据根。不要擅自覆盖子模块改动、重置旧分支或删除旧数据。
+
+## 分层记忆、恢复审计与任务沙箱（A1/A2/E1/E2）
+
+原生构建完成后，沿用本页的 `node src/cli.mjs web --data-dir <新独立数据目录> --port <空闲端口> --no-open` 启动命令，无需重建聊天界面。原生聊天右下角新增「记忆 / 恢复 / 沙箱」链接，路径为同源 `/memory-recovery`。
+
+1. 填写显式项目 ID 与已存在 workspace 绝对路径，点击「创建新原生会话」，再保存配置。首次启用只接受本进程观察到的未启动新会话；旧会话不会自动迁移或开权限。
+2. 默认 required sandbox / workspace-write；read-only 可选。仅 `memory_sandbox_run` 具有 Effect 重放保护，未验证工具被阻断。选择仅记忆模式时，原生工具没有 Effect 重放保护。网络只支持 host，不支持 network=none、容器根或 CPU/内存配额。
+3. 可查看三类记忆、来源和历史版本；追加语义节点/关系、人工确认候选规程；搜索返回摘要，显式调入才选中有界正文页，下一原生模型 step 生效。调出不删历史，工作集重启后需重新调入。
+4. Effect 查询支持 validAt/systemAt 与显式因果边。UNKNOWN 必须核查，不会自动再执行；COMMITTED 不代表业务成功。页面不提供命令执行、recover 或人工伪造机器 proof。
+5. 点击「打开此会话的原生聊天」后才由用户发送任务。模型、审批与 Vault 仍走原生路径；本页面不会替用户生成或继续历史任务。
+
+定向验证：`node --test tests/memory-recovery-ui.test.mjs`；全回归：`node --test tests/*.test.mjs`。显式运行一次全新本地模型验收使用 `node scripts/accept-memory-recovery.mjs`；只启动新的手工环境、不请求模型使用 `node scripts/accept-memory-recovery.mjs --serve-only`。脚本打印独立目录、空闲端口和精确启动参数，使用本机 `127.0.0.1:1234/v1` 的 Qwen 模型；不读取旧凭据、修改 LM Studio 模板或删除夹具。完整证据和局限见[记忆与恢复验收记录](../../docs/testing/2026-09-09-dsh-memory-recovery-acceptance.md)。
