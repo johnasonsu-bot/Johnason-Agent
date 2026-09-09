@@ -2,7 +2,11 @@
 
 日期：2026-09-09。Task 4 基于 `be6a26f`（含 Task 3 真实新会话及 cold-reopen 修复），只增加原生 Web 操作入口，不重做聊天或模型循环。
 
-结论：审查修复后最终全 app **102/102 通过**；真实本地模型完成分页→Seatbelt 文件写入，随后真正冷重启回查及浏览器展示通过。本轮只重新验证保留证据，未再次调用模型。新的手工服务保留在 64356，未操作旧服务/会话或删除任何夹具。
+结论：最终 scoped 修复及 Unicode 补丁 `d34a78f` 后全 app **111/111 通过**（完整结果见 SDD `final-fix-report.md`、`final-unicode-fix-report.md`；下文 89/102/110 为历史轮次）；真实本地模型完成分页→Seatbelt 文件写入，随后真正冷重启回查及浏览器展示通过。后续轮次只重新验证保留证据，未再次调用模型。手工环境仍使用原 64356/dataRoot，未操作旧服务/会话或删除任何夹具。
+
+最终五项修复：先等原生持久化成功再投影并核验已存来源；长流采用有界批量 drain；搜索先过滤再限制结果；保护规程不被无关记录截断；存储/工具/HTTP/UI 支持固定版本的 offset/nextOffset 正文续页。全 app 110 pass / 0 fail，原生持久化/长流/来源冲突/真实工具尾页定向 4/4；既有模型 fixture 冷恢复再次通过，无新模型请求。实现与证据边界详见上述 final-fix-report，不把组件测试称为额外真实模型执行。
+
+最后补丁修复 UTF-16 分页切断代理对时经 SQLite TEXT 变成替代字符的问题：以 JSON 转义传输切片后还原，保持原 offset 单位及边界。真实 SQLite 与 HTTP 的 RED→GREEN 均逐代码单元和拼接原文验证；最终全 app **111 pass / 0 fail**，没有额外模型请求。
 
 ## 验收范围
 
@@ -87,7 +91,11 @@
 
 返回记忆页查看 Effect 和 pending/durable 状态；COMMITTED 仍须结合实际 exitCode 判断成功，UNKNOWN 不重放。此示例只验证沙箱文件任务，不替代上文已经完成的真实分页→模型→沙箱全链路证据。
 
-本次已留运行的新手工环境：[记忆与恢复页面](http://127.0.0.1:64356/memory-recovery)。dataRoot `/Users/sushi/dsh-memory-live-k6bzYi`，workspace `/Users/sushi/dsh-memory-live-k6bzYi/workspace`，默认 provider `local-acceptance` / model `qwen3.8-27b-uncensored-mlx`，没有自动创建任务或调用模型。已请求在 Codex 打开该页；应用返回 queued，页面会在对应任务显示时打开。精确无密钥重启命令（只在此环境已停止且端口空闲时使用）：
+手工环境地址：[记忆与恢复页面](http://127.0.0.1:64356/memory-recovery)。dataRoot `/Users/sushi/dsh-memory-live-k6bzYi`，workspace `/Users/sushi/dsh-memory-live-k6bzYi/workspace`，默认 provider `local-acceptance` / model `qwen3.8-27b-uncensored-mlx`，没有自动创建任务或调用模型。以下记录截至子任务交接，主任务应启动后再确认可访问，不将尚未执行的启动写成成功。
+
+`cc0f070` 更新时只读检查发现旧自有服务已退出：64356 无监听，旧 exec 不存在，无对应进程，因而未发出终止命令。使用同一 dataRoot/workspace/overlay/端口恢复后，原生 `session.list` 和 UI 会话列表均为空（0 running）；只读 SQLite records/cursors 均为 0，无用户既有配置记录可回读。GET 页面 200，defaults 返回上述真实目录，实际页面返回正文 offset 和固定版本「下一页」控件及 nextOffset 逻辑。没有为检查生成测试记录或请求模型。`d34a78f` 交接时再次确认 0 session / 0 running，核对自有 CLI 60297 / native 60298 后仅 TERM CLI；其 exec 77603 退出 0、两个进程消失、64356 无监听。主任务接管同一启动命令持有最终代码服务，避免子任务退出影响手工使用；不替换目录、不复制 Vault、不触碰 3080/3188。
+
+精确无密钥启动命令（已确认端口空闲，启动由主任务负责）：
 
 ```sh
 /Users/sushi/.nvm/versions/node/v22.20.0/bin/node \
