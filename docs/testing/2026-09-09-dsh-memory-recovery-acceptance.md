@@ -91,11 +91,11 @@
 
 返回记忆页查看 Effect 和 pending/durable 状态；COMMITTED 仍须结合实际 exitCode 判断成功，UNKNOWN 不重放。此示例只验证沙箱文件任务，不替代上文已经完成的真实分页→模型→沙箱全链路证据。
 
-手工环境地址：[记忆与恢复页面](http://127.0.0.1:64356/memory-recovery)。dataRoot `/Users/sushi/dsh-memory-live-k6bzYi`，workspace `/Users/sushi/dsh-memory-live-k6bzYi/workspace`，默认 provider `local-acceptance` / model `qwen3.8-27b-uncensored-mlx`，没有自动创建任务或调用模型。以下记录截至子任务交接，主任务应启动后再确认可访问，不将尚未执行的启动写成成功。
+手工环境地址：[记忆与恢复页面](http://127.0.0.1:64356/memory-recovery)。dataRoot `/Users/sushi/dsh-memory-live-k6bzYi`，workspace `/Users/sushi/dsh-memory-live-k6bzYi/workspace`，默认 provider `local-acceptance` / model `qwen3.8-27b-uncensored-mlx`，没有自动创建任务或调用模型。主任务已用下方原命令接管启动（PTY 56863，native PID 63855），观察到 `dsh web: http://127.0.0.1:64356`，并实测 `/memory-recovery` HTTP 200。最终 scoped 复审 Approved、全部五项 closed；主任务最新全 app 再验 **111/111 pass**。
 
 `cc0f070` 更新时只读检查发现旧自有服务已退出：64356 无监听，旧 exec 不存在，无对应进程，因而未发出终止命令。使用同一 dataRoot/workspace/overlay/端口恢复后，原生 `session.list` 和 UI 会话列表均为空（0 running）；只读 SQLite records/cursors 均为 0，无用户既有配置记录可回读。GET 页面 200，defaults 返回上述真实目录，实际页面返回正文 offset 和固定版本「下一页」控件及 nextOffset 逻辑。没有为检查生成测试记录或请求模型。`d34a78f` 交接时再次确认 0 session / 0 running，核对自有 CLI 60297 / native 60298 后仅 TERM CLI；其 exec 77603 退出 0、两个进程消失、64356 无监听。主任务接管同一启动命令持有最终代码服务，避免子任务退出影响手工使用；不替换目录、不复制 Vault、不触碰 3080/3188。
 
-精确无密钥启动命令（已确认端口空闲，启动由主任务负责）：
+精确无密钥启动命令（主任务已执行；再次使用前须确认该自有服务已停止且端口空闲）：
 
 ```sh
 /Users/sushi/.nvm/versions/node/v22.20.0/bin/node \
