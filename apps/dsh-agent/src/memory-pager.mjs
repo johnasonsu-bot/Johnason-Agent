@@ -1,6 +1,7 @@
 const MAX_SEARCH_LIMIT = 100;
 const MAX_PAGE_CHARS = 100_000;
 const MAX_BUDGET_TOKENS = 1_000_000;
+const MAX_LINKED_GROUP = 1_000;
 
 function pagerError(code, message, ErrorClass = Error) {
   const error = new ErrorClass(message);
@@ -71,24 +72,68 @@ function eventSeqs(page, sessionId) {
     .map(source => source.seq);
 }
 
-function groupFor(page, scope, episodes, loadedById) {
+function relatedEpisodes(store, scope, seq) {
+  return store.db.prepare(`
+    WITH latest AS (
+      SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY project_id, id ORDER BY version DESC
+      ) AS rank
+      FROM memory_records
+      WHERE project_id = ? AND kind = 'episodic'
+        AND (visibility = 'project' OR (session_id = ? AND agent_id = ?))
+    )
+    SELECT DISTINCT latest.id, latest.version
+    FROM latest, json_each(latest.source_refs_json) AS source
+    WHERE latest.rank = 1
+      AND json_extract(source.value, '$.type') = 'event'
+      AND json_extract(source.value, '$.projectId') = ?
+      AND json_extract(source.value, '$.sessionId') = ?
+      AND json_extract(source.value, '$.agentId') = ?
+      AND json_extract(source.value, '$.seq') = ?
+    LIMIT ?
+  `).all(
+    scope.projectId,
+    scope.sessionId,
+    scope.agentId,
+    scope.projectId,
+    scope.sessionId,
+    scope.agentId,
+    seq,
+    MAX_LINKED_GROUP + 1,
+  );
+}
+
+function groupFor(page, scope, loadedById, store) {
   if (page.kind !== 'episodic') return [page];
-  const seqs = new Set(eventSeqs(page, scope.sessionId));
-  const groupedIds = new Set([page.id]);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const episode of episodes) {
-      if (groupedIds.has(episode.id)) continue;
-      const episodeSeqs = eventSeqs(episode, scope.sessionId);
-      if (!episodeSeqs.some(seq => seqs.has(seq))) continue;
-      groupedIds.add(episode.id);
-      for (const seq of episodeSeqs) seqs.add(seq);
-      changed = true;
+  const exactEpisodes = new Map([[page.id, page]]);
+  const pendingSeqs = [...eventSeqs(page, scope.sessionId)];
+  const visitedSeqs = new Set();
+  while (pendingSeqs.length > 0) {
+    const seq = pendingSeqs.shift();
+    if (visitedSeqs.has(seq)) continue;
+    visitedSeqs.add(seq);
+
+    const sourceId = `event:${scope.sessionId}:${seq}`;
+    const sourceRecord = store.get(scope, sourceId);
+    if (sourceRecord === null || sourceRecord.kind !== 'episodic') return null;
+    if (!exactEpisodes.has(sourceId)) {
+      exactEpisodes.set(sourceId, loadedById.get(sourceId) ?? handleFor(sourceRecord));
+      if (exactEpisodes.size > MAX_LINKED_GROUP) return null;
+    }
+
+    const related = relatedEpisodes(store, scope, seq);
+    if (related.length > MAX_LINKED_GROUP) return null;
+    for (const relation of related) {
+      if (exactEpisodes.has(relation.id)) continue;
+      const record = store.get(scope, relation.id, relation.version);
+      if (record === null || record.kind !== 'episodic') return null;
+      const exact = loadedById.get(record.id) ?? handleFor(record);
+      exactEpisodes.set(record.id, exact);
+      pendingSeqs.push(...eventSeqs(exact, scope.sessionId));
+      if (exactEpisodes.size > MAX_LINKED_GROUP) return null;
     }
   }
-  return episodes
-    .filter(episode => groupedIds.has(episode.id))
+  return [...exactEpisodes.values()]
     .sort((left, right) => Math.max(...eventSeqs(left, scope.sessionId))
       - Math.max(...eventSeqs(right, scope.sessionId)))
     .map(episode => loadedById.get(episode.id) ?? episode);
@@ -200,12 +245,15 @@ export class MemoryPager {
     const handles = query.trim().length === 0
       ? []
       : this.search(scope, query, { limit: MAX_SEARCH_LIMIT }).filter(page => !loadedIds.has(page.id));
-    const episodes = this.#store.list(scope, { kind: 'episodic', limit: 1_000 }).map(handleFor);
     const pages = [];
     const processedIds = new Set();
     for (const page of [...loaded, ...handles]) {
       if (processedIds.has(page.id)) continue;
-      const group = groupFor(page, scope, episodes, loadedById);
+      const group = groupFor(page, scope, loadedById, this.#store);
+      if (group === null) {
+        processedIds.add(page.id);
+        continue;
+      }
       for (const groupedPage of group) processedIds.add(groupedPage.id);
       const pageText = group.map(contextForPage).join('\n');
       const candidate = contextText.length === 0 ? pageText : `${contextText}\n${pageText}`;

@@ -24,7 +24,11 @@ function semantic(id, summary, content, visibility = 'project') {
     visibility,
     content: { nodes: [{ id, type: 'fact', label: content }], edges: [] },
     summary,
-    sourceRefs: [{ sessionId: 'session', seq: id.length }],
+    sourceRefs: [{
+      type: 'operator',
+      operatorId: 'local-user',
+      reason: 'unit-test definition',
+    }],
   };
 }
 
@@ -56,7 +60,11 @@ test('page in exposes bounded content, page out changes selected context, and ne
   const page = pager.pageIn(owner, 'long', { maxChars: 80 });
   assert.equal(page.contentText.length, 80);
   assert.equal(page.truncated, true);
-  assert.deepEqual(page.sourceRefs, [{ sessionId: 'session', seq: 4 }]);
+  assert.deepEqual(page.sourceRefs, [{
+    type: 'operator',
+    operatorId: 'local-user',
+    reason: 'unit-test definition',
+  }]);
 
   const during = pager.select(owner, { query: '', budgetTokens: 200, anchors: ['Task goal'] });
   assert.equal(during.contextText.includes('xxxxxxxx'), true);
@@ -117,6 +125,85 @@ test('selection treats a tool call and its sourced result as one budget unit', a
 
   const tight = pager.select(owner, { query: 'paired-needle', budgetTokens: 35, anchors: [] });
   assert.notEqual(tight.pages.length, 1);
+  store.close();
+});
+
+test('selection resolves a linked call exactly when it falls outside the latest episodic window', async () => {
+  const { store, pager } = await createPager('tool-pair-window');
+  const events = [
+    { seq: 0, type: 'tool/call', time: 1, data: { name: 'read_file' } },
+    ...Array.from({ length: 1_000 }, (_, index) => ({
+      seq: index + 1,
+      type: 'assistant/chunk',
+      time: index + 2,
+      data: { text: `filler-${index + 1}` },
+    })),
+    {
+      seq: 1_001,
+      type: 'tool/result',
+      time: 1_002,
+      data: { value: 'far-paired-needle' },
+      sourceEventSeqs: [0],
+    },
+  ];
+  store.ingestEvents({ ...owner, events });
+
+  const result = pager.select(owner, { query: 'far-paired-needle', budgetTokens: 200, anchors: [] });
+  assert.deepEqual(result.pages.map(page => page.id), [
+    'event:session:0',
+    'event:session:1001',
+  ]);
+  store.close();
+});
+
+test('selection omits an entire linked group when a source has no visible projection', async () => {
+  const { store, pager } = await createPager('tool-pair-missing');
+  store.ingestEvents({
+    ...owner,
+    events: [
+      { seq: 0, type: 'vault/credentials', time: 1, data: { value: 'filtered' } },
+      {
+        seq: 1,
+        type: 'tool/result',
+        time: 2,
+        data: { value: 'missing-paired-needle' },
+        sourceEventSeqs: [0],
+      },
+    ],
+  });
+
+  const result = pager.select(owner, { query: 'missing-paired-needle', budgetTokens: 200, anchors: [] });
+  assert.deepEqual(result.pages, []);
+  assert.equal(result.contextText, '');
+  store.close();
+});
+
+test('selection resolves reverse and transitive dependencies outside the episodic window', async () => {
+  const { store, pager } = await createPager('tool-pair-reverse-window');
+  const events = [
+    { seq: 0, type: 'tool/call', time: 1, data: { name: 'read_file' } },
+    {
+      seq: 1,
+      type: 'tool/result',
+      time: 2,
+      data: { value: 'result' },
+      sourceEventSeqs: [0],
+    },
+    ...Array.from({ length: 1_000 }, (_, index) => ({
+      seq: index + 2,
+      type: 'assistant/chunk',
+      time: index + 3,
+      data: { text: `later-${index + 2}` },
+    })),
+  ];
+  store.ingestEvents({ ...owner, events });
+  pager.pageIn(owner, 'event:session:0', { maxChars: 100 });
+
+  const result = pager.select(owner, { query: '', budgetTokens: 200, anchors: [] });
+  assert.deepEqual(result.pages.map(page => page.id), [
+    'event:session:0',
+    'event:session:1',
+  ]);
   store.close();
 });
 

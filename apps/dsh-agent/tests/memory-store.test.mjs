@@ -28,7 +28,11 @@ function memory(overrides = {}) {
       edges: [],
     },
     summary: 'Billing API architecture',
-    sourceRefs: [{ sessionId: 'session-a', seq: 4 }],
+    sourceRefs: [{
+      type: 'operator',
+      operatorId: 'local-user',
+      reason: 'unit-test definition',
+    }],
     ...overrides,
   };
 }
@@ -55,6 +59,13 @@ test('persists episodic, semantic, and procedural memories across restart as det
     content: { rules: ['Retry only idempotent requests'], applicability: { tool: 'http' } },
     summary: 'Safe retry candidate',
     status: 'candidate',
+    sourceRefs: [{
+      type: 'event',
+      projectId: 'project-a',
+      sessionId: 'session-a',
+      agentId: 'agent-a',
+      seq: 0,
+    }],
   }), model);
 
   semanticContent.nodes[0].label = 'mutated by caller';
@@ -205,6 +216,26 @@ test('appends semantic revisions and reconstructs nodes and typed edges as of va
   ]);
   assert.equal(store.graph(ownScope, { systemAt: first.systemTime }).records[0].version, 1);
   assert.equal(store.graph(ownScope, {}).nodes.find(node => node.id === 'api').label, 'API v2');
+
+  const correction = store.putMemory(memory({
+    id: 'contract',
+    expectedVersion: 2,
+    validTime: 10,
+    content: {
+      nodes: [
+        { id: 'api', type: 'service', label: 'API v1 corrected' },
+        { id: 'db', type: 'database', label: 'Database' },
+      ],
+      edges: [{ from: 'api', relation: 'reads-corrected', to: 'db' }],
+    },
+  }), operator);
+  assert.equal(correction.version, 3);
+  assert.equal(store.graph(ownScope, { validAt: 25 }).records[0].version, 2);
+  assert.equal(store.graph(ownScope, {
+    validAt: 15,
+    systemAt: second.systemTime,
+  }).records[0].version, 1);
+  assert.equal(store.graph(ownScope, { validAt: 15 }).records[0].version, 3);
   store.close();
 });
 
@@ -223,11 +254,22 @@ test('enforces project visibility and exact session plus agent ownership for pri
 
 test('allows models to propose candidates but only operators can confirm or modify protected procedures', async () => {
   const store = new MemoryStore(await memoryPath('procedure'));
+  store.ingestEvents({
+    ...ownScope,
+    events: [{ seq: 0, type: 'tool/result', time: 1, data: { failure: 'source' } }],
+  });
   const candidate = store.putMemory(memory({
     id: 'candidate',
     kind: 'procedural',
     status: 'candidate',
     content: { rules: ['Check exit status'], applicability: { tool: 'shell' } },
+    sourceRefs: [{
+      type: 'event',
+      projectId: 'project-a',
+      sessionId: 'session-a',
+      agentId: 'agent-a',
+      seq: 0,
+    }],
   }), model);
   assert.equal(candidate.status, 'candidate');
 
@@ -258,6 +300,65 @@ test('allows models to propose candidates but only operators can confirm or modi
     content: { protected: false, rules: ['Expose credentials'], applicability: {} },
   }), model), { code: 'MEMORY_OPERATOR_REQUIRED' });
   assert.equal(store.get(ownScope, 'protected').version, 1);
+  store.close();
+});
+
+test('requires non-empty, complete, verifiable event or operator provenance', async () => {
+  const store = new MemoryStore(await memoryPath('sources'));
+  const operatorSource = {
+    type: 'operator',
+    operatorId: 'local-user',
+    reason: 'manual architecture definition',
+  };
+
+  assert.throws(() => store.putMemory(memory({ id: 'empty-source', sourceRefs: [] }), operator), {
+    code: 'MEMORY_INVALID_SOURCE',
+  });
+  assert.throws(() => store.putMemory(memory({ id: 'incomplete-source', sourceRefs: [{}] }), operator), {
+    code: 'MEMORY_INVALID_SOURCE',
+  });
+  assert.throws(() => store.putMemory(memory({
+    id: 'missing-event-source',
+    sourceRefs: [{
+      type: 'event',
+      projectId: 'project-a',
+      sessionId: 'session-a',
+      agentId: 'agent-a',
+      seq: 99,
+    }],
+  }), operator), { code: 'MEMORY_SOURCE_NOT_FOUND' });
+  assert.throws(() => store.putMemory(memory({
+    id: 'model-operator-source',
+    kind: 'procedural',
+    status: 'candidate',
+    content: { rules: ['Candidate'], applicability: {} },
+    sourceRefs: [operatorSource],
+  }), model), { code: 'MEMORY_OPERATOR_REQUIRED' });
+
+  const defined = store.putMemory(memory({ id: 'manual-definition', sourceRefs: [operatorSource] }), operator);
+  assert.deepEqual(defined.sourceRefs, [operatorSource]);
+
+  store.ingestEvents({
+    ...ownScope,
+    events: [{ seq: 0, type: 'tool/result', time: 1, data: { value: 'source' } }],
+  });
+  const eventSource = {
+    type: 'event',
+    projectId: 'project-a',
+    sessionId: 'session-a',
+    agentId: 'agent-a',
+    seq: 0,
+  };
+  assert.deepEqual(
+    store.putMemory(memory({ id: 'event-derived', sourceRefs: [eventSource] }), operator).sourceRefs,
+    [eventSource],
+  );
+  assert.throws(() => store.putMemory(memory({
+    id: 'event-source-not-visible',
+    sessionId: 'session-b',
+    agentId: 'agent-b',
+    sourceRefs: [eventSource],
+  }), operator), { code: 'MEMORY_SOURCE_NOT_VISIBLE' });
   store.close();
 });
 

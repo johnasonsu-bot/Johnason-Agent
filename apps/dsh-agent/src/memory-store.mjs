@@ -105,17 +105,45 @@ function validateTimestamp(value, name, defaultValue) {
   return value;
 }
 
-function validateSourceRefs(sourceRefs) {
-  if (!Array.isArray(sourceRefs)) {
-    throw memoryError('MEMORY_INVALID_RECORD', 'sourceRefs must be an array', TypeError);
+function validateSourceRefs(sourceRefs, { scope, actor, db }) {
+  if (!Array.isArray(sourceRefs) || sourceRefs.length === 0) {
+    throw memoryError('MEMORY_INVALID_SOURCE', 'sourceRefs must be a non-empty array', TypeError);
   }
   for (const source of sourceRefs) {
     if (!isPlainObject(source)) {
-      throw memoryError('MEMORY_INVALID_RECORD', 'sourceRefs must contain objects', TypeError);
+      throw memoryError('MEMORY_INVALID_SOURCE', 'sourceRefs must contain objects', TypeError);
     }
-    if (Object.hasOwn(source, 'sessionId')) requireText(source.sessionId, 'source sessionId', 'MEMORY_INVALID_RECORD');
-    if (Object.hasOwn(source, 'seq') && (!Number.isSafeInteger(source.seq) || source.seq < 0)) {
-      throw memoryError('MEMORY_INVALID_RECORD', 'source seq must be a non-negative safe integer', TypeError);
+    if (source.type === 'operator') {
+      requireText(source.operatorId, 'source operatorId', 'MEMORY_INVALID_SOURCE');
+      requireText(source.reason, 'source reason', 'MEMORY_INVALID_SOURCE', 16_384);
+      if (actor.role !== 'operator' || actor.id !== source.operatorId) {
+        throw memoryError('MEMORY_OPERATOR_REQUIRED', 'operator provenance must match the trusted operator actor');
+      }
+      continue;
+    }
+    if (source.type !== 'event') {
+      throw memoryError('MEMORY_INVALID_SOURCE', 'source type must be event or operator', TypeError);
+    }
+    requireText(source.projectId, 'source projectId', 'MEMORY_INVALID_SOURCE');
+    requireText(source.sessionId, 'source sessionId', 'MEMORY_INVALID_SOURCE');
+    requireText(source.agentId, 'source agentId', 'MEMORY_INVALID_SOURCE');
+    if (!Number.isSafeInteger(source.seq) || source.seq < 0) {
+      throw memoryError('MEMORY_INVALID_SOURCE', 'source seq must be a non-negative safe integer', TypeError);
+    }
+    const existing = db.prepare(`
+      SELECT project_id, agent_id, memory_id
+      FROM memory_event_sources WHERE session_id = ? AND seq = ?
+    `).get(source.sessionId, source.seq);
+    if (!existing
+        || existing.project_id !== source.projectId
+        || existing.agent_id !== source.agentId
+        || existing.memory_id === null) {
+      throw memoryError('MEMORY_SOURCE_NOT_FOUND', 'event source has no durable memory projection');
+    }
+    if (scope.projectId !== source.projectId
+        || scope.sessionId !== source.sessionId
+        || scope.agentId !== source.agentId) {
+      throw memoryError('MEMORY_SOURCE_NOT_VISIBLE', 'event source is not visible to the memory owner scope');
     }
   }
   return serialize(sourceRefs);
@@ -329,8 +357,10 @@ export class MemoryStore {
           const sourceRefs = [...new Set([...linkedSeqs, item.source.seq])]
             .sort((left, right) => left - right)
             .map(seq => ({
+              type: 'event',
               projectId: scope.projectId,
               sessionId: scope.sessionId,
+              agentId: scope.agentId,
               seq,
             }));
           const content = {
@@ -404,7 +434,11 @@ export class MemoryStore {
     if (record.kind === 'semantic') validateSemanticContent(record.content);
     if (record.kind === 'procedural') validateProceduralContent(record.content);
     const contentJson = serialize(record.content);
-    const sourceRefsJson = validateSourceRefs(record.sourceRefs);
+    const sourceRefsJson = validateSourceRefs(record.sourceRefs, {
+      scope,
+      actor: normalizedActor,
+      db: this.db,
+    });
     const status = record.status ?? (record.kind === 'procedural' ? 'candidate' : 'active');
     if (record.kind === 'procedural' && !PROCEDURE_STATUSES.has(status)) {
       throw memoryError('MEMORY_INVALID_RECORD', 'procedural status must be candidate or confirmed', TypeError);
@@ -545,7 +579,8 @@ export class MemoryStore {
     const rows = this.db.prepare(`
       WITH eligible AS (
         SELECT *, ROW_NUMBER() OVER (
-          PARTITION BY project_id, id ORDER BY system_time DESC, version DESC
+          PARTITION BY project_id, id
+          ORDER BY valid_time DESC, system_time DESC, version DESC
         ) AS rank
         FROM memory_records
         WHERE project_id = ? AND kind = 'semantic'
