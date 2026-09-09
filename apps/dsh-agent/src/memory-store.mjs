@@ -277,7 +277,9 @@ export class MemoryStore {
           + (contentIndex >= 0 ? 10 - Math.min(contentIndex, 9) : 0);
       });
       this.db.function('memory_text_length', { deterministic: true }, text => text.length);
-      this.db.function('memory_text_page', { deterministic: true }, (text, offset, maxChars) => text.slice(offset, offset + maxChars));
+      // SQLite transports UTF-8 text; escape split UTF-16 surrogate halves before
+      // crossing that boundary, then restore their exact code units below.
+      this.db.function('memory_text_page', { deterministic: true }, (text, offset, maxChars) => JSON.stringify(text.slice(offset, offset + maxChars)));
       initializeSchema(this.db);
       chmodSync(path, 0o600);
     } catch (error) {
@@ -671,9 +673,10 @@ export class MemoryStore {
     if (!row) return null;
     if (offset > row.total_chars) throw memoryError('MEMORY_INVALID_OFFSET', 'offset exceeds the fixed record version');
     const { content, ...handle } = rowToRecord({ ...row, content_json: 'null' });
-    const hasMore = offset + row.page_text.length < row.total_chars;
-    return { ...handle, contentText: row.page_text, offset, maxChars, totalChars: row.total_chars,
-      nextOffset: hasMore ? offset + row.page_text.length : null, hasMore, truncated: offset > 0 || hasMore, offsetUnit: 'utf16' };
+    const contentText = JSON.parse(row.page_text);
+    const hasMore = offset + contentText.length < row.total_chars;
+    return { ...handle, contentText, offset, maxChars, totalChars: row.total_chars,
+      nextOffset: hasMore ? offset + contentText.length : null, hasMore, truncated: offset > 0 || hasMore, offsetUnit: 'utf16' };
   }
 
   graph(scope, { validAt, systemAt } = {}) {

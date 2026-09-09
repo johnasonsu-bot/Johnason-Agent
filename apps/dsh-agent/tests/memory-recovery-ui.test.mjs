@@ -80,6 +80,14 @@ test('real native Web creates an unstarted scoped session, versions records and 
   assert.equal(tail.offset, 100000); assert.match(tail.contentText, /HTTP-TAIL-ONLY/);
   assert.equal(tail.hasMore, false); assert.equal(tail.nextOffset, null);
   assert.equal((await f.request('page-in', { sessionId, memoryId: long.id, version: 1, offset: -1 })).body.code, 'MEMORY_INVALID_OFFSET');
+  const unicode = await f.ok('put-memory', { sessionId, reason: 'Reviewed Unicode source', record: { kind: 'semantic', visibility: 'private', summary: 'Unicode HTTP source',
+    content: { nodes: [{ id: 'unicode', type: 'fact', text: 'A😀B' }], edges: [] } } });
+  const unicodeText = JSON.stringify(unicode.content);
+  const split = unicodeText.indexOf('😀') + 1;
+  const unicodeHead = await f.ok('page-in', { sessionId, memoryId: unicode.id, version: 1, maxChars: split });
+  const unicodeTail = await f.ok('page-in', { sessionId, memoryId: unicode.id, version: 1, offset: unicodeHead.nextOffset, maxChars: 1000 });
+  assert.equal(unicodeHead.contentText + unicodeTail.contentText, unicodeText, 'real HTTP JSON must preserve both surrogate halves');
+  assert.equal(unicodeHead.nextOffset, split); assert.equal(unicodeTail.nextOffset, null);
   const other = await f.ok('create-session', { workspaceRoot: f.workspace });
   await f.ok('configure', { sessionId: other.sessionId, input: { ...config, agentId: other.sessionId, projectId: 'beta', sandbox: null }, expectedVersion: 0 });
   assert.equal(await f.ok('memory', { sessionId: other.sessionId, memoryId: first.id }), null);

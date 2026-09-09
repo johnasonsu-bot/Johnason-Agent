@@ -82,6 +82,20 @@ test('bounded continuation reaches the tail and reopens the exact historical ver
   reopened.close();
 });
 
+test('UTF-16 page boundaries preserve split surrogate pairs exactly through SQLite', async () => {
+  const { store, pager } = await createPager('unicode-pages');
+  const record = store.putMemory(semantic('emoji', 'Unicode source', 'A😀B'), operator);
+  const full = JSON.stringify(record.content);
+  const split = full.indexOf('😀') + 1;
+  const head = pager.pageIn(owner, record.id, { version: 1, maxChars: split });
+  const tail = pager.pageIn(owner, record.id, { version: 1, offset: head.nextOffset, maxChars: 1000 });
+  assert.equal(head.contentText + tail.contentText, full);
+  assert.equal(head.contentText.charCodeAt(split - 1), 0xD83D);
+  assert.equal(tail.contentText.charCodeAt(0), 0xDE00);
+  assert.equal(head.nextOffset, split); assert.equal(tail.nextOffset, null);
+  store.close();
+});
+
 test('page in exposes bounded content, page out changes selected context, and neither deletes source records', async () => {
   const { store, pager } = await createPager('page-in-out');
   store.putMemory(semantic('long', 'Needle long record', 'x'.repeat(200)), operator);
