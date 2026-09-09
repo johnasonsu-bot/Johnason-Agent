@@ -7,6 +7,7 @@ import { EffectStore } from './effect-store.mjs';
 import { sanitizeEvent } from './record-sanitizer.mjs';
 import { validateSandboxRequirements, runSandboxTask } from './task-sandbox.mjs';
 import { installMemoryTools, MEMORY_TOOL_NAMES } from './memory-tools.mjs';
+import { installMemoryRecoveryUi } from './memory-recovery-ui.mjs';
 
 const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
 const { Service } = await import(require.resolve('@deepseek-ai/cordis'));
@@ -190,6 +191,7 @@ class MemoryRecovery extends Service {
       return decision;
     }, { prepend: true });
     installMemoryTools(ctx, this);
+    ctx.inject(['webServer', 'apiProxy'], ui => installMemoryRecoveryUi(ui, this));
     ctx.effect(() => async () => {
       await Promise.all(this.#inflight);
       try {

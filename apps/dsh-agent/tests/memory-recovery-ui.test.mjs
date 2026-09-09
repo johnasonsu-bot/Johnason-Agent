@@ -1,0 +1,150 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import { request as httpRequest } from 'node:http';
+import { mkdtemp, mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { MemoryStore } from '../src/memory-store.mjs';
+import { EffectStore } from '../src/effect-store.mjs';
+
+async function fixture(t, options = {}) {
+  const root = await mkdtemp(join(homedir(), 'dsh-memory-web-'));
+  const workspace = join(root, 'workspace'); await mkdir(workspace);
+  options.seed?.(join(root, 'memory/recovery.sqlite'), workspace);
+  const probe = createServer(); await new Promise(r => probe.listen(0, '127.0.0.1', r));
+  const port = probe.address().port; await new Promise(r => probe.close(r));
+  const url = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), 'web', '--data-dir', root, '--port', String(port), '--no-open'], { env: { PATH: process.env.PATH, HOME: root }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
+  const exit = new Promise(r => child.once('exit', (code, signal) => r({ code, signal })));
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; t.diagnostic(output.split('\n').filter(line => /SQLite|ExperimentalWarning/.test(line)).join('\n')); });
+  const deadline = Date.now() + 30000;
+  while (!output.includes(`dsh web: ${url}`)) { assert.equal(child.exitCode, null, output); assert.ok(Date.now() < deadline, output); await new Promise(r => setTimeout(r, 50)); }
+  t.diagnostic(`Retained native Web: ${root}; ${url}`);
+  const request = async (action, data = {}, headers = {}) => {
+    const res = await fetch(`${url}/memory-recovery/api/${action}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json', ...headers }, body: JSON.stringify(data) });
+    return { status: res.status, body: await res.json() };
+  };
+  const ok = async (action, data) => { const r = await request(action, data); assert.equal(r.status, 200, JSON.stringify(r)); return r.body.value; };
+  const rpc = async (method, payload) => {
+    const res = await fetch(`${url}/api/${method}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'acceptance', method, payload }) });
+    const body = await res.json(); assert.equal(body.result.ok, true, JSON.stringify(body)); return body.result.value;
+  };
+  return { root, workspace, url, request, ok, rpc };
+}
+
+test('real native Web creates an unstarted scoped session, versions records and pages without execution routes', { timeout: 60000 }, async t => {
+  const f = await fixture(t);
+  assert.equal((await fetch(`${f.url}/memory-recovery`)).status, 200);
+  const created = await f.ok('create-session', { workspaceRoot: f.workspace });
+  const sessionId = created.sessionId;
+  const config = { enabled: true, projectId: 'alpha', agentId: sessionId, workspaceRoot: f.workspace, sandbox: { sandbox_required: true, mode: 'workspace-write', network: 'host', workspaceRoot: f.workspace }, budgetTokens: 4000, anchors: [] };
+  const configured = await f.ok('configure', { sessionId, input: config, expectedVersion: 0 });
+  assert.equal(configured.executionCoverage, 'managed-sandbox-only');
+  assert.equal((await f.request('configure', { sessionId, input: { ...config, sandbox: { ...config.sandbox, network: 'none' } }, expectedVersion: 1 })).body.code, 'SANDBOX_REQUIREMENT_UNSUPPORTED');
+  assert.equal((await f.request('configure', { sessionId, input: { ...config, sandbox: null }, expectedVersion: 1 })).body.code, 'MEMORY_POLICY_DOWNGRADE_FORBIDDEN');
+  assert.equal((await f.request('configure', { sessionId, input: config, expectedVersion: 0 })).body.code, 'MEMORY_CONFIG_VERSION_CONFLICT');
+  const record = { kind: 'semantic', visibility: 'project', summary: 'alpha contract', validTime: 10, content: { nodes: [{ id: 'alpha', type: 'contract', label: 'Original' }, { id: 'beta', type: 'service' }], edges: [{ from: 'alpha', relation: 'uses', to: 'beta' }] } };
+  const first = await f.ok('put-memory', { sessionId, record, reason: 'Reviewed contract' });
+  assert.equal(first.sourceRefs[0].operatorId, 'local-operator');
+  assert.equal((await f.request('put-memory', { sessionId, record: { ...record, projectId: 'forged' }, reason: 'Spoof' })).status, 400);
+  const second = await f.ok('put-memory', { sessionId, record: { ...record, id: first.id, expectedVersion: 1, validTime: 20, content: { ...record.content, nodes: [{ id: 'alpha', type: 'contract', label: 'Revised' }, record.content.nodes[1]] } }, reason: 'Reviewed revision' });
+  assert.equal(second.version, 2);
+  assert.equal((await f.ok('memory', { sessionId, memoryId: first.id, version: 1 })).content.nodes[0].label, 'Original');
+  assert.equal((await f.ok('semantic-graph', { sessionId, filters: { validAt: 15 } })).nodes[0].label, 'Original');
+  assert.equal((await f.ok('semantic-graph', { sessionId, filters: { systemAt: first.systemTime } })).records[0].version, 1);
+  assert.equal((await f.ok('semantic-graph', { sessionId })).edges[0].relation, 'uses');
+  const candidate = await f.ok('put-memory', { sessionId, record: { kind: 'procedural', visibility: 'private', status: 'candidate', content: { rules: ['Review before repeat'], applicability: {} }, summary: 'Review failure' }, reason: 'Operator observation' });
+  assert.equal((await f.ok('confirm', { sessionId, memoryId: candidate.id, expectedVersion: 1, reason: 'Reviewed source' })).status, 'confirmed');
+  assert.equal((await f.ok('memory', { sessionId, memoryId: candidate.id, version: 1 })).status, 'candidate');
+  assert.equal((await f.request('confirm', { sessionId, memoryId: candidate.id, expectedVersion: 1, reason: 'Stale' })).body.code, 'MEMORY_VERSION_CONFLICT');
+  assert.equal((await f.ok('memories', { sessionId, filters: { kind: 'episodic' } })).length > 0, true);
+  const found = await f.ok('search', { sessionId, query: 'alpha' }); assert.equal(Object.hasOwn(found[0], 'content'), false);
+  assert.match((await f.ok('page-in', { sessionId, memoryId: first.id, version: 1, maxChars: 1000 })).contentText, /Original/);
+  assert.equal(await f.ok('page-out', { sessionId, memoryId: first.id }), true);
+  assert.equal((await f.ok('memory', { sessionId, memoryId: first.id })).version, 2);
+  const other = await f.ok('create-session', { workspaceRoot: f.workspace });
+  await f.ok('configure', { sessionId: other.sessionId, input: { ...config, agentId: other.sessionId, projectId: 'beta', sandbox: null }, expectedVersion: 0 });
+  assert.equal(await f.ok('memory', { sessionId: other.sessionId, memoryId: first.id }), null);
+  const status = await f.ok('status', { sessionId }); assert.equal(status.pending, 0); assert.ok(status.durableThroughSeq >= 0);
+  assert.deepEqual(await f.ok('effects', { sessionId }), []);
+  for (const action of ['invokeTool', 'recover', 'projectContext', 'reconcile', 'execute']) assert.equal((await f.request(action, { sessionId, argv: ['true'], proof: { verified: true } })).status, 404);
+  assert.equal((await f.request('sessions', {}, { origin: 'https://evil.example' })).status, 403);
+  assert.equal((await f.request('sessions', {}, { 'sec-fetch-site': 'cross-site' })).status, 403);
+  // Node fetch overwrites a supplied Host with the URL authority; use the actual HTTP wire.
+  const wrongHost = await new Promise((resolve, reject) => {
+    const req = httpRequest(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { host: 'evil.example', origin: f.url, 'content-type': 'application/json' } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject); req.end('{}');
+  });
+  assert.equal(wrongHost, 403);
+  assert.equal((await f.request('sessions', { actor: { role: 'operator' } })).status, 400);
+  assert.equal((await fetch(`${f.url}/memory-recovery/api/sessions`)).status, 405);
+  const noOrigin = await fetch(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  assert.equal(noOrigin.status, 403);
+  const badJson = await fetch(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { origin: f.url, 'content-type': 'application/json' }, body: 'not-json' });
+  assert.equal(badJson.status, 400); assert.doesNotMatch(await badJson.text(), /not-json/);
+  assert.equal((await f.request('sessions', { padding: 'x'.repeat(262145) })).status, 413);
+});
+
+test('HTTP audit preserves UNKNOWN, causal edges and past system-time without recovering on reads', { timeout: 60000 }, async t => {
+  let parent, stranded;
+  const f = await fixture(t, { seed(path, workspaceRoot) {
+    const store = new MemoryStore(path), effects = new EffectStore(store);
+    const scope = { projectId: 'audit', sessionId: 'audit-new', agentId: 'audit-new' };
+    const base = { ...scope, visibility: 'private', stepId: 'seed', toolName: 'memory_sandbox_run', input: {}, workspaceRoot, sandboxPolicy: {} };
+    parent = effects.prepare({ ...base, callId: 'parent', validTime: 10 });
+    stranded = effects.prepare({ ...base, callId: 'stranded', parentId: parent.id, causationId: parent.id, validTime: 10 });
+    effects.begin(stranded.id, { id: 'former-process', scope }, { validTime: 20 }); store.close();
+  } });
+  await f.rpc('session.create', { sessionId: 'audit-new', cwd: f.workspace });
+  await f.ok('configure', { sessionId: 'audit-new', expectedVersion: 0, input: { enabled: true, projectId: 'audit', agentId: 'audit-new', workspaceRoot: f.workspace, sandbox: null } });
+  const graph = await f.ok('effect-graph', { sessionId: 'audit-new' });
+  assert.equal(graph.nodes.find(n => n.id === stranded.id).state, 'UNKNOWN');
+  assert.deepEqual(new Set(graph.edges.map(e => e.relation)), new Set(['parent', 'causation']));
+  const before = await f.ok('effects', { sessionId: 'audit-new', filters: { systemAt: stranded.systemTime } });
+  assert.equal(before.find(e => e.id === stranded.id).state, 'PREPARED');
+  const valid = await f.ok('effects', { sessionId: 'audit-new', filters: { validAt: 15 } });
+  assert.equal(valid.find(e => e.id === stranded.id).state, 'PREPARED');
+  await f.ok('sessions');
+  assert.deepEqual(await f.ok('effect-graph', { sessionId: 'audit-new' }), graph);
+});
+
+test('independent browser creates/configures and actually opens its selected native chat', { timeout: 90000 }, async t => {
+  const f = await fixture(t);
+  const { chromium } = await import('playwright-core');
+  // Persistent profile is deliberately retained; no browser cleanup deletes artifacts.
+  const browser = await chromium.launchPersistentContext(join(f.root, 'browser-profile'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', viewport: { width: 1440, height: 1000 } });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  const errors = []; page.on('pageerror', e => errors.push(e.message));
+  await page.goto(`${f.url}/memory-recovery`);
+  await page.locator('#project').fill('browser-project'); await page.locator('#workspace').fill(f.workspace);
+  await page.getByRole('button', { name: '创建新原生会话', exact: true }).click();
+  await page.locator('#open-chat').waitFor();
+  const sessionId = await page.locator('#sessions').inputValue();
+  assert.match(sessionId, /^session-/);
+  await page.getByRole('button', { name: '启用 / 保存新配置版本', exact: true }).click();
+  await page.locator('#enabled').waitFor();
+  assert.equal(await page.locator('#mode').inputValue(), 'workspace-write');
+  await page.locator('#summary').fill('Browser contract'); await page.locator('#reason').fill('Browser reviewed definition');
+  await page.getByRole('button', { name: '追加记录版本', exact: true }).click();
+  await page.waitForFunction(() => document.getElementById('version').value === '1');
+  const memoryId = await page.locator('#memory-id').inputValue();
+  assert.ok(memoryId);
+  await page.screenshot({ path: join(f.root, 'memory-recovery.png'), fullPage: true });
+  const nativeRequests = [];
+  page.on('request', request => { if (request.url().includes('/api/')) { try { nativeRequests.push(request.postDataJSON()); } catch {} } });
+  await page.locator('#open-chat').click();
+  await page.getByRole('button', { name: '继续', exact: true }).click();
+  await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
+  await page.waitForFunction(() => !!document.querySelector('a[href="/memory-recovery"]'));
+  await page.waitForTimeout(1000);
+  assert.ok(nativeRequests.some(r => r?.payload?.sessionId === sessionId), JSON.stringify(nativeRequests));
+  assert.equal((await f.rpc('session.list', {})).items[0].running, false);
+  await page.screenshot({ path: join(f.root, 'native-selected-chat.png'), fullPage: true });
+  assert.deepEqual(errors, []);
+  t.diagnostic(`Native browser selected ${sessionId}; screenshots retained in ${f.root}`);
+});
