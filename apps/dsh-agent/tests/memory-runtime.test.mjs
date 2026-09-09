@@ -136,8 +136,14 @@ test('large canonical output is retained raw but native result uses a sourced su
   f.agent.session.append('tool/result', { turn: 1, step: 1, message: createUserMessage({ source: { kind: 'tool', callId: 'raw-call' }, content: [{ type: 'tool-result', toolCallId: 'raw-call', content: result.content }] }) }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] });
   await f.service.barrier(f.agent.id);
   assert.doesNotMatch(JSON.stringify(f.agent.session.deriveMessages()), /ORIGINAL LARGE BODY/);
-  const page = f.service.pageIn(f.agent.id, `event:${f.agent.id}:${io.seq}`, { maxChars: 600 });
-  assert.match(page.contentText, /ORIGINAL LARGE BODY/);
+  // Consume exactly what the native result advertises, including the old prose form;
+  // never reconstruct a corrected id from the separately inspected source event.
+  const advertisedJson = result.content[0].text.match(/memory_page_in\((\{[^\n]+\})\)/)?.[1];
+  const advertisedArgs = advertisedJson ? JSON.parse(advertisedJson)
+    : { id: result.content[0].text.match(/memory handle (\S+)\. Use/)?.[1] };
+  const page = await f.execute('memory_page_in', advertisedArgs);
+  assert.equal(page.isError, false, page.error?.message);
+  assert.equal(page.value.selected, true);
   await f.service.projectContext(f.agent.id);
   assert.match(JSON.stringify(f.agent.session.deriveMessages()), /ORIGINAL LARGE BODY/);
   await f.service.projectContext(f.agent.id);

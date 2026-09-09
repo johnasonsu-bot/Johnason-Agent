@@ -137,7 +137,8 @@ class MemoryRecovery extends Service {
       }
       const content = decision.content ?? result.content;
       if (JSON.stringify(content).length <= 2048) return decision;
-      return { ...decision, content: [{ type: 'text', text: `Large ${exec.name} result stored as memory handle event:${exec.agent.id}:${rawSeq}@1. Use memory_page_in with this id for a bounded original page. Source: ${exec.agent.id}/${rawSeq}.` }] };
+      const pageArguments = JSON.stringify({ id: `event:${exec.agent.id}:${rawSeq}`, version: 1 });
+      return { ...decision, content: [{ type: 'text', text: `Large ${exec.name} result stored in memory. Use memory_page_in(${pageArguments}) for a bounded original page. Source: ${exec.agent.id}/${rawSeq}.` }] };
     }, { prepend: true });
     ctx.on('tools/result', exec => { this.#rawByToken.delete(exec.token); });
     ctx.on('agent/pre-step', async (payload, next) => {
