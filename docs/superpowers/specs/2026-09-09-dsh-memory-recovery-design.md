@@ -1,0 +1,76 @@
+# DSH 分层记忆与事务沙箱设计
+
+日期：2026-09-09。状态：用户已授权完成设计后直接开发；本稿作为实施基线。
+
+## 目标与范围
+
+只实现 A1 三类记忆分类持久化、A2 流式分页调度、E1 两阶段状态与双时态因果审计、E2 按任务启动沙箱。保留原生 DSH Web/CLI、模型适配、Vault、Loop、工具审批；不引入旧 Python/Go 控制面，不新增四级验证器或角色编排。必要的记忆/恢复/沙箱配置页面属于这些能力的操作入口，不重做聊天 UX。
+
+基线为 codex/dsh-standalone-agent、DSH b150a551b8d465e31e418e1b2eaf5e79bbb7d28e。现有 README 和本地模型调优未提交改动保留。仅借鉴 Letta 分页与 Hindsight 认知分层思想，不把安装两套独立 Agent 服务列为前置条件。
+
+## 技术选择与职责
+
+采用独立 Cordis 插件与本地 SQLite 领域存储；对比全部存 JSON 文件，SQLite 可以原子提交事件、索引和游标并支持双时态查询；对比引入独立记忆服务，无额外网络服务及凭据。使用 Node 内置 node:sqlite，沿用应用 Node ^22.19.0 或 >=24.0.0；Node 22 的实验性 SQLite 提示为已知工具链风险，不能伪装成测试失败或静默替换底座。
+
+DSH session log 是会话权威；memory/recovery.sqlite 是三类记忆及 Effect 领域权威，不保存另一套可恢复聊天。情景记忆是 DSH 事件的带来源投影，源引用固定 session_id/seq，重复摄入幂等；游标和投影在同一事务提交。语义和规程修改为追加版本，可从领域记录重建索引。
+
+## A1 三类记忆
+
+1. Episodic：按顺序保留获准记录的工具输入输出、执行结果与事件；大型数据存在底层记录，模型默认只见摘要句柄。过滤凭据字段和已识别秘密，不摄入 credentials/Vault 事件，不声明正则能识别任意秘密。
+2. Semantic：记录项目实体、数据契约、架构定义与类型化关系（from/relation/to）；每次更新有版本、来源、有效时间和系统记录时间；查询可返回实体及关联子图，而非仅一堆文本。
+3. Procedural：系统不变量及从失败中提炼的候选操作规范，包含适用条件、来源和候选/已确认状态。模型只能提出候选，不能自改系统不变量或自行批准规程；用户通过页面确认，保留版本。
+
+记录必须显式包含 project_id、session_id、agent_id 及 visibility(private/project)。私有记录只能在所属 Agent/session 请求中读取；共享不是同目录隐式授权。第一版在会话配置中显式选择项目，并绑定固定工作目录；不从旧应用导入数据。
+
+## A2 流式与分页
+
+session/event 进入有界队列，按批增量持久化；session/flush、工具派发前和新模型 Step 前排空相关队列，写失败阻止依赖该状态的新操作，不以后台忽略异常方式丢数据。未落盘的流式片段允许在突发断电时丢失，关键边界持久化后才确认，页面区分 pending/durable。
+
+记忆调度保持常驻锚点（任务目标、最新用户补充、活动待办、系统不变量）与可换出页。memory_search 返回有界摘要句柄；memory_page_in 读取同项目且获准的指定版本片段；memory_page_out 只移出工作集，不删原始记录。系统按范围、关键词相关性、近期性和预算选择候选页；用户可手动 pin/unpin。预算单位为估算 Token，标明估算，不冒充真实 usage。
+
+模型上下文通过 DSH 原生已记录的 context/user-message 渠道及受控 surface replacement 构建；绝不偷偷修改只用于请求的内存消息。工作集变化后撤换过期页投影，避免每一步无限追加重复摘要。保护工具调用/结果配对。超额锚点明确报 MEMORY_BUDGET_EXCEEDED，不截断不变量继续。已完成的事件源保留以便回读。
+
+语义和规程首先由显式结构化工具写入、用户确认；失败事件自动形成带源引用的候选经历，不通过后台额外模型调用偷偷提炼和收费。后续显式请求反思可使用当前配置模型生成候选，不能把未实施的自主学习描述为完成。
+
+## E1 提交协议与双时态
+
+每个执行操作绑定 effect_id、project/session/step、工具名、输入指纹、workspace 与 sandbox policy。只读或调用方明确支持幂等/事务的能力分类由适配器声明，不由模型一句话决定。
+
+状态为 PREPARED → EXECUTING → COMMITTED / ABORTED / UNKNOWN。真正事务参与方支持 prepare/commit/abort 时执行两阶段协议：prepare durable 后允许 commit，结果 durable 后提交权威状态。任意 shell/API 不支持该协议，明确标记 reservation-execution-confirmation，不冒充分布式 2PC。执行开始前保存意图，执行结果丢失标 UNKNOWN；重启不自动重新执行写操作。
+
+同 effect_id+同输入重复请求返回已有状态/结果；不同输入冲突拒绝。并发 owner 用事务 compare-and-set 抢占，旧 owner 不可覆盖新结果；EXECUTING 不能被第二调用者重复派发。复用原生 callId 但加 session 作用域，不能凭内容相同把两个用户有意重复的操作合并。恢复中未完成 prepare 与已派发未知分开显示。
+
+每条变化保存 valid_time、system_time、causation_id、correlation_id、parent_id。时间戳不能证明先后因果，实际关系来自显式边。更正追加，不重写旧记录；支持按 as-of system time 与 valid time 查询。对账只读：有确定证据才能从 UNKNOWN 确认结果，否则保持 UNKNOWN 请求人工，人工选择不能伪装成机器证明。
+
+## E2 任务沙箱
+
+任务配置 sandbox_required、mode(read-only/workspace-write)、network(host/none)、workspaceRoot 与可选 timeout。先验证真实目录与后端能力再执行。首个受支持后端复用 DSH native sandbox.confine，运行被包装 argv 的真实子进程，明确其文件隔离范围；Git Worktree 只代表版本控制隔离，不宣称为 OS 沙箱。
+
+原生 sandbox seam 只表达文件隔离。network=none、CPU/内存配额或容器根文件系统如无已实现且验证的后端，必须返回 SANDBOX_REQUIREMENT_UNSUPPORTED，不能降级 host。后端可扩展接口保留，但本轮不声称提供 Docker/Daytona 功能。应用管理沙箱进程开始、取消、超时、退出，记录结果；临时输出不自动删除，遵守用户删除需确认要求。
+
+要求沙箱的任务，不允许工具通过未隔离 shell/直接写文件绕过。沿用原生 filesystem/shell sandbox 能力并核对实际执行策略，无法证明满足要求的工具阻断或要求使用受控沙箱工具。UI 明确展示支持/不支持的要求。对已启用任务不能通过运行中降级规则绕过；改变要求需新的任务配置版本。
+
+## 人机入口与部署
+
+本机 DSH 进程加载 memory/recovery 插件，独立数据目录下增加 memory/recovery.sqlite；提供同源本地 /memory-recovery 页面，由原生 UI 添加链接。页面支持选择会话/项目、查看三类记忆和来源、写语义节点/关系、确认规程、分页调入调出、配置任务沙箱、查看 Effect 和因果边/双时态查询。API 与模型工具使用相同业务服务和范围检查。CLI/headless 在相同 profile 下加载相同插件；不要求用户通过命令输入模型凭据。
+
+只为明确新测试会话启用增量能力；默认旧会话继续原生行为，不自动迁移、恢复或调用模型。前端不持久化密码和密钥。状态页面不是任意命令执行管理后台；真实工具操作仍在任务/原生授权路径中进行。
+
+## 风险与限制
+
+- security control：保留原生 Vault 和权限；新 HTTP 写操作限本机同源 JSON，输入不回显秘密；领域文件仅当前用户可读写。
+- accepted risk：单机同用户可信插件边界，不宣称多租户安全；已授权任意工具输出仍可能含敏感数据，因此提供受限采集范围，不把完整原始数据导出到外部遥测。
+- accepted risk：native macOS Seatbelt 不等于容器，不提供未验证网络/资源隔离。
+- accepted risk：重启恢复是状态重建与显式继续，不是模型 KV 状态恢复，也不是外部写入 exactly-once。
+- 不展开全库反复安全审计；本轮针对新增功能做正确性与故障测试，最终单独检查。
+
+## 验收
+
+1. 三类记忆分别入库；重开库后可读取历史版本、项目实体和关系；私有范围不可越界。
+2. 连续流式事件摄入、重复摄入、进程中断及游标恢复无已确认数据丢失或重复。
+3. 动态页进出能改变实际模型上下文；源记录不删除，预算不超限，不拆工具对。
+4. 真实文件/进程副作用在正常、重复请求、并发、执行后结果丢失场景下状态正确；UNKNOWN 不自动再写。
+5. 双时态查询与显式因果边能恢复更正前后事实。
+6. 在临时测试目录实际启动原生 OS 沙箱：允许任务目录操作，拒绝受保护目录写入；不支持的网络要求明确阻断。
+7. 真实 DSH Web/工具链加载插件；可配置记忆和沙箱、查看结果；既有凭据/profile 回归不破坏。
+8. 用户配置可用本地模型时执行一个全新记忆分页+沙箱文件任务。无可用模型/未解锁则标真实模型待验，不以 mock 冒充通过。
