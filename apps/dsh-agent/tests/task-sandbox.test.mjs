@@ -114,3 +114,45 @@ test('cancel kills same-group descendants even after parent closes its output', 
   if (alive) process.kill(pid, 'SIGKILL');
   assert.equal(alive, false);
 });
+
+test('runner diagnosis is independent of display truncation, including cross-chunk fatal lines', async t => {
+  const f = await fixture(t);
+  // Keep real native confinement; only the public diagnostic dialect is fixed
+  // for this classifier fixture. The child intentionally mimics a runner.
+  const sandbox = { confine(argv, policy) {
+    return { ...f.sandbox.confine(argv, policy), runnerFailureRules: [{ allowedExitCodes: [125], fatalSignatures: ['runner fatal'] }] };
+  } };
+  const script = 'process.stderr.write("padding padding padding\\nRUN");setTimeout(()=>{process.stderr.write("NER FATAL: fixture\\n");process.exitCode=125},30)';
+  for (const maxOutputBytes of [1024, 8]) {
+    const outcome = await runSandboxTask({ ...f, sandbox, argv: [process.execPath, '-e', script], requirements: { ...f.requirements, maxOutputBytes } });
+    assert.equal(outcome.runnerFailure, true, `capture limit ${maxOutputBytes}`);
+    assert.equal(outcome.state, 'UNKNOWN');
+    assert.equal(outcome.errorCode, 'SANDBOX_UNAVAILABLE');
+    assert.ok(Buffer.byteLength(outcome.stderr) <= maxOutputBytes);
+  }
+});
+
+test('streaming diagnostics preserve exact informational exclusions and final exit gates', async t => {
+  const f = await fixture(t);
+  const sandbox = { confine(argv, policy) {
+    return { ...f.sandbox.confine(argv, policy), runnerFailureRules: [{ allowedExitCodes: [125], fatalSignatures: ['runner fatal'], informationalLines: ['runner fatal: information'] }] };
+  } };
+  for (const [parts, exitCode, expected] of [
+    [['runner fa', 'tal: information\r', '\n'], 125, false],
+    [['runner fa', 'tal: broken\n'], 1, false],
+    [['runner fatal: information\n', 'x'.repeat(200000), 'RUNNER FA', 'TAL: broken\n'], 125, true],
+    [['runner fa', 'tal: broken'], 125, true],
+  ]) {
+    const script = `const parts=${JSON.stringify(parts)};let i=0;function next(){if(i<parts.length){process.stderr.write(parts[i++]);setTimeout(next,10)}else process.exitCode=${exitCode}}next()`;
+    const outcome = await runSandboxTask({ ...f, sandbox, argv: [process.execPath, '-e', script], requirements: { ...f.requirements, maxOutputBytes: 8 } });
+    assert.equal(outcome.runnerFailure, expected, `exit=${exitCode}, tail=${parts.at(-1)}`);
+  }
+});
+
+test('native denial after truncated display remains classified', async t => {
+  const f = await fixture(t);
+  const script = 'process.stderr.write("padding padding padding\\n");setTimeout(()=>require("node:fs").writeFileSync(process.argv[1],"bad"),10)';
+  const outcome = await runSandboxTask({ ...f, argv: [process.execPath, '-e', script, join(f.protectedRoot, 'denied')], requirements: { ...f.requirements, maxOutputBytes: 8 } });
+  assert.equal(outcome.denied, true);
+  assert.equal(existsSync(join(f.protectedRoot, 'denied')), false);
+});

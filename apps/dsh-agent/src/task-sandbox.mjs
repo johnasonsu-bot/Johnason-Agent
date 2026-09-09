@@ -27,12 +27,50 @@ export function validateSandboxRequirements(requirements) {
 }
 
 function argvValid(argv) { return Array.isArray(argv) && argv.length > 0 && argv.every((s, i) => typeof s === 'string' && !s.includes('\0') && (i !== 0 || s.length > 0)); }
-function runnerFailed(exitCode, stderr, rules) {
-  if (!exitCode) return false;
-  const lines = stderr.toLowerCase().split(/\r?\n/);
-  return rules.some(rule => (!rule.allowedExitCodes || rule.allowedExitCodes.includes(exitCode)) &&
-    lines.some(line => !(rule.informationalLines ?? []).some(info => info.toLowerCase() === line) &&
-      rule.fatalSignatures.some(signature => line.includes(signature.toLowerCase()))));
+function diagnosticScanner(rules, denialSignatures) {
+  const normalized = rules.map(rule => ({ ...rule,
+    fatalSignatures: rule.fatalSignatures.map(s => s.toLowerCase()),
+    informationalLines: (rule.informationalLines ?? []).map(s => s.toLowerCase()),
+    lineMatched: false, matched: false,
+  }));
+  const denials = denialSignatures.map(s => s.toLowerCase());
+  const overlap = Math.max(1, ...denials.map(s => s.length), ...normalized.flatMap(rule => rule.fatalSignatures.map(s => s.length))) - 1;
+  const infoLimit = Math.max(0, ...normalized.flatMap(rule => rule.informationalLines.map(s => s.length)));
+  const decoder = new StringDecoder('utf8');
+  let tail = '', prefix = '', lineLength = 0, denialMatched = false;
+  const endLine = (newline) => {
+    // Retain only enough prefix to test exact informational-line equality.
+    // Long lines cannot equal any exemption, but are still fully scanned.
+    const fullLine = lineLength <= infoLimit + 1 ? (newline ? prefix.replace(/\r$/, '') : prefix) : null;
+    for (const rule of normalized) {
+      if (rule.lineMatched && !rule.informationalLines.includes(fullLine)) rule.matched = true;
+      rule.lineMatched = false;
+    }
+    tail = ''; prefix = ''; lineLength = 0;
+  };
+  const scan = decoded => {
+    const lines = decoded.toLowerCase().split('\n');
+    lines.forEach((part, index) => {
+      const window = tail + part;
+      for (const rule of normalized) {
+        if (!rule.lineMatched && rule.fatalSignatures.some(s => window.includes(s))) rule.lineMatched = true;
+      }
+      if (!denialMatched && denials.some(s => window.includes(s))) denialMatched = true;
+      tail = overlap ? window.slice(-overlap) : '';
+      prefix += part.slice(0, Math.max(0, infoLimit + 1 - prefix.length));
+      lineLength = Math.min(infoLimit + 2, lineLength + part.length);
+      if (index < lines.length - 1) endLine(true);
+    });
+  };
+  return {
+    write(chunk) { scan(decoder.write(chunk)); },
+    finish(exitCode) {
+      scan(decoder.end()); endLine(false);
+      const runnerFailure = Boolean(exitCode) && normalized.some(rule => rule.matched &&
+        (!rule.allowedExitCodes || rule.allowedExitCodes.includes(exitCode)));
+      return { runnerFailure, denied: !runnerFailure && exitCode !== 0 && denialMatched };
+    },
+  };
 }
 
 /** Caller owns the effect transaction. Nonzero exit is an observation, never proof of zero side effects. */
@@ -49,6 +87,7 @@ export async function runSandboxTask({ sandbox, argv, requirements, signal }) {
   const runner = wrapped.argv[0];
   // The public seam has no backend id: report observable runner identity, not private provider state.
   const backend = basename(runner) === 'sandbox-exec' ? 'native-seatbelt' : `native:${basename(runner)}`;
+  const diagnostics = diagnosticScanner(wrapped.runnerFailureRules, wrapped.denialSignatures);
   return new Promise((resolve, reject) => {
     const child = spawn(runner, wrapped.argv.slice(1), { cwd: policy.workspaceRoot, shell: false,
       detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -61,7 +100,7 @@ export async function runSandboxTask({ sandbox, argv, requirements, signal }) {
       return Buffer.concat([previous, chunk.subarray(0, remaining)]);
     };
     child.stdout.on('data', data => { stdout = capture(stdout, data); });
-    child.stderr.on('data', data => { stderr = capture(stderr, data); });
+    child.stderr.on('data', data => { diagnostics.write(data); stderr = capture(stderr, data); });
     const kill = sig => {
       try { if (process.platform === 'win32') child.kill(sig); else if (child.pid) process.kill(-child.pid, sig); }
       catch (failure) { if (failure.code !== 'ESRCH') spawnError ??= failure; }
@@ -84,8 +123,7 @@ export async function runSandboxTask({ sandbox, argv, requirements, signal }) {
       // Do not flush a trailing partial code point into a three-byte replacement
       // character, which could exceed the configured byte bound.
       const out = new StringDecoder('utf8').write(stdout), err = new StringDecoder('utf8').write(stderr);
-      const runnerFailure = runnerFailed(exitCode, err, wrapped.runnerFailureRules);
-      const denied = !runnerFailure && exitCode !== 0 && wrapped.denialSignatures.some(s => err.toLowerCase().includes(s.toLowerCase()));
+      const { runnerFailure, denied } = diagnostics.finish(exitCode);
       resolve({ state: timedOut || cancelled || exitSignal || spawnError || runnerFailure ? 'UNKNOWN' : 'COMMITTED',
         started, exitCode, exitSignal, stdout: out, stderr: err, backend, enforcement: wrapped.enforcement,
         network: 'host', timedOut, cancelled, outputTruncated, denied, runnerFailure,

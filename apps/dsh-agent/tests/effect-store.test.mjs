@@ -29,7 +29,7 @@ test('durable reservation and owner CAS admit one real child side effect only', 
   assert.equal(prepared.protocol, 'reservation-execution-confirmation');
   assert.equal(effects.prepare({ ...input, input: { a: 1, b: 2 } }).id, prepared.id);
   assert.throws(() => effects.prepare({ ...input, input: { a: 2 } }), { code: 'EFFECT_ID_CONFLICT' });
-  effects.begin(prepared.id, owner);
+  effects.begin(prepared.id, owner, { validTime: 15 });
   assert.throws(() => effects.begin(prepared.id, { id: 'worker-b', scope }), { code: 'EFFECT_STATE_CONFLICT' });
   const counter = join(root, 'counter');
   const child = spawnSync(process.execPath, ['-e', 'require("node:fs").appendFileSync(process.argv[1],"1")', counter]);
@@ -105,4 +105,37 @@ test('independent SQLite connections cannot dispatch an already acquired effect'
   assert.equal(other.prepare(input).id, first.id);
   effects.begin(first.id, owner);
   assert.throws(() => other.begin(first.id, { id: 'other-process', scope }), { code: 'EFFECT_STATE_CONFLICT' });
+});
+
+test('retroactive completion supersedes unknown while preserving valid and system history', t => {
+  const { effects, input, memory, path } = fixture(t);
+  const prepared = effects.prepare(input);
+  effects.begin(prepared.id, owner, { validTime: 20 });
+  const unknown = effects.finish(prepared.id, owner, { state: 'UNKNOWN', validTime: 30 });
+  const corrected = effects.reconcile(prepared.id, { scope, kind: 'adapter-readback', adapterId: 'receipt-reader', validTime: 25,
+    readback: () => ({ state: 'COMMITTED', evidence: { receipt: 'completed-at-25' } }) });
+  assert.equal(corrected.validTime, 25);
+  assert.equal(effects.prepare(input).state, 'COMMITTED');
+  assert.equal(effects.list(scope)[0].state, 'COMMITTED');
+  assert.equal(effects.graph(scope).nodes[0].state, 'COMMITTED');
+  assert.equal(effects.list(scope, { validAt: 24 })[0].state, 'EXECUTING');
+  assert.equal(effects.list(scope, { validAt: 25 })[0].state, 'COMMITTED');
+  assert.equal(effects.list(scope, { validAt: 31, systemAt: unknown.systemTime })[0].state, 'UNKNOWN');
+  assert.equal(effects.list(scope, { validAt: 26, systemAt: unknown.systemTime })[0].state, 'EXECUTING');
+  memory.close();
+  const reopened = new MemoryStore(path);
+  t.after(() => reopened.close());
+  assert.equal(new EffectStore(reopened).list(scope)[0].state, 'COMMITTED');
+});
+
+test('ordinary transitions cannot backdate before prior state, correction cannot predate dispatch', t => {
+  const { effects, input } = fixture(t);
+  const prepared = effects.prepare(input);
+  assert.throws(() => effects.begin(prepared.id, owner, { validTime: 9 }), { code: 'EFFECT_INVALID_TIME_ORDER' });
+  effects.begin(prepared.id, owner, { validTime: 20 });
+  assert.throws(() => effects.finish(prepared.id, owner, { state: 'COMMITTED', validTime: 19 }), { code: 'EFFECT_INVALID_TIME_ORDER' });
+  effects.finish(prepared.id, owner, { state: 'UNKNOWN', validTime: 30 });
+  assert.throws(() => effects.reconcile(prepared.id, { scope, kind: 'adapter-readback', adapterId: 'receipt-reader', validTime: 19,
+    readback: () => ({ state: 'COMMITTED', evidence: { receipt: 'invalid-before-dispatch' } }) }), { code: 'EFFECT_INVALID_TIME_ORDER' });
+  assert.equal(effects.list(scope)[0].state, 'UNKNOWN');
 });

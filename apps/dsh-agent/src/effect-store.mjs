@@ -154,9 +154,14 @@ export class EffectStore {
       SELECT e.*, ROW_NUMBER() OVER(PARTITION BY e.id ORDER BY e.valid_time DESC,e.system_time DESC,e.version DESC) AS rank
       FROM effect_events e JOIN effect_identities i ON i.id=e.id
       WHERE i.project_id=? AND (i.visibility='project' OR (i.session_id=? AND i.agent_id=?))
-      AND e.valid_time<=? AND e.system_time<=?)
+      AND e.valid_time<=? AND e.system_time<=?
+      AND NOT EXISTS (
+        SELECT 1 FROM effect_events correction WHERE correction.id=e.id
+        AND json_extract(correction.record_json,'$.supersedesVersion')=e.version
+        AND correction.valid_time<=? AND correction.system_time<=?))
       SELECT record_json FROM eligible WHERE rank=1 ORDER BY system_time DESC,id LIMIT ?`)
-      .all(s.projectId, s.sessionId, s.agentId, time(validAt, Number.MAX_SAFE_INTEGER), time(systemAt, Number.MAX_SAFE_INTEGER), limit)
+      .all(s.projectId, s.sessionId, s.agentId, time(validAt, Number.MAX_SAFE_INTEGER), time(systemAt, Number.MAX_SAFE_INTEGER),
+        time(validAt, Number.MAX_SAFE_INTEGER), time(systemAt, Number.MAX_SAFE_INTEGER), limit)
       .map(row => JSON.parse(row.record_json));
   }
 
@@ -188,8 +193,13 @@ export class EffectStore {
     return this.#transaction(() => {
       const latest = this.#current(effectId, scope, true);
       if (latest.version !== current.version) fail('EFFECT_STATE_CONFLICT', 'Effect changed during readback');
+      const dispatchedAt = this.db.prepare("SELECT valid_time FROM effect_events WHERE id=? AND state='EXECUTING' ORDER BY version DESC LIMIT 1")
+        .get(effectId).valid_time;
+      const validTime = time(proof.validTime, Math.max(Date.now(), latest.validTime));
+      if (validTime < dispatchedAt) fail('EFFECT_INVALID_TIME_ORDER', 'Completion cannot predate dispatch');
       return this.#append(latest, { state: observed.state, result: observed.result ?? null,
-        evidence: { adapterId: proof.adapterId, ...observed.evidence }, validTime: proof.validTime });
+        evidence: { adapterId: proof.adapterId, ...observed.evidence }, validTime,
+        supersedesVersion: latest.version });
     });
   }
 
@@ -208,10 +218,16 @@ export class EffectStore {
     catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   #append(current, change) {
+    const validTime = time(change.validTime, Math.max(Date.now(), current.validTime ?? 0));
+    // Ordinary state transitions are chronological. A verified correction can
+    // replace UNKNOWN retroactively; its explicit supersession is as-of aware.
+    if (change.supersedesVersion === undefined && validTime < (current.validTime ?? 0)) {
+      fail('EFFECT_INVALID_TIME_ORDER', 'State transition cannot predate prior state');
+    }
     const latest = this.db.prepare('SELECT MAX(system_time) AS t FROM effect_events').get().t;
     const systemTime = Math.max(Date.now(), (latest ?? -1) + 1);
     const record = JSON.parse(json({ ...current, ...change, version: current.version + 1, systemTime,
-      validTime: time(change.validTime, Math.max(Date.now(), current.validTime ?? 0)) }));
+      validTime }));
     this.db.prepare('INSERT INTO effect_events VALUES (?,?,?,?,?,?)')
       .run(record.id, record.version, record.state, record.validTime, record.systemTime, json(record));
     return record;
