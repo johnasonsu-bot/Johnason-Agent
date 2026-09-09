@@ -17,7 +17,7 @@ async function fixture(t, options = {}) {
   const probe = createServer(); await new Promise(r => probe.listen(0, '127.0.0.1', r));
   const port = probe.address().port; await new Promise(r => probe.close(r));
   const url = `http://127.0.0.1:${port}`;
-  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), 'web', '--data-dir', root, '--port', String(port), '--no-open'], { env: { PATH: process.env.PATH, HOME: root }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), 'web', '--data-dir', root, '--workspace', workspace, '--port', String(port), '--no-open'], { env: { PATH: process.env.PATH, HOME: root }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
   const exit = new Promise(r => child.once('exit', (code, signal) => r({ code, signal })));
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; t.diagnostic(output.split('\n').filter(line => /SQLite|ExperimentalWarning/.test(line)).join('\n')); });
@@ -39,6 +39,7 @@ async function fixture(t, options = {}) {
 test('real native Web creates an unstarted scoped session, versions records and pages without execution routes', { timeout: 60000 }, async t => {
   const f = await fixture(t);
   assert.equal((await fetch(`${f.url}/memory-recovery`)).status, 200);
+  assert.deepEqual(await f.ok('defaults'), { workspaceRoot: f.workspace });
   const created = await f.ok('create-session', { workspaceRoot: f.workspace });
   const sessionId = created.sessionId;
   const config = { enabled: true, projectId: 'alpha', agentId: sessionId, workspaceRoot: f.workspace, sandbox: { sandbox_required: true, mode: 'workspace-write', network: 'host', workspaceRoot: f.workspace }, budgetTokens: 4000, anchors: [] };
@@ -50,6 +51,12 @@ test('real native Web creates an unstarted scoped session, versions records and 
   const record = { kind: 'semantic', visibility: 'project', summary: 'alpha contract', validTime: 10, content: { nodes: [{ id: 'alpha', type: 'contract', label: 'Original' }, { id: 'beta', type: 'service' }], edges: [{ from: 'alpha', relation: 'uses', to: 'beta' }] } };
   const first = await f.ok('put-memory', { sessionId, record, reason: 'Reviewed contract' });
   assert.equal(first.sourceRefs[0].operatorId, 'local-operator');
+  const listed = await f.ok('memories', { sessionId, filters: { kind: 'semantic' } });
+  assert.equal(listed.length, 1);
+  assert.equal(Object.hasOwn(listed[0], 'content'), false, 'list route must not transfer full record content');
+  assert.equal(listed[0].id, first.id); assert.equal(listed[0].version, 1);
+  assert.deepEqual(listed[0].sourceRefs, first.sourceRefs);
+  assert.equal((await f.ok('memory', { sessionId, memoryId: first.id })).content.nodes[0].label, 'Original');
   assert.equal((await f.request('put-memory', { sessionId, record: { ...record, projectId: 'forged' }, reason: 'Spoof' })).status, 400);
   const second = await f.ok('put-memory', { sessionId, record: { ...record, id: first.id, expectedVersion: 1, validTime: 20, content: { ...record.content, nodes: [{ id: 'alpha', type: 'contract', label: 'Revised' }, record.content.nodes[1]] } }, reason: 'Reviewed revision' });
   assert.equal(second.version, 2);
@@ -121,14 +128,27 @@ test('independent browser creates/configures and actually opens its selected nat
   const page = await browser.newPage();
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   await page.goto(`${f.url}/memory-recovery`);
+  await page.waitForFunction(() => document.getElementById('feedback').textContent.includes('操作已完成'));
+  assert.equal(await page.locator('#workspace').inputValue(), f.workspace);
+  assert.equal(await page.locator('#project').inputValue(), '');
+  assert.equal((await f.ok('sessions')).length, 0);
   await page.locator('#project').fill('browser-project'); await page.locator('#workspace').fill(f.workspace);
+  await page.locator('#mode').selectOption('read-only');
+  await page.locator('#budget').fill('5200');
+  await page.locator('#anchors').fill('Do not widen the file policy\nKeep the target contract');
   await page.getByRole('button', { name: '创建新原生会话', exact: true }).click();
   await page.locator('#open-chat').waitFor();
   const sessionId = await page.locator('#sessions').inputValue();
   assert.match(sessionId, /^session-/);
+  assert.equal(await page.locator('#mode').inputValue(), 'read-only');
+  assert.equal(await page.locator('#budget').inputValue(), '5200');
+  assert.equal(await page.locator('#anchors').inputValue(), 'Do not widen the file policy\nKeep the target contract');
   await page.getByRole('button', { name: '启用 / 保存新配置版本', exact: true }).click();
   await page.locator('#enabled').waitFor();
-  assert.equal(await page.locator('#mode').inputValue(), 'workspace-write');
+  assert.equal(await page.locator('#mode').inputValue(), 'read-only');
+  const saved = await f.ok('config', { sessionId });
+  assert.equal(saved.sandbox.mode, 'read-only'); assert.equal(saved.budgetTokens, 5200);
+  assert.deepEqual(saved.anchors, ['Do not widen the file policy', 'Keep the target contract']);
   await page.locator('#summary').fill('Browser contract'); await page.locator('#reason').fill('Browser reviewed definition');
   await page.getByRole('button', { name: '追加记录版本', exact: true }).click();
   await page.waitForFunction(() => document.getElementById('version').value === '1');

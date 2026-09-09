@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { validateMemoryAcceptance } from './memory-acceptance-result.mjs';
 
 const root = await mkdtemp(join(homedir(), 'dsh-memory-live-'));
 const workspaceRoot = join(root, 'workspace'); await mkdir(workspaceRoot);
@@ -77,8 +78,7 @@ try {
   const events = history.events.map(e => e.event);
   const calls = events.filter(e => e.type === 'assistant/message').flatMap(e => e.data.message.content.filter(b => b.type === 'tool-call').map(b => b.name));
   report.calls = calls;
-  report.success = report.artifact === 'PAGED_SANDBOX_ACCEPTANCE_OK\n' && calls.includes('memory_page_in') && calls.includes('memory_sandbox_run')
-    && report.effects.nodes.some(e => e.state === 'COMMITTED' && e.result.exitCode === 0) && report.turnEnd?.data.reason.kind === 'completed';
+  report.success = validateMemoryAcceptance(report);
 } catch (error) { report.error = error.message; }
 finally {
   report.finishedAt = Date.now();

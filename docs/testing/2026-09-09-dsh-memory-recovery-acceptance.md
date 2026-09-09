@@ -2,7 +2,7 @@
 
 日期：2026-09-09。Task 4 基于 `be6a26f`（含 Task 3 真实新会话及 cold-reopen 修复），只增加原生 Web 操作入口，不重做聊天或模型循环。
 
-结论：最终全 app **89/89 通过**；真实本地模型完成分页→Seatbelt 文件写入，随后真正冷重启回查及浏览器展示通过。新的手工服务保留在 64356，未操作旧服务/会话或删除任何夹具。
+结论：审查修复后最终全 app **102/102 通过**；真实本地模型完成分页→Seatbelt 文件写入，随后真正冷重启回查及浏览器展示通过。本轮只重新验证保留证据，未再次调用模型。新的手工服务保留在 64356，未操作旧服务/会话或删除任何夹具。
 
 ## 验收范围
 
@@ -37,6 +37,17 @@
 - HTTP UNKNOWN / parent / causation / systemAt / validAt fixture：`/Users/sushi/dsh-memory-web-3JGEko`。这里只读查询冷启动保留的真实账本，不伪称是模型执行生成的 UNKNOWN。
 - 最终全 suite 的 UI/browser fixture `/Users/sushi/dsh-memory-web-Jb8LX7`；HTTP `/Users/sushi/dsh-memory-web-5mlstG`；双时态 `/Users/sushi/dsh-memory-web-1KmqOv`。
 
+### 审查修复 round 1
+
+- 新建 version 0 会话保留用户预选的 read-only、预算与锚点；真实独立浏览器在创建前选择 read-only / 5200 / 两条锚点，创建后及保存的真实配置均逐项断言不变。已有版本仍从持久化配置加载。
+- `memories` HTTP 返回显式摘要句柄（id/version/kind/visibility/summary/sourceRefs/validTime/systemTime/status），不包含正文；`memory` 显式读取才返回正文。真实 HTTP 断言列表无 `content`、来源/版本保留，显式读取正文正确。
+- 初次加载通过固定白名单 `defaults` 调用真实 native `host.describe` 获取绝对工作目录，预填 workspace；不创建项目、会话或假数据。
+- 模型成功判定抽为纯函数，以原生历史为准：恰好依序 `memory_page_in` → `memory_sandbox_run`、唯一 completed turn、无脚本限制/错误；唯一 Effect 必须匹配 session/callId，COMMITTED、native-seatbelt/full、exit 0 且无取消/超时/拒绝/runnerFailure。13 项纯函数正反例覆盖额外工具、乱序、重复写、限制触发、弱后端、弱 enforcement、错误 exit、错误 call/session、额外 Effect、取消和缺失真实 turn/end；不依赖摘要字段。
+- TDD RED：列表泄漏正文与预选项重置复现（1 pass / 2 fail）；defaults 未实现时真实 HTTP 404 和浏览器空目录（1 pass / 2 fail）；原宽松判定面对新增反例为 2 pass / 11 fail。修复后定向 **16/16**，最终全 app **102/102，0 fail / 0 skip**（UI 3、纯判定 13、其他回归 86）。SQLite warning 与预期 Seatbelt EPERM 保留。
+- 最新全 suite fixture：HTTP `/Users/sushi/dsh-memory-web-OSdMtX`，双时态 `/Users/sushi/dsh-memory-web-FY3kUr`，浏览器 `/Users/sushi/dsh-memory-web-mylvC0`（session `session-b48a0d1d-8af7-40a3-ac84-e97eec3b9ccc`）。
+- 保留的 `/Users/sushi/dsh-memory-live-c5RjwQ/acceptance-report.json` 通过严格纯判定；同 fixture 真正只读冷重开再次通过，列表按摘要协议、正文显式读取。没有新模型请求。
+- 仅停止自己的 64356 手工服务并按下方原 dataRoot/端口命令重启。独立 browser profile 验证实际默认路径、空项目、空会话，截图 `/Users/sushi/dsh-memory-live-k6bzYi/manual-default-workspace.png` 已目视检查。完整修复记录见 SDD `task-4-fix-round1-report.md`。
+
 ## 真实 sandbox 与本地模型
 
 全 app 中实际 native Seatbelt 允许新 workspace 写入，拒绝 protected 兄弟路径及符号链接逃逸；fixture `/Users/sushi/dsh-task-sandbox-RPx1TS`，backend `native-seatbelt`、enforcement `full`、越界返回 EPERM。真实 ToolRuntime 重复 callId、取消/超时 UNKNOWN 与只读拒写的证据属于 Task 2/3 集成测试，不能替代下述模型任务。
@@ -67,6 +78,14 @@
 ```
 
 脚本输出准确 dataRoot/workspace/空闲端口/overlay/启动 argv。打开输出 URL 的 `/memory-recovery`，填项目、创建会话、保存配置，再打开原生聊天。需要模型时先在新 `/vault` 初始化自己的主密码，默认模型为上述本机 Qwen。不要复用验收脚本的临时随机密码 Vault，不要删除旧数据或把旧 Vault 复制过来。停止只针对自己启动的进程。
+
+手工最小试跑：先在记忆页填写项目 ID，确认预填 workspace，保持 required sandbox / workspace-write，点击「创建新原生会话」后再点「启用 / 保存新配置版本」。确认配置 enabled 且版本已保存，然后打开该会话的原生聊天；如需 Vault，用户自行初始化这个新环境，不能复制旧 Vault。可复制下面的 prompt（用户发送才会执行）：
+
+```text
+请只调用一次 memory_sandbox_run，在当前 workspace 新建 codex-memory-smoke-test.txt，内容为 MEMORY_SANDBOX_SMOKE_OK 加一个换行。若该文件已存在则停止，不覆盖。不要使用其他执行工具，不访问 workspace 外路径，不联网。根据工具实际返回报告是否成功、文件相对路径和退出码；失败或状态不确定时直接报告，不重试，不声称已经写入。
+```
+
+返回记忆页查看 Effect 和 pending/durable 状态；COMMITTED 仍须结合实际 exitCode 判断成功，UNKNOWN 不重放。此示例只验证沙箱文件任务，不替代上文已经完成的真实分页→模型→沙箱全链路证据。
 
 本次已留运行的新手工环境：[记忆与恢复页面](http://127.0.0.1:64356/memory-recovery)。dataRoot `/Users/sushi/dsh-memory-live-k6bzYi`，workspace `/Users/sushi/dsh-memory-live-k6bzYi/workspace`，默认 provider `local-acceptance` / model `qwen3.8-27b-uncensored-mlx`，没有自动创建任务或调用模型。已请求在 Codex 打开该页；应用返回 queued，页面会在对应任务显示时打开。精确无密钥重启命令（只在此环境已停止且端口空闲时使用）：
 

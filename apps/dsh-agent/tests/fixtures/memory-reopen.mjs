@@ -29,7 +29,9 @@ try {
   const effects = await api('effect-graph', { sessionId }); assert.deepEqual(effects, before.effects);
   assert.equal(await readFile(join(before.workspaceRoot, 'acceptance.txt'), 'utf8'), before.artifact);
   const memories = await api('memories', { sessionId, filters: { kind: 'semantic' } });
-  assert.equal(memories[0].version, 1); assert.equal(memories[0].content.nodes[0].exactContent, before.artifact);
+  assert.equal(memories[0].version, 1); assert.equal(Object.hasOwn(memories[0], 'content'), false);
+  const memory = await api('memory', { sessionId, memoryId: memories[0].id, version: memories[0].version });
+  assert.equal(memory.content.nodes[0].exactContent, before.artifact);
   const history = await rpc('session.history', { sessionId, maxMessages: 200 });
   assert.equal(history.events.filter(e => e.event.type === 'turn/end').length, 1);
   assert.equal((await rpc('session.list', {})).items.find(s => s.sessionId === sessionId).running, false);

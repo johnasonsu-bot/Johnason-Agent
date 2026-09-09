@@ -8,8 +8,11 @@ const invalid = () => { throw Object.assign(new Error('Invalid request'), { code
 function fields(value, allowed) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(k => !allowed.includes(k))) invalid();
 }
+function summaryHandle({ id, version, kind, visibility, summary, sourceRefs, validTime, systemTime, status }) {
+  return { id, version, kind, visibility, summary, sourceRefs, validTime, systemTime, status };
+}
 const actions = Object.freeze({
-  sessions: [], 'create-session': ['workspaceRoot'], configure: ['sessionId', 'input', 'expectedVersion'],
+  defaults: [], sessions: [], 'create-session': ['workspaceRoot'], configure: ['sessionId', 'input', 'expectedVersion'],
   config: ['sessionId'], status: ['sessionId'], memories: ['sessionId', 'filters'],
   memory: ['sessionId', 'memoryId', 'version'], 'semantic-graph': ['sessionId', 'filters'],
   'put-memory': ['sessionId', 'record', 'reason'], confirm: ['sessionId', 'memoryId', 'expectedVersion', 'reason'],
@@ -44,6 +47,12 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
       if (data.filters !== undefined) fields(data.filters, action === 'memories' ? ['kind', 'visibility', 'status', 'limit'] : ['validAt', 'systemAt', ...(action === 'semantic-graph' ? [] : ['limit'])]);
       let value; const id = data.sessionId;
       switch (action) {
+        case 'defaults': {
+          const response = await apiProxy.host.describe({ rpcId: randomUUID(), payload: {} });
+          const cwd = response.result.ok && response.result.value.cwd;
+          if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw Object.assign(new Error('Native defaults unavailable'), { code: 'MEMORY_NATIVE_DEFAULTS_FAILED' });
+          value = { workspaceRoot: cwd }; break;
+        }
         case 'sessions': value = service.listSessions(); break;
         case 'create-session': {
           if (typeof data.workspaceRoot !== 'string' || !isAbsolute(data.workspaceRoot)) invalid();
@@ -57,7 +66,7 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
         case 'configure': value = await service.configureSession(id, data.input, { expectedVersion: data.expectedVersion }); break;
         case 'config': value = service.getSessionConfig(id); break;
         case 'status': value = service.status(id); break;
-        case 'memories': value = service.listMemories(id, data.filters); break;
+        case 'memories': value = service.listMemories(id, data.filters).map(summaryHandle); break;
         case 'memory': value = service.getMemory(id, data.memoryId, data.version); break;
         case 'semantic-graph': value = service.semanticGraph(id, data.filters); break;
         case 'put-memory': value = await service.putOperatorMemory(id, data.record, data.reason); break;

@@ -2,6 +2,8 @@
 
 日期：2026-09-09。最终基线 `be6a26f`（包含真实新会话初始化与 native required-event cold-reopen 修复）。
 
+审查 round 1 已修复：新建会话保留权限/预算/锚点草稿，列表只返回摘要，模型判定要求精确原生调用顺序与匹配的强沙箱 Effect，预填真实 native 默认 workspace。最终定向 **16/16**、全 app **102/102，0 fail/skip**；保留模型证据严格复验和只读冷恢复通过，没有新模型请求。具体 RED/GREEN、手工服务重启和文件边界见 `task-4-fix-round1-report.md`。下文 89 项为原交付时历史结果。
+
 ## 交付内容
 
 - 新 `apps/dsh-agent/src/memory-recovery-ui.mjs`：本机同源、256 KiB 有界 JSON、固定业务方法白名单、固定错误代码/无输入反射、显式 native apiProxy 新 session 创建。不提供任意命令/工具/上下文注入/recovery/proof 路由。
