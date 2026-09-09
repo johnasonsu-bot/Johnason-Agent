@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { sanitizeEvent } from './record-sanitizer.mjs';
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const MEMORY_KINDS = new Set(['episodic', 'semantic', 'procedural']);
 const VISIBILITIES = new Set(['private', 'project']);
 const PROCEDURE_STATUSES = new Set(['candidate', 'confirmed']);
@@ -248,6 +248,12 @@ function initializeSchema(db) {
       agent_id TEXT NOT NULL,
       seq INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS memory_native_sources (
+      session_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      event_hash TEXT NOT NULL,
+      PRIMARY KEY (session_id, seq)
+    );
   `);
   if (version < SCHEMA_VERSION) db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
@@ -264,6 +270,14 @@ export class MemoryStore {
       this.db.exec('PRAGMA synchronous = FULL');
       this.db.exec('PRAGMA foreign_keys = ON');
       this.db.exec('PRAGMA busy_timeout = 5000');
+      this.db.function('memory_search_rank', { deterministic: true }, (summary, content, needle) => {
+        const summaryIndex = summary.toLocaleLowerCase().indexOf(needle);
+        const contentIndex = content.toLocaleLowerCase().indexOf(needle);
+        return (summaryIndex >= 0 ? 100 - Math.min(summaryIndex, 99) : 0)
+          + (contentIndex >= 0 ? 10 - Math.min(contentIndex, 9) : 0);
+      });
+      this.db.function('memory_text_length', { deterministic: true }, text => text.length);
+      this.db.function('memory_text_page', { deterministic: true }, (text, offset, maxChars) => text.slice(offset, offset + maxChars));
       initializeSchema(this.db);
       chmodSync(path, 0o600);
     } catch (error) {
@@ -279,14 +293,15 @@ export class MemoryStore {
     this.#closed = true;
   }
 
-  ingestEvents({ projectId, sessionId, agentId, events } = {}) {
+  ingestEvents({ projectId, sessionId, agentId, events, nativeEvents = events } = {}) {
     this.#assertOpen();
     const scope = validateScope({ projectId, sessionId, agentId });
-    if (!Array.isArray(events)) {
+    if (!Array.isArray(events) || !Array.isArray(nativeEvents) || events.length !== nativeEvents.length) {
       throw memoryError('MEMORY_INVALID_EVENT', 'events must be an array', TypeError);
     }
 
-    const preparedEvents = events.map(event => {
+    const preparedEvents = events.map((event, index) => {
+      if (nativeEvents[index].seq !== event.seq) throw memoryError('MEMORY_SOURCE_CONFLICT', 'native and projected sequences differ');
       let sanitized;
       try {
         sanitized = sanitizeEvent(event);
@@ -305,6 +320,7 @@ export class MemoryStore {
         source: event,
         sanitized,
         hash: createHash('sha256').update(canonical).digest('hex'),
+        nativeHash: createHash('sha256').update(serialize(nativeEvents[index], 'MEMORY_INVALID_EVENT')).digest('hex'),
       };
     });
 
@@ -332,9 +348,11 @@ export class MemoryStore {
       for (const item of preparedEvents) {
         const existing = sourceLookup.get(scope.sessionId, item.source.seq);
         if (existing) {
+          const native = this.db.prepare('SELECT event_hash FROM memory_native_sources WHERE session_id=? AND seq=?').get(scope.sessionId, item.source.seq);
           if (existing.project_id !== scope.projectId
               || existing.agent_id !== scope.agentId
-              || existing.event_hash !== item.hash) {
+              || existing.event_hash !== item.hash
+              || (native && native.event_hash !== item.nativeHash)) {
             throw memoryError('MEMORY_SOURCE_CONFLICT', 'event source already exists with different data');
           }
           skipped += 1;
@@ -394,6 +412,7 @@ export class MemoryStore {
           memoryId,
           systemTime,
         );
+        this.db.prepare('INSERT INTO memory_native_sources VALUES (?,?,?)').run(scope.sessionId, item.source.seq, item.nativeHash);
         cursor = item.source.seq;
         expected += 1;
       }
@@ -407,6 +426,24 @@ export class MemoryStore {
       }
       return { inserted, skipped, cursor };
     });
+  }
+
+  /** Verify an already-committed prefix without changing or re-signing legacy sources. */
+  verifyEvents({ projectId, sessionId, agentId, events, nativeEvents = events }) {
+    this.#assertOpen();
+    const scope = validateScope({ projectId, sessionId, agentId });
+    if (!Array.isArray(events) || !Array.isArray(nativeEvents) || events.length !== nativeEvents.length) throw memoryError('MEMORY_INVALID_EVENT', 'event batches differ');
+    for (let index = 0; index < events.length; index++) {
+      const event = events[index];
+      const source = this.db.prepare('SELECT project_id, agent_id, event_hash FROM memory_event_sources WHERE session_id=? AND seq=?').get(sessionId, event.seq);
+      const native = this.db.prepare('SELECT event_hash FROM memory_native_sources WHERE session_id=? AND seq=?').get(sessionId, event.seq);
+      const hash = value => createHash('sha256').update(serialize(value, 'MEMORY_INVALID_EVENT')).digest('hex');
+      if (!source || source.project_id !== scope.projectId || source.agent_id !== scope.agentId
+          || source.event_hash !== hash(event) || nativeEvents[index].seq !== event.seq
+          || (native && native.event_hash !== hash(nativeEvents[index]))) {
+        throw memoryError('MEMORY_SOURCE_CONFLICT', 'native durable source differs from the confirmed memory prefix; retained for inspection');
+      }
+    }
   }
 
   putMemory(record, { actor } = {}) {
@@ -569,6 +606,74 @@ export class MemoryStore {
             AND (visibility = 'project' OR (session_id = ? AND agent_id = ?))
         `).get(normalizedScope.projectId, id, version, normalizedScope.sessionId, normalizedScope.agentId);
     return row ? rowToRecord(row) : null;
+  }
+
+  /** Scope/latest-version/match precede LIMIT; return metadata, never matched bodies. */
+  search(scope, query, { limit = 20, excludeDerived = false } = {}) {
+    this.#assertOpen();
+    const normalized = validateScope(scope);
+    requireText(query, 'query', 'MEMORY_INVALID_QUERY', 16384);
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw memoryError('MEMORY_INVALID_LIMIT', 'search limit must be from 1 to 100');
+    const rows = this.db.prepare(`
+      WITH visible AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY project_id, id ORDER BY version DESC) AS rank
+        FROM memory_records WHERE project_id=? AND (visibility='project' OR (session_id=? AND agent_id=?))
+      ), matched AS (
+        SELECT *, memory_search_rank(summary, content_json, ?) AS score FROM visible
+        WHERE rank=1 AND (?=0 OR coalesce(json_extract(content_json, '$.data.memoryRecoveryDerived'),0)!=1)
+      )
+      SELECT project_id,id,version,kind,session_id,agent_id,visibility,summary,source_refs_json,valid_time,system_time,status,actor_json
+      FROM matched WHERE score>0 ORDER BY score DESC,system_time DESC,id ASC LIMIT ?
+    `).all(normalized.projectId, normalized.sessionId, normalized.agentId, query.trim().toLocaleLowerCase(), Number(excludeDerived), limit);
+    return rows.map(row => { const { content, ...handle } = rowToRecord({ ...row, content_json: 'null' }); return handle; });
+  }
+
+  /** Enumerate every visible latest protected rule; stop loudly at the caller's budget. */
+  protectedRules(scope, { maxChars } = {}) {
+    this.#assertOpen();
+    const normalized = validateScope(scope);
+    if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 400000) throw memoryError('MEMORY_INVALID_BUDGET', 'invalid protected rule budget');
+    const rows = this.db.prepare(`
+      WITH visible AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY project_id,id ORDER BY version DESC) AS rank
+        FROM memory_records WHERE project_id=? AND (visibility='project' OR (session_id=? AND agent_id=?))
+      )
+      SELECT json_extract(content_json,'$.rules') AS rules FROM visible
+      WHERE rank=1 AND kind='procedural' AND status='confirmed' AND json_extract(content_json,'$.protected')=1
+      ORDER BY id ASC
+    `).iterate(normalized.projectId, normalized.sessionId, normalized.agentId);
+    const rules = []; let chars = 0;
+    for (const row of rows) {
+      chars += row.rules.length;
+      if (chars > maxChars) throw memoryError('MEMORY_BUDGET_EXCEEDED', 'mandatory protected rules exceed the memory budget');
+      rules.push(row.rules);
+    }
+    return rules;
+  }
+
+  /** Bounded UTF-16 JSON-text range with an immutable version-qualified continuation. */
+  readPage(scope, id, { version, offset = 0, maxChars = 4000, excludeDerived = false } = {}) {
+    this.#assertOpen();
+    const normalized = validateScope(scope);
+    requireText(id, 'id', 'MEMORY_INVALID_RECORD', 512);
+    if (version !== undefined && (!Number.isSafeInteger(version) || version < 1)) throw memoryError('MEMORY_INVALID_RECORD', 'invalid version');
+    if (!Number.isSafeInteger(offset) || offset < 0) throw memoryError('MEMORY_INVALID_OFFSET', 'offset must be a nonnegative safe integer');
+    if (offset > 0 && version === undefined) throw memoryError('MEMORY_VERSION_REQUIRED', 'continuations require an explicit version');
+    if (!Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 100000) throw memoryError('MEMORY_INVALID_LIMIT', 'maxChars must be from 1 to 100000');
+    const row = this.db.prepare(`
+      SELECT project_id,id,version,kind,session_id,agent_id,visibility,summary,source_refs_json,valid_time,system_time,status,actor_json,
+        memory_text_length(content_json) AS total_chars, memory_text_page(content_json,?,?) AS page_text
+      FROM memory_records WHERE project_id=? AND id=? AND (? IS NULL OR version=?)
+        AND (visibility='project' OR (session_id=? AND agent_id=?))
+        AND (?=0 OR coalesce(json_extract(content_json,'$.data.memoryRecoveryDerived'),0)!=1)
+      ORDER BY version DESC LIMIT 1
+    `).get(offset, maxChars, normalized.projectId, id, version ?? null, version ?? null, normalized.sessionId, normalized.agentId, Number(excludeDerived));
+    if (!row) return null;
+    if (offset > row.total_chars) throw memoryError('MEMORY_INVALID_OFFSET', 'offset exceeds the fixed record version');
+    const { content, ...handle } = rowToRecord({ ...row, content_json: 'null' });
+    const hasMore = offset + row.page_text.length < row.total_chars;
+    return { ...handle, contentText: row.page_text, offset, maxChars, totalChars: row.total_chars,
+      nextOffset: hasMore ? offset + row.page_text.length : null, hasMore, truncated: offset > 0 || hasMore, offsetUnit: 'utf16' };
   }
 
   graph(scope, { validAt, systemAt } = {}) {

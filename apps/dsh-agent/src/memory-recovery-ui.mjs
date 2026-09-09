@@ -16,7 +16,7 @@ const actions = Object.freeze({
   config: ['sessionId'], status: ['sessionId'], memories: ['sessionId', 'filters'],
   memory: ['sessionId', 'memoryId', 'version'], 'semantic-graph': ['sessionId', 'filters'],
   'put-memory': ['sessionId', 'record', 'reason'], confirm: ['sessionId', 'memoryId', 'expectedVersion', 'reason'],
-  search: ['sessionId', 'query', 'limit'], 'page-in': ['sessionId', 'memoryId', 'version', 'maxChars'],
+  search: ['sessionId', 'query', 'limit'], 'page-in': ['sessionId', 'memoryId', 'version', 'offset', 'maxChars'],
   'page-out': ['sessionId', 'memoryId'], barrier: ['sessionId'], effects: ['sessionId', 'filters'], 'effect-graph': ['sessionId', 'filters'],
 });
 
@@ -71,8 +71,8 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
         case 'semantic-graph': value = service.semanticGraph(id, data.filters); break;
         case 'put-memory': value = await service.putOperatorMemory(id, data.record, data.reason); break;
         case 'confirm': value = await service.confirmProcedure(id, data.memoryId, { expectedVersion: data.expectedVersion, reason: data.reason }); break;
-        case 'search': value = service.search(id, data.query, { limit: data.limit }); break;
-        case 'page-in': value = service.pageIn(id, data.memoryId, { version: data.version, maxChars: data.maxChars }); break;
+        case 'search': value = await service.search(id, data.query, { limit: data.limit }); break;
+        case 'page-in': value = await service.pageIn(id, data.memoryId, { version: data.version, offset: data.offset, maxChars: data.maxChars }); break;
         case 'page-out': value = service.pageOut(id, data.memoryId); break;
         case 'barrier': await service.barrier(id); value = service.status(id); break;
         case 'effects': value = service.listEffects(id, data.filters); break;

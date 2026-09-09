@@ -50,8 +50,9 @@ test('restart recovery distinguishes prepared intent and unknown dispatch withou
   memory.close();
   const reopened = new MemoryStore(path);
   t.after(() => reopened.close());
+  const memorySchema = reopened.db.prepare('PRAGMA user_version').get().user_version;
   const restored = new EffectStore(reopened);
-  assert.equal(reopened.db.prepare('PRAGMA user_version').get().user_version, 1);
+  assert.equal(reopened.db.prepare('PRAGMA user_version').get().user_version, memorySchema);
   const states = restored.recover(scope);
   assert.equal(states.find(x => x.id === dispatched.id).state, 'UNKNOWN');
   assert.equal(states.find(x => x.id === pending.id).state, 'PREPARED');

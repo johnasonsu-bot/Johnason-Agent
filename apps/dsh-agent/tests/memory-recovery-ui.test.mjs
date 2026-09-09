@@ -73,6 +73,13 @@ test('real native Web creates an unstarted scoped session, versions records and 
   assert.match((await f.ok('page-in', { sessionId, memoryId: first.id, version: 1, maxChars: 1000 })).contentText, /Original/);
   assert.equal(await f.ok('page-out', { sessionId, memoryId: first.id }), true);
   assert.equal((await f.ok('memory', { sessionId, memoryId: first.id })).version, 2);
+  const long = await f.ok('put-memory', { sessionId, reason: 'Reviewed tail pagination', record: { kind: 'semantic', visibility: 'private', summary: 'Long HTTP source',
+    content: { nodes: [{ id: 'long', type: 'fact', text: 'x'.repeat(100100) + 'HTTP-TAIL-ONLY' }], edges: [] } } });
+  const head = await f.ok('page-in', { sessionId, memoryId: long.id, maxChars: 100000 });
+  const tail = await f.ok('page-in', { sessionId, memoryId: long.id, version: head.version, offset: head.nextOffset, maxChars: 1000 });
+  assert.equal(tail.offset, 100000); assert.match(tail.contentText, /HTTP-TAIL-ONLY/);
+  assert.equal(tail.hasMore, false); assert.equal(tail.nextOffset, null);
+  assert.equal((await f.request('page-in', { sessionId, memoryId: long.id, version: 1, offset: -1 })).body.code, 'MEMORY_INVALID_OFFSET');
   const other = await f.ok('create-session', { workspaceRoot: f.workspace });
   await f.ok('configure', { sessionId: other.sessionId, input: { ...config, agentId: other.sessionId, projectId: 'beta', sandbox: null }, expectedVersion: 0 });
   assert.equal(await f.ok('memory', { sessionId: other.sessionId, memoryId: first.id }), null);
@@ -154,6 +161,13 @@ test('independent browser creates/configures and actually opens its selected nat
   await page.waitForFunction(() => document.getElementById('version').value === '1');
   const memoryId = await page.locator('#memory-id').inputValue();
   assert.ok(memoryId);
+  await page.locator('#max-chars').fill('20');
+  await page.locator('#page-in').click();
+  await page.waitForFunction(() => document.getElementById('detail').textContent.includes('"nextOffset": 20'));
+  await page.locator('#page-next').click();
+  await page.waitForFunction(() => document.getElementById('detail').textContent.includes('"offset": 20'));
+  assert.equal(await page.locator('#page-offset').inputValue(), '20');
+  assert.equal(await page.locator('#version').inputValue(), '1');
   await page.screenshot({ path: join(f.root, 'memory-recovery.png'), fullPage: true });
   const nativeRequests = [];
   page.on('request', request => { if (request.url().includes('/api/')) { try { nativeRequests.push(request.postDataJSON()); } catch {} } });

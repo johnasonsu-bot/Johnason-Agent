@@ -61,7 +61,8 @@ function anchorText(anchor) {
 
 function contextForPage(page) {
   const sources = JSON.stringify(page.sourceRefs);
-  const header = `[memory:${page.id}@${page.version};sources=${sources}] ${page.summary}`;
+  const range = Object.hasOwn(page, 'offset') ? `;offset=${page.offset};total=${page.totalChars};next=${page.nextOffset}` : '';
+  const header = `[memory:${page.id}@${page.version}${range};sources=${sources}] ${page.summary}`;
   return Object.hasOwn(page, 'contentText') ? `${header}\n${page.contentText}` : header;
 }
 
@@ -156,27 +157,7 @@ export class MemoryPager {
       throw pagerError('MEMORY_INVALID_QUERY', 'query must be a non-empty string', TypeError);
     }
     const limit = validateLimit(options.limit, 20, MAX_SEARCH_LIMIT);
-    const needle = query.trim().toLocaleLowerCase();
-    const candidates = this.#store.list(scope, { limit: 1_000 });
-    return candidates
-      .map(record => {
-        const summary = record.summary.toLocaleLowerCase();
-        const content = JSON.stringify(record.content).toLocaleLowerCase();
-        const summaryIndex = summary.indexOf(needle);
-        const contentIndex = content.indexOf(needle);
-        if (summaryIndex < 0 && contentIndex < 0) return null;
-        return {
-          record,
-          score: (summaryIndex >= 0 ? 100 - Math.min(summaryIndex, 99) : 0)
-            + (contentIndex >= 0 ? 10 - Math.min(contentIndex, 9) : 0),
-        };
-      })
-      .filter(Boolean)
-      .sort((left, right) => right.score - left.score
-        || right.record.systemTime - left.record.systemTime
-        || left.record.id.localeCompare(right.record.id))
-      .slice(0, limit)
-      .map(({ record }) => handleFor(record));
+    return this.#store.search(scope, query, { limit }).map(handleFor);
   }
 
   pageIn(scope, id, options = {}) {
@@ -185,14 +166,10 @@ export class MemoryPager {
     if (typeof id !== 'string' || id.length === 0) {
       throw pagerError('MEMORY_INVALID_QUERY', 'id must be a non-empty string', TypeError);
     }
-    const record = this.#store.get(scope, id, options.version);
+    const record = this.#store.readPage(scope, id, { ...options, maxChars });
     if (record === null) throw pagerError('MEMORY_NOT_FOUND', 'memory was not found or is not visible');
-    const serialized = JSON.stringify(record.content);
-    const page = {
-      ...handleFor(record),
-      contentText: serialized.slice(0, maxChars),
-      truncated: serialized.length > maxChars,
-    };
+    const { contentText, truncated, offset, totalChars, nextOffset, hasMore, offsetUnit } = record;
+    const page = { ...handleFor(record), contentText, truncated, offset, maxChars, totalChars, nextOffset, hasMore, offsetUnit };
     const key = scopeKey(scope);
     const pages = this.#workingSets.get(key) ?? new Map();
     pages.set(id, structuredClone(page));

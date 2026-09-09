@@ -3,6 +3,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 
 import { DatabaseSync } from 'node:sqlite';
 
@@ -36,6 +37,31 @@ function memory(overrides = {}) {
     ...overrides,
   };
 }
+
+test('v1 source hashes are verified without re-signing and v2 retains full native identity', async () => {
+  const path = await memoryPath('source-migration');
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`CREATE TABLE memory_event_sources (session_id TEXT,seq INTEGER,project_id TEXT,agent_id TEXT,event_hash TEXT,memory_id TEXT,ingested_at INTEGER,PRIMARY KEY(session_id,seq));
+    CREATE TABLE memory_cursors (session_id TEXT PRIMARY KEY,project_id TEXT,agent_id TEXT,seq INTEGER); PRAGMA user_version=1;`);
+  const hash = createHash('sha256').update('{"data":{"text":"legacy"},"seq":0,"time":1,"type":"assistant/chunk"}').digest('hex');
+  legacy.prepare('INSERT INTO memory_event_sources VALUES (?,?,?,?,?,NULL,1)').run(ownScope.sessionId, 0, ownScope.projectId, ownScope.agentId, hash);
+  legacy.prepare('INSERT INTO memory_cursors VALUES (?,?,?,0)').run(ownScope.sessionId, ownScope.projectId, ownScope.agentId);
+  legacy.close();
+  const store = new MemoryStore(path);
+  const original = { seq: 0, type: 'assistant/chunk', time: 1, data: { text: 'legacy' } };
+  store.verifyEvents({ ...ownScope, events: [original] });
+  store.ingestEvents({ ...ownScope, events: [original] });
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM memory_native_sources').get().n, 0);
+  assert.equal(store.db.prepare('SELECT event_hash FROM memory_event_sources').get().event_hash, hash);
+  assert.throws(() => store.verifyEvents({ ...ownScope, events: [{ ...original, data: { text: 'rewritten' } }] }), { code: 'MEMORY_SOURCE_CONFLICT' });
+  const projection = { seq: 1, type: 'assistant/chunk', time: 2, data: { metadataOnly: true } };
+  const native = { ...projection, data: { text: 'actual native derived body' } };
+  store.ingestEvents({ ...ownScope, events: [projection], nativeEvents: [native] });
+  assert.throws(() => store.verifyEvents({ ...ownScope, events: [projection], nativeEvents: [{ ...native, data: { text: 'different native body' } }] }), { code: 'MEMORY_SOURCE_CONFLICT' });
+  assert.equal(store.cursor(ownScope.sessionId), 1);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
+  store.close();
+});
 
 test('persists episodic, semantic, and procedural memories across restart as detached JSON records', async () => {
   const path = await memoryPath('restart');

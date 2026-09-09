@@ -50,6 +50,38 @@ test('search returns bounded summary handles without content and respects privat
   store.close();
 });
 
+test('search matches across the complete scoped history before limiting candidates', async () => {
+  const { store, pager } = await createPager('old-search');
+  store.putMemory(semantic('old-fact', 'Historic match', 'RARE-TAIL-FACT'), operator);
+  for (let i = 0; i < 1001; i++) store.putMemory(semantic(`noise-${i}`, 'Recent noise', 'irrelevant'), operator);
+  const hits = pager.search(owner, 'rare-tail-fact', { limit: 1 });
+  assert.deepEqual(hits.map(hit => hit.id), ['old-fact']);
+  assert.equal(Object.hasOwn(hits[0], 'content'), false);
+  store.close();
+});
+
+test('bounded continuation reaches the tail and reopens the exact historical version', async () => {
+  const { store, pager } = await createPager('tail-pages');
+  const original = store.putMemory(semantic('long-tail', 'Tail record', 'x'.repeat(110000) + 'TAIL-ONLY-MARKER'), operator);
+  const full = JSON.stringify(original.content);
+  const first = pager.pageIn(owner, original.id, { maxChars: 100000 });
+  assert.equal(first.totalChars, full.length);
+  assert.equal(first.nextOffset, 100000);
+  assert.equal(first.hasMore, true);
+  const args = { version: first.version, offset: first.nextOffset, maxChars: 20000 };
+  const tail = pager.pageIn(owner, original.id, args);
+  assert.equal(tail.contentText, full.slice(100000));
+  assert.equal(tail.hasMore, false); assert.equal(tail.nextOffset, null);
+  assert.match(pager.select(owner, { budgetTokens: 5000 }).contextText, /TAIL-ONLY-MARKER/);
+  store.putMemory({ ...semantic('long-tail', 'New version', 'replacement'), expectedVersion: 1 }, operator);
+  const path = store.db.location(); store.close();
+  const reopened = new MemoryStore(path);
+  assert.equal(new MemoryPager(reopened).pageIn(owner, original.id, args).contentText, tail.contentText);
+  assert.throws(() => new MemoryPager(reopened).pageIn(owner, original.id, { offset: -1 }), { code: 'MEMORY_INVALID_OFFSET' });
+  assert.throws(() => new MemoryPager(reopened).pageIn(owner, original.id, { version: 1, offset: full.length + 1 }), { code: 'MEMORY_INVALID_OFFSET' });
+  reopened.close();
+});
+
 test('page in exposes bounded content, page out changes selected context, and neither deletes source records', async () => {
   const { store, pager } = await createPager('page-in-out');
   store.putMemory(semantic('long', 'Needle long record', 'x'.repeat(200)), operator);

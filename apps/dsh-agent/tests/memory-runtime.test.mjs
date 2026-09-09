@@ -30,7 +30,7 @@ async function fixture(t, options = {}) {
   t.diagnostic(`Retained native integration fixture: ${root}`);
   const ctx = new Context();
   for (const plugin of [Llm, Sessions, Prompt, Tools, Agents]) await ctx.plugin(plugin);
-  if (options.persistence) await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none', packChunks: false });
   await ctx.plugin(Loop, { agents: [] });
   await ctx.plugin(Sandbox);
   await ctx.plugin(Policy, { mode: options.nativeMode ?? 'workspace-write', workspaceRoot });
@@ -181,13 +181,66 @@ test('large canonical output is retained raw but native result uses a sourced su
   assert.match(JSON.stringify(f.agent.session.deriveMessages()), /ORIGINAL LARGE BODY/);
 });
 
-test('bounded observer overflow survives fire-and-forget and fails awaited flush and dispatch', async t => {
+test('bounded observer rejects an oversized event and fails awaited flush and dispatch', async t => {
   const f = await fixture(t); await f.configure();
-  for (let i = 0; i < 513; i++) f.agent.session.append('assistant/chunk', { text: 'stream', i });
+  f.agent.session.append('assistant/chunk', { text: 'x'.repeat(8 * 1024 * 1024) });
   assert.equal(f.service.status(f.agent.id).error, 'MEMORY_QUEUE_OVERFLOW');
-  await assert.rejects(f.ctx.sessions.flush(f.agent.session), /overflow/);
+  await assert.rejects(f.ctx.sessions.flush(f.agent.session), { code: 'MEMORY_QUEUE_OVERFLOW' });
   const result = await f.execute('memory_sandbox_run', { argv: ['true'] });
   assert.equal(result.isError, true); assert.equal(f.service.listEffects(f.agent.id).length, 0);
+});
+
+test('native append failure cannot advance projection and remains visible at every boundary', async t => {
+  const f = await fixture(t, { persistence: true }); await f.configure();
+  const persisted = f.ctx.sessionPersistence;
+  const append = persisted.appendBatch;
+  persisted.appendBatch = async () => { throw new Error('injected native disk failure'); };
+  try {
+    f.agent.session.append('assistant/chunk', { text: 'must not be projected' });
+    await assert.rejects(f.ctx.sessions.flush(f.agent.session), /injected native disk failure/);
+    assert.equal(f.service.status(f.agent.id).durableThroughSeq, 0);
+    assert.equal(f.service.status(f.agent.id).error, 'MEMORY_DURABILITY_FAILED');
+    assert.equal(f.service.getMemory(f.agent.id, `event:${f.agent.id}:1`), null);
+    await assert.rejects(f.service.barrier(f.agent.id), /injected native disk failure/);
+    const raw = await persisted.readFrom(f.agent.id, 0);
+    assert.equal(raw.events.length, 1);
+  } finally { persisted.appendBatch = append; }
+});
+
+test('long native streams drain without step boundaries and concurrent native flushes do not recurse', async t => {
+  const f = await fixture(t, { persistence: true }); await f.configure();
+  for (let i = 0; i < 1200; i++) {
+    f.agent.session.append('assistant/chunk', { text: 'ordinary stream', i });
+    if (i % 100 === 0) await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(f.service.status(f.agent.id).error, null);
+  await Promise.all([f.ctx.sessions.flush(f.agent.session), f.service.barrier(f.agent.id), f.ctx.sessions.flush(f.agent.session)]);
+  assert.equal(f.service.status(f.agent.id).pending, 0);
+  assert.equal(f.service.status(f.agent.id).durableThroughSeq, 1200);
+  assert.equal((await f.ctx.sessionPersistence.readFrom(f.agent.id, 0)).events.length, 1201);
+  assert.equal(f.service.listMemories(f.agent.id, { limit: 1000 })[0].content.data.i, 1199);
+});
+
+test('cold recovery refuses a previously projected source that the native log does not contain', async t => {
+  const f = await fixture(t, { persistence: true }); await f.configure();
+  const external = new MemoryStore(join(f.root, 'memory.sqlite'));
+  external.ingestEvents({ ...f.service.scopeForSession(f.agent.id), events: [{ seq: 1, type: 'assistant/chunk', time: 1, data: { text: 'legacy false durability' } }] });
+  external.close();
+  await f.ctx.fiber.dispose();
+  const ctx = new Context();
+  for (const plugin of [Sessions, Prompt, Tools]) await ctx.plugin(plugin);
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
+  await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
+  t.after(() => ctx.fiber.dispose());
+  const prepared = await ctx.sessionPersistence.prepare(f.agent.id);
+  try {
+    const restored = prepared.session;
+    ctx.effect(() => ctx.sessions.enter(restored)); ctx.sessions.announce(restored);
+    await assert.rejects(ctx.memoryRecovery.barrier(restored.id), { code: 'MEMORY_SOURCE_CONFLICT' });
+    assert.equal(ctx.memoryRecovery.status(restored.id).error, 'MEMORY_SOURCE_CONFLICT');
+    assert.equal(ctx.memoryRecovery.getMemory(restored.id, `event:${restored.id}:1`).content.data.text, 'legacy false durability');
+  } finally { prepared[Symbol.dispose](); }
 });
 
 test('invalid requirements and running downgrade fail before dispatch without disabling isolation', async t => {
@@ -238,6 +291,7 @@ test('restored native same-session config replays missing tail exactly and does 
   await f.ctx.fiber.dispose();
   const ctx = new Context();
   for (const plugin of [Sessions, Prompt, Tools]) await ctx.plugin(plugin);
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
   await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
   await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
   t.after(() => ctx.fiber.dispose());
@@ -328,6 +382,39 @@ test('trusted operator confirms a candidate but model operator impersonation and
   await f.service.configureSession(f.agent.id, { ...f.config, budgetTokens: 128, anchors: ['Invariant '.repeat(300)] }, { expectedVersion: 1 });
   await assert.rejects(f.service.projectContext(f.agent.id), { code: 'MEMORY_BUDGET_EXCEEDED' });
   assert.equal(f.agent.session.surface.nodes.length, 0);
+});
+
+test('old protected procedures survive unrelated records and mandatory overflow fails explicitly', async t => {
+  const f = await fixture(t); await f.configure();
+  const store = new MemoryStore(join(f.root, 'memory.sqlite'));
+  const scope = f.service.scopeForSession(f.agent.id);
+  const sourceRefs = [{ type: 'operator', operatorId: 'test-operator', reason: 'reviewed invariant' }];
+  const put = (id, protectedRule, rule) => store.putMemory({ ...scope, id, kind: 'procedural', visibility: 'private', summary: id, status: 'confirmed',
+    content: { protected: protectedRule, rules: [rule], applicability: {} }, sourceRefs }, { actor: { id: 'test-operator', role: 'operator' } });
+  put('old-protected', true, 'MUST-RETAIN-OLD-INVARIANT');
+  for (let i = 0; i < 1001; i++) put(`unrelated-${i}`, false, 'ordinary advice');
+  const selection = await f.service.projectContext(f.agent.id);
+  assert.match(selection.contextText, /MUST-RETAIN-OLD-INVARIANT/);
+  put('over-budget-protected', true, 'mandatory '.repeat(2000));
+  await assert.rejects(f.service.projectContext(f.agent.id), { code: 'MEMORY_BUDGET_EXCEEDED' });
+  store.close();
+});
+
+test('native page-in tool selects the requested tail in the logged model surface', async t => {
+  const f = await fixture(t); await f.configure();
+  const record = await f.service.putOperatorMemory(f.agent.id, { kind: 'semantic', visibility: 'private', summary: 'Large contract',
+    content: { nodes: [{ id: 'large', type: 'contract', text: 'x'.repeat(100100) + 'MODEL-TAIL-ONLY' }], edges: [] } }, 'Reviewed long source');
+  const result = await f.execute('memory_page_in', { id: record.id, version: 1, offset: 100000, maxChars: 1000 });
+  assert.equal(result.isError, false, result.error?.message);
+  assert.equal(result.value.offset, 100000); assert.equal(result.value.hasMore, false);
+  assert.equal(result.value.nextOffset, null);
+  await f.service.projectContext(f.agent.id);
+  assert.match(JSON.stringify(f.agent.session.deriveMessages()), /MODEL-TAIL-ONLY/);
+  const logged = f.agent.session.events.find(e => e.type === 'memory-recovery/page-selection');
+  assert.equal(logged.data.pages[0].offset, 100000);
+  const seq = f.agent.session.seq;
+  await f.service.projectContext(f.agent.id);
+  assert.equal(f.agent.session.seq, seq);
 });
 
 test('database write failure remains sticky across native normalization and prevents later dispatch', async t => {

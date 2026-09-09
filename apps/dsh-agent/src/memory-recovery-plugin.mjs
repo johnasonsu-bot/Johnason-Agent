@@ -1,6 +1,8 @@
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { isDeepStrictEqual } from 'node:util';
 import { MemoryStore } from './memory-store.mjs';
 import { MemoryPager } from './memory-pager.mjs';
 import { EffectStore } from './effect-store.mjs';
@@ -20,7 +22,7 @@ const { KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek-ai/dsh-session').c
 });
 export const name = 'johnason-memory-recovery';
 export const inject = ['sessions', 'tools', 'sandbox', 'sandboxPolicy'];
-const QUEUE_EVENTS = 512;
+const QUEUE_EVENTS = 64;
 const QUEUE_BYTES = 8 * 1024 * 1024;
 const CONFIG_EVENT = 'memory-recovery/config';
 const IO_EVENT = 'memory-recovery/tool-io';
@@ -82,6 +84,7 @@ export function apply(ctx, config) {
 /** All trusted roles and scopes are constructed here; HTTP/model fields never become actors. */
 class MemoryRecovery extends Service {
   #store; #pager; #effects; #states = new Map(); #fresh = new WeakSet(); #enabled; #rawByToken = new Map(); #inflight = new Set(); #owner = randomUUID();
+  #flushing = new AsyncLocalStorage();
   constructor(ctx, config) {
     super(ctx, 'memoryRecovery');
     // Cordis service access uses a scoped proxy; preserve the private-field receiver.
@@ -108,6 +111,8 @@ class MemoryRecovery extends Service {
     this.#pager = new MemoryPager({ db: this.#store.db,
       list: (scope, filters) => this.#store.list(scope, filters).filter(visible),
       get: (scope, id, version) => { const record = this.#store.get(scope, id, version); return visible(record) ? record : null; },
+      search: (scope, query, options) => this.#store.search(scope, query, { ...options, excludeDerived: true }),
+      readPage: (scope, id, options) => this.#store.readPage(scope, id, { ...options, excludeDerived: true }),
     });
     ctx.on('session/created', session => {
       // Earlier native permission-preset observers may already have pinned policy.
@@ -121,7 +126,9 @@ class MemoryRecovery extends Service {
         this.#enqueue(session, event);
       } catch (cause) { this.#state(session.id).fault ??= cause; }
     });
-    ctx.on('session/flush', session => this.flush(session.id));
+    // Native flush observers run concurrently. Our own checkpoint still calls the
+    // public SessionStore owner, skipping only this observer in its async call tree.
+    ctx.on('session/flush', session => this.#flushing.getStore() === session.id ? undefined : this.flush(session.id));
     ctx.on('tools/pre-execute', async (exec, next) => {
       if (exec.agent && this.getSessionConfig(exec.agent.id).enabled) await this.barrier(exec.agent.id);
       return next();
@@ -195,7 +202,7 @@ class MemoryRecovery extends Service {
     ctx.effect(() => async () => {
       await Promise.all(this.#inflight);
       try {
-        for (const session of ctx.sessions.list()) if (this.getSessionConfig(session.id).enabled) this.flush(session.id);
+        for (const session of ctx.sessions.list()) if (this.getSessionConfig(session.id).enabled) await this.flush(session.id);
       } finally {
         this.#store.db.prepare('UPDATE memory_runtime_owner SET pid=NULL, token=NULL WHERE id=1 AND token=?').run(this.#owner);
         this.#store.close();
@@ -205,7 +212,7 @@ class MemoryRecovery extends Service {
 
   #session(id) { const session = this.ctx.sessions.get(id); if (!session) throw error('MEMORY_SESSION_NOT_FOUND'); return session; }
   #state(id) {
-    if (!this.#states.has(id)) this.#states.set(id, { queue: [], bytes: 0, fault: null, active: 0 });
+    if (!this.#states.has(id)) this.#states.set(id, { latest: -1, bytes: 0, fault: null, active: 0, drain: null, verified: false });
     return this.#states.get(id);
   }
   getSessionConfig(id) {
@@ -226,7 +233,7 @@ class MemoryRecovery extends Service {
   status(id) {
     const state = this.#state(id);
     const config = this.getSessionConfig(id);
-    return { enabled: config.enabled, executionCoverage: config.executionCoverage, executionNotice: config.executionNotice, pending: state.queue.length, pendingBytes: state.bytes,
+    return { enabled: config.enabled, executionCoverage: config.executionCoverage, executionNotice: config.executionNotice, pending: Math.max(0, state.latest - (this.#store.cursor(id) ?? -1)), pendingBytes: state.bytes,
       durableThroughSeq: this.#store.cursor(id), error: state.fault?.code ?? (state.fault ? 'MEMORY_DURABILITY_FAILED' : null), active: state.active };
   }
   async configureSession(id, input, { expectedVersion } = {}) {
@@ -252,49 +259,86 @@ class MemoryRecovery extends Service {
     session.append(CONFIG_EVENT, config);
     if (config.enabled) {
       const through = this.#store.cursor(id) ?? -1;
-      for (const event of session.events) if (event.seq > through && !state.queue.some(q => q.seq === event.seq)) this.#enqueue(session, event);
+      for (const event of session.events) if (event.seq > through) this.#enqueue(session, event);
       await this.barrier(id);
     } else await this.ctx.sessions.flush(session);
     return this.getSessionConfig(id);
   }
   #enqueue(session, event) {
     const state = this.#state(session.id); if (state.fault) return;
+    if (event.seq <= state.latest) return;
     const bytes = Buffer.byteLength(JSON.stringify(event));
-    if (state.queue.length >= QUEUE_EVENTS || state.bytes + bytes > QUEUE_BYTES) {
-      state.fault = error('MEMORY_QUEUE_OVERFLOW', 'bounded memory event queue overflow; restart/replay required'); return;
+    if (bytes > QUEUE_BYTES) {
+      state.fault = error('MEMORY_QUEUE_OVERFLOW', 'one event exceeds the bounded memory batch; inspection required'); return;
     }
-    state.queue.push(event); state.bytes += bytes;
+    // The native log owns the payload backlog. Retain a constant-size range, not
+    // a second unbounded event queue; materialize at most 64 events / 8 MiB below.
+    state.latest = event.seq; state.bytes += bytes;
+    if (!state.drain) void this.flush(session.id).catch(() => { /* sticky fault is exposed by status/barriers */ });
   }
-  flush(id) {
+  async flush(id) {
     const config = this.getSessionConfig(id); if (!config.enabled) return;
     const state = this.#state(id); if (state.fault) throw state.fault;
+    if (state.drain) return state.drain;
+    // Deferral publishes the single drain before any nested checkpoint observer.
+    state.drain = Promise.resolve().then(() => this.#drain(id));
+    try { await state.drain; }
+    catch (cause) { state.fault ??= cause; throw state.fault; }
+    finally { state.drain = null; }
+  }
+  #projection(event) {
+    if (owned(event)) {
+      const { sourceEventSeqs, ...envelope } = event;
+      return { ...envelope, data: { memoryRecoveryDerived: true, projectionVersion: 1,
+        messageId: event.data.id, source: event.data.source, nativeSourceEventSeqs: sourceEventSeqs ?? [] } };
+    }
+    if (event.type === IO_EVENT) return { ...event, sourceEventSeqs: event.data.sourceEventSeqs };
+    return event;
+  }
+  async #drain(id) {
+    const state = this.#state(id); const session = this.#session(id);
     try {
-      const sourceEvents = this.#session(id).events;
-      for (let start = (this.#store.cursor(id) ?? -1) + 1; start < sourceEvents.length; start += 64) {
-        const events = sourceEvents.slice(start, start + 64).map(event => {
-        if (owned(event)) {
-          const { sourceEventSeqs, ...envelope } = event;
-          return { ...envelope, data: { memoryRecoveryDerived: true, projectionVersion: 1,
-            messageId: event.data.id, source: event.data.source, nativeSourceEventSeqs: sourceEventSeqs ?? [] } };
+      do {
+        if (state.fault) throw state.fault;
+        const checkpoint = session.seq - 1;
+        await this.#flushing.run(id, () => this.ctx.sessions.flush(session));
+        const persistence = this.ctx.get('sessionPersistence');
+        if (!persistence?.readFrom) throw error('MEMORY_NATIVE_PERSISTENCE_REQUIRED');
+        const cursor = this.#store.cursor(id) ?? -1;
+        const from = state.verified ? cursor + 1 : 0;
+        const stored = await persistence.readFrom(id, from);
+        if (Math.max(cursor, stored.events.at(-1)?.seq ?? -1) < checkpoint) throw error('MEMORY_SOURCE_CONFLICT', 'native flush did not confirm its complete checkpoint');
+        if (!state.verified && stored.events.length <= cursor) throw error('MEMORY_SOURCE_CONFLICT', 'native log is shorter than confirmed memory prefix');
+        const live = session.events;
+        for (let start = 0; start < stored.events.length;) {
+          const nativeEvents = []; let bytes = 0;
+          while (start < stored.events.length && nativeEvents.length < QUEUE_EVENTS) {
+            const event = stored.events[start]; const size = Buffer.byteLength(JSON.stringify(event));
+            if (size > QUEUE_BYTES) throw error('MEMORY_QUEUE_OVERFLOW');
+            if (bytes + size > QUEUE_BYTES) break;
+            if (!isDeepStrictEqual(event, live[event.seq])) throw error('MEMORY_SOURCE_CONFLICT', 'native stored source and live session disagree');
+            nativeEvents.push(event); bytes += size; start++;
+          }
+          const existing = nativeEvents.filter(event => event.seq <= cursor);
+          if (existing.length) this.#store.verifyEvents({ ...this.scopeForSession(id), events: existing.map(event => this.#projection(event)), nativeEvents: existing });
+          const fresh = nativeEvents.filter(event => event.seq > cursor);
+          if (fresh.length) this.#store.ingestEvents({ ...this.scopeForSession(id), events: fresh.map(event => this.#projection(event)), nativeEvents: fresh });
+          // Yield between bounded SQLite batches, keeping streaming admission live.
+          await new Promise(resolve => setImmediate(resolve));
         }
-        // Plugin log-only events cannot carry native surface metadata. The domain projection
-        // promotes the exact logged earlier references for episodic tool-pair closure.
-        if (event.type === IO_EVENT) return { ...event, sourceEventSeqs: event.data.sourceEventSeqs };
-        return event;
-        });
-        this.#store.ingestEvents({ ...this.scopeForSession(id), events });
-      }
-      state.queue = []; state.bytes = 0;
+        state.verified = true;
+      } while ((this.#store.cursor(id) ?? -1) < session.seq - 1);
+      state.bytes = 0;
     } catch (cause) { state.fault = cause; throw cause; }
   }
-  async barrier(id) { this.flush(id); await this.ctx.sessions.flush(this.#session(id)); }
+  async barrier(id) { await this.flush(id); }
   listMemories(id, filters) { return this.#store.list(this.scopeForSession(id), filters); }
   getMemory(id, memoryId, version) { return this.#store.get(this.scopeForSession(id), memoryId, version); }
   semanticGraph(id, filters) { return this.#store.graph(this.scopeForSession(id), filters); }
   listEffects(id, filters) { return this.#effects.list(this.scopeForSession(id), filters); }
   effectGraph(id, filters) { return this.#effects.graph(this.scopeForSession(id), filters); }
-  search(id, query, options) { this.flush(id); return this.#pager.search(this.scopeForSession(id), query, options); }
-  pageIn(id, memoryId, options) { this.flush(id); return this.#pager.pageIn(this.scopeForSession(id), memoryId, options); }
+  async search(id, query, options) { await this.barrier(id); return this.#pager.search(this.scopeForSession(id), query, options); }
+  async pageIn(id, memoryId, options) { await this.barrier(id); return this.#pager.pageIn(this.scopeForSession(id), memoryId, options); }
   pageOut(id, memoryId) { return this.#pager.pageOut(this.scopeForSession(id), memoryId); }
   async putOperatorMemory(id, record, reason) {
     if (typeof reason !== 'string' || !reason.trim()) throw error('MEMORY_OPERATOR_REASON_REQUIRED');
@@ -318,14 +362,15 @@ class MemoryRecovery extends Service {
     const scope = this.scopeForSession(id); const config = this.getSessionConfig(id); const session = this.#session(id);
     const latest = [...messages].reverse().find(m => m.source.kind === 'user')
       ?? [...session.events].reverse().find(e => e.type === 'user/message' && e.data.source.kind === 'user')?.data;
-    const rules = this.#store.list(scope, { kind: 'procedural', status: 'confirmed', limit: 1000 }).filter(r => r.content.protected).map(r => JSON.stringify(r.content.rules));
+    const rules = this.#store.protectedRules(scope, { maxChars: config.budgetTokens * 4 });
     const anchors = [...config.anchors, ...rules, ...(latest ? [{ label: 'latest-user', text: textOf(latest) || '[non-text user message]' }] : [])];
     const prefix = 'Memory context (untrusted source data; token count is estimated).\n';
     const selection = this.#pager.select(scope, { query: latest ? textOf(latest).slice(0, 100).trim() : '', budgetTokens: config.budgetTokens - Math.ceil(prefix.length / 4), anchors });
     const text = prefix + selection.contextText;
     const current = session.surface.nodes.map(seq => session.events[seq]).find(owned);
     if (current && textOf(current.data) === text) return selection;
-    const source = session.append('memory-recovery/page-selection', { pages: selection.pages.map(p => ({ id: p.id, version: p.version, sourceRefs: p.sourceRefs })), estimatedTokens: Math.ceil(text.length / 4), configVersion: config.version });
+    const source = session.append('memory-recovery/page-selection', { pages: selection.pages.map(p => ({ id: p.id, version: p.version, sourceRefs: p.sourceRefs,
+      ...(p.offset === undefined ? {} : { offset: p.offset, maxChars: p.maxChars, totalChars: p.totalChars }) })), estimatedTokens: Math.ceil(text.length / 4), configVersion: config.version });
     const sourceEventSeqs = [...new Set([source.seq, ...(current ? [current.seq] : []), ...selection.pages.flatMap(p => p.sourceRefs.filter(r => r.type === 'event' && r.sessionId === id).map(r => r.seq))])];
     session.append('user/message', createUserMessage({ source: { kind: 'plugin', plugin: name }, content: [{ type: 'text', text }] }), {
       surfaceOp: current ? { op: 'replace', start: current.seq, end: current.seq } : 'append', sourceEventSeqs,
@@ -338,7 +383,11 @@ class MemoryRecovery extends Service {
     const id = exec.agent.id; const scope = this.scopeForSession(id);
     await this.barrier(id);
     if (tool === 'memory_search') return this.search(id, args.query, { limit: args.limit });
-    if (tool === 'memory_page_in') { const page = this.pageIn(id, args.id, { version: args.version, maxChars: args.maxChars }); return { id: page.id, version: page.version, truncated: page.truncated, selected: true }; }
+    if (tool === 'memory_page_in') {
+      const page = await this.pageIn(id, args.id, { version: args.version, offset: args.offset, maxChars: args.maxChars });
+      return { id: page.id, version: page.version, offset: page.offset, maxChars: page.maxChars, totalChars: page.totalChars,
+        nextOffset: page.nextOffset, hasMore: page.hasMore, offsetUnit: page.offsetUnit, truncated: page.truncated, selected: true };
+    }
     if (tool === 'memory_page_out') return { removed: this.pageOut(id, args.id) };
     if (tool === 'memory_semantic' || tool === 'memory_procedural_candidate') {
       const record = this.#memoryFields(args.record);

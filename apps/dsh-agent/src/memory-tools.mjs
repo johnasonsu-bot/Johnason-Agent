@@ -3,7 +3,7 @@ export function installMemoryTools(ctx, service) {
   const string = { type: 'string' };
   const definitions = [
     ['memory_search', 'Search authorized memory; returns summaries and handles only.', { query: string, limit: { type: 'integer' } }, ['query']],
-    ['memory_page_in', 'Select a bounded, versioned memory page for the next logged context.', { id: string, version: { type: 'integer' }, maxChars: { type: 'integer' } }, ['id']],
+    ['memory_page_in', 'Select a bounded memory JSON-text range for the next logged context. For continuation use the returned version and nextOffset (UTF-16 units) as offset.', { id: string, version: { type: 'integer' }, offset: { type: 'integer' }, maxChars: { type: 'integer' } }, ['id']],
     ['memory_page_out', 'Remove a page from the working set, without deleting source records.', { id: string }, ['id']],
     ['memory_semantic', 'Append a sourced semantic entity/relation version.', { record: { type: 'object' } }, ['record']],
     ['memory_procedural_candidate', 'Propose a sourced candidate procedure. Cannot confirm or protect rules.', { record: { type: 'object' } }, ['record']],
