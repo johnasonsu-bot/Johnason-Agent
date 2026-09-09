@@ -17,6 +17,7 @@ const QUEUE_EVENTS = 512;
 const QUEUE_BYTES = 8 * 1024 * 1024;
 const CONFIG_EVENT = 'memory-recovery/config';
 const IO_EVENT = 'memory-recovery/tool-io';
+const INITIAL_POLICY_EVENTS = new Set(['permission/preset', 'sandbox/mode', 'approval/policy']);
 const actor = Object.freeze({ id: 'local-operator', role: 'operator' });
 const error = (code, message = code) => Object.assign(new Error(message), { code });
 const owned = event => event.type === 'user/message' && event.data.source?.kind === 'plugin' && event.data.source.plugin === name;
@@ -72,7 +73,10 @@ class MemoryRecovery extends Service {
       get: (scope, id, version) => { const record = this.#store.get(scope, id, version); return visible(record) ? record : null; },
     });
     ctx.on('session/created', session => {
-      if (!session.header.seedLength && session.seq === 0) this.#fresh.add(session);
+      // Earlier native permission-preset observers may already have pinned policy.
+      // firstLiveSeq is the public construction boundary, unlike the growing seq.
+      if (!session.header.seedLength && session.firstLiveSeq === 0
+          && session.events.every(event => INITIAL_POLICY_EVENTS.has(event.type))) this.#fresh.add(session);
     });
     ctx.on('session/event', (session, event) => {
       try {

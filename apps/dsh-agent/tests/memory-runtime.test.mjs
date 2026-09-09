@@ -57,6 +57,32 @@ test('explicit new-session opt-in persists config and flushes sourced events, ol
   await assert.rejects(f.service.configureSession(f.agent.id, f.config, { expectedVersion: 0 }), /version/i);
 });
 
+test('fresh native permission initialization is allowed but seeded or started lifecycles are not', async t => {
+  const f = await fixture(t);
+  // Reproduce the native permission-presets publication ordering seen in real Web:
+  // its earlier session/created observer appends these policy facts synchronously.
+  f.ctx.on('session/created', session => {
+    if (session.seq !== 0) return;
+    session.append('permission/preset', { preset: 'workspace-write' });
+    session.append('sandbox/mode', { mode: 'workspace-write' });
+    session.append('approval/policy', { policy: 'ask' });
+  }, { prepend: true });
+  const fresh = f.ctx.sessions.create('initialized-new', { meta: { cwd: f.workspaceRoot } });
+  const initialEvents = fresh.events;
+  assert.equal(fresh.firstLiveSeq, 0); assert.equal(fresh.seq, 3);
+  const configured = await f.service.configureSession(fresh.id, { ...f.config, agentId: fresh.id }, { expectedVersion: 0 });
+  assert.equal(configured.enabled, true);
+  assert.equal(f.service.status(fresh.id).durableThroughSeq, 3);
+  for (const [id, seed] of [['seeded-policy-only', initialEvents], ['seeded-empty', []]]) {
+    const historical = f.ctx.sessions.create(id, { seed, meta: { cwd: f.workspaceRoot } });
+    await assert.rejects(f.service.configureSession(id, { ...f.config, agentId: id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
+    assert.equal(f.service.getSessionConfig(historical.id).enabled, false);
+  }
+  const started = f.ctx.sessions.create('already-started', { meta: { cwd: f.workspaceRoot } });
+  started.append('turn/start', { turn: 1 });
+  await assert.rejects(f.service.configureSession(started.id, { ...f.config, agentId: started.id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
+});
+
 test('native memory tools enforce scope and model cannot confirm procedural records', async t => {
   const f = await fixture(t); await f.configure();
   const record = await f.service.putOperatorMemory(f.agent.id, { kind: 'semantic', visibility: 'private', summary: 'alpha contract', content: { nodes: [{ id: 'alpha', type: 'contract' }], edges: [] } }, 'Initial contract');
