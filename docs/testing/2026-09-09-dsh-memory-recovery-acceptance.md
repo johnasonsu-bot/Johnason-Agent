@@ -105,4 +105,4 @@
   --port 64356 --patch /Users/sushi/dsh-memory-live-k6bzYi/local-model.patch.json --no-open
 ```
 
-README 本次新增 A/E 节与已有 4 行本地模型调优改动分离，留给 controller 按 hunk 提交；设计文档与原有未跟踪报告未修改/暂存。
+README 新增 A/E 使用说明已由主任务按 hunk 单独提交；用户原有 4 行本地模型调优改动与两份此前未跟踪报告仍保持未提交、未覆盖。本轮设计、实现及验收文档保留在 `codex/dsh-standalone-agent`，没有合并、推送或清理工作树。
