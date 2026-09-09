@@ -43,7 +43,9 @@ export async function prepareProfile(config) {
     boot.writeProfileManifest(profileDir, manifest);
     loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
   }
-  const overlay = [{ id: 'credentials', config: { path: join(config.dataRoot, 'vault.enc'), mode: config.mode } }];
+  const memoryPath = fileURLToPath(new URL('./memory-recovery-plugin.mjs', import.meta.url));
+  const overlay = [{ id: 'credentials', config: { path: join(config.dataRoot, 'vault.enc'), mode: config.mode } },
+    { insert: [{ id: 'memory-recovery', name: memoryPath, config: { path: join(config.dataRoot, 'memory/recovery.sqlite'), enabled: true } }] }];
   const layers = [loaded.layers.flatMap(layer => layer.patches), loaded.patches,
     boot.loadOptionalPatches('johnason-dsh', join(config.dataRoot, 'cordis.patch.yml')) ?? [],
     ...patchFiles.map(path => boot.loadOverlayPatches('johnason-dsh', path)), overlay];

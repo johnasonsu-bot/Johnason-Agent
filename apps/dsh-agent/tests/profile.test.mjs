@@ -23,6 +23,9 @@ test('native bundles survive encrypted overlay and duplicate providers fail clos
   const withoutCredential = patches => patches[0].insert.filter(row => row.id !== 'credentials');
   assert.deepEqual(withoutCredential(generated), withoutCredential(native));
   for (const id of ['ui-skill', 'ui-subagent', 'ui-plan', 'ui-goal', 'web-runtime']) assert.ok(prepared.rows.some(r => r.id === id), id);
+  const memory = prepared.rows.find(row => row.id === 'memory-recovery');
+  assert.equal(memory?.name, fileURLToPath(new URL('../src/memory-recovery-plugin.mjs', import.meta.url)));
+  assert.deepEqual(memory.config, { path: join(dataRoot, 'memory/recovery.sqlite'), enabled: true });
   const patchPath = join(dataRoot, 'profiles/web/cordis.patch.yml');
   await writeFile(patchPath, JSON.stringify([{ insert: [{ id: 'bad-extra', name: '@deepseek-ai/dsh-credentials-local' }] }]));
   await assert.rejects(prepareProfile(launch), /exactly one|credential provider/);
