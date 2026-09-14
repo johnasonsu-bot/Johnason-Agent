@@ -166,20 +166,20 @@
 
 ## 6. 源码与原生文档索引
 
-以下链接均指本仓库锁定的 DSH 副本：
+以下链接指向与本地锁定副本一致的 DSH 上游提交，便于在 GitHub Pages 中访问：
 
-- **S1** [Goal：无独立 evaluator、恢复后不自动续跑](../../third_party/deepseek-harness/packages/goal/goal/README.md)
-- **S2** [Goal round driver：原生续跑与人工优先](../../third_party/deepseek-harness/packages/goal/goal-round-driver/README.md)
-- **S3** [Claude Code Hook 桥：Stop 及兼容限制](../../third_party/deepseek-harness/packages/hooks/hooks-claude-code/README.md)
-- **S4** [Agent 原生拦截合同](../../third_party/deepseek-harness/packages/core/agent/src/runtime-types.ts)、[Loop 停止与步进实现](../../third_party/deepseek-harness/packages/core/agent-loop/src/agent.ts)
-- **S5** [fresh-context spawn 与结构化输出能力](../../third_party/deepseek-harness/packages/subagent/subagent-spawn-in-process/README.md)
-- **S6** [压缩、TokenMeter、失败语义与摘要扩展](../../third_party/deepseek-harness/packages/compaction/compaction-basic/README.md)、[摘要扩展实现](../../third_party/deepseek-harness/packages/compaction/compaction-basic/src/index.ts)
-- **S7** [Skill 元数据/正文生命周期及版本限制](../../third_party/deepseek-harness/packages/skill/skill-filesystem/README.md)
-- **S8** [Session 追加事实源、插件事件、flush、恢复与版本限制](../../third_party/deepseek-harness/packages/core/session/README.md)
-- **S9** [执行前 checkpoint 与非 exactly-once 边界](../../third_party/deepseek-harness/packages/session/session-checkpoint-policy/README.md)
-- **S10** [遥测 seam 与脱敏职责](../../third_party/deepseek-harness/packages/session/session-telemetry/README.md)、[OTel 后端、默认关闭及实际上传字段](../../third_party/deepseek-harness/packages/session/session-telemetry-otel/README.md)
-- **S11** [本地沙箱支持范围与限制](../../third_party/deepseek-harness/packages/sandbox/sandbox-local/README.md)
-- **S12** [原生 base 插件组合](../../third_party/deepseek-harness/packages/bundle/base/cordis.patch.yml)
+- **S1** [Goal：无独立 evaluator、恢复后不自动续跑](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/goal/goal/README.md)
+- **S2** [Goal round driver：原生续跑与人工优先](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/goal/goal-round-driver/README.md)
+- **S3** [Claude Code Hook 桥：Stop 及兼容限制](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/hooks/hooks-claude-code/README.md)
+- **S4** [Agent 原生拦截合同](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent/src/runtime-types.ts)、[Loop 停止与步进实现](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/agent-loop/src/agent.ts)
+- **S5** [fresh-context spawn 与结构化输出能力](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/subagent/subagent-spawn-in-process/README.md)
+- **S6** [压缩、TokenMeter、失败语义与摘要扩展](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-basic/README.md)、[摘要扩展实现](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/compaction/compaction-basic/src/index.ts)
+- **S7** [Skill 元数据/正文生命周期及版本限制](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/skill/skill-filesystem/README.md)
+- **S8** [Session 追加事实源、插件事件、flush、恢复与版本限制](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/core/session/README.md)
+- **S9** [执行前 checkpoint 与非 exactly-once 边界](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-checkpoint-policy/README.md)
+- **S10** [遥测 seam 与脱敏职责](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-telemetry/README.md)、[OTel 后端、默认关闭及实际上传字段](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/session/session-telemetry-otel/README.md)
+- **S11** [本地沙箱支持范围与限制](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/sandbox/sandbox-local/README.md)
+- **S12** [原生 base 插件组合](https://github.com/deepseek-ai/deepseek-harness/blob/b150a551b8d465e31e418e1b2eaf5e79bbb7d28e/packages/bundle/base/cordis.patch.yml)
 
 ## 7. 用户选择记录
 

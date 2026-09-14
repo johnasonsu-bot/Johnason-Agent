@@ -11,7 +11,7 @@ DSH ctx.authorization flow -> 加密 grant -> 本地 Data Platform shared core -
 
 权限点向既有受保护模块请求开放；动作 read/write 区分。CLI 注册表绑定精确权限点和现有服务。后端统一鉴权消除 Web/CLI 差异；会话、用户、项目、权限每次实时读取。permission.check 可校验当前主体，管理员可预检目标用户；输入主体属性不能替代权威赋值。
 
-DSH 薄层增加原生授权插件、集成页面（独立 /dataplatform 路由）、结构化命令输入及工具；终端 node apps/dsh-agent/src/cli.mjs dataplatform --core <absolute backend/src/core/index.js> <command>。连接配置只有本地核心入口路径，敏感运行凭据通过进程环境安全注入/既有 Vault；不复制旧 .env。平台页面在现有角色/用户管理中接入同一个配置编辑与校验组件，不新增另一份角色库。
+DSH 薄层增加原生授权插件、集成页面（独立 /dataplatform 路由）、结构化命令输入及工具；终端 `node apps/dsh-agent/src/cli.mjs dataplatform --core <absolute backend/src/core/index.js> <command>`。连接配置只有本地核心入口路径，敏感运行凭据通过进程环境安全注入/既有 Vault；不复制旧 .env。平台页面在现有角色/用户管理中接入同一个配置编辑与校验组件，不新增另一份角色库。
 
 ## 源码边界
 DSH 使用现有隔离工作树 /Users/sushi/Downloads/Johnason-Agent/.worktrees/dsh-standalone-agent，保留个性化未提交修改。Data Platform 使用新工作树 /Users/sushi/Downloads/Johnason-Agent/.worktrees/data-platform-dsh-auth，基线 main@2598100，不修改原 checkout 的用户文件。
