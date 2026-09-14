@@ -12,6 +12,11 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 
 async function main() {
   try {
+    if (process.argv[2] === 'dataplatform') {
+      const { runDataPlatformCli } = await import('./dataplatform-cli.mjs');
+      await runDataPlatformCli(process.argv.slice(3));
+      return;
+    }
     const launch = resolveLaunch(process.argv.slice(2), {
       homeDir: homedir(),
       repoRoot,

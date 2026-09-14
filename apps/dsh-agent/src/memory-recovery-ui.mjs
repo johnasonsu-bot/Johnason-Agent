@@ -5,6 +5,15 @@ import { isAbsolute } from 'node:path';
 const page = new URL('../public/memory-recovery.html', import.meta.url);
 const local = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
 const invalid = () => { throw Object.assign(new Error('Invalid request'), { code: 'MEMORY_INVALID_REQUEST' }); };
+const errorMessages = Object.freeze({
+  MEMORY_NEW_SESSION_REQUIRED: '此会话已有历史或已经启动，不能首次启用运行配置。请保留旧会话，创建新原生会话并在发送消息前启用记忆；不会自动导入旧历史。',
+  MEMORY_SESSION_BUSY: '会话正在执行。请等待本轮结束，刷新会话状态后再保存。',
+  MEMORY_CONFIG_VERSION_CONFLICT: '配置已更新。请刷新会话状态，核对最新版本后重新保存。',
+  MEMORY_INVALID_CONFIG: '请填写项目 ID、已有工作目录，并使用 128–100000 的整数上下文预算。',
+  MEMORY_WORKSPACE_MISMATCH: '工作目录必须与所选原生会话一致。要更换目录，请创建新会话。',
+  MEMORY_SCOPE_IMMUTABLE: '已启用会话的项目与工作目录不可切换；请创建新会话。',
+  MEMORY_POLICY_DOWNGRADE_FORBIDDEN: '已启用的沙箱不能移除或放宽。请保留当前策略，或创建新会话。',
+});
 function fields(value, allowed) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(k => !allowed.includes(k))) invalid();
 }
@@ -22,6 +31,22 @@ const actions = Object.freeze({
 
 /** Explicit local operator surface: no dynamic service dispatch, execution or recovery. */
 export function createMemoryRecoveryHandler(service, apiProxy) {
+  const attaching = new Map();
+  async function selectedConfig(id) {
+    try { return service.getSessionConfig(id); }
+    catch (cause) { if (cause?.code !== 'MEMORY_SESSION_NOT_FOUND') throw cause; }
+    // Native history can be displayed without attaching its Session. Hydrate
+    // only a proven existing root session; never mint an id or submit a prompt.
+    if (!attaching.has(id)) attaching.set(id, (async () => {
+      const listed = await apiProxy.sessions.list({ rpcId: randomUUID(), payload: {} });
+      const row = listed.result.ok && listed.result.value.items.find(item => item.sessionId === id && item.origin !== 'subagent');
+      if (!row || typeof row.cwd !== 'string' || !isAbsolute(row.cwd)) throw Object.assign(new Error('Unknown native session'), { code: 'MEMORY_SESSION_NOT_FOUND' });
+      const response = await apiProxy.sessions.create({ rpcId: randomUUID(), payload: { sessionId: id, cwd: row.cwd } });
+      if (!response.result.ok) throw Object.assign(new Error('Native session unavailable'), { code: 'MEMORY_NATIVE_ATTACH_FAILED' });
+    })().finally(() => attaching.delete(id)));
+    await attaching.get(id);
+    return service.getSessionConfig(id);
+  }
   return async (req, res) => {
     const send = (status, body, type = 'application/json') => {
       res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'content-security-policy': "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'" });
@@ -64,7 +89,7 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
           value = { sessionId: response.result.value.sessionId, workspaceRoot: cwd }; break;
         }
         case 'configure': value = await service.configureSession(id, data.input, { expectedVersion: data.expectedVersion }); break;
-        case 'config': value = service.getSessionConfig(id); break;
+        case 'config': value = await selectedConfig(id); break;
         case 'status': value = service.status(id); break;
         case 'memories': value = service.listMemories(id, data.filters).map(summaryHandle); break;
         case 'memory': value = service.getMemory(id, data.memoryId, data.version); break;
@@ -82,7 +107,7 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
     } catch (cause) {
       const code = /^(MEMORY|EFFECT|SANDBOX)_[A-Z_]+$/.test(cause?.code) ? cause.code : 'MEMORY_OPERATION_FAILED';
       // Do not echo native exceptions, paths, request bodies or secrets.
-      return send(400, { code, error: '操作未完成。请检查输入、会话范围及版本；历史不会被删除。' });
+      return send(400, { code, error: errorMessages[code] ?? '操作未完成。请检查输入、会话范围及版本；历史不会被删除。' });
     }
   };
 }
@@ -90,5 +115,4 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
 export function installMemoryRecoveryUi(ctx, service) {
   const handler = createMemoryRecoveryHandler(service, ctx.apiProxy);
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/memory-recovery', handler }));
-  ctx.effect(() => ctx.webServer.tapIndex(html => html.replace('</body>', '<a href="/memory-recovery" target="_blank" rel="noopener" style="position:fixed;bottom:44px;right:12px;z-index:99999;font:12px sans-serif;background:#fff;color:#17304a;padding:6px 10px;border:1px solid #ccc;border-radius:6px">记忆 / 恢复 / 沙箱</a></body>')));
 }

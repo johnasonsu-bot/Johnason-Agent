@@ -89,6 +89,10 @@ node --test apps/dsh-agent/tests/native-lifecycle.test.mjs
 
 ## 本地扩展夹具
 
+### LM Studio 长时间只有思考、没有正文
+
+先看会话日志区分真实推理、工具等待和超时重试，不能靠增大 timeout 解决。部分本地模型模板默认最高思考强度，而请求中的关闭思考参数不一定生效。当前 Qwen / MLX 的实测诊断、模型模板调整、原生 provider 输出限额和回退步骤见[本地模型调优记录](../../docs/testing/2026-09-08-dsh-local-model-tuning.md)。配置针对本机具体模型，不是所有模型的通用默认；云端凭据和原生运行时保持不变。
+
 `tests/fixtures/acceptance-skill/SKILL.md` 可复制到隔离工作区的 `.dsh/skills/dsh-acceptance-marker/SKILL.md`。Skill 目录按原生 workspace / Git 根规则发现，因此不要把验收目录放在其他仓库内部。模型验收时明确要求读取该 Skill 并返回标记与来源路径。
 
 `tests/fixtures/mcp-server.mjs` 是无密钥 stdio MCP 服务，仅返回 `DSH_LOCAL_MCP_OK`，无文件/网络能力。原生 mcp-client 插件配置为 `transport: stdio`、`serverName: acceptance`、`command: <Node绝对路径>`、`args: [<该文件绝对路径>]`、`env: {}`、`cwd: <隔离目录>`，工具名是 `mcp__acceptance__marker`。

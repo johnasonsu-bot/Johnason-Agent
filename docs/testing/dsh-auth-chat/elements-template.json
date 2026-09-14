@@ -1,0 +1,77 @@
+{
+  "version": 0,
+  "attributes": [
+    {
+      "key": "dsh_test_department",
+      "label": "DSH测试部门",
+      "type": "string",
+      "source": "subject"
+    },
+    {
+      "key": "dsh_test_level",
+      "label": "DSH测试等级",
+      "type": "number",
+      "source": "subject"
+    }
+  ],
+  "scopes": [
+    {
+      "id": "dsh_test_home",
+      "name": "DSH测试默认项目范围",
+      "projectIds": [
+        1
+      ]
+    },
+    {
+      "id": "dsh_test_other",
+      "name": "DSH测试范围外对照",
+      "projectIds": [
+        2
+      ]
+    }
+  ],
+  "policies": [
+    {
+      "id": "dsh_test_read",
+      "name": "DSH测试研发读取",
+      "effect": "allow",
+      "points": [
+        "ingestion.read"
+      ],
+      "conditions": [
+        {
+          "attribute": "dsh_test_department",
+          "op": "eq",
+          "value": "研发"
+        },
+        {
+          "attribute": "dsh_test_level",
+          "op": "gte",
+          "value": 2
+        }
+      ],
+      "enabled": true
+    },
+    {
+      "id": "dsh_test_deny_write",
+      "name": "DSH测试拒绝写入",
+      "effect": "deny",
+      "points": [
+        "ingestion.write"
+      ],
+      "conditions": [],
+      "enabled": true
+    },
+    {
+      "id": "dsh_test_deny_read",
+      "name": "DSH测试拒绝优先",
+      "effect": "deny",
+      "points": [
+        "ingestion.read"
+      ],
+      "conditions": [],
+      "enabled": false
+    }
+  ],
+  "assignments": []
+}

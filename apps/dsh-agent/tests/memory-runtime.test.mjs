@@ -29,7 +29,9 @@ async function fixture(t, options = {}) {
   const workspaceRoot = join(root, 'workspace'); mkdirSync(workspaceRoot);
   t.diagnostic(`Retained native integration fixture: ${root}`);
   const ctx = new Context();
-  for (const plugin of [Llm, Sessions, Prompt, Tools, Agents]) await ctx.plugin(plugin);
+  for (const plugin of [Llm, Sessions, Prompt]) await ctx.plugin(plugin);
+  await ctx.plugin(Tools, options.toolsConfig ?? {});
+  await ctx.plugin(Agents);
   await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none', packChunks: false });
   await ctx.plugin(Loop, { agents: [] });
   await ctx.plugin(Sandbox);
@@ -46,6 +48,108 @@ async function fixture(t, options = {}) {
   const execute = (name, args, callId = `call-${agent.session.seq}`) => ctx.tools.execute({ agent, name, arguments: args, callId, signal: new AbortController().signal });
   return { root, workspaceRoot, ctx, agent, service, config, configure, execute };
 }
+
+// Real registry definitions, not a stand-in registry: a dispatch would return
+// a detectable value if the plugin accidentally made an unsupported path callable.
+function registerNativeTool(ctx, name) {
+  return ctx.tools.register({ name, description: `${name} native capability`, parameters: { type: 'object', properties: {} },
+    output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+    async execute() { return `${name} dispatched`; } });
+}
+const advertisedNames = async (ctx, agent) => (await ctx.systemPrompt.assemble({ scope: agent })).tools.map(tool => tool.name);
+
+test('memory opt-in preserves native capabilities and hides memory tools until they are usable', async t => {
+  const f = await fixture(t);
+  for (const name of ['Bash', 'Glob', 'Read']) registerNativeTool(f.ctx, name);
+  assert.deepEqual(await advertisedNames(f.ctx, f.agent), ['Bash', 'Glob', 'Read']);
+  await f.service.configureSession(f.agent.id, { ...f.config, sandbox: null }, { expectedVersion: 0 });
+  const enabled = await advertisedNames(f.ctx, f.agent);
+  for (const name of ['Bash', 'Glob', 'Read', 'memory_search']) assert.ok(enabled.includes(name), name);
+  assert.equal(enabled.includes('memory_sandbox_run'), false);
+  assert.equal((await f.execute('Bash', {})).value, 'Bash dispatched');
+  await f.service.configureSession(f.agent.id, { ...f.config, enabled: false, sandbox: null }, { expectedVersion: 1 });
+  assert.deepEqual(await advertisedNames(f.ctx, f.agent), ['Bash', 'Glob', 'Read']);
+});
+
+test('required sandbox catalog is session-scoped and filters own scoped tools without weakening the guard', async t => {
+  const f = await fixture(t);
+  for (const name of ['Bash', 'Glob', 'Read']) registerNativeTool(f.ctx, name);
+  registerNativeTool(f.agent.ctx, 'OwnUnconfined');
+  const ordinary = f.ctx.agentLoop.create('ordinary', {}, { cwd: f.workspaceRoot });
+  await f.configure();
+  const names = await advertisedNames(f.ctx, f.agent);
+  assert.ok(names.includes('memory_sandbox_run'));
+  assert.equal(names.some(name => ['Bash', 'Glob', 'Read', 'OwnUnconfined', 'run_code'].includes(name)), false);
+  assert.equal(f.ctx.tools.get('Bash', f.agent), undefined);
+  assert.deepEqual(await advertisedNames(f.ctx, ordinary), ['Bash', 'Glob', 'Read']);
+  // Own-scope tools are deliberately exempt from the native registry mask;
+  // direct/stale calls must still be stopped by the unchanged execution guard.
+  const denied = await f.execute('OwnUnconfined', {});
+  assert.equal(denied.isError, true); assert.match(denied.error.message, /SANDBOX_REQUIREMENT_UNSUPPORTED/);
+  registerNativeTool(f.ctx, 'LateNative');
+  assert.equal((await advertisedNames(f.ctx, f.agent)).includes('LateNative'), false);
+  assert.ok((await advertisedNames(f.ctx, ordinary)).includes('LateNative'));
+});
+
+test('required sandbox replaces deployment code transport with callable confined native tools', async t => {
+  const f = await fixture(t, { toolsConfig: { mode: 'code' } });
+  await f.configure();
+  assert.equal(f.ctx.tools.get('run_code', f.agent), undefined);
+  assert.ok((await advertisedNames(f.ctx, f.agent)).includes('memory_sandbox_run'));
+  const result = await f.execute('memory_sandbox_run', { argv: ['pwd'] });
+  assert.equal(result.isError, false, result.error?.message);
+  assert.equal(result.value.stdout.trim(), f.workspaceRoot);
+});
+
+test('pre-step rejects incompatible late code presentation before advertising an unusable transport', async t => {
+  const f = await fixture(t); await f.configure();
+  f.agent.ctx.tools.presentAs('code');
+  await assert.rejects(f.ctx.waterfall('agent/pre-step', { agent: f.agent, messages: [] },
+    async () => ({ kind: 'enter', messages: [] })), { code: 'SANDBOX_REQUIREMENT_UNSUPPORTED' });
+  assert.equal(f.service.getSessionConfig(f.agent.id).sandbox.sandbox_required, true);
+  assert.equal(f.service.listEffects(f.agent.id).length, 0);
+});
+
+test('failed required-sandbox presentation preflight preserves the saved policy and tool scope', async t => {
+  const f = await fixture(t);
+  registerNativeTool(f.ctx, 'Bash');
+  await f.service.configureSession(f.agent.id, { ...f.config, sandbox: null }, { expectedVersion: 0 });
+  f.agent.ctx.tools.presentAs('code');
+  const before = f.service.getSessionConfig(f.agent.id);
+  const schemas = f.ctx.tools.schemas(f.agent).map(tool => tool.name);
+  const seq = f.agent.session.seq;
+  await assert.rejects(f.service.configureSession(f.agent.id, f.config, { expectedVersion: 1 }),
+    { code: 'SANDBOX_REQUIREMENT_UNSUPPORTED' });
+  assert.deepEqual(f.service.getSessionConfig(f.agent.id), before);
+  assert.equal(f.agent.session.seq, seq);
+  assert.deepEqual(f.ctx.tools.schemas(f.agent).map(tool => tool.name), schemas);
+  assert.ok(f.ctx.tools.get('Bash', f.agent));
+  assert.ok(f.ctx.tools.get('run_code', f.agent));
+  assert.equal(f.ctx.tools.get('memory_sandbox_run', f.agent), undefined);
+  await f.service.barrier(f.agent.id);
+  assert.equal((await f.ctx.sessionPersistence.readFrom(f.agent.id, 0)).events.filter(event => event.type === 'memory-recovery/config').length, 1);
+});
+
+test('persisted required session reopens with a confined catalog before its first step', async t => {
+  const f = await fixture(t); await f.configure();
+  await f.ctx.sessions.flush(f.agent.session);
+  await f.ctx.fiber.dispose();
+  const ctx = new Context();
+  for (const plugin of [Llm, Sessions, Prompt, Tools, Agents]) await ctx.plugin(plugin);
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(Loop, { agents: [] });
+  await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
+  await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
+  t.after(() => ctx.fiber.dispose());
+  registerNativeTool(ctx, 'Bash');
+  const resumed = await ctx.agents.resume({ resumeSessionId: f.agent.id });
+  const agent = resumed.agent;
+  const names = await advertisedNames(ctx, agent);
+  assert.ok(names.includes('memory_sandbox_run')); assert.equal(names.includes('Bash'), false);
+  await ctx.waterfall('agent/pre-step', { agent, messages: [] }, async () => ({ kind: 'enter', messages: [] }));
+  assert.equal((await advertisedNames(ctx, agent)).includes('Bash'), false);
+  await assert.rejects(ctx.memoryRecovery.configureSession(agent.id, { ...f.config, sandbox: null }, { expectedVersion: 1 }), { code: 'MEMORY_POLICY_DOWNGRADE_FORBIDDEN' });
+});
 
 test('explicit new-session opt-in persists config and flushes sourced events, old sessions stay disabled', async t => {
   const f = await fixture(t);
@@ -73,19 +177,31 @@ test('fresh native permission initialization is allowed but seeded or started li
     session.append('approval/policy', { policy: 'ask' });
   }, { prepend: true });
   const fresh = f.ctx.sessions.create('initialized-new', { meta: { cwd: f.workspaceRoot } });
+  assert.equal(f.service.getSessionConfig(fresh.id).canConfigure, true);
+  assert.equal(f.service.getSessionConfig(fresh.id).configurationBlockReason, null);
   const initialEvents = fresh.events;
   assert.equal(fresh.firstLiveSeq, 0); assert.equal(fresh.seq, 3);
   const configured = await f.service.configureSession(fresh.id, { ...f.config, agentId: fresh.id }, { expectedVersion: 0 });
   assert.equal(configured.enabled, true);
   assert.equal(f.service.status(fresh.id).durableThroughSeq, 3);
   for (const [id, seed] of [['seeded-policy-only', initialEvents], ['seeded-empty', []]]) {
-    const historical = f.ctx.sessions.create(id, { seed, meta: { cwd: f.workspaceRoot } });
+    const historical = f.ctx.sessions.create(id, { seed, meta: { cwd: f.workspaceRoot, parentSession: fresh.id, seedLength: seed.length } });
+    assert.equal(f.service.getSessionConfig(id).canConfigure, false);
+    assert.equal(f.service.getSessionConfig(id).configurationBlockReason, 'MEMORY_NEW_SESSION_REQUIRED');
     await assert.rejects(f.service.configureSession(id, { ...f.config, agentId: id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
     assert.equal(f.service.getSessionConfig(historical.id).enabled, false);
   }
   const started = f.ctx.sessions.create('already-started', { meta: { cwd: f.workspaceRoot } });
   started.append('turn/start', { turn: 1 });
+  assert.equal(f.service.getSessionConfig(started.id).configurationBlockReason, 'MEMORY_NEW_SESSION_REQUIRED');
   await assert.rejects(f.service.configureSession(started.id, { ...f.config, agentId: started.id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
+  const queued = f.ctx.sessions.create('message-before-turn', { meta: { cwd: f.workspaceRoot } });
+  queued.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'queued user task' }] }), { surfaceOp: 'append' });
+  assert.equal(f.service.getSessionConfig(queued.id).canConfigure, false, 'a queued message is not an untouched draft');
+  await assert.rejects(f.service.configureSession(queued.id, { ...f.config, agentId: queued.id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
+  const emptyRoot = f.ctx.sessions.create('empty-fork-source', { meta: { cwd: f.workspaceRoot } });
+  const child = f.ctx.sessions.fork(emptyRoot, undefined, 'empty-real-fork');
+  assert.equal(f.service.getSessionConfig(child.id).canConfigure, false, 'fork lineage is preserved even without turns');
 });
 
 test('native memory tools enforce scope and model cannot confirm procedural records', async t => {

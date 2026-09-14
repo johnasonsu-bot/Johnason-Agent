@@ -21,12 +21,15 @@ const { KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek-ai/dsh-session').c
   return import(require.resolve('@deepseek-ai/dsh-session'));
 });
 export const name = 'johnason-memory-recovery';
-export const inject = ['sessions', 'tools', 'sandbox', 'sandboxPolicy'];
+export const inject = ['sessions', 'tools', 'systemPrompt', 'sandbox', 'sandboxPolicy'];
 const QUEUE_EVENTS = 64;
 const QUEUE_BYTES = 8 * 1024 * 1024;
 const CONFIG_EVENT = 'memory-recovery/config';
 const IO_EVENT = 'memory-recovery/tool-io';
-const INITIAL_POLICY_EVENTS = new Set(['permission/preset', 'sandbox/mode', 'approval/policy']);
+const UNSTARTED_SESSION_EVENTS = new Set([
+  'permission/preset', 'sandbox/mode', 'approval/policy', 'session/end-seed',
+  'session/title', 'agent-preset/selected', 'plan/mode',
+]);
 const actor = Object.freeze({ id: 'local-operator', role: 'operator' });
 const error = (code, message = code) => Object.assign(new Error(message), { code });
 const owned = event => event.type === 'user/message' && event.data.source?.kind === 'plugin' && event.data.source.plugin === name;
@@ -83,8 +86,9 @@ export function apply(ctx, config) {
 
 /** All trusted roles and scopes are constructed here; HTTP/model fields never become actors. */
 class MemoryRecovery extends Service {
-  #store; #pager; #effects; #states = new Map(); #fresh = new WeakSet(); #enabled; #rawByToken = new Map(); #inflight = new Set(); #owner = randomUUID();
+  #store; #pager; #effects; #states = new Map(); #enabled; #rawByToken = new Map(); #inflight = new Set(); #owner = randomUUID();
   #flushing = new AsyncLocalStorage();
+  #toolScopes = new Map();
   constructor(ctx, config) {
     super(ctx, 'memoryRecovery');
     // Cordis service access uses a scoped proxy; preserve the private-field receiver.
@@ -113,12 +117,6 @@ class MemoryRecovery extends Service {
       get: (scope, id, version) => { const record = this.#store.get(scope, id, version); return visible(record) ? record : null; },
       search: (scope, query, options) => this.#store.search(scope, query, { ...options, excludeDerived: true }),
       readPage: (scope, id, options) => this.#store.readPage(scope, id, { ...options, excludeDerived: true }),
-    });
-    ctx.on('session/created', session => {
-      // Earlier native permission-preset observers may already have pinned policy.
-      // firstLiveSeq is the public construction boundary, unlike the growing seq.
-      if (!session.header.seedLength && session.firstLiveSeq === 0
-          && session.events.every(event => INITIAL_POLICY_EVENTS.has(event.type))) this.#fresh.add(session);
     });
     ctx.on('session/event', (session, event) => {
       try {
@@ -190,6 +188,7 @@ class MemoryRecovery extends Service {
     }, { prepend: true });
     ctx.on('tools/result', exec => { this.#rawByToken.delete(exec.token); });
     ctx.on('agent/pre-step', async (payload, next) => {
+      this.#syncTools(payload.agent);
       if (!this.getSessionConfig(payload.agent.id).enabled) return next();
       await this.barrier(payload.agent.id);
       const decision = await next();
@@ -198,6 +197,31 @@ class MemoryRecovery extends Service {
       return decision;
     }, { prepend: true });
     installMemoryTools(ctx, this);
+    ctx.on('agent/created', ({ agent }) => this.#syncTools(agent));
+    ctx.on('agent/disposed', ({ agent }) => this.#releaseTools(agent));
+    // Registry restrictions intersect inherited capabilities only. Own-scope
+    // registrations remain native-owned: hide their unsupported schemas here,
+    // while the monotonic execution guard still rejects stale/direct calls.
+    ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+      const agent = context.scope;
+      if (!agent?.session || ctx.sessions.get(agent.id) !== agent.session) return next();
+      this.#syncTools(agent);
+      const assembly = await next();
+      const config = this.getSessionConfig(agent.id);
+      return { ...assembly, tools: assembly.tools.filter(tool => config.enabled
+        ? config.sandbox?.sandbox_required ? MEMORY_TOOL_NAMES.has(tool.name) : tool.name !== 'memory_sandbox_run'
+        : !MEMORY_TOOL_NAMES.has(tool.name)) };
+    }, { prepend: true });
+    ctx.systemPrompt.section({ name: 'memory-recovery:capabilities', order: 200, text: ({ scope }) => {
+      if (!scope?.session || ctx.sessions.get(scope.id) !== scope.session) return '';
+      const config = this.getSessionConfig(scope.id);
+      if (!config.enabled) return '';
+      return config.sandbox?.sandbox_required
+        ? 'This session requires managed sandbox execution. Only the advertised memory tools are callable; do not call Bash, Glob, Read, run_code, or other native tools even if earlier guidance mentions them. Use memory_sandbox_run with literal argv, for example {"argv":["pwd"]}, {"argv":["ls","-la","."]}, or {"argv":["sed","-n","1,120p","README.md"]}. Shell expansion, pipes, and redirection are not interpreted unless you explicitly invoke a shell inside the same sandbox. Keep the configured sandbox policy; never retry unknown side effects with a new call ID.'
+        : 'Memory-only session: native tool permissions and approval remain unchanged. Use the advertised memory tools for sourced recall. memory_sandbox_run is unavailable without explicit required sandbox configuration; native tool calls do not have Effect replay protection.';
+    } });
+    for (const agent of ctx.get('agents')?.list() ?? []) this.#syncTools(agent);
+    ctx.effect(() => () => { for (const agent of this.#toolScopes.keys()) this.#releaseTools(agent); });
     ctx.inject(['webServer', 'apiProxy'], ui => installMemoryRecoveryUi(ui, this));
     ctx.effect(() => async () => {
       await Promise.all(this.#inflight);
@@ -210,16 +234,63 @@ class MemoryRecovery extends Service {
     });
   }
 
+  #releaseTools(agent) {
+    const current = this.#toolScopes.get(agent);
+    if (!current) return;
+    current.restriction(); current.presentation?.();
+    this.#toolScopes.delete(agent);
+  }
+  #syncTools(agent) {
+    this.#adoptTools(agent, this.#prepareTools(agent, this.getSessionConfig(agent.id)));
+  }
+  #adoptTools(agent, prepared) {
+    if (!prepared) return;
+    this.#releaseTools(agent);
+    this.#toolScopes.set(agent, prepared);
+  }
+  #prepareTools(agent, config) {
+    const mode = !config.enabled ? 'disabled' : config.sandbox?.sandbox_required ? 'required' : 'memory-only';
+    const current = this.#toolScopes.get(agent);
+    if (current?.mode === mode && !(mode === 'required' && this.ctx.tools.get('run_code', agent))) return;
+    // Never install a host-global mask. Code transport is outside restrict(),
+    // so required sessions use native presentation instead of advertising a
+    // transport that their execution guard must deny. Conflicting own-scope
+    // presentation declarations fail explicitly; they are never overwritten.
+    let presentation;
+    if (mode === 'required' && this.ctx.tools.get('run_code', agent)) {
+      try { presentation = agent.ctx.tools.presentAs('native'); }
+      catch (cause) { throw error('SANDBOX_REQUIREMENT_UNSUPPORTED', `required sandbox needs native tool presentation: ${cause.message}`); }
+    }
+    let restriction;
+    try {
+      restriction = agent.ctx.tools.restrict(mode === 'required' ? { allow: [...MEMORY_TOOL_NAMES] }
+        : { deny: mode === 'disabled' ? [...MEMORY_TOOL_NAMES] : ['memory_sandbox_run'] });
+    } catch (cause) { presentation?.(); throw cause; }
+    return { mode, restriction, presentation };
+  }
   #session(id) { const session = this.ctx.sessions.get(id); if (!session) throw error('MEMORY_SESSION_NOT_FOUND'); return session; }
   #state(id) {
     if (!this.#states.has(id)) this.#states.set(id, { latest: -1, bytes: 0, fault: null, active: 0, drain: null, verified: false });
     return this.#states.get(id);
   }
+  #configurationBlockReason(session, version) {
+    // Eligibility is a durable lifecycle fact, not "created in this process".
+    // Native resume appends end-seed even for untouched drafts. Root drafts
+    // containing only setup metadata remain eligible; fork lineage, execution
+    // records and unknown events do not become eligible through restart.
+    if (!version && (session.header.parentSession !== undefined || session.header.seedLength !== undefined
+        || session.header.origin === 'subagent' || (session.header.delegationDepth ?? 0) > 0
+        || session.events.some(event => !UNSTARTED_SESSION_EVENTS.has(event.type)))) return 'MEMORY_NEW_SESSION_REQUIRED';
+    if (this.#state(session.id).active || this.ctx.get('agents')?.get(session.id)?.status === 'running') return 'MEMORY_SESSION_BUSY';
+    return null;
+  }
   getSessionConfig(id) {
     const session = this.#session(id);
     const found = [...session.events].reverse().find(event => event.type === CONFIG_EVENT && event.data.sessionId === id);
     const config = found ? { ...structuredClone(found.data), enabled: this.#enabled && found.data.enabled } : { sessionId: id, version: 0, enabled: false };
-    return { ...config, executionCoverage: !config.enabled ? 'disabled' : config.sandbox ? 'managed-sandbox-only' : 'native-memory-only',
+    const configurationBlockReason = this.#configurationBlockReason(session, config.version);
+    return { ...config, canConfigure: configurationBlockReason === null, configurationBlockReason,
+      executionCoverage: !config.enabled ? 'disabled' : config.sandbox ? 'managed-sandbox-only' : 'native-memory-only',
       executionNotice: !config.enabled ? 'Native session; memory/recovery disabled.' : config.sandbox
         ? 'Only memory_sandbox_run has Effect replay protection; other unverified native tools are blocked.'
         : 'Memory-only mode: native tools have NO Effect replay protection. Use a required sandbox task for managed execution.' };
@@ -237,10 +308,10 @@ class MemoryRecovery extends Service {
       durableThroughSeq: this.#store.cursor(id), error: state.fault?.code ?? (state.fault ? 'MEMORY_DURABILITY_FAILED' : null), active: state.active };
   }
   async configureSession(id, input, { expectedVersion } = {}) {
-    const session = this.#session(id); const previous = this.getSessionConfig(id); const state = this.#state(id);
+    const session = this.#session(id); const previous = this.getSessionConfig(id);
     if (expectedVersion !== previous.version) throw error('MEMORY_CONFIG_VERSION_CONFLICT', 'session configuration version conflict');
-    if (!previous.version && (!this.#fresh.has(session) || session.events.some(e => ['turn/start', 'user/message'].includes(e.type)))) throw error('MEMORY_NEW_SESSION_REQUIRED', 'only an explicit new unstarted session can enable memory');
-    if (state.active || this.ctx.get('agents')?.get(id)?.status === 'running') throw error('MEMORY_SESSION_BUSY');
+    const blocked = this.#configurationBlockReason(session, previous.version);
+    if (blocked) throw error(blocked, blocked === 'MEMORY_NEW_SESSION_REQUIRED' ? 'only an explicit new unstarted session can enable memory' : 'session is running');
     if (!input || Object.keys(input).some(key => !['enabled', 'projectId', 'agentId', 'workspaceRoot', 'sandbox', 'budgetTokens', 'anchors'].includes(key))) throw error('MEMORY_INVALID_CONFIG');
     if (typeof input.enabled !== 'boolean' || typeof input.projectId !== 'string' || !input.projectId.trim()
         || input.agentId !== id || typeof input.workspaceRoot !== 'string') throw error('MEMORY_INVALID_CONFIG');
@@ -256,7 +327,14 @@ class MemoryRecovery extends Service {
     if (!Number.isSafeInteger(budgetTokens) || budgetTokens < 128 || budgetTokens > 100000 || !Array.isArray(anchors) || anchors.some(a => typeof a !== 'string' || !a)) throw error('MEMORY_INVALID_CONFIG');
     const config = { sessionId: id, version: previous.version + 1, enabled: input.enabled,
       projectId: input.projectId, agentId: id, workspaceRoot, sandbox, budgetTokens, anchors };
-    session.append(CONFIG_EVENT, config);
+    const agent = this.ctx.get('agents')?.get(id);
+    // Validate and stage the native scoped registrations before recording an
+    // irreversible policy change. A presentation conflict leaves the saved
+    // version and prior scope untouched; append failure releases only staging.
+    const preparedTools = agent ? this.#prepareTools(agent, { ...config, enabled: this.#enabled && config.enabled }) : undefined;
+    try { session.append(CONFIG_EVENT, config); }
+    catch (cause) { preparedTools?.restriction(); preparedTools?.presentation?.(); throw cause; }
+    if (agent) this.#adoptTools(agent, preparedTools);
     if (config.enabled) {
       const through = this.#store.cursor(id) ?? -1;
       for (const event of session.events) if (event.seq > through) this.#enqueue(session, event);

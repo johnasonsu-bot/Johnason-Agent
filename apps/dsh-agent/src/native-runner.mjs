@@ -10,6 +10,12 @@ const { parseDshArgs } = await import(pathToFileURL(join(config.upstreamRoot, 'a
 const invocation = parseDshArgs(config.args, '0.1.1-rc.2');
 config.invocation = invocation;
 const prepared = await prepareProfile(config);
+if (config.corePath && invocation.mode !== 'dump-config') {
+  const { prepareTrustedCore, CORE_ENV_KEYS } = await import('./dataplatform.mjs');
+  prepareTrustedCore(config.corePath);
+  // Capture DB/JWT in the core before native tool environments and snapshots exist.
+  for (const key of CORE_ENV_KEYS) delete process.env[key];
+}
 if (config.mode === 'plugin') {
   const { runPlugin } = await import(pathToFileURL(join(config.upstreamRoot, 'apps/cli/src/plugin.ts')));
   process.exitCode = runPlugin(prepared.profile, prepared.args);
@@ -19,5 +25,14 @@ if (config.mode === 'plugin') {
 } else {
   const { createLaunchEnvironmentSnapshot } = await import(require.resolve('@deepseek-ai/dsh-launch-environment'));
   const { runProfile } = await import(pathToFileURL(join(config.upstreamRoot, 'apps/cli/src/profile-boot.ts')));
-  await runProfile({ ...prepared, environment: createLaunchEnvironmentSnapshot([{ source: 'process', values: process.env }]) });
+  const { closeTrustedCores } = await import('./dataplatform.mjs');
+  try {
+    const { ctx } = await runProfile({ ...prepared, environment: createLaunchEnvironmentSnapshot([{ source: 'process', values: process.env }]) });
+    // This root effect survives plugin HMR and owns the shared pool until process teardown.
+    if (ctx.get('loader') === undefined) await closeTrustedCores();
+    else ctx.effect(() => () => closeTrustedCores());
+  } catch (error) {
+    await closeTrustedCores();
+    throw error;
+  }
 }

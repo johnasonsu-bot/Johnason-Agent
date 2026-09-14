@@ -123,7 +123,7 @@ export default class VaultCredentials extends CredentialProvider {
 }
 
 /** Read a master password without echo; never accept arguments or redirected input. */
-async function passwordPrompt(label) {
+export async function passwordPrompt(label) {
   const input = process.stdin, output = process.stderr;
   if (!input.isTTY || !output.isTTY) throw new Error('Vault is locked. Use the local Web /vault unlock page; headless requires its own interactive terminal unlock.');
   output.write(label);

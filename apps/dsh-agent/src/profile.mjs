@@ -1,5 +1,5 @@
 import { createRequire } from 'node:module';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -46,6 +46,16 @@ export async function prepareProfile(config) {
   const memoryPath = fileURLToPath(new URL('./memory-recovery-plugin.mjs', import.meta.url));
   const overlay = [{ id: 'credentials', config: { path: join(config.dataRoot, 'vault.enc'), mode: config.mode } },
     { insert: [{ id: 'memory-recovery', name: memoryPath, config: { path: join(config.dataRoot, 'memory/recovery.sqlite'), enabled: true } }] }];
+  if (config.corePath) overlay.push({ insert: [{ id: 'dataplatform-authorization', name: join(config.upstreamRoot, 'packages/credentials/authorization/lib/index.js') }, { id: 'dataplatform', name: fileURLToPath(new URL('./dataplatform-plugin.mjs', import.meta.url)), config: { corePath: config.corePath } }] });
+  if (config.mode === 'web') {
+    const uiName = '@johnason/dsh-memory-ui';
+    const uiDir = join(config.dataRoot, 'profiles/node_modules', uiName);
+    await mkdir(uiDir, { recursive: true, mode: 0o700 });
+    for (const file of ['package.json', 'index.mjs', 'client.js']) {
+      await copyFile(new URL('../browser/' + file, import.meta.url), join(uiDir, file));
+    }
+    overlay.push({ insert: [{ id: 'memory-ui', name: uiName }] });
+  }
   const layers = [loaded.layers.flatMap(layer => layer.patches), loaded.patches,
     boot.loadOptionalPatches('johnason-dsh', join(config.dataRoot, 'cordis.patch.yml')) ?? [],
     ...patchFiles.map(path => boot.loadOverlayPatches('johnason-dsh', path)), overlay];

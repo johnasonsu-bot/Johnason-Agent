@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width"
+  /><title>Data Platform</title
+  ><style>
+    body {
+      font: 16px system-ui;
+      max-width: 850px;
+      margin: 40px auto;
+      padding: 20px;
+      color: #17304a;
+    }
+    input,
+    select,
+    textarea,
+    button {
+      font: inherit;
+      margin: 8px;
+      padding: 8px;
+    }
+    textarea {
+      width: 90%;
+      height: 220px;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    #login label { display: inline-flex; flex-direction: column; vertical-align: middle; }
+    #login label span { margin-left: 8px; font-weight: 600; }
+  </style>
+  <h1>Data Platform</h1>
+  <p>
+    先在
+    <a href="/vault">Vault</a>
+    解锁保险箱，再使用 Data Platform 的用户名和密码登录。保险箱主密码与平台账号密码是两种凭据。命令权限由平台实时校验。
+  </p>
+  <p>用户名填写平台账号，例如 admin；平台网址填写 Data Platform 地址。当前已配置 http://127.0.0.1:46120 的本地共享核心接入。</p>
+  <form id="login" novalidate>
+    <label for="platformUrl"><span>平台网址</span><input id="platformUrl" type="url" value="http://127.0.0.1:46120" autocomplete="off" /></label>
+    <label for="username"><span>平台用户名</span>
+    <input
+      id="username"
+      autocomplete="username"
+      placeholder="平台用户名"
+      required
+    /></label><label for="password"><span>平台密码</span><input
+      id="password"
+      type="password"
+      autocomplete="current-password"
+      placeholder="平台密码"
+      required
+    /></label><button>登录</button><button type="button" id="logout">注销</button>
+  </form>
+  <p id="loginFeedback" role="status" aria-live="polite">正在检查登录状态…</p>
+  <details id="jsonPanel">
+    <summary>登录 JSON 输入</summary>
+    <p>可从上方三个输入项生成 JSON，也可粘贴登录 JSON。此输入含密码，仅用于登录；提交后清空，请勿粘贴到聊天记录。</p>
+    <button type="button" id="generateJson">生成登录 JSON</button>
+    <label for="loginJson">登录 JSON</label>
+    <textarea id="loginJson" autocomplete="off" spellcheck="false" placeholder='{"url":"http://127.0.0.1:46120","username":"admin","password":"你的平台密码"}'></textarea>
+    <button type="button" id="jsonLogin">使用 JSON 登录</button>
+  </details>
+  <form id="execute">
+    <select id="command"></select
+    ><input id="project" type="number" min="1" placeholder="项目 ID（可选）" />
+    <p>命令 JSON 输入（不得包含密码、Token 或密钥）</p>
+    <textarea id="input">{}</textarea
+    ><input
+      id="userPassword"
+      type="password"
+      autocomplete="new-password"
+      placeholder="新用户密码（创建/修改用户时）"
+    /><button>执行</button>
+  </form>
+  <pre id="result" aria-live="polite"></pre>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function call(path, data) {
+      const r = await fetch(
+        "/dataplatform/" + path,
+        data === undefined
+          ? { signal: AbortSignal.timeout(30000) }
+          : {
+              signal: AbortSignal.timeout(30000),
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(data),
+            },
+      );
+      const v = await r.json();
+      $("result").textContent = JSON.stringify(v, null, 2);
+      return v;
+    }
+    async function status() {
+      const v = await call("status");
+      if (!loginTouched) $("loginFeedback").textContent = v.authorized
+        ? "已登录 Data Platform，当前账号：" + (v.user?.username || "已授权账号")
+        : v.error === "VAULT_LOCKED" ? "保险箱尚未解锁，请先打开 Vault 解锁。" : v.error ? "无法确认平台登录状态，请查看下方错误信息。" : "尚未登录 Data Platform。";
+      $("command").replaceChildren();
+      for (const c of v.commands || []) {
+        const o = document.createElement("option");
+        o.value = c;
+        o.textContent = c;
+        $("command").append(o);
+      }
+    }
+    let loginBusy = false;
+    let loginTouched = false;
+    function validateLogin(data) {
+      if (!data || typeof data !== "object" || typeof data.username !== "string" || typeof data.password !== "string" || !data.username.trim() || !data.password)
+        throw new Error("请填写平台用户名和密码。");
+      if (data.username.includes("://")) throw new Error("请输入平台用户名，例如 admin；这里不能填写网址。");
+      let target;
+      try { target = new URL(data.url); } catch { throw new Error("请填写有效的平台网址，例如 http://127.0.0.1:46120。"); }
+      if (target.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(target.hostname) || target.port !== "46120" || target.username || target.password || target.search || target.hash || target.pathname !== "/")
+        throw new Error("此网址尚未配置本地共享核心接入，请使用 http://127.0.0.1:46120。");
+      return { url: target.origin, username: data.username.trim(), password: data.password };
+    }
+    function formLogin() {
+      return { url: $("platformUrl").value.trim(), username: $("username").value, password: $("password").value };
+    }
+    $("generateJson").onclick = () => {
+      loginTouched = true;
+      try {
+        $("loginJson").value = JSON.stringify(validateLogin(formLogin()), null, 2);
+        $("loginFeedback").textContent = "已生成登录 JSON，点击“使用 JSON 登录”提交。";
+      } catch (error) { $("loginFeedback").textContent = error.message; }
+    };
+    async function signIn(raw) {
+      if (loginBusy) return;
+      loginTouched = true;
+      let data;
+      try { data = validateLogin(raw); }
+      catch (error) { $("loginFeedback").textContent = error.message; return; }
+      loginBusy = true;
+      $("login").querySelector("button").disabled = true;
+      $("jsonLogin").disabled = true;
+      $("password").value = "";
+      $("loginJson").value = "";
+      $("loginFeedback").textContent = "正在登录，请稍候（最多 30 秒）…";
+      try {
+        const outcome = await call("login", data);
+        if (outcome.status === "authorized") {
+          $("loginFeedback").textContent = "登录成功，当前平台账号：" + data.username;
+          await status();
+        } else {
+          const messages = {
+            VAULT_LOCKED: "请先打开 Vault，使用保险箱主密码解锁，再填写平台用户名和密码登录。",
+            DP_UNAUTHORIZED: "登录未通过：请使用 Data Platform 的用户名和密码，并确认账号已启用。",
+            DP_PERMISSION_DENIED: "登录被拒绝：当前账号没有所需权限。",
+            DP_UNAVAILABLE: "平台服务暂不可用，请稍后重试。",
+          };
+          $("loginFeedback").textContent = messages[outcome.error] || "登录未完成，请查看下方错误信息。";
+        }
+      } catch (error) {
+        $("loginFeedback").textContent = error.name === "TimeoutError"
+          ? "登录请求超时，尚未确认接入结果。请刷新检查状态后重试。"
+          : "无法连接 DSH 服务，请确认服务正在运行后重试。";
+      } finally {
+        data.password = "";
+        raw.password = "";
+        loginBusy = false;
+        $("login").querySelector("button").disabled = false;
+        $("jsonLogin").disabled = false;
+      }
+    }
+    $("login").onsubmit = (e) => { e.preventDefault(); signIn(formLogin()); };
+    $("jsonLogin").onclick = () => {
+      loginTouched = true;
+      let data;
+      try { data = JSON.parse($("loginJson").value); }
+      catch { $("loginFeedback").textContent = "登录 JSON 格式错误，请检查双引号、逗号及括号。"; return; }
+      signIn(data);
+    };
+    $("logout").onclick = async () => {
+      try {
+        await call("logout", {});
+        $("loginFeedback").textContent = "已注销平台登录。";
+      } catch {
+        $("loginFeedback").textContent = "无法连接 DSH 服务，请重试注销。";
+      }
+    };
+    $("execute").onsubmit = async (e) => {
+      e.preventDefault();
+      try {
+        const userPassword = $("userPassword").value;
+        $("userPassword").value = "";
+        await call("execute", {
+          userPassword,
+          command: $("command").value,
+          input: JSON.parse($("input").value),
+          ...($("project").value
+            ? { projectId: Number($("project").value) }
+            : {}),
+        });
+      } catch {
+        $("result").textContent = "无效的 JSON 或连接失败";
+      }
+    };
+    status().then(() => {}).catch(() => {
+      $("loginFeedback").textContent = "无法连接 DSH 服务，请确认服务正在运行后刷新。";
+    });
+  </script>
+</html>

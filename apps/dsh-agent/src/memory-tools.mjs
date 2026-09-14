@@ -7,7 +7,7 @@ export function installMemoryTools(ctx, service) {
     ['memory_page_out', 'Remove a page from the working set, without deleting source records.', { id: string }, ['id']],
     ['memory_semantic', 'Append a sourced semantic entity/relation version.', { record: { type: 'object' } }, ['record']],
     ['memory_procedural_candidate', 'Propose a sourced candidate procedure. Cannot confirm or protect rules.', { record: { type: 'object' } }, ['record']],
-    ['memory_sandbox_run', 'Run literal argv using the task file sandbox and native approval. Network/resource isolation is not provided. Repeated call IDs never repeat unknown side effects.', { argv: { type: 'array', items: string } }, ['argv']],
+    ['memory_sandbox_run', 'Run literal argv using the task file sandbox and native approval. Examples: {"argv":["pwd"]}, {"argv":["ls","-la","."]}, {"argv":["sed","-n","1,120p","README.md"]}. No implicit shell expansion, pipes, or redirection. Network/resource isolation is not provided. Repeated call IDs never repeat unknown side effects.', { argv: { type: 'array', items: string } }, ['argv']],
   ];
   for (const [name, description, properties, required] of definitions) {
     ctx.tools.register({ name, description,

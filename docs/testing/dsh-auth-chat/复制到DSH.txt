@@ -1,0 +1,60 @@
+执行 DSH / Data Platform 用户登录与授权验收。请实际调用 dataplatform_execute，不能只给建议、模拟结果或用 shell/SQL/HTTP 绕过共享核心。以下步骤是我授权你在独立测试角色、测试账号上执行的操作；不修改 admin、user1 或其他业务对象。密码及 Token 绝不能出现在聊天、工具参数、日志或文件中。
+
+【执行规则】
+1. 所有命令只使用工具 dataplatform_execute，参数形如 {"command":"role.list","projectId":1,"input":{}}。不要把 CLI 字符串当成 command。
+2. 当前环境已核实：admin ID 1、启用；user1 ID 2、停用，角色 viewer ID 4；当前共 6 个项目，ID 为 1、2、3、5、6、7，默认项目 ID 1；本测试仅使用项目 1、2，其余项目保持不变。开始时实时读取，若与此不同，使用真实返回值并解释差异，不猜 ID。
+3. 全程只使用 roleCode=dsh_auth_tester、username=dsh_auth_test 和 dsh_test_ 前缀的要素。遇到同名已有对象，先展示并核对；无法确认属于这次测试则暂停，不覆盖。
+4. permission.config.save 是完整配置保存：每次先 config.get，保留最新 version，保留所有非本次测试条目，仅合并修改本次条目；不要用空数组清空配置，不要猜 version。保存后重读确认。除专门的冲突测试外，遇到版本冲突停止并提示，不盲目重试。
+5. 不修改系统内置角色，不新增管理员权限，不执行删除，不恢复整个旧配置覆盖其他人的更新。每步记录编号、实际调用、预期、实际返回、PASS/FAIL。预期拒绝也算 PASS；出现意外结果立即暂停，不继续写入。
+6. 安全登录/密码框操作需要由我完成。到指定检查点时暂停，给出页面链接和准确非敏感 JSON。我回复约定短句后才继续，等待不算成功。不要尝试读取 Vault、浏览器存储、.env 或猜密码。
+7. 若工具提示 DP_LOGIN_REQUIRED/VAULT_LOCKED，让我打开 http://127.0.0.1:3080/vault 解锁，再在 http://127.0.0.1:3080/dataplatform 以 admin 登录。不得要求我把密码发进聊天。如果找不到工具，报告工具不可用，不换用其他路径绕过。
+
+【阶段 A：管理员读取与角色维护】
+A1. 用 project.list(input={})、role.list(projectId=1,input={})、user.list(projectId=1,input={})、permission.catalog(projectId=1,input={})、permission.config.get(projectId=1,input={}) 读取四个页面对应的真实设置。输出用户/角色/项目简表及 ABAC 当前版本与数量，不输出凭据。
+A2. 管理员调用 permission.check，外层 projectId=1，input={"userId":2,"projectId":1,"point":"overview.read"}；若 user1 仍停用，预期 allowed=false、code=USER_INACTIVE。只校验，不启用 user1。
+A3. 创建独立角色：role.create(projectId=1,input={"roleName":"DSH授权测试角色","roleCode":"dsh_auth_tester","roleType":"custom","permissions":{"modules":["overview","ingestion"]},"status":"active"})。从返回值/role.list取得真实角色 ID，记为 R。不存在时才创建。
+A4. role.update 的输入是平铺结构：{"id":R,"roleName":"DSH授权测试角色-维护验证","roleCode":"dsh_auth_tester","roleType":"custom","permissions":{"modules":["overview","ingestion"]},"status":"active"}。执行后 role.list 验证名称、ID、权限；再以同样格式恢复名称为“DSH授权测试角色”，重读确认。不得改其他角色。
+A5. 此处必须暂停，告诉我：打开 http://127.0.0.1:3080/dataplatform ，保持 admin 登录；选择 user.create，项目 ID 填 1，把你生成的 JSON 粘入输入框；在页面专用“新用户密码”框自行设置密码，然后点击执行。JSON 必须用真实数字 R：{"username":"dsh_auth_test","displayName":"DSH授权测试账号","roleId":R,"status":"active"}，不可带 password。若账号已存在，不重复创建，不要求重置密码。提示我回复“测试账号已创建，继续”。
+
+【阶段 B：管理员维护要素、分配、校验】
+收到“测试账号已创建，继续”后仍以 admin 身份执行。
+B1. user.list 查到 dsh_auth_test 的真实 ID 记为 U，要求启用且不是 admin/user1。user.role.set(projectId=1,input={"userId":U,"roleId":R})，重读确认。新账号由平台自动加入默认项目 1。
+B2. 获取最新完整 ABAC 配置，按以下结构合并本次要素和 U 的授权：
+attributes 追加：
+{"key":"dsh_test_department","label":"DSH测试部门","type":"string","source":"subject"}
+{"key":"dsh_test_level","label":"DSH测试等级","type":"number","source":"subject"}
+scopes 追加：
+{"id":"dsh_test_home","name":"DSH测试默认项目范围","projectIds":[1]}
+{"id":"dsh_test_other","name":"DSH测试范围外对照","projectIds":[2]}
+policies 追加：
+{"id":"dsh_test_read","name":"DSH测试研发读取","effect":"allow","points":["ingestion.read"],"conditions":[{"attribute":"dsh_test_department","op":"eq","value":"研发"},{"attribute":"dsh_test_level","op":"gte","value":2}],"enabled":true}
+{"id":"dsh_test_deny_write","name":"DSH测试拒绝写入","effect":"deny","points":["ingestion.write"],"conditions":[],"enabled":true}
+{"id":"dsh_test_deny_read","name":"DSH测试拒绝优先","effect":"deny","points":["ingestion.read"],"conditions":[],"enabled":false}
+assignments 追加：
+{"userId":U,"attributes":{"dsh_test_department":"研发","dsh_test_level":2},"scopeIds":["dsh_test_home"],"policyIds":["dsh_test_read","dsh_test_deny_write","dsh_test_deny_read"]}
+合并后调用 permission.config.save，外层 projectId=1，input 就是带最新 version 的完整配置对象。保存前把该非敏感配置保留在本轮上下文，用于 B9 的故意旧版本提交。不要将上面“U”作为字符串发送。
+B3. 以后管理员代查均使用 permission.check，外层 projectId=1，input={"userId":U,"projectId":1,"point":"指定权限点"}。overview.read 预期 ALLOWED；ingestion.read 预期 ALLOWED；ingestion.write 预期 POLICY_DENY；system_roles.read 预期 MODULE_PERMISSION_FORBIDDEN。
+B4. 最新配置中仅把 U 的 dsh_test_level 改成 1，保存；校验 ingestion.read 预期 POLICY_ALLOW_REQUIRED。恢复为 2，保存并校验允许。
+B5. 最新配置中仅取消 U 的 dsh_test_department 属性赋值，保存；校验 ingestion.read 预期 ATTRIBUTE_MISSING_OR_INVALID。重新赋值“研发”，保存并校验允许。这是取消本次测试属性值，不删除任何文件或业务对象。
+B6. 最新配置中启用 dsh_test_deny_read，保存；即使允许条件满足，校验 ingestion.read 也应 POLICY_DENY。再停用该策略，保存并校验允许。
+B7. 最新配置中仅把 U.scopeIds 改为 ["dsh_test_other"]，保存；仍对项目 1 校验 ingestion.read，预期 SCOPE_FORBIDDEN。然后恢复 ["dsh_test_home"] 并验证允许。注意：不要用目标项目 2 做本案例，因为新账号未加入项目 2，会先触发项目成员拒绝，不能证明范围规则生效。
+B8. user.role.set 把 U 暂时绑定现有 viewer 角色（动态查 roleCode=viewer 的真实 ID）；校验 ingestion.read 预期 MODULE_PERMISSION_FORBIDDEN，overview.write 预期 READ_ONLY_FORBIDDEN。再绑定回 R 并验证 ingestion.read 允许。
+B9. 故意再次提交 B2 留存的旧版本完整配置，预期 DP_VERSION_CONFLICT/status=409，重读确认内容和版本没被旧配置覆盖。再复制最新配置，仅将 U 的数值属性 dsh_test_level 改成字符串“2”提交，预期 DP_INVALID_INPUT/status=400，重读确认未写入。不要把预期拒绝当作故障重试。
+B10. 输出阶段结果，暂停，提示我在 http://127.0.0.1:3080/dataplatform 注销 admin，以 dsh_auth_test 和我自己设置的密码登录。登录成功后回复“测试账号已登录，继续”。
+
+【阶段 C：用真实测试账号验证访问】
+收到“测试账号已登录，继续”后执行；本阶段不要使用 userId 参数冒充别的用户。
+C1. 先调用 permission.config.get(projectId=1,input={})，预期 DP_PERMISSION_DENIED/status=403。若成功，可能仍是管理员登录，立即停下要求核对登录用户，不能继续写操作。
+C2. project.list(input={}) 应只显示默认项目 1。
+C3. permission.check 的外层 projectId=1，input={"projectId":1,"point":"overview.read"}，预期 allowed=true；ingestion.read 预期 allowed=true；ingestion.write 预期 allowed=false、code=POLICY_DENY；system_roles.read 预期 allowed=false、code=MODULE_PERMISSION_FORBIDDEN。
+C4. 实际调用 role.list(projectId=1,input={}) 和 user.list(projectId=1,input={})，均预期 DP_PERMISSION_DENIED/status=403。这证明真实操作被拒绝，不只是预检结果。不要尝试创建管理员或读取其他账号的属性配置。
+C5. 暂停，提示我在安全页面切回 admin，回复“管理员已登录，继续停用测试”。
+
+【阶段 D：停用、登录失败与收尾】
+收到“管理员已登录，继续停用测试”后执行。
+D1. user.list 重新读取 dsh_auth_test，核对 U，读取完整非敏感 username/displayName/roleId/status。用 user.update(projectId=1,input={"id":U,"username":"dsh_auth_test","displayName":"实际原显示名称","roleId":实际原角色ID,"status":"inactive"}) 停用该独立账号；不发送 password 字段。重读确认 inactive。
+D2. 管理员 permission.check(input={"userId":U,"projectId":1,"point":"overview.read"},projectId=1)，预期 USER_INACTIVE。
+D3. 暂停，提示我打开安全登录页注销 admin，使用原测试账号密码尝试登录 dsh_auth_test，预期 DP_UNAUTHORIZED/status=401。请我回复“停用账号登录被拒绝”或准确错误码，不要让我发送密码。不能把管理员代查当作真实登录测试。
+D4. 收到真实反馈后记录结果，提示我重新登录 admin。保留停用测试账号、独立角色及 dsh_test_ 要素供页面查看，不删除。最终输出所有案例的 PASS/FAIL/未执行、各对象真实 ID、配置最终版本、现有账号未改动的检查结果。未收到真实登录反馈的步骤必须写“待人工验证”，不能报全部通过。
+
+现在从阶段 A 开始实际执行。
