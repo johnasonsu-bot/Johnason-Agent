@@ -9,10 +9,12 @@ const require = createRequire(join(config.upstreamRoot, 'apps/cli/package.json')
 const { parseDshArgs } = await import(pathToFileURL(join(config.upstreamRoot, 'apps/cli/src/args.ts')));
 const invocation = parseDshArgs(config.args, '0.1.1-rc.2');
 config.invocation = invocation;
+const { readProviders } = await import('./systems.mjs');
+config.providers = readProviders(config.systemsPath, config.corePath);
 const prepared = await prepareProfile(config);
-if (config.corePath && invocation.mode !== 'dump-config') {
+if (invocation.mode !== 'dump-config') {
   const { prepareTrustedCore, CORE_ENV_KEYS } = await import('./dataplatform.mjs');
-  prepareTrustedCore(config.corePath);
+  for (const provider of config.providers) if (provider.type === 'dataplatform') prepareTrustedCore(provider.corePath);
   // Capture DB/JWT in the core before native tool environments and snapshots exist.
   for (const key of CORE_ENV_KEYS) delete process.env[key];
 }

@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readProviders } from './systems.mjs';
 
 /** Compose native bundles and user patches, with the encrypted provider as the final overlay. */
 export async function prepareProfile(config) {
@@ -46,7 +47,8 @@ export async function prepareProfile(config) {
   const memoryPath = fileURLToPath(new URL('./memory-recovery-plugin.mjs', import.meta.url));
   const overlay = [{ id: 'credentials', config: { path: join(config.dataRoot, 'vault.enc'), mode: config.mode } },
     { insert: [{ id: 'memory-recovery', name: memoryPath, config: { path: join(config.dataRoot, 'memory/recovery.sqlite'), enabled: true } }] }];
-  if (config.corePath) overlay.push({ insert: [{ id: 'dataplatform-authorization', name: join(config.upstreamRoot, 'packages/credentials/authorization/lib/index.js') }, { id: 'dataplatform', name: fileURLToPath(new URL('./dataplatform-plugin.mjs', import.meta.url)), config: { corePath: config.corePath } }] });
+  const systems = config.providers ?? readProviders(config.systemsPath, config.corePath);
+  if (systems.length) overlay.push({ insert: [{ id: 'dataplatform-authorization', name: join(config.upstreamRoot, 'packages/credentials/authorization/lib/index.js') }, { id: 'dataplatform', name: fileURLToPath(new URL('./systems-plugin.mjs', import.meta.url)), config: { providers: systems } }] });
   if (config.mode === 'web') {
     const uiName = '@johnason/dsh-memory-ui';
     const uiDir = join(config.dataRoot, 'profiles/node_modules', uiName);

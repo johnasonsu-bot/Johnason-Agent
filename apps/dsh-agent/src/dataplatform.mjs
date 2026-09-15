@@ -108,10 +108,12 @@ export class DataPlatform {
   #path;
   #ownsCore;
   #closed = false;
-  constructor({ corePath, credentials, core }) {
+  #commands;
+  constructor({ corePath, credentials, core, systemId = "dataplatform", label = "Data Platform", commands = COMMANDS }) {
     if (!corePath || !isAbsolute(corePath)) throw fail("DP_CORE_REQUIRED");
     this.#path = core ? corePath : realpathSync(corePath);
-    this.key = `dataplatform/core-${createHash("sha256").update(this.#path).digest("hex")}`;
+    this.#commands = [...commands];
+    this.key = `${systemId}/core-${createHash("sha256").update(this.#path).digest("hex")}`;
     this.#credentials = credentials;
     this.#ownsCore = Boolean(core) || !preparedCores.has(this.#path);
     this.#core =
@@ -120,7 +122,7 @@ export class DataPlatform {
       createRequire(import.meta.url)(this.#path).createCore();
     this.flow = {
       key: this.key,
-      label: "Data Platform",
+      label,
       methods: [{ id: "password", label: "平台账号登录" }],
       run: async (session) => {
         session.signal.throwIfAborted();
@@ -128,11 +130,11 @@ export class DataPlatform {
         const previous = await this.#grant();
         const username = await session.prompt({
           kind: "text",
-          message: "Data Platform username",
+          message: `${label} username`,
         });
         let password = await session.prompt({
             kind: "secret",
-            message: "Data Platform password",
+            message: `${label} password`,
           }),
           token;
         try {
@@ -234,7 +236,7 @@ export class DataPlatform {
       )
     )
       throw fail("DP_INVALID_INPUT");
-    if (!COMMANDS.includes(args.command)) throw fail("DP_UNKNOWN_COMMAND");
+    if (!this.#commands.includes(args.command)) throw fail("DP_UNKNOWN_COMMAND");
     rejectSecrets(args.input);
     if (
       args.input !== undefined &&

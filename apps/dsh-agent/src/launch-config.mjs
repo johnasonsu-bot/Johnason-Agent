@@ -43,6 +43,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
   let dataRoot = join(homeDir, '.johnason-dsh')
   let workspace
   let corePath
+  let systemsPath
   let port
   let noOpen = false
   const passthrough = []
@@ -58,6 +59,10 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     } else if (token === '--core') {
       corePath = takeValue(argv, index, token)
       if (!isAbsolute(corePath)) throw new Error('--core requires an absolute trusted path')
+      index += 1
+    } else if (token === '--systems') {
+      systemsPath = takeValue(argv, index, token)
+      if (!isAbsolute(systemsPath)) throw new Error('--systems requires an absolute trusted configuration path')
       index += 1
     } else if (token === '--workspace') {
       workspace = resolve(takeValue(argv, index, token))
@@ -96,7 +101,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
   const childEnv = Object.fromEntries(
     Object.entries(env).filter(([key]) => SAFE_ENV_KEYS.has(key)),
   )
-  if (corePath) {
+  if (corePath || systemsPath) {
     for (const key of ['DB_HOST', 'DB_PORT', 'DB_USER', 'DB_PASSWORD', 'DB_NAME', 'DB_TIMEZONE', 'JWT_SECRET', 'JWT_EXPIRES_IN', 'BCRYPT_SALT_ROUNDS']) {
       if (env[key] !== undefined) childEnv[key] = env[key]
     }
@@ -122,6 +127,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     dataRoot,
     workspace,
     corePath,
+    systemsPath,
     upstreamRoot,
     args,
     env: childEnv,
