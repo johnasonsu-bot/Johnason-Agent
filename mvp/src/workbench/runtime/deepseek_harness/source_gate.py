@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 DSH_SUBMODULE_PATH = "third_party/deepseek-harness"
 DSH_SUBMODULE_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
-DSH_PINNED_REVISION = "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e"
+DSH_PINNED_REVISION = "ddefc45fbc7f8e46dd73185e68295696d1297887"
 DSH_SOURCE_MANIFEST_SCHEMA = "workbench.runtime.dsh.source_manifest.v1"
 DSH_HOST_V2_BUILD_SCHEMA = "workbench.runtime.dsh.host_v2_build.v1"
 DSH_HOST_V2_BUILD_ID = "dsh:fixed-host-v2-smoke"
@@ -32,17 +32,16 @@ _RELEASE_TARGETS = (
     ("node24-linux-arm64", "linux", "arm64"),
     ("node24-macos-arm64", "darwin", "arm64"),
 )
-_SIDECAR_PACKAGE = "dsh-jsonrpc-agent-pkg"
+_SIDECAR_PACKAGE = "dsh-python-runtime-closure"
 _SIDECAR_PACKAGE_MANIFEST = "python/sdk-runtime/package.json"
-_SIDECAR_ENTRYPOINT = (
-    "node_modules/@deepseek-ai/dsh-sdk-jsonrpc-demo/lib/packaged-bin.js"
-)
-_SIDECAR_ENTRYPOINT_SOURCE = "packages/examples/jsonrpc-demo/src/packaged-bin.ts"
+_SIDECAR_ENTRYPOINT = "runtime-bootstrap.mjs"
+_SIDECAR_ENTRYPOINT_SOURCE = "python/sdk-runtime/runtime-bootstrap.mjs"
 _BUILD_POLICY_FILES = (
     "scripts/build-exe-for-python-sdk.ts",
     _SIDECAR_PACKAGE_MANIFEST,
-    "packages/examples/jsonrpc-demo/package.json",
     _SIDECAR_ENTRYPOINT_SOURCE,
+    "apps/cli/package.json",
+    "apps/cli/src/bin.ts",
 )
 _REQUIRED_LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
 _HOST_V2_ROOT = "mvp/sidecars/deepseek-harness"

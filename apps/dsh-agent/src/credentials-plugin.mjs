@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { StringDecoder } from 'node:string_decoder';
 import { VaultStore } from './vault-store.mjs';
 import { installVaultUi } from './vault-ui.mjs';
+import { BROWSER_SESSION_RECORD_KEY, browserSessionRecord } from './browser-session-record.mjs';
 
 const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
 const baseRequire = createRequire(require.resolve('@deepseek-ai/dsh-base'));
@@ -36,13 +37,14 @@ function validateRecord(record) {
   }
 }
 
-/** Encrypted-only native credentials provider. Every operation rereads the vault. */
+/** Encrypted credentials with one process-local signing record for native browser startup. */
 export default class VaultCredentials extends CredentialProvider {
   constructor(ctx, config) {
     super(ctx);
     if (!config?.path || !['web', 'headless'].includes(config.mode)) throw new Error('Vault path and mode are required');
     this.config = config;
     this.vault = new VaultStore(config.path);
+    this.browserSession = config.mode === 'web' ? browserSessionRecord(ctx.root) : undefined;
   }
 
   async* [Service.init]() {
@@ -80,12 +82,17 @@ export default class VaultCredentials extends CredentialProvider {
   }
   async readRecord(key) {
     parseCredentialKey(key);
+    if (key === BROWSER_SESSION_RECORD_KEY && this.browserSession) return this.browserSession.read();
     const record = (await this.vault.read()).records[key];
     if (record !== undefined) validateRecord(record);
     return record;
   }
   async describeRecord(key) {
     parseCredentialKey(key);
+    if (key === BROWSER_SESSION_RECORD_KEY && this.browserSession) {
+      const record = await this.browserSession.read();
+      return { configured: record !== undefined, ...record && { kind: record.kind }, writable: true };
+    }
     if ((await this.vault.status()).locked) return { configured: false, writable: false };
     const record = await this.readRecord(key);
     return { configured: record !== undefined, ...record && { kind: record.kind }, writable: true };
@@ -98,6 +105,11 @@ export default class VaultCredentials extends CredentialProvider {
   }
   async modifyRecord(key, mutate) {
     parseCredentialKey(key);
+    if (key === BROWSER_SESSION_RECORD_KEY && this.browserSession) {
+      const result = await this.browserSession.modify(mutate);
+      if (result.changed) this.notifyRecordUpdated(key);
+      return result.record;
+    }
     let result, changed = false;
     await this.vault.update(async data => {
       const current = data.records[key];
@@ -116,6 +128,10 @@ export default class VaultCredentials extends CredentialProvider {
   }
   async deleteRecord(key) {
     parseCredentialKey(key);
+    if (key === BROWSER_SESSION_RECORD_KEY && this.browserSession) {
+      if (await this.browserSession.clear()) this.notifyRecordUpdated(key);
+      return;
+    }
     let changed = false;
     await this.vault.update(data => { changed = Object.hasOwn(data.records, key); delete data.records[key]; return data; });
     if (changed) this.notifyRecordUpdated(key);

@@ -5,6 +5,7 @@ import SessionStore, {
   Session,
   SessionId,
 } from "../../../../third_party/deepseek-harness/packages/core/session/lib/index.js";
+import SessionProjections from "../../../../third_party/deepseek-harness/packages/session/session-projection/lib/index.js";
 import SystemPrompt from "../../../../third_party/deepseek-harness/packages/core/system-prompt/lib/index.js";
 import ToolRuntime, {
   assertObjectJsonSchema,
@@ -12,6 +13,7 @@ import ToolRuntime, {
 import LlmRuntime, {
   LlmError,
   createAssistantMessage,
+  createSystemMessage,
   createUserMessage,
 } from "../../../../third_party/deepseek-harness/packages/llm/llm/lib/index.js";
 import {
@@ -200,6 +202,20 @@ export function registerPlatformTools(ctx, {
 function historySeed(messages, provider, model, sessionId) {
   const seed = Session.create(SessionId(`${sessionId}:seed`));
   let turn = 0;
+  let openStep = false;
+  if (messages.length !== 0) {
+    // V3 requires its protected system node before every historical surface
+    // message, inside an open step. The loop replaces this empty head with
+    // the assembled platform prompt when admitting the current request.
+    turn = 1;
+    seed.append("turn/start", { turn });
+    seed.append("step/start", { turn, step: 1 });
+    seed.append("system/message", {
+      turn, step: 1,
+      message: createSystemMessage("", "@deepseek-ai/dsh-system-prompt"),
+    }, { surfaceOp: "append" });
+    openStep = true;
+  }
   for (const message of messages) {
     if (message.role === "user") {
       seed.append("user/message", createUserMessage({
@@ -211,17 +227,27 @@ function historySeed(messages, provider, model, sessionId) {
     if (message.role !== "assistant") {
       throw new Error("DSH native Session history supports user and assistant roles only");
     }
-    turn += 1;
-    seed.append("turn/start", { turn });
-    seed.append("step/start", { turn, step: 1 });
+    if (!openStep) {
+      turn += 1;
+      seed.append("turn/start", { turn });
+      seed.append("step/start", { turn, step: 1 });
+    }
     seed.append("assistant/message", {
       turn,
       step: 1,
+      stream: [],
       message: createAssistantMessage({
         content: [{ type: "text", text: message.content }],
         source: { provider, model },
       }),
     }, { surfaceOp: "append" });
+    seed.append("step/end", { turn, step: 1 });
+    seed.append("turn/end", { turn, reason: { kind: "completed" } });
+    openStep = false;
+  }
+  // An input may supply earlier user context without any assistant response.
+  // Close the head's setup step so the live loop starts a fresh balanced turn.
+  if (openStep) {
     seed.append("step/end", { turn, step: 1 });
     seed.append("turn/end", { turn, reason: { kind: "completed" } });
   }
@@ -264,6 +290,7 @@ function realProviderAdapter(provider, credential) {
     throw new Error("DSH upstream adapter does not accept custom metadata headers");
   }
   const connection = resolveAdapterOptions({
+    protocol: "chat-completions",
     baseURL: route.base_url,
     thinking: route.thinking_enabled ? "enabled" : "disabled",
     reasoningEffort: route.thinking_enabled ? route.reasoning_effort : "off",
@@ -287,6 +314,7 @@ export async function runDeepSeekHarnessSession({
   runIdentity,
   executeTool,
   onEvent = () => {},
+  onChunk = () => {},
   adapter = realProviderAdapter,
 }) {
   if (signal.aborted) throw signal.reason ?? new Error("DSH Session was cancelled");
@@ -305,10 +333,11 @@ export async function runDeepSeekHarnessSession({
   try {
     await ctx.plugin(LlmRuntime);
     await ctx.plugin(SessionStore);
+    await ctx.plugin(SessionProjections);
     await ctx.plugin(SystemPrompt, {
       includeHarnessIdentity: false,
       includeRuntimeContext: true,
-      persona: "",
+      personaPrefix: "",
     });
     await ctx.plugin(ToolRuntime);
     if (toolManifest.length !== 0) {
@@ -320,12 +349,15 @@ export async function runDeepSeekHarnessSession({
     ctx.llm.registerAdapter([route], adapter(provider, credential));
     ctx.on("session/event", (_session, event) => {
       onEvent(event);
-      if (event.type === "assistant/chunk"
-          && event.data?.chunk?.type === "text-delta") {
-        content += event.data.chunk.text;
-      }
       if (event.type === "assistant/message") {
         content = messageText(event.data.message);
+      }
+    });
+    ctx.on("agent/assistant-stream", ({ agent: streamingAgent, frame }) => {
+      if (streamingAgent !== agent || frame.type !== "chunk") return;
+      onChunk(frame.chunk);
+      if (frame.chunk.type === "text-delta") {
+        content += frame.chunk.text;
       }
     });
     const published = await ctx.agentLoop.createAgent(ctx, {

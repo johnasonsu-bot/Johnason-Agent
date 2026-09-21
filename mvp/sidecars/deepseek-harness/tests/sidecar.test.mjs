@@ -525,6 +525,7 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   const nativeEvents = [];
+  const nativeChunks = [];
   const materialized = {
     promptSections: [
       { section_id: "first", order: 10, content: "First instruction" },
@@ -556,6 +557,7 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
       sessionId: "native-session-test",
       signal: new AbortController().signal,
       onEvent: event => nativeEvents.push(event.type),
+      onChunk: chunk => nativeChunks.push(chunk),
     });
     assert.equal(result.content, "native session");
   } finally {
@@ -575,7 +577,10 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
   assert.match(system, /First instruction[\s\S]*Second instruction/);
   assert.ok(nativeEvents.includes("turn/start"));
   assert.ok(nativeEvents.includes("step/start"));
-  assert.ok(nativeEvents.includes("assistant/chunk"));
+  assert.equal(nativeEvents.includes("assistant/chunk"), false);
+  assert.deepEqual(nativeChunks.filter(chunk => chunk.type === "text-delta").map(chunk => chunk.text), [
+    "native ", "session",
+  ]);
   assert.ok(nativeEvents.includes("assistant/message"));
   assert.ok(nativeEvents.includes("turn/end"));
 });

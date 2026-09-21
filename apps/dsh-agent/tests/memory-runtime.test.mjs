@@ -17,12 +17,78 @@ const { default: Sessions, KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek
 });
 const { default: Tools } = await native('core/tools');
 const { default: Prompt } = await native('core/system-prompt');
-const { default: Llm, createUserMessage } = await native('llm/llm');
+const { default: Llm, createUserMessage, createSystemMessage } = await native('llm/llm');
 const { default: Agents } = await native('core/agent');
 const { default: Loop } = await native('core/agent-loop');
+const { default: SessionProjections } = await native('session/session-projection');
 const { default: Sandbox } = await native('sandbox/sandbox-local');
 const { default: Policy } = await native('sandbox/sandbox-policy');
 const { default: JsonlPersistence } = await native('session/session-persistence-jsonl');
+
+async function readStored(persistence, id, from = 0) {
+  const handle = await persistence.open(id, 'read');
+  try { return await handle.read(from); }
+  finally { await handle.close(); }
+}
+
+async function prepareStoredSession(ctx, id) {
+  const handle = await ctx.sessionPersistence.open(id, 'write');
+  try {
+    const stored = await handle.read();
+    const session = ctx.sessions.prepare(id, { seed: stored.events, meta: handle.header,
+      inheritedEventCount: handle.inheritedEventCount, eventState: stored.eventState });
+    // Constructor resume markers predate session/event routing.
+    await handle.append(session.events.slice(stored.events.length));
+    await handle.flush();
+    return { session, close: () => handle.close() };
+  } catch (cause) { await handle.close(); throw cause; }
+}
+
+async function createStoredSession(ctx, id, options) {
+  const session = ctx.sessions.prepare(id, options);
+  const handle = await ctx.sessionPersistence.create(session.header, { inheritedEventCount: session.inheritedEventCount });
+  try {
+    await handle.append(session.events);
+    // The backend routes live events into this handle; the fixture owns its close.
+    ctx.effect(function* () {
+      yield () => handle.close();
+      yield ctx.sessions.enter(session);
+      ctx.sessions.announce(session);
+    });
+    return session;
+  } catch (cause) { await handle.close(); throw cause; }
+}
+
+function ensureNativeStep(session, { systemHead = false } = {}) {
+  const turnBoundary = session.events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
+  const turn = turnBoundary?.type === 'turn/start' ? turnBoundary.data.turn : (turnBoundary?.data.turn ?? 0) + 1;
+  if (turnBoundary?.type !== 'turn/start') session.append('turn/start', { turn });
+  const stepBoundary = session.events.findLast(event => event.type === 'step/start' || event.type === 'step/end');
+  const open = stepBoundary?.type === 'step/start' && stepBoundary.data.turn === turn;
+  const step = open ? stepBoundary.data.step : stepBoundary?.data.turn === turn ? stepBoundary.data.step + 1 : 1;
+  if (!open) session.append('step/start', { turn, step });
+  if (systemHead && session.surface.nodes.length === 0) session.append('system/message', {
+    turn, step, message: createSystemMessage('Native memory integration fixture', 'memory-runtime-test'),
+  }, { surfaceOp: 'append' });
+  return { turn, step };
+}
+
+function appendAttempt(session, text) {
+  const { turn, step } = ensureNativeStep(session);
+  return session.append('assistant/attempt', { turn, step,
+    stream: [{ type: 'text-chunks', time0: 1, index: 0, dt: [], texts: [text] }] });
+}
+
+async function projectAndCommitContext(f) {
+  const projection = await f.service.projectContext(f.agent.id);
+  if (projection.pendingMessage) {
+    // Reproduce the loop's first-step ordering: system head, then admitted context.
+    ensureNativeStep(f.agent.session, { systemHead: true });
+    f.agent.session.append('user/message', projection.pendingMessage, { surfaceOp: 'append' });
+    await f.service.barrier(f.agent.id);
+  }
+  return projection;
+}
 
 async function fixture(t, options = {}) {
   const root = mkdtempSync(join(homedir(), 'dsh-memory-runtime-'));
@@ -32,14 +98,15 @@ async function fixture(t, options = {}) {
   for (const plugin of [Llm, Sessions, Prompt]) await ctx.plugin(plugin);
   await ctx.plugin(Tools, options.toolsConfig ?? {});
   await ctx.plugin(Agents);
-  await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(SessionProjections);
+  await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none' });
   await ctx.plugin(Loop, { agents: [] });
   await ctx.plugin(Sandbox);
   await ctx.plugin(Policy, { mode: options.nativeMode ?? 'workspace-write', workspaceRoot });
   options.seedDatabase?.(join(root, 'memory.sqlite'), workspaceRoot);
   await ctx.plugin(memoryPlugin, { path: join(root, 'memory.sqlite'), enabled: true });
   t.after(() => ctx.fiber.dispose());
-  const agent = ctx.agentLoop.create('new-session', {}, { cwd: workspaceRoot });
+  const agent = await ctx.agentLoop.create('new-session', {}, { cwd: workspaceRoot });
   const service = ctx.memoryRecovery;
   const config = { enabled: true, projectId: 'project-a', agentId: agent.id, workspaceRoot,
     sandbox: { sandbox_required: true, mode: 'workspace-write', network: 'host', workspaceRoot },
@@ -75,7 +142,7 @@ test('required sandbox catalog is session-scoped and filters own scoped tools wi
   const f = await fixture(t);
   for (const name of ['Bash', 'Glob', 'Read']) registerNativeTool(f.ctx, name);
   registerNativeTool(f.agent.ctx, 'OwnUnconfined');
-  const ordinary = f.ctx.agentLoop.create('ordinary', {}, { cwd: f.workspaceRoot });
+  const ordinary = await f.ctx.agentLoop.create('ordinary', {}, { cwd: f.workspaceRoot });
   await f.configure();
   const names = await advertisedNames(f.ctx, f.agent);
   assert.ok(names.includes('memory_sandbox_run'));
@@ -91,8 +158,8 @@ test('required sandbox catalog is session-scoped and filters own scoped tools wi
   assert.ok((await advertisedNames(f.ctx, ordinary)).includes('LateNative'));
 });
 
-test('required sandbox replaces deployment code transport with callable confined native tools', async t => {
-  const f = await fixture(t, { toolsConfig: { mode: 'code' } });
+test('required sandbox replaces deployment PTC transport with callable confined native tools', async t => {
+  const f = await fixture(t, { toolsConfig: { mode: 'ptc' } });
   await f.configure();
   assert.equal(f.ctx.tools.get('run_code', f.agent), undefined);
   assert.ok((await advertisedNames(f.ctx, f.agent)).includes('memory_sandbox_run'));
@@ -101,9 +168,9 @@ test('required sandbox replaces deployment code transport with callable confined
   assert.equal(result.value.stdout.trim(), f.workspaceRoot);
 });
 
-test('pre-step rejects incompatible late code presentation before advertising an unusable transport', async t => {
+test('pre-step rejects incompatible late PTC presentation before advertising an unusable transport', async t => {
   const f = await fixture(t); await f.configure();
-  f.agent.ctx.tools.presentAs('code');
+  f.agent.ctx.tools.presentAs('ptc');
   await assert.rejects(f.ctx.waterfall('agent/pre-step', { agent: f.agent, messages: [] },
     async () => ({ kind: 'enter', messages: [] })), { code: 'SANDBOX_REQUIREMENT_UNSUPPORTED' });
   assert.equal(f.service.getSessionConfig(f.agent.id).sandbox.sandbox_required, true);
@@ -114,7 +181,7 @@ test('failed required-sandbox presentation preflight preserves the saved policy 
   const f = await fixture(t);
   registerNativeTool(f.ctx, 'Bash');
   await f.service.configureSession(f.agent.id, { ...f.config, sandbox: null }, { expectedVersion: 0 });
-  f.agent.ctx.tools.presentAs('code');
+  f.agent.ctx.tools.presentAs('ptc');
   const before = f.service.getSessionConfig(f.agent.id);
   const schemas = f.ctx.tools.schemas(f.agent).map(tool => tool.name);
   const seq = f.agent.session.seq;
@@ -127,7 +194,7 @@ test('failed required-sandbox presentation preflight preserves the saved policy 
   assert.ok(f.ctx.tools.get('run_code', f.agent));
   assert.equal(f.ctx.tools.get('memory_sandbox_run', f.agent), undefined);
   await f.service.barrier(f.agent.id);
-  assert.equal((await f.ctx.sessionPersistence.readFrom(f.agent.id, 0)).events.filter(event => event.type === 'memory-recovery/config').length, 1);
+  assert.equal((await readStored(f.ctx.sessionPersistence, f.agent.id)).events.filter(event => event.type === 'memory-recovery/config').length, 1);
 });
 
 test('persisted required session reopens with a confined catalog before its first step', async t => {
@@ -136,7 +203,8 @@ test('persisted required session reopens with a confined catalog before its firs
   await f.ctx.fiber.dispose();
   const ctx = new Context();
   for (const plugin of [Llm, Sessions, Prompt, Tools, Agents]) await ctx.plugin(plugin);
-  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(SessionProjections);
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none' });
   await ctx.plugin(Loop, { agents: [] });
   await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
   await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
@@ -156,6 +224,7 @@ test('explicit new-session opt-in persists config and flushes sourced events, ol
   assert.equal(f.service.getSessionConfig(f.agent.id).enabled, false);
   await f.configure();
   assert.equal(f.service.status(f.agent.id).executionCoverage, 'managed-sandbox-only');
+  ensureNativeStep(f.agent.session, { systemHead: true });
   const user = f.agent.session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'remember project alpha' }] }), { surfaceOp: 'append' });
   await f.ctx.sessions.flush(f.agent.session);
   assert.equal(f.service.status(f.agent.id).durableThroughSeq, user.seq);
@@ -176,7 +245,7 @@ test('fresh native permission initialization is allowed but seeded or started li
     session.append('sandbox/mode', { mode: 'workspace-write' });
     session.append('approval/policy', { policy: 'ask' });
   }, { prepend: true });
-  const fresh = f.ctx.sessions.create('initialized-new', { meta: { cwd: f.workspaceRoot } });
+  const fresh = await createStoredSession(f.ctx, 'initialized-new', { meta: { cwd: f.workspaceRoot } });
   assert.equal(f.service.getSessionConfig(fresh.id).canConfigure, true);
   assert.equal(f.service.getSessionConfig(fresh.id).configurationBlockReason, null);
   const initialEvents = fresh.events;
@@ -185,7 +254,7 @@ test('fresh native permission initialization is allowed but seeded or started li
   assert.equal(configured.enabled, true);
   assert.equal(f.service.status(fresh.id).durableThroughSeq, 3);
   for (const [id, seed] of [['seeded-policy-only', initialEvents], ['seeded-empty', []]]) {
-    const historical = f.ctx.sessions.create(id, { seed, meta: { cwd: f.workspaceRoot, parentSession: fresh.id, seedLength: seed.length } });
+    const historical = f.ctx.sessions.create(id, { seed, inheritedEventCount: seed.length, meta: { cwd: f.workspaceRoot, parentSession: fresh.id, isSeeded: true } });
     assert.equal(f.service.getSessionConfig(id).canConfigure, false);
     assert.equal(f.service.getSessionConfig(id).configurationBlockReason, 'MEMORY_NEW_SESSION_REQUIRED');
     await assert.rejects(f.service.configureSession(id, { ...f.config, agentId: id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
@@ -196,7 +265,9 @@ test('fresh native permission initialization is allowed but seeded or started li
   assert.equal(f.service.getSessionConfig(started.id).configurationBlockReason, 'MEMORY_NEW_SESSION_REQUIRED');
   await assert.rejects(f.service.configureSession(started.id, { ...f.config, agentId: started.id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
   const queued = f.ctx.sessions.create('message-before-turn', { meta: { cwd: f.workspaceRoot } });
-  queued.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'queued user task' }] }), { surfaceOp: 'append' });
+  queued.append('agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [
+    createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'queued user task' }] }),
+  ] });
   assert.equal(f.service.getSessionConfig(queued.id).canConfigure, false, 'a queued message is not an untouched draft');
   await assert.rejects(f.service.configureSession(queued.id, { ...f.config, agentId: queued.id }, { expectedVersion: 0 }), { code: 'MEMORY_NEW_SESSION_REQUIRED' });
   const emptyRoot = f.ctx.sessions.create('empty-fork-source', { meta: { cwd: f.workspaceRoot } });
@@ -210,7 +281,7 @@ test('native memory tools enforce scope and model cannot confirm procedural reco
   const found = await f.execute('memory_search', { query: 'alpha' });
   assert.equal(found.isError, false); assert.equal(found.value[0].id, record.id);
   assert.equal(Object.hasOwn(found.value[0], 'content'), false);
-  const other = f.ctx.agentLoop.create('other', {}, { cwd: f.workspaceRoot });
+  const other = await f.ctx.agentLoop.create('other', {}, { cwd: f.workspaceRoot });
   await f.service.configureSession(other.id, { ...f.config, projectId: 'project-b', agentId: other.id }, { expectedVersion: 0 });
   assert.equal(f.service.getMemory(other.id, record.id), null);
   const denied = await f.execute('memory_procedural_candidate', { summary: 'escape', content: { rules: ['escape'], applicability: {}, protected: true }, status: 'confirmed', sourceRefs: [{ type: 'operator', operatorId: 'operator', reason: 'fake' }] });
@@ -221,6 +292,7 @@ test('page selection changes logged native surface without duplicating pages or 
   const f = await fixture(t); await f.configure();
   const record = await f.service.putOperatorMemory(f.agent.id, { kind: 'semantic', visibility: 'private', summary: 'contract', content: { nodes: [{ id: 'alpha', type: 'contract', detail: 'FULL PAGE BODY' }], edges: [] } }, 'Initial contract');
   const direct = createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'User authority stays' }] });
+  ensureNativeStep(f.agent.session, { systemHead: true });
   f.agent.session.append('user/message', direct, { surfaceOp: 'append' });
   assert.equal((await f.execute('memory_page_in', { id: record.id })).isError, false);
   const payload = { agent: f.agent, messages: [], turn: 1, step: 1, signal: new AbortController().signal };
@@ -272,7 +344,9 @@ test('large canonical output is retained raw but native result uses a sourced su
   assert.equal(f.service.getSessionConfig(f.agent.id).executionCoverage, 'native-memory-only');
   const full = 'ORIGINAL LARGE BODY '.repeat(800);
   f.ctx.tools.register({ name: 'AuthorizedRead', description: 'canonical output fixture', parameters: { type: 'object', properties: {} }, output: { schema: { type: 'object' }, render: () => [{ type: 'text', text: full }] }, async execute() { return { full }; } });
-  const call = f.agent.session.append('assistant/message', { turn: 1, step: 1, message: { id: 'assistant-call', role: 'assistant', source: { kind: 'model', provider: 'test-source', model: 'test-source' }, content: [{ type: 'tool-call', id: 'raw-call', name: 'AuthorizedRead', arguments: '{}' }] } }, { surfaceOp: 'append', sourceEventSeqs: [] });
+  ensureNativeStep(f.agent.session, { systemHead: true });
+  const call = f.agent.session.append('assistant/message', { turn: 1, step: 1, stream: [], message: { id: 'assistant-call', role: 'assistant', source: { kind: 'model', provider: 'test-source', model: 'test-source' }, content: [{ type: 'tool-call', id: 'raw-call', name: 'AuthorizedRead', arguments: '{}' }] } }, { surfaceOp: 'append' });
+  const dispatch = f.agent.session.append('tool/call', { turn: 1, step: 1, callId: 'raw-call', name: 'AuthorizedRead', arguments: '{}' });
   const result = await f.execute('AuthorizedRead', {}, 'raw-call');
   assert.equal(result.isError, false, result.error?.message);
   assert.deepEqual(result.value, { full });
@@ -280,7 +354,7 @@ test('large canonical output is retained raw but native result uses a sourced su
   assert.match(result.content[0].text, /memory_page_in/);
   const io = f.agent.session.events.find(e => e.type === 'memory-recovery/tool-io');
   assert.equal(io.data.value.full, full); assert.deepEqual(io.data.sourceEventSeqs, [call.seq]);
-  f.agent.session.append('tool/result', { turn: 1, step: 1, message: createUserMessage({ source: { kind: 'tool', callId: 'raw-call' }, content: [{ type: 'tool-result', toolCallId: 'raw-call', content: result.content }] }) }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] });
+  f.agent.session.append('tool/result', { turn: 1, step: 1, message: createUserMessage({ source: { kind: 'tool', callId: 'raw-call' }, content: [{ type: 'tool-result', toolCallId: 'raw-call', content: result.content }] }) }, { surfaceOp: 'append', sourceEventSeqs: [dispatch.seq] });
   await f.service.barrier(f.agent.id);
   assert.doesNotMatch(JSON.stringify(f.agent.session.deriveMessages()), /ORIGINAL LARGE BODY/);
   // Consume exactly what the native result advertises, including the old prose form;
@@ -299,7 +373,7 @@ test('large canonical output is retained raw but native result uses a sourced su
 
 test('bounded observer rejects an oversized event and fails awaited flush and dispatch', async t => {
   const f = await fixture(t); await f.configure();
-  f.agent.session.append('assistant/chunk', { text: 'x'.repeat(8 * 1024 * 1024) });
+  appendAttempt(f.agent.session, 'x'.repeat(8 * 1024 * 1024));
   assert.equal(f.service.status(f.agent.id).error, 'MEMORY_QUEUE_OVERFLOW');
   await assert.rejects(f.ctx.sessions.flush(f.agent.session), { code: 'MEMORY_QUEUE_OVERFLOW' });
   const result = await f.execute('memory_sandbox_run', { argv: ['true'] });
@@ -308,33 +382,41 @@ test('bounded observer rejects an oversized event and fails awaited flush and di
 
 test('native append failure cannot advance projection and remains visible at every boundary', async t => {
   const f = await fixture(t, { persistence: true }); await f.configure();
+  ensureNativeStep(f.agent.session);
+  await f.service.barrier(f.agent.id);
+  const durableBefore = f.service.status(f.agent.id).durableThroughSeq;
+  const storedCount = f.agent.session.seq;
   const persisted = f.ctx.sessionPersistence;
-  const append = persisted.appendBatch;
-  persisted.appendBatch = async () => { throw new Error('injected native disk failure'); };
+  const append = persisted.persistBatch;
+  persisted.persistBatch = async () => { throw new Error('injected native disk failure'); };
   try {
-    f.agent.session.append('assistant/chunk', { text: 'must not be projected' });
+    const attempted = appendAttempt(f.agent.session, 'must not be projected');
     await assert.rejects(f.ctx.sessions.flush(f.agent.session), /injected native disk failure/);
-    assert.equal(f.service.status(f.agent.id).durableThroughSeq, 0);
+    assert.equal(f.service.status(f.agent.id).durableThroughSeq, durableBefore);
     assert.equal(f.service.status(f.agent.id).error, 'MEMORY_DURABILITY_FAILED');
-    assert.equal(f.service.getMemory(f.agent.id, `event:${f.agent.id}:1`), null);
+    assert.equal(f.service.getMemory(f.agent.id, `event:${f.agent.id}:${attempted.seq}`), null);
     await assert.rejects(f.service.barrier(f.agent.id), /injected native disk failure/);
-    const raw = await persisted.readFrom(f.agent.id, 0);
-    assert.equal(raw.events.length, 1);
-  } finally { persisted.appendBatch = append; }
+    const raw = await readStored(persisted, f.agent.id);
+    assert.equal(raw.events.length, storedCount);
+  } finally { persisted.persistBatch = append; }
 });
 
 test('long native streams drain without step boundaries and concurrent native flushes do not recurse', async t => {
   const f = await fixture(t, { persistence: true }); await f.configure();
+  ensureNativeStep(f.agent.session);
+  const firstAttemptSeq = f.agent.session.seq;
   for (let i = 0; i < 1200; i++) {
-    f.agent.session.append('assistant/chunk', { text: 'ordinary stream', i });
+    appendAttempt(f.agent.session, `ordinary stream ${i}`);
     if (i % 100 === 0) await new Promise(resolve => setImmediate(resolve));
   }
   assert.equal(f.service.status(f.agent.id).error, null);
   await Promise.all([f.ctx.sessions.flush(f.agent.session), f.service.barrier(f.agent.id), f.ctx.sessions.flush(f.agent.session)]);
   assert.equal(f.service.status(f.agent.id).pending, 0);
-  assert.equal(f.service.status(f.agent.id).durableThroughSeq, 1200);
-  assert.equal((await f.ctx.sessionPersistence.readFrom(f.agent.id, 0)).events.length, 1201);
-  assert.equal(f.service.listMemories(f.agent.id, { limit: 1000 })[0].content.data.i, 1199);
+  assert.equal(f.service.status(f.agent.id).durableThroughSeq, firstAttemptSeq + 1199);
+  const stored = await readStored(f.ctx.sessionPersistence, f.agent.id);
+  assert.equal(stored.events.length, firstAttemptSeq + 1200);
+  assert.ok(stored.events.slice(firstAttemptSeq).every(event => event.type === 'assistant/attempt' && event.data.step === 1));
+  assert.equal(f.service.listMemories(f.agent.id, { limit: 1000 })[0].content.data.stream[0].texts[0], 'ordinary stream 1199');
 });
 
 test('cold recovery refuses a previously projected source that the native log does not contain', async t => {
@@ -345,18 +427,18 @@ test('cold recovery refuses a previously projected source that the native log do
   await f.ctx.fiber.dispose();
   const ctx = new Context();
   for (const plugin of [Sessions, Prompt, Tools]) await ctx.plugin(plugin);
-  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none' });
   await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
   await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
   t.after(() => ctx.fiber.dispose());
-  const prepared = await ctx.sessionPersistence.prepare(f.agent.id);
+  const prepared = await prepareStoredSession(ctx, f.agent.id);
   try {
     const restored = prepared.session;
     ctx.effect(() => ctx.sessions.enter(restored)); ctx.sessions.announce(restored);
     await assert.rejects(ctx.memoryRecovery.barrier(restored.id), { code: 'MEMORY_SOURCE_CONFLICT' });
     assert.equal(ctx.memoryRecovery.status(restored.id).error, 'MEMORY_SOURCE_CONFLICT');
     assert.equal(ctx.memoryRecovery.getMemory(restored.id, `event:${restored.id}:1`).content.data.text, 'legacy false durability');
-  } finally { prepared[Symbol.dispose](); }
+  } finally { await prepared.close(); }
 });
 
 test('invalid requirements and running downgrade fail before dispatch without disabling isolation', async t => {
@@ -401,20 +483,22 @@ test('interrupted native sandbox result remains unknown on repeated call and yie
 
 test('restored native same-session config replays missing tail exactly and does not reingest derived bodies', async t => {
   const f = await fixture(t); await f.configure();
-  await f.service.projectContext(f.agent.id);
-  const last = f.agent.session.append('assistant/chunk', { text: 'unflushed-tail' });
-  const seed = f.agent.session.events;
+  await projectAndCommitContext(f);
+  const last = appendAttempt(f.agent.session, 'unflushed-tail');
   await f.ctx.fiber.dispose();
   const ctx = new Context();
   for (const plugin of [Sessions, Prompt, Tools]) await ctx.plugin(plugin);
-  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none' });
   await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
   await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
   t.after(() => ctx.fiber.dispose());
-  const restored = ctx.sessions.create('new-session', { seed, meta: { cwd: f.workspaceRoot } });
+  const prepared = await prepareStoredSession(ctx, f.agent.id);
+  const restored = prepared.session;
+  ctx.effect(() => ctx.sessions.enter(restored)); ctx.sessions.announce(restored);
+  t.after(() => prepared.close());
   await ctx.sessions.flush(restored);
   assert.equal(ctx.memoryRecovery.status(restored.id).durableThroughSeq, restored.seq - 1);
-  assert.equal(ctx.memoryRecovery.getMemory(restored.id, `event:${restored.id}:${last.seq}`).content.data.text, 'unflushed-tail');
+  assert.equal(ctx.memoryRecovery.getMemory(restored.id, `event:${restored.id}:${last.seq}`).content.data.stream[0].texts[0], 'unflushed-tail');
   const derived = ctx.memoryRecovery.listMemories(restored.id).find(r => r.content.data?.memoryRecoveryDerived);
   assert.equal(Object.hasOwn(derived.content.data, 'content'), false);
   await ctx.sessions.flush(restored);
@@ -454,23 +538,23 @@ test('native catalog implementation mismatch fails plugin initialization explici
 
 test('real native persistence reopens required memory events without allowing unrelated unknown types', async t => {
   const f = await fixture(t, { persistence: true }); await f.configure();
-  await f.service.projectContext(f.agent.id);
+  await projectAndCommitContext(f);
   assert.equal((await f.execute('memory_sandbox_run', { argv: [process.execPath, '-e', 'process.stdout.write("reopen-raw")'] }, 'persisted-call')).value.state, 'COMMITTED');
   await f.service.barrier(f.agent.id);
   const expectedTypes = ['memory-recovery/config', 'memory-recovery/page-selection', 'memory-recovery/tool-io'];
   const expected = f.agent.session.events.filter(event => expectedTypes.includes(event.type));
   assert.deepEqual(expected.map(event => event.type), expectedTypes);
-  const unknown = f.ctx.sessions.create('unknown-required', { meta: { cwd: f.workspaceRoot } });
+  const unknown = await createStoredSession(f.ctx, 'unknown-required', { meta: { cwd: f.workspaceRoot } });
   unknown.append('memory-recovery/unregistered', { value: 'must reject' });
   await f.ctx.sessions.flush(unknown);
   await f.ctx.fiber.dispose();
   const ctx = new Context();
   for (const plugin of [Sessions, Prompt, Tools]) await ctx.plugin(plugin);
-  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none', packChunks: false });
+  await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none' });
   await ctx.plugin(Sandbox); await ctx.plugin(Policy, { mode: 'workspace-write', workspaceRoot: f.workspaceRoot });
   await ctx.plugin(memoryPlugin, { path: join(f.root, 'memory.sqlite'), enabled: true });
   t.after(() => ctx.fiber.dispose());
-  const prepared = await ctx.sessionPersistence.prepare(f.agent.id);
+  const prepared = await prepareStoredSession(ctx, f.agent.id);
   try {
     const restored = prepared.session;
     assert.deepEqual(restored.events.filter(event => expectedTypes.includes(event.type)), expected);
@@ -479,13 +563,13 @@ test('real native persistence reopens required memory events without allowing un
     assert.equal(ctx.memoryRecovery.getSessionConfig(restored.id).enabled, true);
     assert.equal(ctx.memoryRecovery.listEffects(restored.id)[0].state, 'COMMITTED');
     assert.equal(ctx.memoryRecovery.getMemory(restored.id, `event:${restored.id}:${expected[2].seq}`).content.data.value.stdout, 'reopen-raw');
-  } finally { prepared[Symbol.dispose](); }
-  await assert.rejects(ctx.sessionPersistence.prepare('unknown-required'), { name: 'SessionFormatUnsupportedError' });
+  } finally { await prepared.close(); }
+  await assert.rejects(readStored(ctx.sessionPersistence, 'unknown-required'), { name: 'SessionFormatUnsupportedError' });
 });
 
 test('trusted operator confirms a candidate but model operator impersonation and budget overflow fail closed', async t => {
   const f = await fixture(t); await f.configure();
-  const source = f.agent.session.append('assistant/chunk', { text: 'source for reflection' });
+  const source = appendAttempt(f.agent.session, 'source for reflection');
   const record = { visibility: 'private', summary: 'candidate', content: { rules: ['Check returned result'], applicability: {} },
     sourceRefs: [{ type: 'event', projectId: 'project-a', sessionId: f.agent.id, agentId: f.agent.id, seq: source.seq }] };
   const candidate = await f.execute('memory_procedural_candidate', { record });
@@ -509,7 +593,7 @@ test('old protected procedures survive unrelated records and mandatory overflow 
     content: { protected: protectedRule, rules: [rule], applicability: {} }, sourceRefs }, { actor: { id: 'test-operator', role: 'operator' } });
   put('old-protected', true, 'MUST-RETAIN-OLD-INVARIANT');
   for (let i = 0; i < 1001; i++) put(`unrelated-${i}`, false, 'ordinary advice');
-  const selection = await f.service.projectContext(f.agent.id);
+  const selection = await projectAndCommitContext(f);
   assert.match(selection.contextText, /MUST-RETAIN-OLD-INVARIANT/);
   put('over-budget-protected', true, 'mandatory '.repeat(2000));
   await assert.rejects(f.service.projectContext(f.agent.id), { code: 'MEMORY_BUDGET_EXCEEDED' });
@@ -524,12 +608,12 @@ test('native page-in tool selects the requested tail in the logged model surface
   assert.equal(result.isError, false, result.error?.message);
   assert.equal(result.value.offset, 100000); assert.equal(result.value.hasMore, false);
   assert.equal(result.value.nextOffset, null);
-  await f.service.projectContext(f.agent.id);
+  await projectAndCommitContext(f);
   assert.match(JSON.stringify(f.agent.session.deriveMessages()), /MODEL-TAIL-ONLY/);
   const logged = f.agent.session.events.find(e => e.type === 'memory-recovery/page-selection');
   assert.equal(logged.data.pages[0].offset, 100000);
   const seq = f.agent.session.seq;
-  await f.service.projectContext(f.agent.id);
+  await projectAndCommitContext(f);
   assert.equal(f.agent.session.seq, seq);
 });
 
@@ -537,7 +621,7 @@ test('database write failure remains sticky across native normalization and prev
   const f = await fixture(t); await f.configure();
   const external = new MemoryStore(join(f.root, 'memory.sqlite'));
   external.db.exec("CREATE TRIGGER fail_runtime_ingest BEFORE INSERT ON memory_event_sources BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END");
-  f.agent.session.append('assistant/chunk', { text: 'must reach durability' });
+  appendAttempt(f.agent.session, 'must reach durability');
   await assert.rejects(f.ctx.sessions.flush(f.agent.session), /injected persistence failure/);
   const result = await f.execute('memory_sandbox_run', { argv: ['true'] });
   assert.equal(result.isError, true);

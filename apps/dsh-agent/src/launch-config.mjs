@@ -33,6 +33,19 @@ function inspectBuild(upstreamRoot) {
   return { built: diagnostics.length === 0, diagnostics }
 }
 
+function hasProfileOption(args) {
+  // Native launcher options end at the first app argument or delimiter.
+  // A --profile inside the task must not suppress the headless default.
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index]
+    if (token === '--profile' || token.startsWith('--profile=')) return true
+    if (token === '--patch' || token === '--from-default-profile') index += 1
+    else if (token.startsWith('--patch=') || token.startsWith('--from-default-profile=')) continue
+    else if (!['--dump-config', '--dump-default-config'].includes(token)) break
+  }
+  return false
+}
+
 export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
   assertSupportedNode(nodeVersion)
   const mode = argv[0]
@@ -115,7 +128,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     if (port !== undefined) args.push('--port', port)
     if (noOpen) args.push('--no-open')
   } else if (mode === 'headless') {
-    args = ['--profile', 'headless', ...passthrough]
+    args = hasProfileOption(passthrough) ? passthrough : ['--profile', 'headless', ...passthrough]
   } else if (mode === 'plugin') {
     args = ['plugin', ...passthrough]
   } else {

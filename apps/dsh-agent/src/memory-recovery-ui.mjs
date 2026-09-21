@@ -30,7 +30,7 @@ const actions = Object.freeze({
 });
 
 /** Explicit local operator surface: no dynamic service dispatch, execution or recovery. */
-export function createMemoryRecoveryHandler(service, apiProxy) {
+export function createMemoryRecoveryHandler(service, sessionController, { cwd: hostCwd = process.cwd() } = {}) {
   const attaching = new Map();
   async function selectedConfig(id) {
     try { return service.getSessionConfig(id); }
@@ -38,11 +38,13 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
     // Native history can be displayed without attaching its Session. Hydrate
     // only a proven existing root session; never mint an id or submit a prompt.
     if (!attaching.has(id)) attaching.set(id, (async () => {
-      const listed = await apiProxy.sessions.list({ rpcId: randomUUID(), payload: {} });
-      const row = listed.result.ok && listed.result.value.items.find(item => item.sessionId === id && item.origin !== 'subagent');
+      const listed = await sessionController.list({}, new AbortController().signal);
+      const row = listed.items.find(item => item.sessionId === id && item.origin !== 'subagent');
       if (!row || typeof row.cwd !== 'string' || !isAbsolute(row.cwd)) throw Object.assign(new Error('Unknown native session'), { code: 'MEMORY_SESSION_NOT_FOUND' });
-      const response = await apiProxy.sessions.create({ rpcId: randomUUID(), payload: { sessionId: id, cwd: row.cwd } });
-      if (!response.result.ok) throw Object.assign(new Error('Native session unavailable'), { code: 'MEMORY_NATIVE_ATTACH_FAILED' });
+      try {
+        const response = await sessionController.create({ sessionId: id, cwd: row.cwd });
+        if (response.sessionId !== id) throw new Error('Native session identity mismatch');
+      } catch { throw Object.assign(new Error('Native session unavailable'), { code: 'MEMORY_NATIVE_ATTACH_FAILED' }); }
     })().finally(() => attaching.delete(id)));
     await attaching.get(id);
     return service.getSessionConfig(id);
@@ -73,10 +75,9 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
       let value; const id = data.sessionId;
       switch (action) {
         case 'defaults': {
-          const response = await apiProxy.host.describe({ rpcId: randomUUID(), payload: {} });
-          const cwd = response.result.ok && response.result.value.cwd;
-          if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw Object.assign(new Error('Native defaults unavailable'), { code: 'MEMORY_NATIVE_DEFAULTS_FAILED' });
-          value = { workspaceRoot: cwd }; break;
+          // Capture the same host default used by the native SessionController.
+          if (typeof hostCwd !== 'string' || !isAbsolute(hostCwd)) throw Object.assign(new Error('Native defaults unavailable'), { code: 'MEMORY_NATIVE_DEFAULTS_FAILED' });
+          value = { workspaceRoot: hostCwd }; break;
         }
         case 'sessions': value = service.listSessions(); break;
         case 'create-session': {
@@ -84,9 +85,11 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
           const cwd = await realpath(data.workspaceRoot); if (!(await stat(cwd)).isDirectory()) invalid();
           // Native API remains the creation authority. Never adopt a caller-selected old id.
           const sessionId = `session-${randomUUID()}`;
-          const response = await apiProxy.sessions.create({ rpcId: randomUUID(), payload: { sessionId, cwd } });
-          if (!response.result.ok) throw Object.assign(new Error('Native session creation failed'), { code: 'MEMORY_NATIVE_CREATE_FAILED' });
-          value = { sessionId: response.result.value.sessionId, workspaceRoot: cwd }; break;
+          try {
+            const response = await sessionController.create({ sessionId, cwd });
+            if (response.sessionId !== sessionId) throw new Error('Native session identity mismatch');
+          } catch { throw Object.assign(new Error('Native session creation failed'), { code: 'MEMORY_NATIVE_CREATE_FAILED' }); }
+          value = { sessionId, workspaceRoot: cwd }; break;
         }
         case 'configure': value = await service.configureSession(id, data.input, { expectedVersion: data.expectedVersion }); break;
         case 'config': value = await selectedConfig(id); break;
@@ -113,6 +116,6 @@ export function createMemoryRecoveryHandler(service, apiProxy) {
 }
 
 export function installMemoryRecoveryUi(ctx, service) {
-  const handler = createMemoryRecoveryHandler(service, ctx.apiProxy);
+  const handler = createMemoryRecoveryHandler(service, ctx.sessionController);
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/memory-recovery', handler }));
 }

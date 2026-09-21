@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export const PINNED_DSH_SHA = 'b150a551b8d465e31e418e1b2eaf5e79bbb7d28e'
+export const PINNED_DSH_SHA = 'ddefc45fbc7f8e46dd73185e68295696d1297887'
 
 export function runNativeBuild({ repoRoot, spawn = spawnSync, env = process.env }) {
   const upstreamRoot = join(repoRoot, 'third_party/deepseek-harness')

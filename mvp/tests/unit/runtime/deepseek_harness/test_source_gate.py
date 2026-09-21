@@ -213,15 +213,20 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
     _write(source / "THIRD_PARTY_NOTICES.md", "# Notices\n")
     _write(
         source / "python" / "sdk-runtime" / "package.json",
-        json.dumps({"name": "dsh-jsonrpc-agent-pkg", "private": True}),
+        json.dumps({"name": "dsh-python-runtime-closure", "private": True}),
     )
     _write(
-        source / "packages" / "examples" / "jsonrpc-demo" / "package.json",
-        json.dumps({"name": "@deepseek-ai/dsh-sdk-jsonrpc-demo"}),
+        source / "apps" / "cli" / "package.json",
+        json.dumps({"name": "@deepseek-ai/dsh", "bin": {"dsh": "lib/bin.js"}}),
     )
     _write(
-        source / "packages" / "examples" / "jsonrpc-demo" / "src" / "packaged-bin.ts",
-        "export {}\n",
+        source / "apps" / "cli" / "src" / "bin.ts",
+        "export async function runCli() {}\n",
+    )
+    _write(
+        source / "python" / "sdk-runtime" / "runtime-bootstrap.mjs",
+        "const { runCli } = await import('@deepseek-ai/dsh/lib/bin.js');\n"
+        "await runCli();\n",
     )
     _write(
         source / "scripts" / "build-exe-for-python-sdk.ts",
@@ -314,10 +319,21 @@ def test_manifest_records_frozen_build_boundary_and_sidecar_inputs(
     assert manifest["release_build"]["plugin_download"] is False
     assert manifest["release_build"]["user_plugin_scan"] is False
     assert manifest["release_build"]["requires_prepared_frozen_lock"] is True
-    assert manifest["sidecar"]["package"] == "dsh-jsonrpc-agent-pkg"
-    assert manifest["sidecar"]["entrypoint"] == (
-        "node_modules/@deepseek-ai/dsh-sdk-jsonrpc-demo/lib/packaged-bin.js"
-    )
+    assert manifest["sidecar"]["package"] == "dsh-python-runtime-closure"
+    assert manifest["sidecar"]["entrypoint"] == "runtime-bootstrap.mjs"
+    assert manifest["sidecar"]["entrypoint_source"] == "python/sdk-runtime/runtime-bootstrap.mjs"
+    policy_inputs = {item["path"]: item for item in manifest["build_policy_inputs"]}
+    assert set(policy_inputs) == {
+        "scripts/build-exe-for-python-sdk.ts",
+        "python/sdk-runtime/package.json",
+        "python/sdk-runtime/runtime-bootstrap.mjs",
+        "apps/cli/package.json",
+        "apps/cli/src/bin.ts",
+    }
+    for relative_path, record in policy_inputs.items():
+        payload = (root / "third_party/deepseek-harness" / relative_path).read_bytes()
+        assert record["sha256"] == hashlib.sha256(payload).hexdigest()
+        assert record["size"] == len(payload)
     assert manifest["sidecar"]["targets"] == [
         "node24-linux-x64",
         "node24-linux-arm64",
@@ -369,7 +385,7 @@ def test_plugin_smoke_gate_requires_the_recorded_actual_artifact(
         root
         / "mvp/sidecars/deepseek-harness/dist/deepseek-harness-host-v2.mjs"
     )
-    artifact.unlink()
+    artifact.rename(root / "withheld-host-v2-artifact.mjs")
 
     with pytest.raises(SourceReadinessError, match="build artifact"):
         verifier.verify_plugin_smoke(root, manifest_path)

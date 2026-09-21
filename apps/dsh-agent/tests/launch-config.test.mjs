@@ -137,7 +137,40 @@ test('CLI non-TTY headless fails with visible unlock instructions and no secret'
 test('headless preserves native profile, overlay and application flags', async () => {
   const { resolveLaunch } = await loadLauncher()
   const result = resolveLaunch(['headless', '--workspace', '/tmp/example', '--profile', 'custom', '--patch', '/tmp/extra.yml', '--model', 'local', 'hello'], baseOptions)
-  assert.deepEqual(result.args, ['--profile', 'headless', '--profile', 'custom', '--patch', '/tmp/extra.yml', '--model', 'local', 'hello'])
+  assert.deepEqual(result.args, ['--profile', 'custom', '--patch', '/tmp/extra.yml', '--model', 'local', 'hello'])
+})
+
+test('headless recognizes explicit profiles only in the native launcher prefix', async () => {
+  const { resolveLaunch } = await loadLauncher()
+  for (const [input, expected] of [
+    [['--profile=custom', 'hello'], ['--profile=custom', 'hello']],
+    [['--patch', '/tmp/extra.yml', '--profile', 'custom', 'hello'], ['--patch', '/tmp/extra.yml', '--profile', 'custom', 'hello']],
+    [['--from-default-profile=headless', '--profile', 'custom', 'hello'], ['--from-default-profile=headless', '--profile', 'custom', 'hello']],
+    [['--', '--profile', 'task text', '--systems', '/tmp/task'], ['--profile', 'headless', '--', '--profile', 'task text', '--systems', '/tmp/task']],
+    [['explain', '--profile', 'custom'], ['--profile', 'headless', 'explain', '--profile', 'custom']],
+    [['--model', 'local', '--profile', 'custom'], ['--profile', 'headless', '--model', 'local', '--profile', 'custom']],
+    [['--patch', '/tmp/--profile', 'hello'], ['--profile', 'headless', '--patch', '/tmp/--profile', 'hello']],
+  ]) {
+    const result = resolveLaunch(['headless', '--workspace', '/tmp/example', ...input], baseOptions)
+    assert.deepEqual(result.args, expected, JSON.stringify(input))
+  }
+})
+
+test('systems and core paths retain only the trusted provider environment', async () => {
+  const { resolveLaunch } = await loadLauncher()
+  const env = { ...baseOptions.env, DB_HOST: '127.0.0.1', DB_NAME: 'fixture', JWT_EXPIRES_IN: '1h' }
+  const result = resolveLaunch(['headless', '--workspace', '/tmp/work space', '--systems', '/tmp/systems.json', '--core', '/tmp/core.mjs', '--profile', 'custom', '--', 'task'], { ...baseOptions, env })
+  assert.equal(result.systemsPath, '/tmp/systems.json')
+  assert.equal(result.corePath, '/tmp/core.mjs')
+  assert.deepEqual(result.args, ['--profile', 'custom', '--', 'task'])
+  assert.deepEqual(result.env, {
+    PATH: '/usr/bin', HOME: '/tmp/user home', LANG: 'zh_CN.UTF-8',
+    DB_HOST: '127.0.0.1', DB_NAME: 'fixture', JWT_EXPIRES_IN: '1h',
+    DSH_HOME: '/tmp/user home/.johnason-dsh', DSH_TELEMETRY_DISABLED: '1',
+  })
+  const ordinary = resolveLaunch(['web'], { ...baseOptions, env })
+  assert.equal('DB_HOST' in ordinary.env, false)
+  assert.equal('JWT_EXPIRES_IN' in ordinary.env, false)
 })
 
 test('Web forwards overlays and native help without choosing a workspace', async () => {

@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readProviders } from './systems.mjs';
 
 /** Compose native bundles and user patches, with the encrypted provider as the final overlay. */
@@ -23,6 +23,12 @@ export async function prepareProfile(config) {
   }
   boot.resolveProfileDir(profile, config.dataRoot);
   if (config.mode === 'plugin') return { profile, args, patchFiles };
+  if (config.invocation?.fromDefaultProfile !== undefined) {
+    const { initializeProfileFromDefault } = await import(pathToFileURL(join(config.upstreamRoot, 'apps/cli/src/profile-boot.ts')));
+    // Initialize before loadProfile can create the target. The later native
+    // boot/dump reuses this encrypted profile and must not initialize it twice.
+    initializeProfileFromDefault(profile, config.invocation.fromDefaultProfile, config.dataRoot);
+  }
   const anchor = join(config.upstreamRoot, 'apps/cli/package.json');
   const pluginPath = fileURLToPath(new URL('./credentials-plugin.mjs', import.meta.url));
   const bundleName = '@johnason/dsh-encrypted-base';

@@ -6,6 +6,7 @@ import { mkdtemp, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { authenticateWeb, redactLaunchOutput } from './fixtures/native-web-client.mjs';
 
 test('real isolated native Web serves native UI plus Vault and exits after SIGTERM', { timeout: 40000 }, async t => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-real-web-'));
@@ -25,19 +26,21 @@ test('real isolated native Web serves native UI plus Vault and exits after SIGTE
   const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
   t.after(async () => { if (child.exitCode === null) child.kill('SIGTERM'); await exited; });
   await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`Native Web did not start: ${output}`)), 30000);
+    const timeout = setTimeout(() => reject(new Error(`Native Web did not start: ${redactLaunchOutput(output)}`)), 30000);
     const interval = setInterval(() => {
       if (output.includes(`dsh web: http://127.0.0.1:${port}`)) { clearInterval(interval); clearTimeout(timeout); resolve(); }
-      else if (child.exitCode !== null) { clearInterval(interval); clearTimeout(timeout); reject(new Error(output)); }
+      else if (child.exitCode !== null) { clearInterval(interval); clearTimeout(timeout); reject(new Error(redactLaunchOutput(output))); }
     }, 50);
     t.after(() => { clearTimeout(timeout); clearInterval(interval); });
   });
   const url = `http://127.0.0.1:${port}`;
-  const index = await (await fetch(url)).text();
+  assert.equal((await fetch(url)).status, 401);
+  const client = await authenticateWeb(output, url);
+  const index = await (await client.fetch('/')).text();
   assert.match(index, /__DSH_BOOT__|__ModuleLoader__/);
   assert.match(index, /href="\/vault"/);
-  assert.equal((await fetch(`${url}/vault`)).status, 200);
-  assert.deepEqual(await (await fetch(`${url}/vault/status`)).json(), { initialized: false, locked: true });
+  assert.equal((await client.fetch('/vault')).status, 200);
+  assert.deepEqual(await (await client.fetch('/vault/status')).json(), { initialized: false, locked: true });
   await assert.rejects(access(join(dataRoot, '.credentials.yaml')), { code: 'ENOENT' });
   assert.equal(output.includes('synthetic-secret-do-not-use'), false);
   child.kill('SIGTERM');

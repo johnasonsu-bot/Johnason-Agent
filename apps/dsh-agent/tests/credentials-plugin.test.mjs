@@ -5,9 +5,25 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { PassThrough } from 'node:stream';
+import { randomBytes } from 'node:crypto';
 import Provider from '../src/credentials-plugin.mjs';
 const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
 const { Context, Service } = await import(require.resolve('@deepseek-ai/cordis'));
+
+test('native browser authentication bootstraps while model and system credentials stay locked', async () => {
+  const ctx = new Context();
+  const provider = new Provider(ctx, { path: join(await mkdtemp(join(tmpdir(), 'dsh-browser-auth-')), 'vault.enc'), mode: 'web' });
+  const key = 'client-connection/browser-session';
+  const grant = { kind: 'grant', payload: { version: 1, secret: randomBytes(32).toString('base64url') } };
+  assert.deepEqual(await provider.modifyRecord(key, () => grant), grant);
+  assert.deepEqual(await provider.readRecord(key), grant);
+  assert.deepEqual(await provider.vault.status(), { initialized: false, locked: true });
+  await assert.rejects(provider.resolve('DEEPSEEK_API_KEY'), { code: 'VAULT_LOCKED' });
+  await assert.rejects(provider.readRecord('dataplatform/session'), { code: 'VAULT_LOCKED' });
+  await assert.rejects(provider.modifyRecord('forge/session', () => grant), { code: 'VAULT_LOCKED' });
+  assert.deepEqual(await provider.listRecords(), []);
+  await ctx.fiber.dispose();
+});
 
 test('locked resolution fails; changes are fresh and descriptions never reveal values', async () => {
   const ctx = new Context();

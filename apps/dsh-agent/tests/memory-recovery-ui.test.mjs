@@ -10,9 +10,28 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { MemoryStore } from '../src/memory-store.mjs';
 import { EffectStore } from '../src/effect-store.mjs';
+import { authenticateWeb, redactLaunchOutput, captureNativeRequests, assertSessionRequest } from './fixtures/native-web-client.mjs';
 
 // Chromium normalizes trailing fractional zeroes and zero seconds on datetime-local inputs.
 const browserDate = time => new Date(time).toISOString().replace(/\.000Z$/, 'Z').replace(/(\.\d*?[1-9])0+Z$/, '$1Z').replace(/:00Z$/, 'Z').replace(/Z$/, '');
+
+// Seed durable cold history directly; a Session outside Agent Loop has no writer.
+async function seedNativeSession(root, workspace, sessionId, events) {
+  const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
+  const { Context } = require('@deepseek-ai/cordis');
+  const { default: Sessions } = await import('../../../third_party/deepseek-harness/packages/core/session/lib/index.js');
+  const { default: Persistence } = await import('../../../third_party/deepseek-harness/packages/session/session-persistence-jsonl/lib/index.js');
+  const ctx = new Context();
+  try {
+    await ctx.plugin(Sessions);
+    await ctx.plugin(Persistence, { root: join(root, 'sessions'), compression: 'zstd', packChunks: false });
+    const session = ctx.sessions.prepare(sessionId, { meta: { cwd: workspace } });
+    for (const [type, data] of events) session.append(type, data);
+    const handle = await ctx.sessionPersistence.create(session.header, { inheritedEventCount: session.inheritedEventCount });
+    try { await handle.append(session.events); await handle.flush(); }
+    finally { await handle.close(); }
+  } finally { await ctx.fiber.dispose(); }
+}
 
 test('structured memory queries show provenance, graph relations, temporal snapshots and exact JSON downloads', { timeout: 90000 }, async t => {
   const f = await fixture(t);
@@ -24,7 +43,10 @@ test('structured memory queries show provenance, graph relations, temporal snaps
     content: { nodes: [{ id: 'task', type: 'task', label: 'Revised logo task' }, { id: 'file', type: 'artifact', label: 'animation.html' }], edges: [{ from: 'task', relation: 'produces', to: 'file' }] } } });
   await f.ok('put-memory', { sessionId, reason: 'Observed failure', record: { kind: 'procedural', visibility: 'private', summary: 'Verify artifacts', content: { rules: ['Check the output file'], applicability: { task: 'html' } } } });
   const { chromium } = await import('playwright-core');
-  const browser = await chromium.launchPersistentContext(join(f.root, 'structured-browser'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', viewport: { width: 1440, height: 1000 } });
+  const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  t.after(() => browserProcess.close());
+  const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
+  await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   const page = await browser.newPage(); page.setDefaultTimeout(6000);
   const errors = []; page.on('pageerror', e => errors.push(e.message));
@@ -111,7 +133,7 @@ test('structured memory queries show provenance, graph relations, temporal snaps
   assert.equal(await page.locator('#download-detail').isDisabled(), true, 'switching sessions must clear old downloadable data');
   assert.equal(await page.locator('#detail').innerText(), '选择记录查看详情。');
   assert.deepEqual(errors, []);
-  assert.equal((await f.rpc('session.list', {})).items.every(item => !item.running), true);
+  assert.equal((await f.rpc('session/list', { _request: {} })).items.every(item => !item.running), true);
   t.diagnostic(`Structured browser evidence retained: ${f.root}`);
 });
 
@@ -126,25 +148,22 @@ async function fixture(t, options = {}) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), 'web', '--data-dir', root, '--workspace', workspace, '--port', String(port), '--no-open'], { env: { PATH: process.env.PATH, HOME: root }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
   const exit = new Promise(r => child.once('exit', (code, signal) => r({ code, signal })));
-  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; t.diagnostic(output.split('\n').filter(line => /SQLite|ExperimentalWarning/.test(line)).join('\n')); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; t.diagnostic(redactLaunchOutput(output).split('\n').filter(line => /SQLite|ExperimentalWarning/.test(line)).join('\n')); });
   const deadline = Date.now() + 30000;
-  while (!output.includes(`dsh web: ${url}`)) { assert.equal(child.exitCode, null, output); assert.ok(Date.now() < deadline, output); await new Promise(r => setTimeout(r, 50)); }
+  while (!output.includes(`dsh web: ${url}`)) { assert.equal(child.exitCode, null, redactLaunchOutput(output)); assert.ok(Date.now() < deadline, redactLaunchOutput(output)); await new Promise(r => setTimeout(r, 50)); }
   t.diagnostic(`Retained native Web: ${root}; ${url}`);
+  const client = await authenticateWeb(output, url);
   const request = async (action, data = {}, headers = {}) => {
-    const res = await fetch(`${url}/memory-recovery/api/${action}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json', ...headers }, body: JSON.stringify(data) });
+    const res = await client.fetch(`/memory-recovery/api/${action}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json', ...headers }, body: JSON.stringify(data) });
     return { status: res.status, body: await res.json() };
   };
   const ok = async (action, data) => { const r = await request(action, data); assert.equal(r.status, 200, JSON.stringify(r)); return r.body.value; };
-  const rpc = async (method, payload) => {
-    const res = await fetch(`${url}/api/${method}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'acceptance', method, payload }) });
-    const body = await res.json(); assert.equal(body.result.ok, true, JSON.stringify(body)); return body.result.value;
-  };
-  return { root, workspace, url, request, ok, rpc };
+  return { root, workspace, url, request, ok, ...client };
 }
 
 test('real native Web creates an unstarted scoped session, versions records and pages without execution routes', { timeout: 60000 }, async t => {
   const f = await fixture(t);
-  assert.equal((await fetch(`${f.url}/memory-recovery`)).status, 200);
+  assert.equal((await f.fetch('/memory-recovery')).status, 200);
   assert.deepEqual(await f.ok('defaults'), { workspaceRoot: f.workspace });
   const created = await f.ok('create-session', { workspaceRoot: f.workspace });
   const sessionId = created.sessionId;
@@ -204,15 +223,15 @@ test('real native Web creates an unstarted scoped session, versions records and 
   assert.equal((await f.request('sessions', {}, { 'sec-fetch-site': 'cross-site' })).status, 403);
   // Node fetch overwrites a supplied Host with the URL authority; use the actual HTTP wire.
   const wrongHost = await new Promise((resolve, reject) => {
-    const req = httpRequest(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { host: 'evil.example', origin: f.url, 'content-type': 'application/json' } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    const req = httpRequest(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { cookie: f.cookie, host: 'evil.example', origin: f.url, 'content-type': 'application/json' } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
     req.on('error', reject); req.end('{}');
   });
   assert.equal(wrongHost, 403);
   assert.equal((await f.request('sessions', { actor: { role: 'operator' } })).status, 400);
-  assert.equal((await fetch(`${f.url}/memory-recovery/api/sessions`)).status, 405);
-  const noOrigin = await fetch(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  assert.equal((await f.fetch('/memory-recovery/api/sessions')).status, 405);
+  const noOrigin = await fetch(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { cookie: f.cookie, 'content-type': 'application/json' }, body: '{}' });
   assert.equal(noOrigin.status, 403);
-  const badJson = await fetch(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { origin: f.url, 'content-type': 'application/json' }, body: 'not-json' });
+  const badJson = await f.fetch('/memory-recovery/api/sessions', { method: 'POST', headers: { origin: f.url, 'content-type': 'application/json' }, body: 'not-json' });
   assert.equal(badJson.status, 400); assert.doesNotMatch(await badJson.text(), /not-json/);
   assert.equal((await f.request('sessions', { padding: 'x'.repeat(262145) })).status, 413);
 });
@@ -227,7 +246,7 @@ test('HTTP audit preserves UNKNOWN, causal edges and past system-time without re
     stranded = effects.prepare({ ...base, callId: 'stranded', parentId: parent.id, causationId: parent.id, validTime: 10 });
     effects.begin(stranded.id, { id: 'former-process', scope }, { validTime: 20 }); store.close();
   } });
-  await f.rpc('session.create', { sessionId: 'audit-new', cwd: f.workspace });
+  await f.rpc('session/create', { request: { sessionId: 'audit-new', cwd: f.workspace } });
   await f.ok('configure', { sessionId: 'audit-new', expectedVersion: 0, input: { enabled: true, projectId: 'audit', agentId: 'audit-new', workspaceRoot: f.workspace, sandbox: null } });
   const graph = await f.ok('effect-graph', { sessionId: 'audit-new' });
   assert.equal(graph.nodes.find(n => n.id === stranded.id).state, 'UNKNOWN');
@@ -239,7 +258,10 @@ test('HTTP audit preserves UNKNOWN, causal edges and past system-time without re
   await f.ok('sessions');
   assert.deepEqual(await f.ok('effect-graph', { sessionId: 'audit-new' }), graph);
   const { chromium } = await import('playwright-core');
-  const browser = await chromium.launchPersistentContext(join(f.root, 'effect-browser'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  t.after(() => browserProcess.close());
+  const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
+  await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   const page = await browser.newPage();
   await page.goto(`${f.url}/memory-recovery?sessionId=audit-new`);
@@ -258,8 +280,11 @@ test('HTTP audit preserves UNKNOWN, causal edges and past system-time without re
 test('independent browser creates/configures and actually opens its selected native chat', { timeout: 90000 }, async t => {
   const f = await fixture(t);
   const { chromium } = await import('playwright-core');
-  // Persistent profile is deliberately retained; no browser cleanup deletes artifacts.
-  const browser = await chromium.launchPersistentContext(join(f.root, 'browser-profile'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', viewport: { width: 1440, height: 1000 } });
+  // Authentication stays in memory; screenshots remain available as evidence.
+  const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  t.after(() => browserProcess.close());
+  const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
+  await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   const page = await browser.newPage();
   const errors = []; page.on('pageerror', e => errors.push(e.message));
@@ -314,15 +339,14 @@ test('independent browser creates/configures and actually opens its selected nat
   assert.equal(await page.locator('#page-offset').inputValue(), '20');
   assert.equal(await page.locator('#version').inputValue(), '1');
   await page.screenshot({ path: join(f.root, 'memory-recovery.png'), fullPage: true });
-  const nativeRequests = [];
-  page.on('request', request => { if (request.url().includes('/api/')) { try { nativeRequests.push(request.postDataJSON()); } catch {} } });
+  const nativeRequests = captureNativeRequests(page);
   await page.locator('#open-chat').click();
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
   await page.getByRole('button', { name: '记忆：已启用', exact: true }).waitFor();
   await page.waitForTimeout(1000);
-  assert.ok(nativeRequests.some(r => r?.payload?.sessionId === sessionId), JSON.stringify(nativeRequests));
-  assert.equal((await f.rpc('session.list', {})).items[0].running, false);
+  assertSessionRequest(nativeRequests, sessionId);
+  assert.equal((await f.rpc('session/list', { _request: {} })).items[0].running, false);
   await page.screenshot({ path: join(f.root, 'native-selected-chat.png'), fullPage: true });
   assert.deepEqual(errors, []);
   t.diagnostic(`Native browser selected ${sessionId}; screenshots retained in ${f.root}`);
@@ -331,19 +355,9 @@ test('independent browser creates/configures and actually opens its selected nat
 test('historical native session explains its boundary and keeps history while a new session enables memory', { timeout: 60000 }, async t => {
   const sessionId = 'history-config-regression';
   const f = await fixture(t, { async seedNative(root, workspace) {
-    const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
-    const { Context } = require('@deepseek-ai/cordis');
-    const { default: Sessions } = await import('../../../third_party/deepseek-harness/packages/core/session/lib/index.js');
-    const { default: Persistence } = await import('../../../third_party/deepseek-harness/packages/session/session-persistence-jsonl/lib/index.js');
-    const ctx = new Context();
-    try {
-      await ctx.plugin(Sessions);
-      await ctx.plugin(Persistence, { root: join(root, 'sessions'), compression: 'zstd', packChunks: false });
-      const session = ctx.sessions.create(sessionId, { meta: { cwd: workspace } });
-      session.append('turn/start', { turn: 1 });
-      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
-      await ctx.sessions.flush(session);
-    } finally { await ctx.fiber.dispose(); }
+    await seedNativeSession(root, workspace, sessionId, [
+      ['turn/start', { turn: 1 }], ['turn/end', { turn: 1, reason: { kind: 'completed' } }],
+    ]);
   } });
   assert.equal((await f.ok('sessions')).some(row => row.id === sessionId), false, 'history begins cold, not attached');
   assert.equal((await f.ok('config', { sessionId })).configurationBlockReason, 'MEMORY_NEW_SESSION_REQUIRED');
@@ -351,7 +365,10 @@ test('historical native session explains its boundary and keeps history while a 
   assert.equal(blocked.body.code, 'MEMORY_NEW_SESSION_REQUIRED');
   assert.match(blocked.body.error, /创建新原生会话/);
   const { chromium } = await import('playwright-core');
-  const browser = await chromium.launchPersistentContext(join(f.root, 'history-browser'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  t.after(() => browserProcess.close());
+  const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
+  await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   const page = await browser.newPage();
   await page.goto(`${f.url}/memory-recovery`);
@@ -370,7 +387,7 @@ test('historical native session explains its boundary and keeps history while a 
   assert.equal((await f.ok('config', { sessionId: newId })).enabled, true);
   assert.equal((await f.ok('config', { sessionId })).version, 0);
   assert.equal((await f.ok('status', { sessionId })).durableThroughSeq, null);
-  assert.ok((await f.rpc('session.list', {})).items.some(s => s.sessionId === sessionId && !s.running));
+  assert.ok((await f.rpc('session/list', { _request: {} })).items.some(s => s.sessionId === sessionId && !s.running));
   await page.locator('#sessions').selectOption('');
   await page.waitForFunction(() => document.getElementById('config-version').textContent === '尚未选择会话');
   assert.equal(await page.locator('#configure').isDisabled(), true);
@@ -381,26 +398,19 @@ test('historical native session explains its boundary and keeps history while a 
 test('restored unstarted native conversation enables memory without creating or running another session', { timeout: 60000 }, async t => {
   const sessionId = 'restored-blank-memory-regression';
   const f = await fixture(t, { async seedNative(root, workspace) {
-    const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
-    const { Context } = require('@deepseek-ai/cordis');
-    const { default: Sessions } = await import('../../../third_party/deepseek-harness/packages/core/session/lib/index.js');
-    const { default: Persistence } = await import('../../../third_party/deepseek-harness/packages/session/session-persistence-jsonl/lib/index.js');
-    const ctx = new Context();
-    try {
-      await ctx.plugin(Sessions);
-      await ctx.plugin(Persistence, { root: join(root, 'sessions'), compression: 'zstd', packChunks: false });
-      const session = ctx.sessions.create(sessionId, { meta: { cwd: workspace } });
-      session.append('permission/preset', { preset: 'workspace-write' });
-      session.append('sandbox/mode', { mode: 'workspace-write' });
-      session.append('approval/policy', { policy: 'ask' });
-      await ctx.sessions.flush(session);
-    } finally { await ctx.fiber.dispose(); }
+    await seedNativeSession(root, workspace, sessionId, [
+      ['permission/preset', { preset: 'workspace-write' }],
+      ['sandbox/mode', { mode: 'workspace-write' }], ['approval/policy', { policy: 'ask' }],
+    ]);
   } });
-  const before = (await f.rpc('session.list', {})).items.find(s => s.sessionId === sessionId);
+  const before = (await f.rpc('session/list', { _request: {} })).items.find(s => s.sessionId === sessionId);
   assert.equal(before.blank, true); assert.equal(before.running, false);
   assert.equal((await f.ok('config', { sessionId })).canConfigure, true, 'persisted policy-only session remains eligible after process restart');
   const { chromium } = await import('playwright-core');
-  const browser = await chromium.launchPersistentContext(join(f.root, 'restored-blank-browser'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  t.after(() => browserProcess.close());
+  const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
+  await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   await browser.addInitScript(id => { if (!localStorage.getItem('dsh.sessions.current')) localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: id })); }, sessionId);
   const page = await browser.newPage();
@@ -413,7 +423,7 @@ test('restored unstarted native conversation enables memory without creating or 
   await page.getByRole('button', { name: '记忆：已启用', exact: true }).waitFor();
   const configured = await f.ok('config', { sessionId });
   assert.equal(configured.version, 1); assert.equal(configured.projectId, 'abc'); assert.equal(configured.sandbox, null);
-  const after = await f.rpc('session.list', {});
+  const after = await f.rpc('session/list', { _request: {} });
   assert.equal(after.items.length, 1); assert.equal(after.items[0].blank, true); assert.equal(after.items[0].running, false);
   assert.equal(after.items[0].projections.values.sessionStats.turns, 0);
 });
@@ -422,7 +432,10 @@ test('native composer enables ordinary memory for the selected session without i
   const f = await fixture(t);
   const { sessionId } = await f.ok('create-session', { workspaceRoot: f.workspace });
   const { chromium } = await import('playwright-core');
-  const browser = await chromium.launchPersistentContext(join(f.root, 'composer-browser'), { headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', viewport: { width: 1440, height: 1000 } });
+  const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
+  t.after(() => browserProcess.close());
+  const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
+  await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   await browser.addInitScript(id => { if (!localStorage.getItem('dsh.sessions.current')) localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: id })); }, sessionId);
   const page = await browser.newPage(); const errors = [];
@@ -451,8 +464,8 @@ test('native composer enables ordinary memory for the selected session without i
   const config = await f.ok('config', { sessionId });
   assert.equal(config.projectId, 'composer-project'); assert.equal(config.sandbox, null);
   assert.equal(config.executionCoverage, 'native-memory-only');
-  assert.equal((await f.rpc('session.list', {})).items.length, 1, 'configure binds existing composer, not another session');
-  assert.equal((await f.rpc('session.list', {})).items[0].running, false);
+  assert.equal((await f.rpc('session/list', { _request: {} })).items.length, 1, 'configure binds existing composer, not another session');
+  assert.equal((await f.rpc('session/list', { _request: {} })).items[0].running, false);
   await page.reload();
   await page.getByRole('button', { name: '记忆：已启用', exact: true }).waitFor();
   assert.equal(await page.locator('svg[class*="_fish"], [class*="_fishHitbox"] svg').count(), 0, 'hero whale mark absent');

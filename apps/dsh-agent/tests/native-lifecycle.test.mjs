@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, copyFile, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { authenticateWeb, redactLaunchOutput } from './fixtures/native-web-client.mjs';
 
 const cli = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
 const fixture = name => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
@@ -23,7 +24,7 @@ function launch(t, root, port, extra = []) {
   child.stderr.on('data', bytes => { output += bytes; });
   const exit = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; });
-  return { child, exit, output: () => output };
+  return { child, exit, output: () => redactLaunchOutput(output), authenticate: () => authenticateWeb(output, `http://127.0.0.1:${port}`) };
 }
 async function waitFor(check, timeout = 30000) {
   const deadline = Date.now() + timeout;
@@ -39,14 +40,6 @@ async function ready(process, port) {
     return process.output().includes(`dsh web: http://127.0.0.1:${port}`);
   });
 }
-async function rpc(url, method, payload) {
-  const response = await fetch(`${url}/api/${method}`, { method: 'POST', headers: { 'content-type': 'application/json', origin: url }, body: JSON.stringify({ type: 'client-request', rpcId: 'acceptance', method, payload }) });
-  const body = await response.json();
-  assert.equal(response.status, 200, JSON.stringify(body));
-  assert.equal(body.result.ok, true, JSON.stringify(body));
-  return body.result.value;
-}
-
 // Catches accidental port auto-increment, swallowed bind errors, or killing a foreign listener.
 test('occupied port fails visibly and leaves the existing listener alive', { timeout: 40000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-port-conflict-'));
@@ -75,31 +68,35 @@ test('native profile loads local MCP and Skill; normal restart restores workspac
   const url = `http://127.0.0.1:${port}`;
   const first = launch(t, root, port, ['--patch', patch]);
   await ready(first, port);
-  await waitFor(async () => (await fetch(`${url}/acceptance-fixture`)).status === 200);
-  const marker = await (await fetch(`${url}/acceptance-fixture`)).json();
+  const firstClient = await first.authenticate();
+  await waitFor(async () => (await firstClient.fetch('/acceptance-fixture')).status === 200);
+  const marker = await (await firstClient.fetch('/acceptance-fixture')).json();
   assert.equal(marker.source, 'dsh-acceptance-profile-plugin');
   assert.equal(marker.result.isError, false);
   assert.deepEqual(marker.result.content, [{ type: 'text', text: 'DSH_LOCAL_MCP_OK' }]);
-  const created = await rpc(url, 'workspace.create', { path: workspace });
-  const { sessionId } = await rpc(url, 'session.create', { workspaceId: created.workspace.workspaceId });
-  await rpc(url, 'session.rename', { sessionId, title: 'Local restart acceptance' });
-  const skills = await rpc(url, 'skill.list', { sessionId });
+  const created = await firstClient.rpc('workspace/create', { request: { path: workspace } });
+  const { sessionId } = await firstClient.rpc('session/create', { request: { workspaceId: created.workspace.workspaceId } });
+  await firstClient.rpc('session/rename', { request: { sessionId, title: 'Local restart acceptance' } });
+  const skills = await firstClient.rpc('skills/list', { request: { sessionId } });
   assert.ok(skills.skills.some(skill => skill.name === 'dsh-acceptance-marker'), JSON.stringify(skills));
   const password = 'synthetic-acceptance-password';
-  const initialized = await fetch(`${url}/vault/initialize`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ password, confirmation: password }) });
+  const initialized = await firstClient.fetch('/vault/initialize', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password, confirmation: password }) });
   assert.equal(initialized.status, 200, await initialized.text());
   const encrypted = await readFile(join(root, 'vault.enc'));
   first.child.kill('SIGTERM');
   assert.deepEqual(await first.exit, { code: 0, signal: null });
   const second = launch(t, root, port, ['--patch', patch]);
   await ready(second, port);
-  assert.deepEqual(await (await fetch(`${url}/vault/status`)).json(), { initialized: true, locked: true });
+  const secondClient = await second.authenticate();
+  assert.deepEqual(await (await secondClient.fetch('/vault/status')).json(), { initialized: true, locked: true });
   assert.deepEqual(await readFile(join(root, 'vault.enc')), encrypted);
-  const workspaces = await rpc(url, 'workspace.list', {});
+  const workspaceFrame = await secondClient.firstFrame('workspace/follow', {});
+  assert.equal(workspaceFrame.type, 'baseline');
+  const workspaces = workspaceFrame.value;
   assert.ok(workspaces.items.some(item => item.workspaceId === created.workspace.workspaceId && item.sessionIds.includes(sessionId)));
-  const sessions = await rpc(url, 'session.list', {});
+  const sessions = await secondClient.rpc('session/list', { _request: {} });
   assert.ok(sessions.items.some(item => item.sessionId === sessionId && item.running === false));
-  const history = await rpc(url, 'session.history', { sessionId });
+  const history = await secondClient.history(sessionId);
   assert.match(JSON.stringify(history), /Local restart acceptance/);
   assert.equal(first.output().includes(password), false);
   assert.equal(second.output().includes(password), false);

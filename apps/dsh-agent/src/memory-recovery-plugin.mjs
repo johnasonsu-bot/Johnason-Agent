@@ -192,9 +192,14 @@ class MemoryRecovery extends Service {
       if (!this.getSessionConfig(payload.agent.id).enabled) return next();
       await this.barrier(payload.agent.id);
       const decision = await next();
-      if (decision.kind === 'reject') return decision;
-      await this.projectContext(payload.agent.id, decision.messages);
-      return decision;
+      if (decision.kind === 'reject'
+          || (decision.messages.length === 0 && payload.agent.session.surface.nodes.length === 0)) return decision;
+      const projection = await this.projectContext(payload.agent.id, decision.messages);
+      // The loop must commit its protected system head before the first user
+      // surface node. Later memory updates can replace their own retained node.
+      return projection.pendingMessage
+        ? { ...decision, messages: [...decision.messages, projection.pendingMessage] }
+        : decision;
     }, { prepend: true });
     installMemoryTools(ctx, this);
     ctx.on('agent/created', ({ agent }) => this.#syncTools(agent));
@@ -222,7 +227,7 @@ class MemoryRecovery extends Service {
     } });
     for (const agent of ctx.get('agents')?.list() ?? []) this.#syncTools(agent);
     ctx.effect(() => () => { for (const agent of this.#toolScopes.keys()) this.#releaseTools(agent); });
-    ctx.inject(['webServer', 'apiProxy'], ui => installMemoryRecoveryUi(ui, this));
+    ctx.inject(['webServer', 'sessionController'], ui => installMemoryRecoveryUi(ui, this));
     ctx.effect(() => async () => {
       await Promise.all(this.#inflight);
       try {
@@ -278,7 +283,7 @@ class MemoryRecovery extends Service {
     // Native resume appends end-seed even for untouched drafts. Root drafts
     // containing only setup metadata remain eligible; fork lineage, execution
     // records and unknown events do not become eligible through restart.
-    if (!version && (session.header.parentSession !== undefined || session.header.seedLength !== undefined
+    if (!version && (session.header.parentSession !== undefined || session.header.isSeeded
         || session.header.origin === 'subagent' || (session.header.delegationDepth ?? 0) > 0
         || session.events.some(event => !UNSTARTED_SESSION_EVENTS.has(event.type)))) return 'MEMORY_NEW_SESSION_REQUIRED';
     if (this.#state(session.id).active || this.ctx.get('agents')?.get(session.id)?.status === 'running') return 'MEMORY_SESSION_BUSY';
@@ -364,11 +369,17 @@ class MemoryRecovery extends Service {
     catch (cause) { state.fault ??= cause; throw state.fault; }
     finally { state.drain = null; }
   }
-  #projection(event) {
+  #projection(event, session) {
     if (owned(event)) {
       const { sourceEventSeqs, ...envelope } = event;
+      // A first projection is committed by the native loop, which owns its
+      // append intent. Its required selection event binds the message identity
+      // to the same source chain used by subsequent direct replacements.
+      const selection = sourceEventSeqs ? undefined : session.events.slice(0, event.seq).findLast(candidate =>
+        candidate.type === 'memory-recovery/page-selection' && candidate.data.messageId === event.data.id);
       return { ...envelope, data: { memoryRecoveryDerived: true, projectionVersion: 1,
-        messageId: event.data.id, source: event.data.source, nativeSourceEventSeqs: sourceEventSeqs ?? [] } };
+        messageId: event.data.id, source: event.data.source,
+        nativeSourceEventSeqs: sourceEventSeqs ?? (selection ? [selection.seq, ...selection.data.sourceEventSeqs] : []) } };
     }
     if (event.type === IO_EVENT) return { ...event, sourceEventSeqs: event.data.sourceEventSeqs };
     return event;
@@ -381,10 +392,15 @@ class MemoryRecovery extends Service {
         const checkpoint = session.seq - 1;
         await this.#flushing.run(id, () => this.ctx.sessions.flush(session));
         const persistence = this.ctx.get('sessionPersistence');
-        if (!persistence?.readFrom) throw error('MEMORY_NATIVE_PERSISTENCE_REQUIRED');
+        if (typeof persistence?.open !== 'function') throw error('MEMORY_NATIVE_PERSISTENCE_REQUIRED');
         const cursor = this.#store.cursor(id) ?? -1;
         const from = state.verified ? cursor + 1 : 0;
-        const stored = await persistence.readFrom(id, from);
+        // The SessionStore remains the write/durability owner. Open a read
+        // handle only after its barrier, and release it even when reads fail.
+        const handle = await persistence.open(id, 'read');
+        let stored;
+        try { stored = await handle.read(from); }
+        finally { await handle.close(); }
         if (Math.max(cursor, stored.events.at(-1)?.seq ?? -1) < checkpoint) throw error('MEMORY_SOURCE_CONFLICT', 'native flush did not confirm its complete checkpoint');
         if (!state.verified && stored.events.length <= cursor) throw error('MEMORY_SOURCE_CONFLICT', 'native log is shorter than confirmed memory prefix');
         const live = session.events;
@@ -398,9 +414,9 @@ class MemoryRecovery extends Service {
             nativeEvents.push(event); bytes += size; start++;
           }
           const existing = nativeEvents.filter(event => event.seq <= cursor);
-          if (existing.length) this.#store.verifyEvents({ ...this.scopeForSession(id), events: existing.map(event => this.#projection(event)), nativeEvents: existing });
+          if (existing.length) this.#store.verifyEvents({ ...this.scopeForSession(id), events: existing.map(event => this.#projection(event, session)), nativeEvents: existing });
           const fresh = nativeEvents.filter(event => event.seq > cursor);
-          if (fresh.length) this.#store.ingestEvents({ ...this.scopeForSession(id), events: fresh.map(event => this.#projection(event)), nativeEvents: fresh });
+          if (fresh.length) this.#store.ingestEvents({ ...this.scopeForSession(id), events: fresh.map(event => this.#projection(event, session)), nativeEvents: fresh });
           // Yield between bounded SQLite batches, keeping streaming admission live.
           await new Promise(resolve => setImmediate(resolve));
         }
@@ -447,11 +463,17 @@ class MemoryRecovery extends Service {
     const text = prefix + selection.contextText;
     const current = session.surface.nodes.map(seq => session.events[seq]).find(owned);
     if (current && textOf(current.data) === text) return selection;
+    const message = createUserMessage({ source: { kind: 'plugin', plugin: name }, content: [{ type: 'text', text }] });
+    const references = [...new Set([...(current ? [current.seq] : []), ...selection.pages.flatMap(p => p.sourceRefs.filter(r => r.type === 'event' && r.sessionId === id).map(r => r.seq))])];
     const source = session.append('memory-recovery/page-selection', { pages: selection.pages.map(p => ({ id: p.id, version: p.version, sourceRefs: p.sourceRefs,
-      ...(p.offset === undefined ? {} : { offset: p.offset, maxChars: p.maxChars, totalChars: p.totalChars }) })), estimatedTokens: Math.ceil(text.length / 4), configVersion: config.version });
-    const sourceEventSeqs = [...new Set([source.seq, ...(current ? [current.seq] : []), ...selection.pages.flatMap(p => p.sourceRefs.filter(r => r.type === 'event' && r.sessionId === id).map(r => r.seq))])];
-    session.append('user/message', createUserMessage({ source: { kind: 'plugin', plugin: name }, content: [{ type: 'text', text }] }), {
-      surfaceOp: current ? { op: 'replace', start: current.seq, end: current.seq } : 'append', sourceEventSeqs,
+      ...(p.offset === undefined ? {} : { offset: p.offset, maxChars: p.maxChars, totalChars: p.totalChars }) })), estimatedTokens: Math.ceil(text.length / 4), configVersion: config.version,
+      messageId: message.id, sourceEventSeqs: references });
+    if (session.surface.nodes.length === 0) {
+      await this.barrier(id);
+      return { ...selection, pendingMessage: message };
+    }
+    session.append('user/message', message, {
+      surfaceOp: current ? { op: 'replace', startSeq: current.seq, endSeq: current.seq } : 'append', sourceEventSeqs: [source.seq, ...references],
     });
     await this.barrier(id);
     return selection;

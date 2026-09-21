@@ -18,7 +18,7 @@ async function toolContext() {
   await ctx.plugin(SystemPrompt, {
     includeHarnessIdentity: false,
     includeRuntimeContext: false,
-    persona: "",
+    personaPrefix: "",
   });
   await ctx.plugin(ToolRuntime);
   return ctx;

@@ -360,10 +360,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
                 }
                 return toolTransport.execute(call);
               },
-              onEvent: nativeEvent => {
-                const chunk = nativeEvent.type === "assistant/chunk"
-                  ? nativeEvent.data?.chunk
-                  : null;
+              onChunk: chunk => {
                 if (active !== state) return;
                 if (chunk?.type === "text-delta" && chunk.text.length !== 0) {
                   const [event] = mapSessionEvents(identity, [

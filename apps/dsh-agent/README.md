@@ -8,15 +8,19 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 凭据引用与授权记录只保存到独立数据根的 `vault.enc`（scrypt + AES-256-GCM），不写明文配置。不要把主密码或 API Key 放进 `.env`、命令行参数或普通文件。忘记主密码无法恢复内容；错误密码不会删除已有数据。
 
+新版原生 Web 会在凭据 Vault 解锁前初始化浏览器认证。启动器仅将 `client-connection/browser-session` 这一个浏览器签名记录保存在当前应用进程内存中，保证解锁入口能启动；API Key 和业务系统授权仍必须通过加密 Vault。浏览器签名不写磁盘，服务重启后须用本次启动提供的原生认证链接重新进入。
+
 ## 环境要求
 
 - 实测平台：macOS、Node.js v22.20.0；Windows/Linux 尚未实测，不承诺相同的 TTY、目录选择器和信号行为。
 - Node.js 22.19+（仅 22.x），或 Node.js 24+
 - Git、Corepack 可用；首次安装依赖需要网络和磁盘空间。无需旧 Python/Go 服务。
-- 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`
+- 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `ddefc45fbc7f8e46dd73185e68295696d1297887`（官方 `0.1.6-alpha.2`）
 - 构建工具固定为 `pnpm@11.7.0`，不下载 `latest`
 
 ## 原生构建
+
+2026-09-21 的合并候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展，并对接上述官方版本。用户要求本阶段仅做代码合并：尚未安装依赖或构建，原生运行、浏览器及重启恢复留待后续验证。已确认官方旧格式迁移器拒绝自定义记忆事件，既有记忆日志需要单独设计迁移，不能直接切换。已有的带日期验收报告对应旧版本，不代表该候选已通过原生验收。详见[代码合并报告](../../docs/testing/2026-09-21-dsh-upstream-code-merge.md)；请勿用候选打开原有用户数据根。
 
 从仓库根目录运行：
 
@@ -25,7 +29,7 @@ git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
 ```
 
-以下命令假定当前目录是你的独立源码根 `<repo-root>`（例如 `<checkout>/.worktrees/dsh-standalone-agent`）；本次验收机器的实际路径只记录在[带日期的验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)。本地分支 `codex/dsh-standalone-agent` 尚未推送/合并，不是已有远端发行版。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
+以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前合并候选位于 `codex/dsh-upstream-merge` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
 
 构建入口依次执行冻结 lockfile 安装和上游原生构建。两个步骤都显式设置 `CI=true`：上游的安装脚本会据此只跳过 Git hook 配置，避免子模块位于 linked worktree 时修改 Git 配置失败；构建前的依赖状态检查也因此使用非交互模式。依赖生命周期脚本及构建检查仍会运行。启动器不会修改子模块 Git 配置。
 

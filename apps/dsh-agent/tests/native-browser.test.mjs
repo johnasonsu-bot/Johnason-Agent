@@ -7,6 +7,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { authenticateWeb, redactLaunchOutput, captureNativeRequests, assertSessionRequest } from './fixtures/native-web-client.mjs';
 
 // Real headless Chromium navigation/reload, never an API-only reconnect substitute.
 // A bundled playwright-core may be selected explicitly; normal installs use devDependencies.
@@ -30,46 +31,41 @@ test('browser reload restores the selected native session, title, model and idle
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; });
   const deadline = Date.now() + 30000;
   while (!output.includes(`dsh web: ${url}`)) {
-    assert.equal(child.exitCode, null, output);
-    assert.ok(Date.now() < deadline, `Web startup timed out: ${output}`);
+    assert.equal(child.exitCode, null, redactLaunchOutput(output));
+    assert.ok(Date.now() < deadline, `Web startup timed out: ${redactLaunchOutput(output)}`);
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  async function rpc(method, payload) {
-    const response = await fetch(`${url}/api/${method}`, { method: 'POST', headers: { origin: url, 'content-type': 'application/json' }, body: JSON.stringify({ type: 'client-request', rpcId: 'browser-fixture', method, payload }) });
-    const body = await response.json();
-    assert.equal(body.result.ok, true, JSON.stringify(body));
-    return body.result.value;
-  }
-  // Setup through public native APIs only. No model request or credential is needed.
-  const created = await rpc('workspace.create', { path: workspace });
-  const { sessionId } = await rpc('session.create', { workspaceId: created.workspace.workspaceId });
+  const client = await authenticateWeb(output, url);
+  // Setup through public native APIs only. No model request or provider credential is needed.
+  const created = await client.rpc('workspace/create', { request: { path: workspace } });
+  const { sessionId } = await client.rpc('session/create', { request: { workspaceId: created.workspace.workspaceId } });
   const title = 'Browser refresh acceptance';
-  await rpc('session.rename', { sessionId, title });
-  await rpc('session.selectModel', { sessionId, provider: 'deepseek-official', model: 'deepseek-v4-pro' });
-  const beforeModels = await rpc('session.models', { sessionId });
-  const beforeHistory = await rpc('session.history', { sessionId });
+  await client.rpc('session/rename', { request: { sessionId, title } });
+  const { selected } = await client.rpc('session/selectModel', { request: { sessionId, provider: 'deepseek-official', model: 'deepseek-v4-pro' } });
+  const beforeModel = (await client.snapshot(sessionId)).projections.values.model;
+  assert.deepEqual(beforeModel.next, selected);
+  assert.equal(beforeModel.next.provider, 'deepseek-official');
+  assert.equal(beforeModel.next.model, 'deepseek-v4-pro');
+  const beforeHistory = await client.history(sessionId);
+  assert.match(JSON.stringify(beforeHistory), /Browser refresh acceptance/);
   const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   const executablePath = process.env.DSH_TEST_BROWSER_PATH || (existsSync(chrome) ? chrome : undefined);
   const browser = await chromium.launch({ headless: true, executablePath });
   t.after(() => browser.close());
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  await client.authenticateBrowser(page.context());
   // Block every external HTTP request, including any accidental model/telemetry request.
   const external = [];
   await page.route('**/*', async route => {
     if (!route.request().url().startsWith(url + '/')) { external.push(route.request().url()); await route.abort(); }
     else await route.continue();
   });
-  const clientRequests = [];
-  page.on('request', request => {
-    if (request.url().includes('/api/')) {
-      try { clientRequests.push(request.postDataJSON()); } catch {}
-    }
-  });
+  const clientRequests = captureNativeRequests(page);
   await page.goto(url);
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
   await page.getByText('DeepSeek-V4-Pro', { exact: true }).waitFor();
-  assert.ok(clientRequests.some(request => request?.payload?.sessionId === sessionId), JSON.stringify(clientRequests));
+  assertSessionRequest(clientRequests, sessionId);
   const selectedUrl = page.url();
   await page.screenshot({ path: join(root, 'before-refresh.png'), fullPage: true });
   clientRequests.length = 0;
@@ -77,12 +73,12 @@ test('browser reload restores the selected native session, title, model and idle
   await page.getByText('DeepSeek-V4-Pro', { exact: true }).waitFor();
   assert.equal(await page.evaluate(() => performance.getEntriesByType('navigation')[0].type), 'reload');
   assert.equal(page.url(), selectedUrl);
-  assert.ok(clientRequests.some(request => request?.payload?.sessionId === sessionId), JSON.stringify(clientRequests));
+  assertSessionRequest(clientRequests, sessionId);
   // Native UI deliberately calls an empty session "New Session", even if renamed.
   // Its title remains verified through history; selected identity is read from the page client's requests.
-  assert.deepEqual((await rpc('session.models', { sessionId })).current, beforeModels.current);
-  assert.deepEqual(await rpc('session.history', { sessionId }), beforeHistory);
-  const sessions = await rpc('session.list', {});
+  assert.deepEqual((await client.snapshot(sessionId)).projections.values.model, beforeModel);
+  assert.deepEqual(await client.history(sessionId), beforeHistory);
+  const sessions = await client.rpc('session/list', { _request: {} });
   assert.equal(sessions.items.length, 1);
   assert.equal(sessions.items[0].sessionId, sessionId);
   assert.equal(sessions.items[0].running, false);
