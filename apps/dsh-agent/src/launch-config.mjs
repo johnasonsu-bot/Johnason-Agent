@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { inspectPlatformBuild, platformPaths } from './platform/runtime.mjs'
 import { join, resolve, isAbsolute } from 'node:path'
 
 const SAFE_ENV_KEYS = new Set([
@@ -20,17 +20,6 @@ function takeValue(argv, index, option) {
     throw new Error(`${option} requires a value`)
   }
   return value
-}
-
-function inspectBuild(upstreamRoot) {
-  const required = [
-    ['CLI build artifact', join(upstreamRoot, 'apps/cli/lib/bin.js')],
-    ['Web build artifact', join(upstreamRoot, 'apps/web/dist/index.html')],
-  ]
-  const diagnostics = required
-    .filter(([, artifact]) => !existsSync(artifact))
-    .map(([label, artifact]) => `${label} missing: ${artifact}`)
-  return { built: diagnostics.length === 0, diagnostics }
 }
 
 function hasProfileOption(args) {
@@ -110,7 +99,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     throw new Error('doctor does not accept a workspace or positional arguments')
   }
 
-  const upstreamRoot = join(repoRoot, 'third_party/deepseek-harness')
+  const { upstreamRoot } = platformPaths(repoRoot)
   const childEnv = Object.fromEntries(
     Object.entries(env).filter(([key]) => SAFE_ENV_KEYS.has(key)),
   )
@@ -144,6 +133,6 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     upstreamRoot,
     args,
     env: childEnv,
-    ...(mode === 'doctor' ? inspectBuild(upstreamRoot) : {}),
+    ...(mode === 'doctor' ? inspectPlatformBuild(upstreamRoot) : {}),
   }
 }

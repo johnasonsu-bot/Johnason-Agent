@@ -8,7 +8,7 @@ const browserAuthSource = new URL('../../../third_party/deepseek-harness/package
 const names = new Set(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-credentials-local', '@deepseek-ai/dsh-credentials', '@deepseek-ai/cordis']);
 const hook = registerHooks({
   resolve(specifier, context, nextResolve) {
-    if (specifier === 'node:module' && context.parentURL === new URL('../src/credentials-plugin.mjs', import.meta.url).href) return { url: nativeFixture, shortCircuit: true };
+    if (specifier.endsWith('/platform/credential-api.mjs')) return { url: nativeFixture, shortCircuit: true };
     return names.has(specifier) ? { url: nativeFixture, shortCircuit: true } : nextResolve(specifier, context);
   },
   load(url, context, nextLoad) {

@@ -10,6 +10,7 @@ import { join } from 'node:path';
 // stores. Pure native surface/format validators run directly from the pinned
 // TypeScript sources in memory; routing and sandbox dispatch remain integration tests.
 const pluginUrl = new URL('../src/memory-recovery-plugin.mjs', import.meta.url).href;
+const memoryApiUrl = new URL('../src/platform/memory-api.mjs', import.meta.url).href;
 const stub = source => `data:text/javascript,${encodeURIComponent(source)}`;
 const native = path => new URL(`../../../third_party/deepseek-harness/packages/${path}`, import.meta.url).href;
 const modules = {
@@ -24,12 +25,11 @@ const nativeAliases = {
   '@deepseek-ai/dsh-session-format-v0-to-v1': native('session/session-format-v0-to-v1/src/index.ts'),
   '@deepseek-ai/dsh-session-format-v1-to-v2': stub(`export * from ${JSON.stringify(native('session/session-format-v1-to-v2/src/validation.ts'))}; export * from ${JSON.stringify(native('session/session-format-v1-to-v2/src/dispositions.ts'))};`),
 };
-const moduleBridge = stub(`export function createRequire() { return { resolve(name) { if (name === '@deepseek-ai/cordis') return ${JSON.stringify(modules.cordis)}; throw new Error('Unexpected native dependency: ' + name); } }; }`);
+const moduleBridge = stub(`export function nativeRequire() { return { resolve(name) { if (name === '@deepseek-ai/cordis') return ${JSON.stringify(modules.cordis)}; throw new Error('Unexpected native dependency: ' + name); } }; } export function nativeUrl(path) { if (path === 'packages/llm/llm/lib/index.js') return ${JSON.stringify(modules.llm)}; throw new Error('Unexpected native path: ' + path); }`);
 const hooks = registerHooks({ resolve(specifier, context, next) {
-  if (context.parentURL === pluginUrl) {
-    if (specifier === 'node:module') return { url: moduleBridge, shortCircuit: true };
+  if (context.parentURL === memoryApiUrl) {
+    if (specifier === './runtime.mjs') return { url: moduleBridge, shortCircuit: true };
     if (specifier === '@deepseek-ai/dsh-session') return { url: modules.session, shortCircuit: true };
-    if (specifier.endsWith('/packages/llm/llm/lib/index.js')) return { url: modules.llm, shortCircuit: true };
   }
   if (nativeAliases[specifier]) return { url: nativeAliases[specifier], shortCircuit: true };
   return next(specifier, context);
@@ -38,9 +38,10 @@ const hooks = registerHooks({ resolve(specifier, context, next) {
     source: stripTypeScriptTypes(readFileSync(new URL(url), 'utf8'), { mode: 'transform', sourceUrl: url }), shortCircuit: true };
   return next(url, context);
 } });
-let memoryPlugin, SurfaceManager, restoreReleasedV3Artifact, assertReleasedEventPayload, KNOWN_SESSION_EVENT_TYPES;
+let memoryPlugin, SurfaceManager, restoreReleasedV3Artifact, assertReleasedEventPayload, KNOWN_SESSION_EVENT_TYPES, retainRequiredEventTypes;
 try {
   memoryPlugin = await import(pluginUrl);
+  ({ retainRequiredEventTypes } = await import(memoryApiUrl));
   ({ SurfaceManager } = await import(native('core/session/src/surface.ts')));
   ({ restoreReleasedV3Artifact } = await import(native('session/session-format-v2-to-v3/src/validation.ts')));
   ({ assertReleasedEventPayload } = await import(native('session/session-format-v0-to-v1/src/validation.ts')));
@@ -206,4 +207,33 @@ test('memory pre-step preserves native empty-input short circuit', async t => {
 
 test('official historical validator refuses legacy custom memory events instead of silently dropping them', () => {
   assert.throws(() => assertReleasedEventPayload({ type: 'memory-recovery/config', seq: 0, time: 1, data: {} }, 0), /unknown historical event/);
+});
+
+
+test('platform required-event registrations retain overlapping owners and preserve upstream entries', () => {
+  const nativeType = KNOWN_SESSION_EVENT_TYPES.values().next().value;
+  const firstType = 'plugin-isolation/first';
+  const secondType = 'plugin-isolation/second';
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(firstType), false);
+  const releaseFirst = retainRequiredEventTypes([nativeType, firstType, firstType]);
+  const releaseSecond = retainRequiredEventTypes([firstType, secondType]);
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(firstType), true);
+  releaseFirst(); releaseFirst();
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(nativeType), true);
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(firstType), true);
+  releaseSecond();
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(firstType), false);
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(secondType), false);
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.has(nativeType), true);
+});
+
+test('platform event shim rejects unsupported catalogs and invalid types before changing the set', () => {
+  const size = KNOWN_SESSION_EVENT_TYPES.size;
+  assert.throws(() => retainRequiredEventTypes(['plugin-isolation/unused', '']), TypeError);
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.size, size);
+  KNOWN_SESSION_EVENT_TYPES.has = value => Set.prototype.has.call(KNOWN_SESSION_EVENT_TYPES, value);
+  try {
+    assert.throws(() => retainRequiredEventTypes(['plugin-isolation/unused']), { code: 'MEMORY_NATIVE_EVENT_CATALOG_UNSUPPORTED' });
+  } finally { delete KNOWN_SESSION_EVENT_TYPES.has; }
+  assert.equal(KNOWN_SESSION_EVENT_TYPES.size, size);
 });

@@ -1,0 +1,13 @@
+{
+  "schema": "johnason.dsh.host-components.v1",
+  "modules": [
+    "bootstrap",
+    "checkpoint",
+    "event-mapper",
+    "grant-channel",
+    "native-session",
+    "platform-contract",
+    "platform-runtime",
+    "server"
+  ]
+}

@@ -4,7 +4,8 @@ import { createInterface } from "node:readline";
 
 import { createCheckpoint, sealAcknowledgement } from "./checkpoint.ts";
 import { mapSessionEvents, sortPromptSections } from "./event-mapper.ts";
-import { runDeepSeekHarnessSession, DshSessionFailure } from "./native-session.ts";
+import { createNativeAdapter, DshSessionFailure } from "./native-session.ts";
+import { validateNativeAdapter } from "./platform-contract.ts";
 
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -234,7 +235,8 @@ function createNdjsonToolTransport(output) {
 }
 
 
-export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest }) {
+export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest, nativeAdapter = createNativeAdapter() }) {
+  const runNativeSession = validateNativeAdapter(nativeAdapter).run.bind(nativeAdapter);
   if (!grantChannel || typeof runtimeId !== "string" || typeof buildId !== "string") {
     throw new Error("DSH Host v2 bootstrap is invalid");
   }
@@ -346,7 +348,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
         active = state;
         const completion = (async () => {
           try {
-            const result = await runDeepSeekHarnessSession({
+            const result = await runNativeSession({
               materialized,
               provider: consumedGrant.provider,
               credential: () => credential,

@@ -10,6 +10,12 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 新版原生 Web 会在凭据 Vault 解锁前初始化浏览器认证。启动器仅将 `client-connection/browser-session` 这一个浏览器签名记录保存在当前应用进程内存中，保证解锁入口能启动；API Key 和业务系统授权仍必须通过加密 Vault。浏览器签名不写磁盘，服务重启后须用本次启动提供的原生认证链接重新进入。
 
+## 平台与本地插件
+
+官方模块解析、启动、profile 组合及兼容 SDK 集中在 `src/platform/`；Vault、记忆恢复、Forge/Data Platform 实现在 `src/plugins/`。原 `src` 入口继续转发，插件注册表保留公开路径，避免破坏已有 profile 的名称匹配条件。插件生命周期目前按每进程一个活动 runner 设计。
+
+共享版本策略位于 `mvp/src/workbench/runtime/deepseek_harness/platform-release.json`。升级时先运行 `npm --prefix apps/dsh-agent run check:platform`，再完成源码契约、构建及原生回归。此检查验证版本和依赖边界，不代替构建产物内容校验。不能彻底隔离的内部接口及建议见[边界与演进清单](../../docs/architecture/dsh-platform-plugin-boundary.md)。
+
 ## 环境要求
 
 - 实测平台：macOS、Node.js v22.20.0；Windows/Linux 尚未实测，不承诺相同的 TTY、目录选择器和信号行为。

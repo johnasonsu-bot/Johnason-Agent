@@ -2,7 +2,7 @@
 import { homedir } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
+import { nativeLoaderOptions } from './platform/runtime.mjs'
 import { spawn } from 'node:child_process'
 import { mkdir } from 'node:fs/promises'
 import { resolveLaunch } from './launch-config.mjs'
@@ -32,12 +32,11 @@ async function main() {
         process.exitCode = 1
       }
     } else {
-      const require = createRequire(resolve(launch.upstreamRoot, 'package.json'))
-      const hook = require.resolve('tsx/esm')
+      const { hook, tsconfig } = nativeLoaderOptions(launch.upstreamRoot)
       await mkdir(launch.dataRoot, { recursive: true, mode: 0o700 })
       const child = spawn(process.execPath, ['--import', hook, fileURLToPath(new URL('./native-runner.mjs', import.meta.url)), JSON.stringify({ ...launch, env: undefined })], {
         cwd: launch.workspace ?? launch.dataRoot,
-        env: { ...launch.env, TSX_TSCONFIG_PATH: resolve(launch.upstreamRoot, 'tsconfig.json') },
+        env: { ...launch.env, TSX_TSCONFIG_PATH: tsconfig },
         stdio: 'inherit',
       })
       const terminate = () => child.kill('SIGTERM')

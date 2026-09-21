@@ -1,32 +1,26 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PLATFORM_RELEASE, componentFiles } from "../src/platform-contract.ts";
 
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourceRoot = path.join(root, "src");
 const outputRoot = path.join(root, "dist");
-const repositoryPrefix = "mvp/sidecars/deepseek-harness";
-const expectedSourceEntries = [
-  "bootstrap.ts",
-  "checkpoint.ts",
-  "event-mapper.ts",
-  "grant-channel.ts",
-  "native-session.ts",
-  "server.ts",
-];
-const expectedArtifactEntries = [
-  "bootstrap.mjs",
-  "build-receipt.json",
-  "checkpoint.mjs",
-  "deepseek-harness-host-v2.mjs",
-  "deepseek-harness-model-host-v2.mjs",
-  "event-mapper.mjs",
-  "grant-channel.mjs",
-  "native-session.mjs",
-  "server.mjs",
-];
+const repositoryRoot = path.resolve(root, "../../..");
+const components = JSON.parse(await readFile(path.join(root, "component-manifest.json"), "utf8"));
+const { sourceEntries: expectedSourceEntries, sourceFiles, artifactFiles } = componentFiles(components);
+const expectedArtifactEntries = [...artifactFiles.map(relative => path.basename(relative)), "build-receipt.json"].sort();
+const upstreamRoot = path.join(repositoryRoot, "third_party/deepseek-harness");
+const upstreamPackage = JSON.parse(await readFile(path.join(upstreamRoot, "package.json"), "utf8"));
+const upstreamCli = JSON.parse(await readFile(path.join(upstreamRoot, "apps/cli/package.json"), "utf8"));
+const upstreamRevision = execFileSync("git", ["-C", upstreamRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+if (upstreamRevision !== PLATFORM_RELEASE.revision || upstreamCli.version !== PLATFORM_RELEASE.version
+    || upstreamPackage.packageManager !== PLATFORM_RELEASE.packageManager) {
+  throw new Error("DSH platform release does not match the official checkout");
+}
 
 
 function canonical(value) {
@@ -44,9 +38,9 @@ function digest(value) {
 
 
 async function fileRecord(relative) {
-  const payload = await readFile(path.join(root, relative));
+  const payload = await readFile(path.join(repositoryRoot, relative));
   return {
-    path: `${repositoryPrefix}/${relative}`,
+    path: relative,
     sha256: createHash("sha256").update(payload).digest("hex"),
     size: payload.length,
   };
@@ -99,28 +93,6 @@ await writeFile(
 );
 }
 
-const sourceFiles = [
-  "package.json",
-  "tsconfig.json",
-  "cordis.host-v2.yml",
-  "scripts/build.mjs",
-  "src/bootstrap.ts",
-  "src/checkpoint.ts",
-  "src/event-mapper.ts",
-  "src/grant-channel.ts",
-  "src/native-session.ts",
-  "src/server.ts",
-];
-const artifactFiles = [
-  "dist/bootstrap.mjs",
-  "dist/checkpoint.mjs",
-  "dist/deepseek-harness-host-v2.mjs",
-  "dist/deepseek-harness-model-host-v2.mjs",
-  "dist/event-mapper.mjs",
-  "dist/grant-channel.mjs",
-  "dist/native-session.mjs",
-  "dist/server.mjs",
-];
 const sources = await Promise.all(sourceFiles.map(fileRecord));
 const artifacts = await Promise.all(artifactFiles.map(fileRecord));
 const receipt = canonical({

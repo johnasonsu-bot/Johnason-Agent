@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "test:source": "node --experimental-strip-types --no-warnings --test tests/platform-contract.test.mjs tests/source-runtime.test.mjs",
     "test": "npm run build && node --experimental-strip-types --no-warnings --test tests/*.test.mjs"
   }
 }

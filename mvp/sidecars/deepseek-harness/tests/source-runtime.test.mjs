@@ -26,6 +26,7 @@ const hook = registerHooks({
   resolve(specifier, context, nextResolve) {
     const key = specifier.split("/third_party/deepseek-harness/")[1];
     if (!exportsByPath.has(key)) return nextResolve(specifier, context);
+    assert.ok(context.parentURL.endsWith("/src/platform-runtime.ts"), "upstream imports must cross the real platform boundary");
     return { url: `data:text/javascript,${encodeURIComponent(
       `export { ${exportsByPath.get(key)} } from ${JSON.stringify(fixtureUrl)};`,
     )}`, shortCircuit: true };
@@ -234,7 +235,7 @@ test("seeded assistant history carries the required compact stream field", async
   assert.equal(contexts[0].currentMessage.content[0].text, "Current question");
 });
 
-function modelQuery() {
+function modelQuery(options = {}) {
   const { payload } = JSON.parse(readFileSync(new URL("./runtime-query-v2-fixture.json", import.meta.url)));
   payload.envelope.provider_ref = "provider-profile:source-contract";
   payload.envelope.tool_manifest = [];
@@ -244,9 +245,36 @@ function modelQuery() {
     grantChannel: { consumeForEnvelope: envelope => ({
       acknowledgement: envelope, provider, secret: Buffer.from("source-fixture-only"),
     }) },
+    ...options,
   });
   return { sidecar, payload };
 }
+
+test("Host rejects an incompatible adapter before consuming a provider grant", () => {
+  let consumed = false;
+  assert.throws(() => modelQuery({
+    grantChannel: { consumeForEnvelope() { consumed = true; } },
+    nativeAdapter: { contractVersion: 2, capabilities: {}, run() {} },
+  }), /native adapter/);
+  assert.equal(consumed, false);
+});
+
+test("Host invokes the explicit adapter contract and preserves conservative capabilities", async () => {
+  const { NATIVE_ADAPTER_CAPABILITIES } = await import("../src/platform-contract.ts");
+  let input;
+  const { sidecar, payload } = modelQuery({ nativeAdapter: {
+    contractVersion: 1, capabilities: NATIVE_ADAPTER_CAPABILITIES,
+    async run(value) { input = value; return { content: "adapter result", nativeEvents: [] }; },
+  } });
+  const events = [];
+  await sidecar.startQuery(payload, event => events.push(event)).completion;
+  assert.equal(input.sessionId, payload.envelope.session_id);
+  assert.equal(typeof input.credential, "function");
+  assert.equal(typeof input.executeTool, "function");
+  assert.ok(input.signal instanceof AbortSignal);
+  assert.equal(events[0].payload.content, "adapter result");
+  for (const flag of ["tools", "plugins", "workspace", "pause_resume", "checkpoints"]) assert.equal(sidecar.capabilities()[flag], false);
+});
 
 test("Host v2 maps transient text chunks to ordered output deltas before completion", async () => {
   configureDriver(emitChunks);

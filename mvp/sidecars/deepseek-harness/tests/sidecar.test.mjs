@@ -216,7 +216,8 @@ test("build receipt binds actual artifacts to the exact sidecar source", () => {
   assert.equal(receipt.command, "npm run build");
   assert.match(receipt.source_digest, /^[0-9a-f]{64}$/);
   assert.match(receipt.artifact_digest, /^[0-9a-f]{64}$/);
-  assert.equal(receipt.artifacts.length, 8);
+  const components = JSON.parse(readFileSync(path.join(ROOT, "component-manifest.json"), "utf8"));
+  assert.equal(receipt.artifacts.length, components.modules.length + 2);
 });
 
 

@@ -16,17 +16,45 @@ import subprocess
 from typing import Any, Mapping
 
 
+class SourceReadinessError(RuntimeError):
+    """The pinned DSH checkout or canonical manifest is not source-ready."""
+
+
+def load_platform_release(path: Path) -> dict[str, Any]:
+    """Load the shared, secret-free release pin and supported adapter contract."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schema", "revision", "version", "packageManager", "adapterContract"}
+            or value.get("schema") != "johnason.dsh.platform.v1"
+            or not isinstance(value.get("revision"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", value["revision"]) is None
+            or not isinstance(value.get("version"), str)
+            or re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", value["version"]) is None
+            or not isinstance(value.get("packageManager"), str)
+            or re.fullmatch(r"pnpm@\d+\.\d+\.\d+", value["packageManager"]) is None
+            or type(value.get("adapterContract")) is not int
+            or value["adapterContract"] != 1
+        ):
+            raise ValueError
+    except (OSError, ValueError) as error:
+        raise SourceReadinessError("DeepSeek Harness platform release is missing, invalid or incompatible") from error
+    return value
+
+
+_PLATFORM_RELEASE = load_platform_release(Path(__file__).with_name("platform-release.json"))
+_PLATFORM_RELEASE_PATH = "mvp/src/workbench/runtime/deepseek_harness/platform-release.json"
 DSH_SUBMODULE_PATH = "third_party/deepseek-harness"
 DSH_SUBMODULE_URL = "https://github.com/deepseek-ai/deepseek-harness.git"
-DSH_PINNED_REVISION = "ddefc45fbc7f8e46dd73185e68295696d1297887"
+DSH_PINNED_REVISION = _PLATFORM_RELEASE["revision"]
 DSH_SOURCE_MANIFEST_SCHEMA = "workbench.runtime.dsh.source_manifest.v1"
 DSH_HOST_V2_BUILD_SCHEMA = "workbench.runtime.dsh.host_v2_build.v1"
 DSH_HOST_V2_BUILD_ID = "dsh:fixed-host-v2-smoke"
 DSH_MODEL_HOST_V2_BUILD_ID = "dsh:model-host-v2-r1"
 
-_DEPENDENCY_PREPARATION_COMMAND = (
-    "corepack pnpm@11.7.0 install --frozen-lockfile"
-)
 _RELEASE_TARGETS = (
     ("node24-linux-x64", "linux", "x64"),
     ("node24-linux-arm64", "linux", "arm64"),
@@ -48,28 +76,7 @@ _HOST_V2_ROOT = "mvp/sidecars/deepseek-harness"
 _HOST_V2_PRESET = f"{_HOST_V2_ROOT}/cordis.host-v2.yml"
 _HOST_V2_PACKAGE_LOCK = f"{_HOST_V2_ROOT}/package-lock.json"
 _HOST_V2_BUILD_RECEIPT = f"{_HOST_V2_ROOT}/dist/build-receipt.json"
-_HOST_V2_SOURCE_FILES = (
-    f"{_HOST_V2_ROOT}/package.json",
-    f"{_HOST_V2_ROOT}/tsconfig.json",
-    _HOST_V2_PRESET,
-    f"{_HOST_V2_ROOT}/scripts/build.mjs",
-    f"{_HOST_V2_ROOT}/src/bootstrap.ts",
-    f"{_HOST_V2_ROOT}/src/checkpoint.ts",
-    f"{_HOST_V2_ROOT}/src/event-mapper.ts",
-    f"{_HOST_V2_ROOT}/src/grant-channel.ts",
-    f"{_HOST_V2_ROOT}/src/native-session.ts",
-    f"{_HOST_V2_ROOT}/src/server.ts",
-)
-_HOST_V2_ARTIFACT_FILES = (
-    f"{_HOST_V2_ROOT}/dist/bootstrap.mjs",
-    f"{_HOST_V2_ROOT}/dist/checkpoint.mjs",
-    f"{_HOST_V2_ROOT}/dist/deepseek-harness-host-v2.mjs",
-    f"{_HOST_V2_ROOT}/dist/deepseek-harness-model-host-v2.mjs",
-    f"{_HOST_V2_ROOT}/dist/event-mapper.mjs",
-    f"{_HOST_V2_ROOT}/dist/grant-channel.mjs",
-    f"{_HOST_V2_ROOT}/dist/native-session.mjs",
-    f"{_HOST_V2_ROOT}/dist/server.mjs",
-)
+_HOST_V2_COMPONENT_MANIFEST = f"{_HOST_V2_ROOT}/component-manifest.json"
 _FIXED_HOST_V2_PLUGINS = (
     "@deepseek-ai/dsh-agent",
     "@deepseek-ai/dsh-session-persistence-jsonl",
@@ -77,10 +84,6 @@ _FIXED_HOST_V2_PLUGINS = (
     "@deepseek-ai/dsh-llm-deepseek",
     "@johnason/deepseek-harness-host-v2",
 )
-
-
-class SourceReadinessError(RuntimeError):
-    """The pinned DSH checkout or canonical manifest is not source-ready."""
 
 
 def canonical_manifest_bytes(document: Mapping[str, Any]) -> bytes:
@@ -235,9 +238,36 @@ def _require_exact_regular_file_set(
         )
 
 
+def _host_v2_component_files(repository_root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    path = repository_root / _HOST_V2_COMPONENT_MANIFEST
+    if path.is_symlink():
+        raise SourceReadinessError("DeepSeek Harness component manifest must be a regular file")
+    manifest = _load_json(path, "DeepSeek Harness component manifest")
+    modules = manifest.get("modules")
+    if (
+        set(manifest) != {"schema", "modules"}
+        or manifest.get("schema") != "johnason.dsh.host-components.v1"
+        or not isinstance(modules, list) or not modules
+        or any(not isinstance(name, str) or re.fullmatch(r"[a-z]+(?:-[a-z]+)*", name) is None for name in modules)
+        or modules != sorted(set(modules))
+        or not {"bootstrap", "checkpoint", "event-mapper", "grant-channel", "native-session", "platform-contract", "platform-runtime", "server"}.issubset(modules)
+    ):
+        raise SourceReadinessError("DeepSeek Harness component manifest is missing or invalid")
+    sources = tuple(f"{_HOST_V2_ROOT}/{relative}" for relative in (
+        "package.json", "tsconfig.json", "cordis.host-v2.yml", "scripts/build.mjs", "component-manifest.json",
+        *(f"src/{name}.ts" for name in modules),
+    )) + (_PLATFORM_RELEASE_PATH,)
+    artifacts = tuple(f"{_HOST_V2_ROOT}/dist/{name}" for name in sorted((
+        *(f"{name}.mjs" for name in modules),
+        "deepseek-harness-host-v2.mjs", "deepseek-harness-model-host-v2.mjs",
+    )))
+    return sources, artifacts
+
+
 def _host_v2_sidecar_manifest(repository_root: Path) -> dict[str, Any]:
     """Return exact fixed-sidecar source and materialized artifact evidence."""
 
+    source_files, artifact_files = _host_v2_component_files(repository_root)
     package = _load_json(
         repository_root / f"{_HOST_V2_ROOT}/package.json",
         "DeepSeek Harness Host v2 package.json",
@@ -278,8 +308,8 @@ def _host_v2_sidecar_manifest(repository_root: Path) -> dict[str, Any]:
         f"{_HOST_V2_ROOT}/src",
         {
             Path(relative_path).name
-            for relative_path in _HOST_V2_SOURCE_FILES
-            if "/src/" in relative_path
+            for relative_path in source_files
+            if relative_path.startswith(f"{_HOST_V2_ROOT}/src/")
         },
         "source",
     )
@@ -287,19 +317,19 @@ def _host_v2_sidecar_manifest(repository_root: Path) -> dict[str, Any]:
         repository_root,
         f"{_HOST_V2_ROOT}/dist",
         {
-            *(Path(relative_path).name for relative_path in _HOST_V2_ARTIFACT_FILES),
+            *(Path(relative_path).name for relative_path in artifact_files),
             Path(_HOST_V2_BUILD_RECEIPT).name,
         },
         "dist",
     )
     source_records = [
         _file_record(repository_root, relative_path)
-        for relative_path in _HOST_V2_SOURCE_FILES
+        for relative_path in source_files
     ]
     try:
         artifact_records = [
             _file_record(repository_root, relative_path)
-            for relative_path in _HOST_V2_ARTIFACT_FILES
+            for relative_path in artifact_files
         ]
     except SourceReadinessError as error:
         raise SourceReadinessError(
@@ -447,12 +477,18 @@ class DeepSeekSourceVerifier:
 
         repository_root = repository_root.resolve()
         source = self._verify_source_checkout(repository_root)
+        release = load_platform_release(repository_root / _PLATFORM_RELEASE_PATH)
+        if release["revision"] != self.expected_revision:
+            raise SourceReadinessError("DeepSeek Harness platform release revision drift")
+        cli_package = _load_json(source / "apps/cli/package.json", "CLI package.json")
+        if cli_package.get("version") != release["version"]:
+            raise SourceReadinessError("DeepSeek Harness platform release version drift")
 
         root_package = _load_json(source / "package.json", "root package.json")
         package_manager = root_package.get("packageManager")
         engines = root_package.get("engines")
         workspaces = root_package.get("workspaces")
-        if package_manager != "pnpm@11.7.0":
+        if package_manager != release["packageManager"]:
             raise SourceReadinessError("DeepSeek Harness package-manager declaration drift")
         if not isinstance(engines, dict) or not isinstance(engines.get("node"), str):
             raise SourceReadinessError("DeepSeek Harness Node engine declaration is missing")
@@ -521,7 +557,7 @@ class DeepSeekSourceVerifier:
                 _file_record(source, path) for path in _BUILD_POLICY_FILES
             ],
             "dependency_preparation": {
-                "command": _DEPENDENCY_PREPARATION_COMMAND,
+                "command": f"corepack {package_manager} install --frozen-lockfile",
                 "separate_from_release_build": True,
                 "frozen_lockfile": True,
             },
@@ -532,7 +568,7 @@ class DeepSeekSourceVerifier:
                         "host_os": host_os,
                         "host_arch": host_arch,
                         "command": (
-                            "corepack pnpm@11.7.0 exec tsx "
+                            f"corepack {package_manager} exec tsx "
                             "scripts/build-exe-for-python-sdk.ts "
                             f"--targets={target}"
                         ),

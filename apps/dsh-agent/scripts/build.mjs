@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { readPlatformRelease, platformPaths } from '../src/platform/runtime.mjs'
 
-export const PINNED_DSH_SHA = 'ddefc45fbc7f8e46dd73185e68295696d1297887'
+const release = readPlatformRelease()
+export const PINNED_DSH_SHA = release.revision
 
 export function runNativeBuild({ repoRoot, spawn = spawnSync, env = process.env }) {
-  const upstreamRoot = join(repoRoot, 'third_party/deepseek-harness')
+  const { upstreamRoot } = platformPaths(repoRoot)
   const revision = spawn('git', ['rev-parse', 'HEAD'], {
     cwd: upstreamRoot,
     encoding: 'utf8',
@@ -26,8 +28,8 @@ export function runNativeBuild({ repoRoot, spawn = spawnSync, env = process.env 
   // dependency lifecycle scripts and all build checks still run normally.
   const childEnv = { ...env, CI: 'true' }
   const commands = [
-    ['corepack', ['pnpm@11.7.0', 'install', '--frozen-lockfile']],
-    ['corepack', ['pnpm@11.7.0', 'run', 'build']],
+    ['corepack', [release.packageManager, 'install', '--frozen-lockfile']],
+    ['corepack', [release.packageManager, 'run', 'build']],
   ]
   for (const [command, args] of commands) {
     const result = spawn(command, args, {

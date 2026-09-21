@@ -6,6 +6,7 @@
     "johnason-dsh": "src/cli.mjs"
   },
   "scripts": {
+    "check:platform": "node scripts/check-platform.mjs",
     "start": "node src/cli.mjs web",
     "headless": "node src/cli.mjs headless",
     "build:native": "node scripts/build.mjs",

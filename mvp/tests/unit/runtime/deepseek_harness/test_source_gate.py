@@ -13,11 +13,48 @@ from workbench.runtime.engine_host.v2.contracts import (
     RuntimeQueryInputV2,
 )
 from workbench.runtime.deepseek_harness.source_gate import (
+    DSH_PINNED_REVISION,
     DeepSeekSourceVerifier,
     SourceReadinessError,
     canonical_manifest_bytes,
+    load_platform_release,
     select_release_build_command,
 )
+
+
+def test_shared_platform_release_is_the_exported_pin() -> None:
+    from workbench.runtime.deepseek_harness import source_gate
+
+    release = load_platform_release(Path(source_gate.__file__).with_name("platform-release.json"))
+    assert release["revision"] == DSH_PINNED_REVISION
+    assert release["adapterContract"] == 1
+
+
+@pytest.mark.parametrize("patch", [
+    {"revision": "HEAD"}, {"version": "latest"}, {"packageManager": "pnpm"},
+    {"adapterContract": 2}, {"adapterContract": True}, {"extra": True},
+])
+def test_platform_release_rejects_invalid_fields(tmp_path: Path, patch: dict) -> None:
+    from workbench.runtime.deepseek_harness import source_gate
+
+    release = load_platform_release(Path(source_gate.__file__).with_name("platform-release.json"))
+    target = tmp_path / "release.json"
+    _write(target, json.dumps({**release, **patch}))
+    with pytest.raises(SourceReadinessError, match="platform release"):
+        load_platform_release(target)
+
+
+def test_platform_release_rejects_missing_fields_and_file(tmp_path: Path) -> None:
+    from workbench.runtime.deepseek_harness import source_gate
+
+    release = load_platform_release(Path(source_gate.__file__).with_name("platform-release.json"))
+    target = tmp_path / "release.json"
+    with pytest.raises(SourceReadinessError, match="platform release"):
+        load_platform_release(target)
+    for field in release:
+        _write(target, json.dumps({key: value for key, value in release.items() if key != field}))
+        with pytest.raises(SourceReadinessError, match="platform release"):
+            load_platform_release(target)
 
 
 def test_published_wire_fixture_is_a_shared_host_v2_query() -> None:
@@ -120,35 +157,23 @@ def _write_host_v2_sidecar(root: Path) -> None:
         )
         + "\n",
     )
+    checked_in_sidecar = Path(__file__).resolve().parents[4] / "sidecars" / "deepseek-harness"
+    components = json.loads((checked_in_sidecar / "component-manifest.json").read_text(encoding="utf-8"))
+    _write(sidecar / "component-manifest.json", json.dumps(components) + "\n")
     source_relatives = (
-        "package.json",
-        "tsconfig.json",
-        "cordis.host-v2.yml",
-        "scripts/build.mjs",
-        "src/bootstrap.ts",
-        "src/checkpoint.ts",
-        "src/event-mapper.ts",
-        "src/grant-channel.ts",
-        "src/native-session.ts",
-        "src/server.ts",
+        "package.json", "tsconfig.json", "cordis.host-v2.yml", "scripts/build.mjs", "component-manifest.json",
+        *(f"src/{name}.ts" for name in components["modules"]),
     )
-    for relative in source_relatives[3:]:
+    for relative in ("scripts/build.mjs", *(f"src/{name}.ts" for name in components["modules"])):
         _write(sidecar / relative, f"// fixture {relative}\n")
-    artifact_names = (
-        "bootstrap.mjs",
-        "checkpoint.mjs",
-        "deepseek-harness-host-v2.mjs",
-        "deepseek-harness-model-host-v2.mjs",
-        "event-mapper.mjs",
-        "grant-channel.mjs",
-        "native-session.mjs",
-        "server.mjs",
-    )
+    artifact_names = sorted((
+        *(f"{name}.mjs" for name in components["modules"]),
+        "deepseek-harness-host-v2.mjs", "deepseek-harness-model-host-v2.mjs",
+    ))
     for artifact in artifact_names:
         _write(sidecar / "dist" / artifact, f"// built fixture {artifact}\n")
 
-    def record(relative: str) -> dict[str, object]:
-        repository_relative = f"mvp/sidecars/deepseek-harness/{relative}"
+    def record(repository_relative: str) -> dict[str, object]:
         payload = (root / repository_relative).read_bytes()
         return {
             "path": repository_relative,
@@ -162,8 +187,9 @@ def _write_host_v2_sidecar(root: Path) -> None:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    sources = [record(relative) for relative in source_relatives]
-    artifacts = [record(f"dist/{name}") for name in artifact_names]
+    sources = [record(f"mvp/sidecars/deepseek-harness/{relative}") for relative in source_relatives]
+    sources.append(record("mvp/src/workbench/runtime/deepseek_harness/platform-release.json"))
+    artifacts = [record(f"mvp/sidecars/deepseek-harness/dist/{name}") for name in artifact_names]
     _write(
         sidecar / "dist" / "build-receipt.json",
         json.dumps(
@@ -217,7 +243,7 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
     )
     _write(
         source / "apps" / "cli" / "package.json",
-        json.dumps({"name": "@deepseek-ai/dsh", "bin": {"dsh": "lib/bin.js"}}),
+        json.dumps({"name": "@deepseek-ai/dsh", "version": "0.1.6-alpha.2", "bin": {"dsh": "lib/bin.js"}}),
     )
     _write(
         source / "apps" / "cli" / "src" / "bin.ts",
@@ -262,6 +288,9 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
     )
     manifest_path = root / "mvp" / "src" / "workbench" / "runtime" / "deepseek_harness" / "source_manifest.json"
     manifest_path.parent.mkdir(parents=True)
+    from workbench.runtime.deepseek_harness import source_gate
+    release = load_platform_release(Path(source_gate.__file__).with_name("platform-release.json"))
+    _write(manifest_path.with_name("platform-release.json"), json.dumps({**release, "revision": revision}) + "\n")
     _write_host_v2_sidecar(root)
     manifest_path.write_bytes(canonical_manifest_bytes(verifier.build_manifest(root)))
     return root, verifier, manifest_path
@@ -628,3 +657,62 @@ def test_missing_submodule_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(SourceReadinessError, match="submodule"):
         verifier.verify(tmp_path, manifest_path)
+
+
+@pytest.mark.parametrize("field,value,match", [
+    ("revision", "0" * 40, "release revision drift"),
+    ("version", "0.0.0", "release version drift"),
+    ("packageManager", "pnpm@0.0.0", "package-manager declaration drift"),
+    ("adapterContract", 2, "platform release"),
+])
+def test_shared_release_drift_fails_closed(source_repository, field, value, match) -> None:
+    root, verifier, manifest_path = source_repository
+    release_path = manifest_path.with_name("platform-release.json")
+    release = json.loads(release_path.read_text(encoding="utf-8"))
+    _write(release_path, json.dumps({**release, field: value}))
+    with pytest.raises(SourceReadinessError, match=match):
+        verifier.verify(root, manifest_path)
+
+
+def test_shared_release_bytes_are_bound_to_build_receipt(source_repository) -> None:
+    root, verifier, manifest_path = source_repository
+    release_path = manifest_path.with_name("platform-release.json")
+    _write(release_path, release_path.read_text(encoding="utf-8") + "\n")
+    with pytest.raises(SourceReadinessError, match="build receipt source digest"):
+        verifier.verify(root, manifest_path)
+
+
+@pytest.mark.parametrize("name", ["platform-runtime", "platform-contract"])
+def test_new_adapter_modules_are_bound_to_build_receipt(source_repository, name) -> None:
+    root, verifier, manifest_path = source_repository
+    _write(root / "mvp" / "sidecars" / "deepseek-harness" / "src" / f"{name}.ts", "// changed adapter\n")
+    with pytest.raises(SourceReadinessError, match="build receipt source digest"):
+        verifier.verify(root, manifest_path)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unknown", "duplicate", "escape", "unsorted"])
+def test_component_declaration_rejects_invalid_inventory(source_repository, mutation) -> None:
+    root, verifier, manifest_path = source_repository
+    path = root / "mvp" / "sidecars" / "deepseek-harness" / "component-manifest.json"
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "missing":
+        document["modules"].remove("platform-runtime")
+    elif mutation == "unknown":
+        document["extra"] = True
+    elif mutation == "duplicate":
+        document["modules"].append(document["modules"][0])
+    elif mutation == "escape":
+        document["modules"].append("../escape")
+    else:
+        document["modules"].reverse()
+    _write(path, json.dumps(document))
+    with pytest.raises(SourceReadinessError, match="component manifest"):
+        verifier.verify(root, manifest_path)
+
+
+def test_component_declaration_bytes_are_bound_to_build_receipt(source_repository) -> None:
+    root, verifier, manifest_path = source_repository
+    path = root / "mvp" / "sidecars" / "deepseek-harness" / "component-manifest.json"
+    _write(path, path.read_text(encoding="utf-8") + "\n")
+    with pytest.raises(SourceReadinessError, match="build receipt source digest"):
+        verifier.verify(root, manifest_path)
