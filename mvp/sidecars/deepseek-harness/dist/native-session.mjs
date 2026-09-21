@@ -1,26 +1,10 @@
-import { Context } from "../../../../third_party/deepseek-harness/vendor/cordis/lib/index.js";
-import AgentLoop from "../../../../third_party/deepseek-harness/packages/core/agent-loop/lib/index.js";
-import AgentRegistry from "../../../../third_party/deepseek-harness/packages/core/agent/lib/index.js";
-import SessionStore, {
-  Session,
-  SessionId,
-} from "../../../../third_party/deepseek-harness/packages/core/session/lib/index.js";
-import SystemPrompt from "../../../../third_party/deepseek-harness/packages/core/system-prompt/lib/index.js";
-import ToolRuntime, {
-  assertObjectJsonSchema,
-} from "../../../../third_party/deepseek-harness/packages/core/tools/lib/index.js";
-import LlmRuntime, {
-  LlmError,
-  createAssistantMessage,
-  createUserMessage,
-} from "../../../../third_party/deepseek-harness/packages/llm/llm/lib/index.js";
 import {
-  DeepSeekAdapter,
-  resolveAdapterOptions,
-} from "../../../../third_party/deepseek-harness/packages/llm/llm-deepseek/lib/index.js";
-import {
-  MAX_TIMER_DELAY_MS,
-} from "../../../../third_party/deepseek-harness/packages/util/timeout/lib/index.js";
+  Context, AgentLoop, AgentRegistry, SessionStore, Session, SessionId,
+  SessionProjections, SystemPrompt, ToolRuntime, assertObjectJsonSchema,
+  LlmRuntime, LlmError, createAssistantMessage, createSystemMessage,
+  createUserMessage, DeepSeekAdapter, resolveAdapterOptions, MAX_TIMER_DELAY_MS,
+} from "./platform-runtime.mjs";
+import { PLATFORM_RELEASE, NATIVE_ADAPTER_CAPABILITIES } from "./platform-contract.mjs";
 
 const PLATFORM_RUN_IDENTITY_FIELDS = Object.freeze([
   "session_id", "run_id", "term_id", "step_id", "command_id", "agent_id", "agent_role",
@@ -200,6 +184,20 @@ export function registerPlatformTools(ctx, {
 function historySeed(messages, provider, model, sessionId) {
   const seed = Session.create(SessionId(`${sessionId}:seed`));
   let turn = 0;
+  let openStep = false;
+  if (messages.length !== 0) {
+    // V3 requires its protected system node before every historical surface
+    // message, inside an open step. The loop replaces this empty head with
+    // the assembled platform prompt when admitting the current request.
+    turn = 1;
+    seed.append("turn/start", { turn });
+    seed.append("step/start", { turn, step: 1 });
+    seed.append("system/message", {
+      turn, step: 1,
+      message: createSystemMessage("", "@deepseek-ai/dsh-system-prompt"),
+    }, { surfaceOp: "append" });
+    openStep = true;
+  }
   for (const message of messages) {
     if (message.role === "user") {
       seed.append("user/message", createUserMessage({
@@ -211,17 +209,27 @@ function historySeed(messages, provider, model, sessionId) {
     if (message.role !== "assistant") {
       throw new Error("DSH native Session history supports user and assistant roles only");
     }
-    turn += 1;
-    seed.append("turn/start", { turn });
-    seed.append("step/start", { turn, step: 1 });
+    if (!openStep) {
+      turn += 1;
+      seed.append("turn/start", { turn });
+      seed.append("step/start", { turn, step: 1 });
+    }
     seed.append("assistant/message", {
       turn,
       step: 1,
+      stream: [],
       message: createAssistantMessage({
         content: [{ type: "text", text: message.content }],
         source: { provider, model },
       }),
     }, { surfaceOp: "append" });
+    seed.append("step/end", { turn, step: 1 });
+    seed.append("turn/end", { turn, reason: { kind: "completed" } });
+    openStep = false;
+  }
+  // An input may supply earlier user context without any assistant response.
+  // Close the head's setup step so the live loop starts a fresh balanced turn.
+  if (openStep) {
     seed.append("step/end", { turn, step: 1 });
     seed.append("turn/end", { turn, reason: { kind: "completed" } });
   }
@@ -264,6 +272,7 @@ function realProviderAdapter(provider, credential) {
     throw new Error("DSH upstream adapter does not accept custom metadata headers");
   }
   const connection = resolveAdapterOptions({
+    protocol: "chat-completions",
     baseURL: route.base_url,
     thinking: route.thinking_enabled ? "enabled" : "disabled",
     reasoningEffort: route.thinking_enabled ? route.reasoning_effort : "off",
@@ -287,6 +296,7 @@ export async function runDeepSeekHarnessSession({
   runIdentity,
   executeTool,
   onEvent = () => {},
+  onChunk = () => {},
   adapter = realProviderAdapter,
 }) {
   if (signal.aborted) throw signal.reason ?? new Error("DSH Session was cancelled");
@@ -305,10 +315,11 @@ export async function runDeepSeekHarnessSession({
   try {
     await ctx.plugin(LlmRuntime);
     await ctx.plugin(SessionStore);
+    await ctx.plugin(SessionProjections);
     await ctx.plugin(SystemPrompt, {
       includeHarnessIdentity: false,
       includeRuntimeContext: true,
-      persona: "",
+      personaPrefix: "",
     });
     await ctx.plugin(ToolRuntime);
     if (toolManifest.length !== 0) {
@@ -320,12 +331,15 @@ export async function runDeepSeekHarnessSession({
     ctx.llm.registerAdapter([route], adapter(provider, credential));
     ctx.on("session/event", (_session, event) => {
       onEvent(event);
-      if (event.type === "assistant/chunk"
-          && event.data?.chunk?.type === "text-delta") {
-        content += event.data.chunk.text;
-      }
       if (event.type === "assistant/message") {
         content = messageText(event.data.message);
+      }
+    });
+    ctx.on("agent/assistant-stream", ({ agent: streamingAgent, frame }) => {
+      if (streamingAgent !== agent || frame.type !== "chunk") return;
+      onChunk(frame.chunk);
+      if (frame.chunk.type === "text-delta") {
+        content += frame.chunk.text;
       }
     });
     const published = await ctx.agentLoop.createAgent(ctx, {
@@ -369,4 +383,14 @@ export async function runDeepSeekHarnessSession({
     if (abort !== undefined) signal.removeEventListener("abort", abort);
     await ctx.fiber.dispose();
   }
+}
+
+
+/** Host execution contract; compatibility with upstream stays inside this module. */
+export function createNativeAdapter() {
+  return Object.freeze({
+    contractVersion: PLATFORM_RELEASE.adapterContract,
+    capabilities: NATIVE_ADAPTER_CAPABILITIES,
+    run: runDeepSeekHarnessSession,
+  });
 }

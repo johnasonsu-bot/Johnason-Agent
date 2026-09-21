@@ -4,7 +4,8 @@ import { createInterface } from "node:readline";
 
 import { createCheckpoint, sealAcknowledgement } from "./checkpoint.mjs";
 import { mapSessionEvents, sortPromptSections } from "./event-mapper.mjs";
-import { runDeepSeekHarnessSession, DshSessionFailure } from "./native-session.mjs";
+import { createNativeAdapter, DshSessionFailure } from "./native-session.mjs";
+import { validateNativeAdapter } from "./platform-contract.mjs";
 
 
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -234,7 +235,8 @@ function createNdjsonToolTransport(output) {
 }
 
 
-export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest }) {
+export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest, nativeAdapter = createNativeAdapter() }) {
+  const runNativeSession = validateNativeAdapter(nativeAdapter).run.bind(nativeAdapter);
   if (!grantChannel || typeof runtimeId !== "string" || typeof buildId !== "string") {
     throw new Error("DSH Host v2 bootstrap is invalid");
   }
@@ -346,7 +348,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
         active = state;
         const completion = (async () => {
           try {
-            const result = await runDeepSeekHarnessSession({
+            const result = await runNativeSession({
               materialized,
               provider: consumedGrant.provider,
               credential: () => credential,
@@ -360,10 +362,7 @@ export function createSidecar({ grantChannel, runtimeId, buildId, instanceDigest
                 }
                 return toolTransport.execute(call);
               },
-              onEvent: nativeEvent => {
-                const chunk = nativeEvent.type === "assistant/chunk"
-                  ? nativeEvent.data?.chunk
-                  : null;
+              onChunk: chunk => {
                 if (active !== state) return;
                 if (chunk?.type === "text-delta" && chunk.text.length !== 0) {
                   const [event] = mapSessionEvents(identity, [

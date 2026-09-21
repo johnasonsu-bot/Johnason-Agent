@@ -30,7 +30,8 @@
 - [x] Isolate Workbench official imports, add an adapter contract boundary, update sidecar source/artifact inventories and regression tests. Preserve declared capabilities.
 - [x] Add platform/plugin boundary audit and upgrade contract command, and an evidence-based unresolved-isolation/evolution list.
 - [ ] Run source tests and review; inspect actual automatic cleanup targets and obtain the user-required cleanup confirmation.
-- [ ] Install frozen dependencies and build official runtime and sidecar. Generate real receipts/manifests, run available native and browser integration, report any blocked test accurately.
+- [x] Build the non-deleting sidecar and generate real receipt/source/gate manifests; verify source-build provenance without claiming native runtime acceptance.
+- [ ] Install frozen dependencies and build official runtime after cleanup confirmation. Run native and browser integration and report any blocked test accurately.
 - [ ] Commit code and verified generated artifacts, keeping source changes separate from post-build attestation when necessary for HEAD-bound gates.
 
 Focused baseline from the preceding upgrade is 134 passing source checks. Run new contract checks first to observe missing boundaries, then retain behavior checks during the refactor. Run built integration only after the concrete cleanup authorization.

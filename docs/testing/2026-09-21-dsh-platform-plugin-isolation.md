@@ -24,4 +24,8 @@
 
 ## 构建状态
 
-待用户确认官方构建的具体生成物/临时文件自动清理范围后执行冻结安装和构建。当前尚未执行本轮原生或 sidecar 构建、生成 receipt/manifest 或完整原生验收；保留的旧产物不能用于证明本轮代码已构建。原工作目录及运行版本未切换。
+无需删除文件的 Sidecar 构建已执行：在 `mvp/sidecars/deepseek-harness` 运行 `node scripts/build.mjs`，退出 0；生成 10 个可执行模块/入口和真实 `build-receipt.json`。
+
+随后依次运行 `verify_deepseek_harness_source.py --write-manifest`、`build_python_term_gate_manifest.py`，并重新执行 DSH verifier。结果为 `GO_DSH_SOURCE_READY`，摘要 `ee0dfd77cc1801be1861ff2a2d2723cf317e3b97cfc05e9ed440bd70acff8a82`，范围明确是 `source_build_provenance_only`。Python gate manifest 已重生成（163 个 generated files、7 个 build inputs），这不等于完整 Python Term gate 或官方原生运行验收。
+
+官方运行时的冻结依赖安装、native/Web 构建和完整原生验收仍待用户确认自动清理范围；没有执行这部分构建。原工作目录及运行版本未切换。
