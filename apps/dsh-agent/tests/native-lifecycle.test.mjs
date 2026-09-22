@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { mkdtemp, mkdir, copyFile, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -56,6 +56,9 @@ test('occupied port fails visibly and leaves the existing listener alive', { tim
 test('native profile loads local MCP and Skill; normal restart restores workspace/session and relocks Vault', { timeout: 80000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-restart-'));
   const workspace = await mkdtemp(join(tmpdir(), 'dsh-skill-workspace-'));
+  // TMPDIR may be inside the candidate repository. Give this fixture its own
+  // project root so native skill discovery cannot ascend into the parent repo.
+  execFileSync('git', ['init', '--quiet', workspace]);
   await mkdir(join(workspace, '.dsh/skills/dsh-acceptance-marker'), { recursive: true });
   await copyFile(fixture('acceptance-skill/SKILL.md'), join(workspace, '.dsh/skills/dsh-acceptance-marker/SKILL.md'));
   const patch = join(root, 'fixture.patch.json');

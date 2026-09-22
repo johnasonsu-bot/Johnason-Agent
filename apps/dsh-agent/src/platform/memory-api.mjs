@@ -47,3 +47,20 @@ export function retainRequiredEventTypes(types) {
     }
   };
 }
+
+/**
+ * Bridge the pinned Session read API for the existing synchronous memory hooks.
+ * Upstream marks snapshotEvents deprecated; a future projection/persistence
+ * adapter must replace this seam before that API disappears. Never treat a
+ * missing snapshot as an empty history, which could bypass activation guards.
+ */
+export function snapshotSessionEvents(session, from = 0, to = undefined) {
+  if (typeof session?.snapshotEvents !== 'function') {
+    throw Object.assign(new Error('Pinned native Session snapshot API is unavailable'), { code: 'MEMORY_NATIVE_SESSION_API_UNSUPPORTED' });
+  }
+  const events = session.snapshotEvents(from, to);
+  if (!Array.isArray(events)) {
+    throw Object.assign(new Error('Pinned native Session snapshot is not an event array'), { code: 'MEMORY_NATIVE_SESSION_API_UNSUPPORTED' });
+  }
+  return events;
+}

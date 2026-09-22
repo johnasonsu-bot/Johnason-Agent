@@ -34,12 +34,16 @@ export const createSystemMessage = (text, plugin) => Object.freeze({
 export const isReplacementSurfaceEvent = event => typeof event.surfaceOp === "object";
 
 export class Session {
+  #log = [];
   static create(id) { return new Session(id); }
-  constructor(id) { this.id = id; this.events = []; this.surface = { nodes: [] }; }
-  eventAt(seq) { return this.events[seq]; }
+  constructor(id) { this.id = id; this.surface = { nodes: [] }; }
+  eventAt(seq) { return this.#log[seq]; }
+  snapshotEvents(fromSeq = 0, toSeqExclusive = this.#log.length) {
+    return Object.freeze(this.#log.slice(fromSeq, toSeqExclusive));
+  }
   append(type, data, options = {}) {
-    const event = { seq: this.events.length, time: Date.now(), type, data, ...options };
-    this.events.push(event);
+    const event = { seq: this.#log.length, time: Date.now(), type, data, ...options };
+    this.#log.push(event);
     if (options.surfaceOp === "append") this.surface.nodes.push(event.seq);
     else if (options.surfaceOp?.op === "replace") {
       const first = this.surface.nodes.indexOf(options.surfaceOp.startSeq);
@@ -51,7 +55,12 @@ export class Session {
 }
 
 export class DeepSeekAdapter {
-  constructor(connection) { this.connection = connection; }
+  constructor(connection) {
+    if (typeof connection.prepareExtensions !== "function") {
+      throw new Error("DeepSeekAdapter requires the request-extension preparation contract");
+    }
+    this.connection = connection;
+  }
 }
 export function resolveAdapterOptions(config) {
   // The new upstream default is messages. A missing explicit protocol must

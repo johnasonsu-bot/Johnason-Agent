@@ -25,11 +25,11 @@ test('memory UI creates an operator-selected workspace with direct native busine
   const calls = [];
   const handler = createMemoryRecoveryHandler({}, {
     async create(request) { calls.push(request); return { sessionId: request.sessionId }; },
-  });
+  }, { workspaceController: { async create(request) { calls.push(request); return { workspace: { workspaceId: 'workspace-native', path: workspaceRoot } }; } } });
   const result = await post(handler, 'create-session', { workspaceRoot });
   assert.equal(result.status, 200);
   assert.match(result.body.value.sessionId, /^session-[0-9a-f-]{36}$/);
-  assert.deepEqual(calls, [{ sessionId: result.body.value.sessionId, cwd: workspaceRoot }]);
+  assert.deepEqual(calls, [{ path: workspaceRoot }, { sessionId: result.body.value.sessionId, workspaceId: 'workspace-native' }]);
   assert.equal(result.body.value.workspaceRoot, workspaceRoot);
 });
 
@@ -46,7 +46,7 @@ test('memory UI reattaches only proven root history and shares concurrent attach
       return { items: [{ sessionId: 'saved-root', cwd: '/saved-workspace', running: false }] };
     },
     async create(request) { creates.push(request); await new Promise(resolve => setImmediate(resolve)); attached = true; return { sessionId: request.sessionId }; },
-  });
+  }, { workspaceRegistry: { create() { assert.fail('reading historical config must not create or associate workspaces'); } } });
   const results = await Promise.all([post(handler, 'config', { sessionId: 'saved-root' }), post(handler, 'config', { sessionId: 'saved-root' })]);
   assert.deepEqual(results, [0, 1].map(() => ({ status: 200, body: { value: config } })));
   assert.equal(listed, 1);
@@ -66,11 +66,37 @@ test('memory UI refuses unknown, subagent and nonabsolute historical identities 
 test('memory UI contains direct native creation exceptions and unexpected identities', async () => {
   const workspaceRoot = await realpath(new URL('..', import.meta.url));
   for (const create of [async () => { throw new Error('native-private-detail'); }, async () => ({ sessionId: 'different-existing-id' })]) {
-    const result = await post(createMemoryRecoveryHandler({}, { create }), 'create-session', { workspaceRoot });
+    const result = await post(createMemoryRecoveryHandler({}, { create }, { workspaceController: {
+      async create() { return { workspace: { workspaceId: 'workspace-native', path: workspaceRoot } }; },
+    } }), 'create-session', { workspaceRoot });
     assert.equal(result.status, 400);
     assert.equal(result.body.code, 'MEMORY_NATIVE_CREATE_FAILED');
     assert.equal(JSON.stringify(result).includes('native-private-detail'), false);
   }
+});
+
+test('explicit configure associates the validated existing session without resuming it', async () => {
+  const calls = []; const scope = { sessionId: 'saved-root', workspaceRoot: '/saved-workspace' };
+  const handler = createMemoryRecoveryHandler({ async configureSession(id, input, options) {
+    assert.equal(id, scope.sessionId); assert.equal(options.expectedVersion, 0);
+    await options.beforeCommit(scope); return { ...scope, version: 1 };
+  } }, { create() { assert.fail('association must not recreate or resume an existing session'); } }, {
+    workspaceRegistry: { async create(path) { calls.push(['workspace', path]); return { path, async attachSession(id) { calls.push(['attach', id]); } }; } },
+  });
+  const result = await post(handler, 'configure', { sessionId: scope.sessionId, expectedVersion: 0, input: {} });
+  assert.equal(result.status, 200);
+  assert.deepEqual(calls, [['workspace', scope.workspaceRoot], ['attach', scope.sessionId]]);
+});
+
+test('workspace association failures are contained before the configuration commit', async () => {
+  const handler = createMemoryRecoveryHandler({ async configureSession(id, input, options) {
+    await options.beforeCommit({ sessionId: id, workspaceRoot: '/saved-workspace' });
+    assert.fail('failed association must not commit memory config');
+  } }, {}, { workspaceRegistry: { async create() { throw new Error('private-native-detail'); } } });
+  const result = await post(handler, 'configure', { sessionId: 'saved-root', expectedVersion: 0, input: {} });
+  assert.equal(result.body.code, 'MEMORY_NATIVE_WORKSPACE_FAILED');
+  assert.equal(JSON.stringify(result).includes('private-native-detail'), false);
+  assert.match(result.body.error, /尚未保存/);
 });
 
 test('memory UI rejects foreign origins before invoking native operations', async () => {

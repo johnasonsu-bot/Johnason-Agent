@@ -12,7 +12,7 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 ## 平台与本地插件
 
-官方模块解析、启动、profile 组合及兼容 SDK 集中在 `src/platform/`；Vault、记忆恢复、Forge/Data Platform 实现在 `src/plugins/`。原 `src` 入口继续转发，插件注册表保留公开路径，避免破坏已有 profile 的名称匹配条件。插件生命周期目前按每进程一个活动 runner 设计。
+官方模块解析、启动、profile 组合及兼容 SDK 集中在 `src/platform/`；Vault、记忆恢复、Forge/Data Platform 实现在 `src/plugins/`。原 `src` 入口继续转发，插件注册表保留公开路径，避免破坏已有 profile 的名称匹配条件。浏览器插件生成到各 profile 自己的 `node_modules`，按新版原生解析规则装载。插件生命周期目前按每进程一个活动 runner 设计。
 
 共享版本策略位于 `mvp/src/workbench/runtime/deepseek_harness/platform-release.json`。升级时先运行 `npm --prefix apps/dsh-agent run check:platform`，再完成源码契约、构建及原生回归。此检查验证版本和依赖边界，不代替构建产物内容校验。不能彻底隔离的内部接口及建议见[边界与演进清单](../../docs/architecture/dsh-platform-plugin-boundary.md)。
 
@@ -26,7 +26,7 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 ## 原生构建
 
-2026-09-21 的合并候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展，并对接上述官方版本。用户要求本阶段仅做代码合并：尚未安装依赖或构建，原生运行、浏览器及重启恢复留待后续验证。已确认官方旧格式迁移器拒绝自定义记忆事件，既有记忆日志需要单独设计迁移，不能直接切换。已有的带日期验收报告对应旧版本，不代表该候选已通过原生验收。详见[代码合并报告](../../docs/testing/2026-09-21-dsh-upstream-code-merge.md)；请勿用候选打开原有用户数据根。
+2026-09-21 的平台/插件隔离候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展，并对接上述官方版本。冻结依赖安装、macOS ARM 原生模块、平台库和 Web 构建已完成；具体测试范围见[隔离验收记录](../../docs/testing/2026-09-21-dsh-platform-plugin-isolation.md)。官方旧格式迁移器仍拒绝自定义记忆事件，既有记忆日志需要单独设计迁移，不能直接切换；请勿用候选打开原有用户数据根。此前的[代码合并报告](../../docs/testing/2026-09-21-dsh-upstream-code-merge.md)保留合并阶段的状态。
 
 从仓库根目录运行：
 
@@ -35,7 +35,7 @@ git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
 ```
 
-以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前合并候选位于 `codex/dsh-upstream-merge` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
+以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前隔离候选位于 `codex/dsh-platform-plugins` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
 
 构建入口依次执行冻结 lockfile 安装和上游原生构建。两个步骤都显式设置 `CI=true`：上游的安装脚本会据此只跳过 Git hook 配置，避免子模块位于 linked worktree 时修改 Git 配置失败；构建前的依赖状态检查也因此使用非交互模式。依赖生命周期脚本及构建检查仍会运行。启动器不会修改子模块 Git 配置。
 
@@ -111,13 +111,13 @@ node --test apps/dsh-agent/tests/native-lifecycle.test.mjs
 
 ## 固定版本升级
 
-升级是明确维护动作，不自动追踪 `latest`。先停止自己启动的服务，备份整个独立数据根（含加密 Vault 与原生会话；不导出明文密钥），在新的维护分支/工作树中评估目标提交。一起更新子模块 gitlink、构建入口与启动校验中的固定 SHA；保留冻结 lockfile 和经验证的 pnpm 版本，必要时显式评审其升级。重新执行原生构建、doctor、全部薄层测试和 D1–D12 实测后再使用正式数据根。不要擅自覆盖子模块改动、重置旧分支或删除旧数据。
+升级是明确维护动作，不自动追踪 `latest`。先停止自己启动的服务，备份整个独立数据根（含加密 Vault 与原生会话；不导出明文密钥），在新的维护分支/工作树中评估目标提交。一起更新子模块 gitlink 与共享 `platform-release.json`；保留冻结 lockfile 和经验证的 pnpm 版本，必要时显式评审其升级。先运行 `check:platform`，再完成原生构建、doctor、全部薄层测试和 D1–D12 实测，处理数据迁移后才能使用正式数据根。不要擅自覆盖子模块改动、重置旧分支或删除旧数据。
 
 ## 分层记忆、恢复审计与任务沙箱（A1/A2/E1/E2）
 
 原生构建完成后，沿用本页的 `node src/cli.mjs web --data-dir <新独立数据目录> --port <空闲端口> --no-open` 启动命令，无需重建聊天界面。原生聊天右下角新增「记忆 / 恢复 / 沙箱」链接，路径为同源 `/memory-recovery`。
 
-1. 填写显式项目 ID 与已存在 workspace 绝对路径，点击「创建新原生会话」，再保存配置。首次启用只接受本进程观察到的未启动新会话；旧会话不会自动迁移或开权限。
+1. 填写显式项目 ID 与已存在 workspace 绝对路径，点击「创建新原生会话」，再保存配置。创建过程通过原生接口关联 Workspace，聊天输入不再停留在未选择工作区状态。首次启用只接受经过原生日志核验的未启动会话；已有未开始会话在显式保存时补全 Workspace 成员关系，读取配置不修改关联，旧历史会话不会自动迁移或开权限。
 2. 默认 required sandbox / workspace-write；read-only 可选。仅 `memory_sandbox_run` 具有 Effect 重放保护，未验证工具被阻断。选择仅记忆模式时，原生工具没有 Effect 重放保护。网络只支持 host，不支持 network=none、容器根或 CPU/内存配额。
 3. 可查看三类记忆、来源和历史版本；追加语义节点/关系、人工确认候选规程；搜索返回摘要，显式调入才选中有界正文页，下一原生模型 step 生效。调出不删历史，工作集重启后需重新调入。
 4. Effect 查询支持 validAt/systemAt 与显式因果边。UNKNOWN 必须核查，不会自动再执行；COMMITTED 不代表业务成功。页面不提供命令执行、recover 或人工伪造机器 proof。

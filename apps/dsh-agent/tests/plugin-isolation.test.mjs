@@ -10,6 +10,17 @@ const groups = {
 };
 const src = new URL('../src/', import.meta.url);
 
+test('browser plugin declares available native client entries', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../browser/package.json', import.meta.url), 'utf8'));
+  for (const name of manifest.dsh.client.inject) {
+    assert.match(name, /^@deepseek-ai\/dsh-client-[a-z-]+$/);
+    const directory = name.slice('@deepseek-ai/dsh-client-'.length);
+    const dependency = JSON.parse(readFileSync(new URL(`../../../third_party/deepseek-harness/packages/client/${directory}/package.json`, import.meta.url), 'utf8'));
+    assert.equal(dependency.name, name);
+    assert.equal(dependency.dsh?.client?.platform, 'web', `${name} must be an active browser entry`);
+  }
+});
+
 test('local plugin implementations have explicit homes and no direct native dependency resolution', () => {
   for (const [group, names] of Object.entries(groups)) {
     for (const name of names) {
@@ -34,6 +45,7 @@ test('old public imports preserve every export and class identity after relocati
     export const parseCredentialKey = value => value;
     export const createUserMessage = value => value;
     export const retainRequiredEventTypes = () => () => {};
+    export const snapshotSessionEvents = session => session.snapshotEvents();
   `)}`;
   const hooks = registerHooks({ resolve(specifier, context, next) {
     if (/\/platform\/(credential|memory)-api\.mjs$/.test(new URL(specifier, context.parentURL).pathname)) return { url: boundary, shortCircuit: true };

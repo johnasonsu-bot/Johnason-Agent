@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createPluginPlan } from '../plugins/index.mjs';
 import { loadProfilePlatform } from './launch-platform.mjs';
 
@@ -52,7 +53,9 @@ export async function prepareProfile(config, options = {}) {
   }
   const overlay = plugins.profileOverlay(platform);
   for (const bundle of plugins.clientBundles) {
-    const uiDir = join(config.dataRoot, 'profiles/node_modules', bundle.name);
+    // The native runtime resolver excludes arbitrary packages in the shared
+    // profiles/node_modules directory; the owning profile has its own scope.
+    const uiDir = join(profileDir, 'node_modules', bundle.name);
     await mkdir(uiDir, { recursive: true, mode: 0o700 });
     for (const file of bundle.files) await copyFile(new URL(file, bundle.sourceRoot), join(uiDir, file));
   }
@@ -61,7 +64,9 @@ export async function prepareProfile(config, options = {}) {
     ...patchFiles.map(path => boot.loadOverlayPatches('johnason-dsh', path)), overlay];
   const rows = boot.composeEntries(layers);
   const providers = rows.filter(row => row.id === 'credentials' || /credentials-(?:local|plugin)/.test(row.name ?? ''));
-  if (providers.length !== 1 || providers[0].name !== pluginPath || providers[0].disabled) throw new Error('Exactly one encrypted credential provider is required');
+  // Native file-backed profile layers canonicalize absolute paths to file URLs.
+  const providerNames = [pluginPath, pathToFileURL(pluginPath).href];
+  if (providers.length !== 1 || !providerNames.includes(providers[0].name) || providers[0].disabled) throw new Error('Exactly one encrypted credential provider is required');
   const overlayPath = join(config.dataRoot, `standalone-${profile}.patch.yml`);
   await mkdir(config.dataRoot, { recursive: true, mode: 0o700 });
   await writeFile(overlayPath, JSON.stringify(overlay, null, 2) + '\n', { mode: 0o600 });

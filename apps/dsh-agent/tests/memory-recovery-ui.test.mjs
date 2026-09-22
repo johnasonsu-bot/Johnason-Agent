@@ -15,6 +15,12 @@ import { authenticateWeb, redactLaunchOutput, captureNativeRequests, assertSessi
 // Chromium normalizes trailing fractional zeroes and zero seconds on datetime-local inputs.
 const browserDate = time => new Date(time).toISOString().replace(/\.000Z$/, 'Z').replace(/(\.\d*?[1-9])0+Z$/, '$1Z').replace(/:00Z$/, 'Z').replace(/Z$/, '');
 
+async function nativeWorkspaces(f) {
+  const frame = await f.firstFrame('workspace/follow', {});
+  assert.equal(frame.type, 'baseline');
+  return frame.value.items;
+}
+
 // Seed durable cold history directly; a Session outside Agent Loop has no writer.
 async function seedNativeSession(root, workspace, sessionId, events) {
   const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
@@ -28,7 +34,7 @@ async function seedNativeSession(root, workspace, sessionId, events) {
     const session = ctx.sessions.prepare(sessionId, { meta: { cwd: workspace } });
     for (const [type, data] of events) session.append(type, data);
     const handle = await ctx.sessionPersistence.create(session.header, { inheritedEventCount: session.inheritedEventCount });
-    try { await handle.append(session.events); await handle.flush(); }
+    try { await handle.append(session.snapshotEvents()); await handle.flush(); }
     finally { await handle.close(); }
   } finally { await ctx.fiber.dispose(); }
 }
@@ -148,7 +154,7 @@ async function fixture(t, options = {}) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), 'web', '--data-dir', root, '--workspace', workspace, '--port', String(port), '--no-open'], { env: { PATH: process.env.PATH, HOME: root }, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = ''; child.stdout.on('data', b => output += b); child.stderr.on('data', b => output += b);
   const exit = new Promise(r => child.once('exit', (code, signal) => r({ code, signal })));
-  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; t.diagnostic(redactLaunchOutput(output).split('\n').filter(line => /SQLite|ExperimentalWarning/.test(line)).join('\n')); });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); await exit; t.diagnostic(redactLaunchOutput(output)); });
   const deadline = Date.now() + 30000;
   while (!output.includes(`dsh web: ${url}`)) { assert.equal(child.exitCode, null, redactLaunchOutput(output)); assert.ok(Date.now() < deadline, redactLaunchOutput(output)); await new Promise(r => setTimeout(r, 50)); }
   t.diagnostic(`Retained native Web: ${root}; ${url}`);
@@ -158,7 +164,17 @@ async function fixture(t, options = {}) {
     return { status: res.status, body: await res.json() };
   };
   const ok = async (action, data) => { const r = await request(action, data); assert.equal(r.status, 200, JSON.stringify(r)); return r.body.value; };
-  return { root, workspace, url, request, ok, ...client };
+  return { root, workspace, url, request, ok, ...client,
+    async authenticateBrowser(browser) {
+      await client.authenticateBrowser(browser);
+      const external = [];
+      await browser.route('**/*', async route => {
+        if (!route.request().url().startsWith(url + '/')) { external.push(route.request().url()); await route.abort(); }
+        else await route.continue();
+      });
+      t.after(() => assert.deepEqual(external, [], 'Memory UI must not make external service requests'));
+    },
+  };
 }
 
 test('real native Web creates an unstarted scoped session, versions records and pages without execution routes', { timeout: 60000 }, async t => {
@@ -167,6 +183,8 @@ test('real native Web creates an unstarted scoped session, versions records and 
   assert.deepEqual(await f.ok('defaults'), { workspaceRoot: f.workspace });
   const created = await f.ok('create-session', { workspaceRoot: f.workspace });
   const sessionId = created.sessionId;
+  const workspace = (await nativeWorkspaces(f)).find(item => item.path === f.workspace);
+  assert.deepEqual(workspace?.sessionIds, [sessionId], 'explicit creation must register its native workspace membership');
   const config = { enabled: true, projectId: 'alpha', agentId: sessionId, workspaceRoot: f.workspace, sandbox: { sandbox_required: true, mode: 'workspace-write', network: 'host', workspaceRoot: f.workspace }, budgetTokens: 4000, anchors: [] };
   const configured = await f.ok('configure', { sessionId, input: config, expectedVersion: 0 });
   assert.equal(configured.executionCoverage, 'managed-sandbox-only');
@@ -263,7 +281,7 @@ test('HTTP audit preserves UNKNOWN, causal edges and past system-time without re
   const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
   await f.authenticateBrowser(browser);
   t.after(() => browser.close());
-  const page = await browser.newPage();
+  const page = await browser.newPage(); page.setDefaultTimeout(10000);
   await page.goto(`${f.url}/memory-recovery?sessionId=audit-new`);
   await page.getByRole('tab', { name: '双时态审计', exact: true }).click();
   await page.locator('#audit-kind').selectOption('effects'); await page.locator('#audit-query').click();
@@ -286,7 +304,7 @@ test('independent browser creates/configures and actually opens its selected nat
   const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
   await f.authenticateBrowser(browser);
   t.after(() => browser.close());
-  const page = await browser.newPage();
+  const page = await browser.newPage(); page.setDefaultTimeout(10000);
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   await page.goto(`${f.url}/memory-recovery`);
   await page.waitForFunction(() => document.getElementById('feedback').textContent.includes('操作已完成'));
@@ -344,6 +362,11 @@ test('independent browser creates/configures and actually opens its selected nat
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
   await page.getByRole('button', { name: '记忆：已启用', exact: true }).waitFor();
+  await page.getByText('Johnason Agent', { exact: true }).waitFor();
+  await page.locator('[data-composer-input][contenteditable="true"]').waitFor();
+  await page.locator('[data-composer-input]').fill('记忆功能验收草稿，不发送');
+  assert.equal(await page.locator('[data-composer-input]').innerText(), '记忆功能验收草稿，不发送');
+  await page.locator('[data-composer-input]').fill('');
   await page.waitForTimeout(1000);
   assertSessionRequest(nativeRequests, sessionId);
   assert.equal((await f.rpc('session/list', { _request: {} })).items[0].running, false);
@@ -359,18 +382,20 @@ test('historical native session explains its boundary and keeps history while a 
       ['turn/start', { turn: 1 }], ['turn/end', { turn: 1, reason: { kind: 'completed' } }],
     ]);
   } });
+  const originalWorkspaces = await nativeWorkspaces(f);
   assert.equal((await f.ok('sessions')).some(row => row.id === sessionId), false, 'history begins cold, not attached');
   assert.equal((await f.ok('config', { sessionId })).configurationBlockReason, 'MEMORY_NEW_SESSION_REQUIRED');
   const blocked = await f.request('configure', { sessionId, expectedVersion: 0, input: {} });
   assert.equal(blocked.body.code, 'MEMORY_NEW_SESSION_REQUIRED');
   assert.match(blocked.body.error, /创建新原生会话/);
+  assert.deepEqual(await nativeWorkspaces(f), originalWorkspaces, 'reading or rejecting historical configuration must not change its native workspace');
   const { chromium } = await import('playwright-core');
   const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
   t.after(() => browserProcess.close());
   const browser = await browserProcess.newContext({ viewport: { width: 1440, height: 1000 } });
   await f.authenticateBrowser(browser);
   t.after(() => browser.close());
-  const page = await browser.newPage();
+  const page = await browser.newPage(); page.setDefaultTimeout(10000);
   await page.goto(`${f.url}/memory-recovery`);
   await page.locator('#sessions').selectOption(sessionId);
   await page.waitForFunction(() => document.getElementById('configuration-notice').textContent.includes('此会话已有历史'));
@@ -404,8 +429,14 @@ test('restored unstarted native conversation enables memory without creating or 
     ]);
   } });
   const before = (await f.rpc('session/list', { _request: {} })).items.find(s => s.sessionId === sessionId);
-  assert.equal(before.blank, true); assert.equal(before.running, false);
+  const originalWorkspaces = await nativeWorkspaces(f);
+  assert.equal(before.running, false);
   assert.equal((await f.ok('config', { sessionId })).canConfigure, true, 'persisted policy-only session remains eligible after process restart');
+  assert.deepEqual(await nativeWorkspaces(f), originalWorkspaces, 'reading an unstarted config must not change its native workspace');
+  // Cold list summaries conservatively mark a record without cached metadata
+  // non-blank. The authoritative snapshot proves this policy-only fixture has
+  // never started a turn; opening it does not execute the Agent.
+  assert.equal((await f.snapshot(sessionId)).projections.values.sessionStats.turns, 0);
   const { chromium } = await import('playwright-core');
   const browserProcess = await chromium.launch({ headless: true, executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
   t.after(() => browserProcess.close());
@@ -413,7 +444,7 @@ test('restored unstarted native conversation enables memory without creating or 
   await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   await browser.addInitScript(id => { if (!localStorage.getItem('dsh.sessions.current')) localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: id })); }, sessionId);
-  const page = await browser.newPage();
+  const page = await browser.newPage(); page.setDefaultTimeout(10000);
   await page.goto(f.url);
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
@@ -422,10 +453,12 @@ test('restored unstarted native conversation enables memory without creating or 
   await page.getByRole('button', { name: '启用当前会话记忆', exact: true }).click();
   await page.getByRole('button', { name: '记忆：已启用', exact: true }).waitFor();
   const configured = await f.ok('config', { sessionId });
+  await page.locator('[data-composer-input][contenteditable="true"]').waitFor();
   assert.equal(configured.version, 1); assert.equal(configured.projectId, 'abc'); assert.equal(configured.sandbox, null);
+  assert.deepEqual((await nativeWorkspaces(f)).find(item => item.path === f.workspace)?.sessionIds, [sessionId]);
   const after = await f.rpc('session/list', { _request: {} });
   assert.equal(after.items.length, 1); assert.equal(after.items[0].blank, true); assert.equal(after.items[0].running, false);
-  assert.equal(after.items[0].projections.values.sessionStats.turns, 0);
+  assert.equal((await f.snapshot(sessionId)).projections.values.sessionStats.turns, 0);
 });
 
 test('native composer enables ordinary memory for the selected session without imposing a sandbox', { timeout: 60000 }, async t => {
@@ -438,12 +471,24 @@ test('native composer enables ordinary memory for the selected session without i
   await f.authenticateBrowser(browser);
   t.after(() => browser.close());
   await browser.addInitScript(id => { if (!localStorage.getItem('dsh.sessions.current')) localStorage.setItem('dsh.sessions.current', JSON.stringify({ sessionId: id })); }, sessionId);
-  const page = await browser.newPage(); const errors = [];
+  const page = await browser.newPage(); page.setDefaultTimeout(10000); const errors = [];
   page.on('pageerror', e => errors.push(e.message));
+  const consoleErrors = []; page.on('console', msg => { if (msg.type() === 'error' || msg.type() === 'warning') consoleErrors.push(msg.text()); });
   await page.goto(f.url);
   await page.getByRole('button', { name: '继续', exact: true }).click();
   await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
-  await page.getByRole('button', { name: '记忆：未启用', exact: true }).click({ timeout: 10000 });
+  try { await page.getByRole('button', { name: '记忆：未启用', exact: true }).click({ timeout: 10000 }); }
+  catch (cause) {
+    t.diagnostic(JSON.stringify({ pageErrors: errors, consoleErrors,
+      boot: await page.evaluate(() => window.__DSH_BOOT__?.entries.filter(row => row.id.startsWith('@johnason/'))),
+      selection: await page.evaluate(() => localStorage.getItem('dsh.sessions.current')),
+      body: await page.locator('body').innerText(),
+    }));
+    await page.screenshot({ path: join(f.root, 'composer-missing.png'), fullPage: true });
+    throw cause;
+  }
+  await page.getByText('Johnason Agent', { exact: true }).waitFor();
+  await page.locator('[data-composer-input][contenteditable="true"]').waitFor();
   await page.emulateMedia({ colorScheme: 'dark' });
   const panel = page.locator('[data-memory-panel]');
   assert.equal(await panel.count(), 1);

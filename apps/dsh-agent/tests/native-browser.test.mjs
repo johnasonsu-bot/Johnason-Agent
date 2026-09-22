@@ -22,7 +22,7 @@ test('browser reload restores the selected native session, title, model and idle
   await new Promise(resolve => probe.close(resolve));
   const url = `http://127.0.0.1:${port}`;
   const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.mjs', import.meta.url)), 'web', '--data-dir', root, '--port', String(port), '--no-open'], {
-    env: { PATH: process.env.PATH, HOME: root }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH, HOME: root, TMPDIR: process.env.TMPDIR }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
   child.stdout.on('data', bytes => { output += bytes; });
@@ -42,7 +42,8 @@ test('browser reload restores the selected native session, title, model and idle
   const title = 'Browser refresh acceptance';
   await client.rpc('session/rename', { request: { sessionId, title } });
   const { selected } = await client.rpc('session/selectModel', { request: { sessionId, provider: 'deepseek-official', model: 'deepseek-v4-pro' } });
-  const beforeModel = (await client.snapshot(sessionId)).projections.values.model;
+  const beforeModel = (await client.snapshot(sessionId)).projections.values.modelSelection;
+  assert.ok(beforeModel, 'Native snapshot must include its modelSelection projection');
   assert.deepEqual(beforeModel.next, selected);
   assert.equal(beforeModel.next.provider, 'deepseek-official');
   assert.equal(beforeModel.next.model, 'deepseek-v4-pro');
@@ -76,7 +77,7 @@ test('browser reload restores the selected native session, title, model and idle
   assertSessionRequest(clientRequests, sessionId);
   // Native UI deliberately calls an empty session "New Session", even if renamed.
   // Its title remains verified through history; selected identity is read from the page client's requests.
-  assert.deepEqual((await client.snapshot(sessionId)).projections.values.model, beforeModel);
+  assert.deepEqual((await client.snapshot(sessionId)).projections.values.modelSelection, beforeModel);
   assert.deepEqual(await client.history(sessionId), beforeHistory);
   const sessions = await client.rpc('session/list', { _request: {} });
   assert.equal(sessions.items.length, 1);

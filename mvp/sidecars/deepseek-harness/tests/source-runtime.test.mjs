@@ -105,7 +105,7 @@ test("historical turns restore as V3 and keep the current system prompt ahead of
   let request;
   configureDriver(ctx => {
     restoreV3(ctx.createOptions.seed);
-    const turn = ctx.agent.session.events.findLast(event => event.type === "turn/end").data.turn + 1;
+    const turn = ctx.agent.session.snapshotEvents().findLast(event => event.type === "turn/end").data.turn + 1;
     ctx.persist("turn/start", { turn });
     ctx.persist("step/start", { turn, step: 1 });
     const rendered = ctx.sections.map(section => section.text).filter(Boolean).join("\n\n");
@@ -180,6 +180,10 @@ test("native composition supplies session projections and preserves chat-complet
   assert.ok(ctx.plugins.indexOf(SessionProjections) < ctx.plugins.indexOf(AgentLoop));
   assert.equal(ctx.adapter.connection.options().protocol, "chat-completions");
   assert.equal(ctx.adapter.connection.options().baseURL, "https://example.invalid");
+  const extensions = await ctx.adapter.connection.prepareExtensions({ body: {} });
+  assert.deepEqual(extensions.fields, {});
+  assert.equal(typeof extensions.accept, "function");
+  await extensions.accept();
   assert.equal(ctx.promptConfig.personaPrefix, "");
   assert.equal(ctx.sections[0].text, "Platform instruction");
   assert.equal(ctx.contextItems[0].text, "Platform context");
@@ -202,6 +206,8 @@ test("native transient chunks reach their callback without becoming durable sess
   ]);
   assert.equal(result.content, "live answer");
   assert.deepEqual(result.nativeEvents, events);
+  assert.ok(Object.isFrozen(result.nativeEvents));
+  assert.equal("events" in contexts[0].agent.session, false);
 });
 
 test("native stream callback ignores publications owned by a different agent", async () => {

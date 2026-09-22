@@ -1,6 +1,7 @@
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
+import { attachSessionWorkspace, createWorkspaceSession } from '../../platform/workspace-api.mjs';
 
 const page = new URL('../../../public/memory-recovery.html', import.meta.url);
 const local = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
@@ -13,6 +14,7 @@ const errorMessages = Object.freeze({
   MEMORY_WORKSPACE_MISMATCH: '工作目录必须与所选原生会话一致。要更换目录，请创建新会话。',
   MEMORY_SCOPE_IMMUTABLE: '已启用会话的项目与工作目录不可切换；请创建新会话。',
   MEMORY_POLICY_DOWNGRADE_FORBIDDEN: '已启用的沙箱不能移除或放宽。请保留当前策略，或创建新会话。',
+  MEMORY_NATIVE_WORKSPACE_FAILED: '工作区关联失败，记忆配置尚未保存。请检查工作目录后重试。',
 });
 function fields(value, allowed) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(k => !allowed.includes(k))) invalid();
@@ -30,7 +32,7 @@ const actions = Object.freeze({
 });
 
 /** Explicit local operator surface: no dynamic service dispatch, execution or recovery. */
-export function createMemoryRecoveryHandler(service, sessionController, { cwd: hostCwd = process.cwd() } = {}) {
+export function createMemoryRecoveryHandler(service, sessionController, { cwd: hostCwd = process.cwd(), workspaceController, workspaceRegistry } = {}) {
   const attaching = new Map();
   async function selectedConfig(id) {
     try { return service.getSessionConfig(id); }
@@ -86,12 +88,16 @@ export function createMemoryRecoveryHandler(service, sessionController, { cwd: h
           // Native API remains the creation authority. Never adopt a caller-selected old id.
           const sessionId = `session-${randomUUID()}`;
           try {
-            const response = await sessionController.create({ sessionId, cwd });
-            if (response.sessionId !== sessionId) throw new Error('Native session identity mismatch');
+            await createWorkspaceSession(sessionController, workspaceController, { sessionId, workspaceRoot: cwd });
           } catch { throw Object.assign(new Error('Native session creation failed'), { code: 'MEMORY_NATIVE_CREATE_FAILED' }); }
           value = { sessionId, workspaceRoot: cwd }; break;
         }
-        case 'configure': value = await service.configureSession(id, data.input, { expectedVersion: data.expectedVersion }); break;
+        case 'configure': value = await service.configureSession(id, data.input, { expectedVersion: data.expectedVersion,
+          async beforeCommit(scope) {
+            try { await attachSessionWorkspace(workspaceRegistry, scope); }
+            catch { throw Object.assign(new Error('Native workspace unavailable'), { code: 'MEMORY_NATIVE_WORKSPACE_FAILED' }); }
+          },
+        }); break;
         case 'config': value = await selectedConfig(id); break;
         case 'status': value = service.status(id); break;
         case 'memories': value = service.listMemories(id, data.filters).map(summaryHandle); break;
@@ -116,6 +122,6 @@ export function createMemoryRecoveryHandler(service, sessionController, { cwd: h
 }
 
 export function installMemoryRecoveryUi(ctx, service) {
-  const handler = createMemoryRecoveryHandler(service, ctx.sessionController);
+  const handler = createMemoryRecoveryHandler(service, ctx.sessionController, { workspaceController: ctx.workspaceController, workspaceRegistry: ctx.workspaceRegistry });
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/memory-recovery', handler }));
 }

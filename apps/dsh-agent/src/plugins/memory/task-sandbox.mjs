@@ -77,9 +77,16 @@ function diagnosticScanner(rules, denialSignatures) {
 export async function runSandboxTask({ sandbox, argv, requirements, signal }) {
   const policy = validateSandboxRequirements(requirements);
   if (!argvValid(argv)) throw error('SANDBOX_INVALID_ARGV', 'argv must contain a program and literal NUL-free arguments');
-  if (signal?.aborted) return { state: 'ABORTED', started: false, cancelled: true, timedOut: false, exitCode: null, stdout: '', stderr: '', backend: null, enforcement: null, outputTruncated: false, denied: false };
+  const abortedBeforeSpawn = () => ({ state: 'ABORTED', started: false, cancelled: true, timedOut: false, exitCode: null, stdout: '', stderr: '', backend: null, enforcement: null, outputTruncated: false, denied: false });
+  if (signal?.aborted) return abortedBeforeSpawn();
   if (typeof sandbox?.confine !== 'function') throw error('SANDBOX_UNAVAILABLE', 'Native sandbox provider unavailable');
-  const wrapped = sandbox.confine([...argv], { mode: policy.mode, workspaceRoot: policy.workspaceRoot });
+  let wrapped;
+  try { wrapped = await sandbox.confine([...argv], { mode: policy.mode, workspaceRoot: policy.workspaceRoot }, signal); }
+  catch (cause) {
+    if (signal?.aborted) return abortedBeforeSpawn();
+    throw cause;
+  }
+  if (signal?.aborted) return abortedBeforeSpawn();
   if (!argvValid(wrapped?.argv) || !['full', 'partial'].includes(wrapped.enforcement) ||
     !Array.isArray(wrapped.denialSignatures) || !Array.isArray(wrapped.runnerFailureRules)) {
     throw error('SANDBOX_UNAVAILABLE', 'Invalid native confinement response');

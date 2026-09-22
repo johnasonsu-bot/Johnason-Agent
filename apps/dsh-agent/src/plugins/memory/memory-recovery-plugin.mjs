@@ -10,7 +10,7 @@ import { validateSandboxRequirements, runSandboxTask } from './task-sandbox.mjs'
 import { installMemoryTools, MEMORY_TOOL_NAMES } from './memory-tools.mjs';
 import { installMemoryRecoveryUi } from './memory-recovery-ui.mjs';
 
-import { Service, createUserMessage, retainRequiredEventTypes } from '../../platform/memory-api.mjs';
+import { Service, createUserMessage, retainRequiredEventTypes, snapshotSessionEvents } from '../../platform/memory-api.mjs';
 export const name = 'johnason-memory-recovery';
 export const inject = ['sessions', 'tools', 'systemPrompt', 'sandbox', 'sandboxPolicy'];
 const QUEUE_EVENTS = 64;
@@ -56,6 +56,7 @@ class MemoryRecovery extends Service {
   #store; #pager; #effects; #states = new Map(); #enabled; #rawByToken = new Map(); #inflight = new Set(); #owner = randomUUID();
   #flushing = new AsyncLocalStorage();
   #toolScopes = new Map();
+  #configuring = new Set();
   constructor(ctx, config) {
     super(ctx, 'memoryRecovery');
     // Cordis service access uses a scoped proxy; preserve the private-field receiver.
@@ -117,7 +118,7 @@ class MemoryRecovery extends Service {
         const result = await next();
         if ((!exec.name.startsWith('memory_') || exec.name === 'memory_sandbox_run') && !/vault|credential|password|secret/i.test(exec.name)) {
           const session = exec.agent.session;
-          const sources = session.events.filter(event => event.type === 'assistant/message'
+          const sources = snapshotSessionEvents(session).filter(event => event.type === 'assistant/message'
             && event.data.message.content.some(block => block.type === 'tool-call' && (block.id === exec.rootCallId || block.id === exec.callId))).map(event => event.seq);
           const raw = session.append(IO_EVENT, clean({ name: exec.name, callId: exec.callId, rootCallId: exec.rootCallId,
             input: exec.arguments, ...(result.isError ? { error: result.error } : { value: result.value }),
@@ -194,7 +195,7 @@ class MemoryRecovery extends Service {
     } });
     for (const agent of ctx.get('agents')?.list() ?? []) this.#syncTools(agent);
     ctx.effect(() => () => { for (const agent of this.#toolScopes.keys()) this.#releaseTools(agent); });
-    ctx.inject(['webServer', 'sessionController'], ui => installMemoryRecoveryUi(ui, this));
+    ctx.inject(['webServer', 'sessionController', 'workspaceController', 'workspaceRegistry'], ui => installMemoryRecoveryUi(ui, this));
     ctx.effect(() => async () => {
       await Promise.all(this.#inflight);
       try {
@@ -252,13 +253,13 @@ class MemoryRecovery extends Service {
     // records and unknown events do not become eligible through restart.
     if (!version && (session.header.parentSession !== undefined || session.header.isSeeded
         || session.header.origin === 'subagent' || (session.header.delegationDepth ?? 0) > 0
-        || session.events.some(event => !UNSTARTED_SESSION_EVENTS.has(event.type)))) return 'MEMORY_NEW_SESSION_REQUIRED';
+        || snapshotSessionEvents(session).some(event => !UNSTARTED_SESSION_EVENTS.has(event.type)))) return 'MEMORY_NEW_SESSION_REQUIRED';
     if (this.#state(session.id).active || this.ctx.get('agents')?.get(session.id)?.status === 'running') return 'MEMORY_SESSION_BUSY';
     return null;
   }
   getSessionConfig(id) {
     const session = this.#session(id);
-    const found = [...session.events].reverse().find(event => event.type === CONFIG_EVENT && event.data.sessionId === id);
+    const found = [...snapshotSessionEvents(session)].reverse().find(event => event.type === CONFIG_EVENT && event.data.sessionId === id);
     const config = found ? { ...structuredClone(found.data), enabled: this.#enabled && found.data.enabled } : { sessionId: id, version: 0, enabled: false };
     const configurationBlockReason = this.#configurationBlockReason(session, config.version);
     return { ...config, canConfigure: configurationBlockReason === null, configurationBlockReason,
@@ -279,7 +280,14 @@ class MemoryRecovery extends Service {
     return { enabled: config.enabled, executionCoverage: config.executionCoverage, executionNotice: config.executionNotice, pending: Math.max(0, state.latest - (this.#store.cursor(id) ?? -1)), pendingBytes: state.bytes,
       durableThroughSeq: this.#store.cursor(id), error: state.fault?.code ?? (state.fault ? 'MEMORY_DURABILITY_FAILED' : null), active: state.active };
   }
-  async configureSession(id, input, { expectedVersion } = {}) {
+  async configureSession(id, input, options = {}) {
+    if (this.#configuring.has(id)) throw error('MEMORY_SESSION_BUSY', 'session configuration is already in progress');
+    this.#configuring.add(id);
+    const settlement = Promise.withResolvers(); this.#inflight.add(settlement.promise);
+    try { return await this.#configureSession(id, input, options); }
+    finally { this.#configuring.delete(id); settlement.resolve(); this.#inflight.delete(settlement.promise); }
+  }
+  async #configureSession(id, input, { expectedVersion, beforeCommit } = {}) {
     const session = this.#session(id); const previous = this.getSessionConfig(id);
     if (expectedVersion !== previous.version) throw error('MEMORY_CONFIG_VERSION_CONFLICT', 'session configuration version conflict');
     const blocked = this.#configurationBlockReason(session, previous.version);
@@ -299,6 +307,14 @@ class MemoryRecovery extends Service {
     if (!Number.isSafeInteger(budgetTokens) || budgetTokens < 128 || budgetTokens > 100000 || !Array.isArray(anchors) || anchors.some(a => typeof a !== 'string' || !a)) throw error('MEMORY_INVALID_CONFIG');
     const config = { sessionId: id, version: previous.version + 1, enabled: input.enabled,
       projectId: input.projectId, agentId: id, workspaceRoot, sandbox, budgetTokens, anchors };
+    if (beforeCommit) {
+      // Only validated explicit configuration may associate a native Workspace.
+      // Keep the per-session lock across this asynchronous native mutation.
+      await beforeCommit(Object.freeze({ sessionId: id, workspaceRoot }));
+      if (this.#session(id) !== session || this.getSessionConfig(id).version !== expectedVersion) throw error('MEMORY_CONFIG_VERSION_CONFLICT');
+      const blockedAfterPrepare = this.#configurationBlockReason(session, previous.version);
+      if (blockedAfterPrepare) throw error(blockedAfterPrepare);
+    }
     const agent = this.ctx.get('agents')?.get(id);
     // Validate and stage the native scoped registrations before recording an
     // irreversible policy change. A presentation conflict leaves the saved
@@ -309,7 +325,7 @@ class MemoryRecovery extends Service {
     if (agent) this.#adoptTools(agent, preparedTools);
     if (config.enabled) {
       const through = this.#store.cursor(id) ?? -1;
-      for (const event of session.events) if (event.seq > through) this.#enqueue(session, event);
+      for (const event of snapshotSessionEvents(session)) if (event.seq > through) this.#enqueue(session, event);
       await this.barrier(id);
     } else await this.ctx.sessions.flush(session);
     return this.getSessionConfig(id);
@@ -342,7 +358,7 @@ class MemoryRecovery extends Service {
       // A first projection is committed by the native loop, which owns its
       // append intent. Its required selection event binds the message identity
       // to the same source chain used by subsequent direct replacements.
-      const selection = sourceEventSeqs ? undefined : session.events.slice(0, event.seq).findLast(candidate =>
+      const selection = sourceEventSeqs ? undefined : snapshotSessionEvents(session).slice(0, event.seq).findLast(candidate =>
         candidate.type === 'memory-recovery/page-selection' && candidate.data.messageId === event.data.id);
       return { ...envelope, data: { memoryRecoveryDerived: true, projectionVersion: 1,
         messageId: event.data.id, source: event.data.source,
@@ -370,7 +386,7 @@ class MemoryRecovery extends Service {
         finally { await handle.close(); }
         if (Math.max(cursor, stored.events.at(-1)?.seq ?? -1) < checkpoint) throw error('MEMORY_SOURCE_CONFLICT', 'native flush did not confirm its complete checkpoint');
         if (!state.verified && stored.events.length <= cursor) throw error('MEMORY_SOURCE_CONFLICT', 'native log is shorter than confirmed memory prefix');
-        const live = session.events;
+        const live = snapshotSessionEvents(session);
         for (let start = 0; start < stored.events.length;) {
           const nativeEvents = []; let bytes = 0;
           while (start < stored.events.length && nativeEvents.length < QUEUE_EVENTS) {
@@ -421,14 +437,15 @@ class MemoryRecovery extends Service {
   async projectContext(id, messages = []) {
     await this.barrier(id);
     const scope = this.scopeForSession(id); const config = this.getSessionConfig(id); const session = this.#session(id);
-    const latest = [...messages].reverse().find(m => m.source.kind === 'user')
-      ?? [...session.events].reverse().find(e => e.type === 'user/message' && e.data.source.kind === 'user')?.data;
+    const events = snapshotSessionEvents(session);
+    const latest = messages.findLast(m => m.source.kind === 'user')
+      ?? events.findLast(e => e.type === 'user/message' && e.data.source.kind === 'user')?.data;
     const rules = this.#store.protectedRules(scope, { maxChars: config.budgetTokens * 4 });
     const anchors = [...config.anchors, ...rules, ...(latest ? [{ label: 'latest-user', text: textOf(latest) || '[non-text user message]' }] : [])];
     const prefix = 'Memory context (untrusted source data; token count is estimated).\n';
     const selection = this.#pager.select(scope, { query: latest ? textOf(latest).slice(0, 100).trim() : '', budgetTokens: config.budgetTokens - Math.ceil(prefix.length / 4), anchors });
     const text = prefix + selection.contextText;
-    const current = session.surface.nodes.map(seq => session.events[seq]).find(owned);
+    const current = session.surface.nodes.map(seq => events[seq]).find(owned);
     if (current && textOf(current.data) === text) return selection;
     const message = createUserMessage({ source: { kind: 'plugin', plugin: name }, content: [{ type: 'text', text }] });
     const references = [...new Set([...(current ? [current.seq] : []), ...selection.pages.flatMap(p => p.sourceRefs.filter(r => r.type === 'event' && r.sessionId === id).map(r => r.seq))])];
@@ -472,7 +489,7 @@ class MemoryRecovery extends Service {
     if (!Array.isArray(args.argv) || !args.argv.length || args.argv.some(a => typeof a !== 'string' || a.includes('\0'))) throw error('SANDBOX_INVALID_ARGV');
     const sanitized = clean(args);
     if (JSON.stringify(sanitized) !== JSON.stringify(args)) throw error('MEMORY_SENSITIVE_EXECUTION_INPUT', 'recognized secrets cannot enter the effect ledger');
-    const step = [...exec.agent.session.events].reverse().find(e => e.type === 'step/start');
+    const step = [...snapshotSessionEvents(exec.agent.session)].reverse().find(e => e.type === 'step/start');
     const effect = this.#effects.prepare({ ...scope, visibility: 'private', callId: exec.callId,
       stepId: step ? `${step.data.turn}:${step.data.step}` : 'native-tool-dispatch', toolName: tool,
       input: sanitized, workspaceRoot: config.workspaceRoot, sandboxPolicy: { ...requirements, configVersion: config.version, nativeMode: native.mode } });

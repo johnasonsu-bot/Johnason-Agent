@@ -74,6 +74,32 @@ test('timeout and cancellation await termination and preserve unknown side effec
   assert.equal(notStarted.started, false);
 });
 
+test('cancellation during asynchronous confinement never starts the command', async t => {
+  const f = await fixture(t);
+  const argv = [process.execPath, '-e', 'require("node:fs").writeFileSync("must-not-start","bad")'];
+  const wrapped = await f.sandbox.confine(argv, { mode: f.requirements.mode, workspaceRoot: f.workspaceRoot });
+  for (const rejects of [false, true]) {
+    const controller = new AbortController();
+    let finish, fail, entered;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const confinement = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+    const sandbox = { confine(_argv, _policy, signal) {
+      assert.equal(signal, controller.signal);
+      entered();
+      return confinement;
+    } };
+    const pending = runSandboxTask({ ...f, sandbox, argv, signal: controller.signal });
+    await ready;
+    controller.abort();
+    if (rejects) fail(new Error('Confinement preparation cancelled')); else finish(wrapped);
+    const result = await pending;
+    assert.equal(result.state, 'ABORTED');
+    assert.equal(result.started, false);
+    assert.equal(result.cancelled, true);
+    assert.equal(existsSync(join(f.workspaceRoot, 'must-not-start')), false);
+  }
+});
+
 test('bounded output and argv stay literal with read-only enforcement', async t => {
   const f = await fixture(t);
   const result = await runSandboxTask({ ...f, argv: [process.execPath, '-e', 'console.log(process.argv[1]);console.log("x".repeat(10000))', '$(touch surprise)'], requirements: { ...f.requirements, maxOutputBytes: 128 } });
@@ -119,8 +145,8 @@ test('runner diagnosis is independent of display truncation, including cross-chu
   const f = await fixture(t);
   // Keep real native confinement; only the public diagnostic dialect is fixed
   // for this classifier fixture. The child intentionally mimics a runner.
-  const sandbox = { confine(argv, policy) {
-    return { ...f.sandbox.confine(argv, policy), runnerFailureRules: [{ allowedExitCodes: [125], fatalSignatures: ['runner fatal'] }] };
+  const sandbox = { async confine(argv, policy, signal) {
+    return { ...await f.sandbox.confine(argv, policy, signal), runnerFailureRules: [{ allowedExitCodes: [125], fatalSignatures: ['runner fatal'] }] };
   } };
   const script = 'process.stderr.write("padding padding padding\\nRUN");setTimeout(()=>{process.stderr.write("NER FATAL: fixture\\n");process.exitCode=125},30)';
   for (const maxOutputBytes of [1024, 8]) {
@@ -134,8 +160,8 @@ test('runner diagnosis is independent of display truncation, including cross-chu
 
 test('streaming diagnostics preserve exact informational exclusions and final exit gates', async t => {
   const f = await fixture(t);
-  const sandbox = { confine(argv, policy) {
-    return { ...f.sandbox.confine(argv, policy), runnerFailureRules: [{ allowedExitCodes: [125], fatalSignatures: ['runner fatal'], informationalLines: ['runner fatal: information'] }] };
+  const sandbox = { async confine(argv, policy, signal) {
+    return { ...await f.sandbox.confine(argv, policy, signal), runnerFailureRules: [{ allowedExitCodes: [125], fatalSignatures: ['runner fatal'], informationalLines: ['runner fatal: information'] }] };
   } };
   for (const [parts, exitCode, expected] of [
     [['runner fa', 'tal: information\r', '\n'], 125, false],

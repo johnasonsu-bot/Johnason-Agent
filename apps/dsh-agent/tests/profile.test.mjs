@@ -15,6 +15,8 @@ test('native bundles survive encrypted overlay and duplicate providers fail clos
   assert.equal(prepared.profile, 'web');
   assert.deepEqual(prepared.args, ['--no-open']);
   assert.equal(prepared.rows.filter(r => r.id === 'credentials').length, 1);
+  assert.equal(prepared.rows.find(r => r.id === 'credentials').name,
+    new URL('../src/credentials-plugin.mjs', import.meta.url).href);
   assert.equal(prepared.rows.some(r => r.name?.includes('credentials-local')), false);
   const require = createRequire(join(upstreamRoot, 'apps/cli/package.json'));
   const boot = await import(require.resolve('@deepseek-ai/dsh-app-boot'));
@@ -26,8 +28,14 @@ test('native bundles survive encrypted overlay and duplicate providers fail clos
   const memory = prepared.rows.find(row => row.id === 'memory-recovery');
   assert.equal(memory?.name, fileURLToPath(new URL('../src/memory-recovery-plugin.mjs', import.meta.url)));
   assert.deepEqual(memory.config, { path: join(dataRoot, 'memory/recovery.sqlite'), enabled: true });
+  // Native excludes arbitrary packages from the shared profiles/node_modules.
+  const profileRequire = createRequire(join(dataRoot, 'profiles/web/package.json'));
+  assert.equal(profileRequire.resolve('@johnason/dsh-memory-ui'),
+    join(dataRoot, 'profiles/web/node_modules/@johnason/dsh-memory-ui/index.mjs'));
   const patchPath = join(dataRoot, 'profiles/web/cordis.patch.yml');
   await writeFile(patchPath, JSON.stringify([{ insert: [{ id: 'bad-extra', name: '@deepseek-ai/dsh-credentials-local' }] }]));
   await assert.rejects(prepareProfile(launch), /exactly one|credential provider/);
   assert.match(await readFile(patchPath, 'utf8'), /bad-extra/);
+  await writeFile(patchPath, JSON.stringify([{ id: 'credentials', disabled: true }]));
+  await assert.rejects(prepareProfile(launch), /exactly one|credential provider/i);
 });
