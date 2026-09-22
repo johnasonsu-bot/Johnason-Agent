@@ -233,7 +233,7 @@ function historySeed(messages, provider, model, sessionId) {
     seed.append("step/end", { turn, step: 1 });
     seed.append("turn/end", { turn, reason: { kind: "completed" } });
   }
-  return seed.events;
+  return seed.snapshotEvents();
 }
 
 
@@ -282,6 +282,9 @@ function realProviderAdapter(provider, credential) {
     options: () => connection,
     resolveApiKey: () => Promise.resolve(credential()),
     resolveUserId: () => "00000000-0000-4000-8000-000000000001",
+    // Match the official adapter's no-extension service behavior. Host v2's
+    // fixed preset does not admit dynamically contributed request fields.
+    prepareExtensions: async () => ({ fields: {}, accept: async () => {} }),
   });
 }
 
@@ -367,14 +370,15 @@ export async function runDeepSeekHarnessSession({
       source: { kind: "user" },
     }));
     await agent.whenIdle();
-    const terminal = agent.session.events.findLast(event => event.type === "turn/end");
+    const nativeEvents = agent.session.snapshotEvents();
+    const terminal = nativeEvents.findLast(event => event.type === "turn/end");
     const reason = terminal?.data?.reason?.kind;
     if (!terminal || !["completed", "max-tokens"].includes(reason)) {
       throw new Error(`DSH native Session ended with ${reason ?? "no terminal"}`);
     }
-    return Object.freeze({ content, nativeEvents: agent.session.events });
+    return Object.freeze({ content, nativeEvents });
   } catch (error) {
-    const terminal = agent?.session.events.findLast(event => event.type === "turn/end");
+    const terminal = agent?.session.snapshotEvents().findLast(event => event.type === "turn/end");
     throw new DshSessionFailure(
       error instanceof LlmError ? error.failure : terminal?.data?.reason?.error,
       stage,
