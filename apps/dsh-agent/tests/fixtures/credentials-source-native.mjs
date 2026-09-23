@@ -15,3 +15,10 @@ export class CredentialProvider {
   notifyUpdated(ref) { this.ctx.updates.push(ref); }
   notifyRecordUpdated(key) { this.ctx.updates.push(key); }
 }
+export class LlmError extends Error {
+  constructor(message, code, options) {
+    super(message, options);
+    this.name = 'LlmError';
+    this.code = code;
+  }
+}

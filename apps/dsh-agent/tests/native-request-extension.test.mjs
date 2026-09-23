@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { authenticateWeb, redactLaunchOutput } from './fixtures/native-web-client.mjs';
 
 async function loopbackModel(t) {
@@ -29,11 +30,11 @@ async function loopbackModel(t) {
   return { requests, baseURL: `http://127.0.0.1:${server.address().port}` };
 }
 
-async function launchProfile(t, baseURL, { missingVersion = false } = {}) {
+async function launchProfile(t, baseURL, { missingVersion = false, protocol, useVault = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-request-extension-'));
   const entries = [{ id: 'request-extension-acceptance',
     name: fileURLToPath(new URL('./fixtures/request-extension-plugin.mjs', import.meta.url)),
-    config: { baseURL } }];
+    config: { baseURL, protocol, useVault } }];
   if (missingVersion) {
     const bad = join(root, 'missing-version');
     await mkdir(bad);
@@ -102,4 +103,27 @@ test('native official inventory keeps rejecting missing package versions before 
   assert.equal(result.code, 'REQUEST_EXTENSION');
   assert.match(result.cause, /missing-version\/package\.json must declare non-empty name and version/);
   assert.equal(model.requests.length, 0, 'Metadata failure must prevent HTTP dispatch');
+});
+
+test('official Messages adapter reports the locked Vault action instead of a transport failure', { timeout: 45000 }, async t => {
+  const model = await loopbackModel(t);
+  const { client } = await launchProfile(t, model.baseURL, { protocol: 'messages', useVault: true });
+  const password = randomUUID();
+  const initialize = await client.fetch('/vault/initialize', { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password, confirmation: password }) });
+  assert.equal(initialize.status, 200, await initialize.text());
+  const lock = await client.fetch('/vault/lock', { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: '{}' });
+  assert.equal(lock.status, 200, await lock.text());
+  assert.deepEqual(await (await client.fetch('/vault/status')).json(), { initialized: true, locked: true });
+  const response = await client.fetch('/request-extension-acceptance');
+  const result = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(result.code, 'VAULT_LOCKED', JSON.stringify(result));
+  assert.match(result.error, /Vault/);
+  assert.match(result.error, /解锁|unlock/i);
+  assert.match(result.error, /\/vault/);
+  assert.doesNotMatch(result.error, /transport failed/i);
+  assert.equal(model.requests.length, 0, 'Locked model credentials must fail before HTTP dispatch');
+  assert.deepEqual(await (await client.fetch('/vault/status')).json(), { initialized: true, locked: true });
 });

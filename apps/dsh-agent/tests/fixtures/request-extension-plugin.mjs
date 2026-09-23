@@ -2,10 +2,10 @@
 // Its endpoint is confined to loopback, and its synthetic API key exists only in memory.
 import { randomUUID } from 'node:crypto';
 import { DeepSeekAdapter, resolveAdapterOptions } from '../../../../third_party/deepseek-harness/packages/llm/llm-deepseek/lib/index.js';
-import { BlockAssembler, createUserMessage } from '../../../../third_party/deepseek-harness/packages/llm/llm/lib/index.js';
+import { BlockAssembler, createUserMessage, LlmError } from '../../../../third_party/deepseek-harness/packages/llm/llm/lib/index.js';
 
 export const name = 'request-extension-acceptance';
-export const inject = ['webServer', 'deepseekLlmApiExtensions'];
+export const inject = ['webServer', 'deepseekLlmApiExtensions', 'credentials'];
 
 export function apply(ctx, config) {
   const endpoint = new URL(config.baseURL);
@@ -18,8 +18,13 @@ export function apply(ctx, config) {
       try {
         let fields;
         const adapter = new DeepSeekAdapter({
-          options: () => resolveAdapterOptions({ protocol: 'chat-completions', baseURL: endpoint.origin }),
-          resolveApiKey: async () => apiKey,
+          options: () => resolveAdapterOptions({ protocol: config.protocol ?? 'chat-completions', baseURL: endpoint.origin }),
+          resolveApiKey: async () => {
+            if (!config.useVault) return apiKey;
+            const hit = await ctx.credentials.resolve('DEEPSEEK_API_KEY');
+            if (!hit) throw new LlmError('No test model credential configured', 'MISSING_CREDENTIAL');
+            return hit.value;
+          },
           resolveUserId: () => '00000000-0000-4000-8000-000000000001',
           prepareExtensions: async request => {
             const prepared = await ctx.deepseekLlmApiExtensions.prepare(request);

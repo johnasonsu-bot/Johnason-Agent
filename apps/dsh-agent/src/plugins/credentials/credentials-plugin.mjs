@@ -4,7 +4,7 @@ import { VaultStore } from './vault-store.mjs';
 import { installVaultUi } from './vault-ui.mjs';
 import { BROWSER_SESSION_RECORD_KEY, browserSessionRecord } from './browser-session-record.mjs';
 
-import { CredentialProvider, credentialRef, parseCredentialKey, Service } from '../../platform/credential-api.mjs';
+import { CredentialProvider, credentialRef, parseCredentialKey, Service, LlmError } from '../../platform/credential-api.mjs';
 
 function jsonValue(value, seen = new Set()) {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
@@ -53,7 +53,21 @@ export default class VaultCredentials extends CredentialProvider {
 
   async resolve(ref) {
     credentialRef(ref);
-    const value = (await this.vault.read()).refs[ref];
+    let data;
+    try {
+      data = await this.vault.read();
+    } catch (error) {
+      // Native model adapters preserve LlmError codes but wrap ordinary errors
+      // as transport failures, which would hide the user's required action.
+      if (error?.code === 'VAULT_LOCKED') {
+        throw new LlmError('Vault 已锁定，请打开 /vault 解锁后重试。', error.code, { cause: error });
+      }
+      if (error?.code === 'VAULT_NOT_INITIALIZED') {
+        throw new LlmError('Vault 尚未初始化，请打开 /vault 初始化并配置模型凭据后重试。', error.code, { cause: error });
+      }
+      throw error;
+    }
+    const value = data.refs[ref];
     return typeof value === 'string' && value.length ? { value, source: 'vault' } : undefined;
   }
   async describe(ref) {

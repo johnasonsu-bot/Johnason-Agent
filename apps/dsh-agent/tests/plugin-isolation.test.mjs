@@ -41,6 +41,7 @@ test('old public imports preserve every export and class identity after relocati
   const boundary = `data:text/javascript,${encodeURIComponent(`
     export class CredentialProvider {};
     export class Service {};
+    export class LlmError extends Error {};
     export const credentialRef = value => value;
     export const parseCredentialKey = value => value;
     export const createUserMessage = value => value;
