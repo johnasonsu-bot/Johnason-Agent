@@ -1,8 +1,13 @@
 {
   "name": "@johnason/dsh-memory-ui",
+  "version": "1.0.0",
+  "description": "Johnason 本地扩展：加密 Vault、三类记忆、恢复审计、任务沙箱、Forge 与 Data Platform 系统授权",
   "private": true,
   "type": "module",
   "main": "index.mjs",
   "exports": { ".": "./index.mjs", "./client": "./client.js", "./package.json": "./package.json" },
-  "dsh": { "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-renderer", "@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-sidebar"] } }
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-renderer", "@deepseek-ai/dsh-client-ui-conversation", "@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-client-ui-plugin-manager"] }
+  }
 }

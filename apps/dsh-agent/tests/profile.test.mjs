@@ -1,11 +1,73 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { prepareProfile } from '../src/profile.mjs';
+
+test('local features are an installed native bundle, without duplicate activation or overriding an explicit disable', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-local-bundle-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web', '--no-open'] };
+  const name = '@johnason/dsh-memory-ui';
+  const first = await prepareProfile(launch);
+  const manifestPath = join(dataRoot, 'profiles/web/package.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  assert.ok(manifest.dependencies?.[name], 'native Installed list requires a profile dependency');
+  assert.ok(manifest.dsh.profile.bundles.includes(name));
+  assert.equal(first.rows.filter(row => row.id === 'memory-ui').length, 1);
+  const bundle = JSON.parse(await readFile(join(dataRoot, 'profiles/web/node_modules', name, 'package.json'), 'utf8'));
+  assert.ok(bundle.version);
+  assert.ok(bundle.dsh.bundle.patch);
+  const repeated = await prepareProfile(launch);
+  assert.equal(repeated.rows.filter(row => row.id === 'memory-ui').length, 1);
+  // A user can hide the local UI without changing host credentials or session policy.
+  manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(value => value !== name);
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const disabled = await prepareProfile(launch);
+  assert.equal(disabled.rows.some(row => row.id === 'memory-ui'), false);
+  assert.equal(disabled.rows.filter(row => row.id === 'credentials').length, 1);
+  assert.ok(disabled.rows.some(row => row.id === 'memory-recovery'));
+});
+
+test('disabled local UI retains safe provider configuration for a native live re-enable', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-bundle-reactivate-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web'], providers: [
+    { id: 'forge', label: 'Forge', type: 'forge', url: 'http://127.0.0.1:8010', python: '/trusted/python', sourceRoot: '/trusted/forge', dbPath: '/trusted/data.db' },
+  ] };
+  await prepareProfile(launch);
+  const manifestPath = join(dataRoot, 'profiles/web/package.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(name => name !== '@johnason/dsh-memory-ui');
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const disabled = await prepareProfile(launch);
+  assert.equal(disabled.rows.some(row => row.id === 'memory-ui'), false);
+  const overlay = JSON.parse(await readFile(disabled.overlayPath, 'utf8'));
+  const require = createRequire(join(upstreamRoot, 'apps/cli/package.json'));
+  const boot = await import(require.resolve('@deepseek-ai/dsh-app-boot'));
+  const reenabled = boot.composeEntries([[{ insert: [{ id: 'memory-ui', name: '@johnason/dsh-memory-ui' }] }], overlay]);
+  assert.deepEqual(reenabled.find(row => row.id === 'memory-ui').config?.providers, [{ id: 'forge', label: 'Forge', type: 'forge' }]);
+});
+
+test('native uninstall is not undone by a later launcher run', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-bundle-uninstall-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web'] };
+  await prepareProfile(launch);
+  const manifestPath = join(dataRoot, 'profiles/web/package.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  const name = '@johnason/dsh-memory-ui';
+  // Emulate the native manager's manifest update, retaining files per user policy.
+  delete manifest.dependencies[name];
+  manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(value => value !== name);
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const restarted = await prepareProfile(launch);
+  assert.equal(restarted.rows.some(row => row.id === 'memory-ui'), false);
+  assert.equal(Object.hasOwn(JSON.parse(await readFile(manifestPath, 'utf8')).dependencies, name), false);
+});
 
 test('native bundles survive encrypted overlay and duplicate providers fail closed', async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-profile-'));
@@ -31,7 +93,7 @@ test('native bundles survive encrypted overlay and duplicate providers fail clos
   // Native excludes arbitrary packages from the shared profiles/node_modules.
   const profileRequire = createRequire(join(dataRoot, 'profiles/web/package.json'));
   assert.equal(profileRequire.resolve('@johnason/dsh-memory-ui'),
-    join(dataRoot, 'profiles/web/node_modules/@johnason/dsh-memory-ui/index.mjs'));
+    await realpath(join(dataRoot, 'profiles/web/node_modules/@johnason/dsh-memory-ui/index.mjs')));
   const patchPath = join(dataRoot, 'profiles/web/cordis.patch.yml');
   await writeFile(patchPath, JSON.stringify([{ insert: [{ id: 'bad-extra', name: '@deepseek-ai/dsh-credentials-local' }] }]));
   await assert.rejects(prepareProfile(launch), /exactly one|credential provider/);

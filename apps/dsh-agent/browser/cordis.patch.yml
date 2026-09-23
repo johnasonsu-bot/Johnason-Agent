@@ -1,0 +1,3 @@
+- insert:
+    - id: memory-ui
+      name: '@johnason/dsh-memory-ui'

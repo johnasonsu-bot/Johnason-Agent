@@ -13,6 +13,91 @@ window.__ModuleLoader__.load({
     }
     const control = { font: 'inherit', padding: '7px 10px', border: '1px solid #dce1e9', borderRadius: 8, background: '#fff', color: '#17304a', lineHeight: 1.5, opacity: 1 };
     const field = { ...control, width: '100%', boxSizing: 'border-box' };
+    function LocalPluginPanel() {
+      const [metadata, setMetadata] = useState({ state: 'loading' });
+      const [vault, setVault] = useState({ state: 'loading' });
+      const [memory, setMemory] = useState({ state: 'loading' });
+      const [busy, setBusy] = useState(false);
+      const active = useRef(false), serial = useRef(0), pending = useRef(null);
+      async function refresh() {
+        pending.current?.abort();
+        const controller = new AbortController();
+        pending.current = controller;
+        const seq = ++serial.current;
+        setBusy(true);
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        async function load(url, options, project, setState) {
+          setState({ state: 'loading' });
+          try {
+            const response = await fetch(url, { ...options, signal: controller.signal, credentials: 'same-origin', cache: 'no-store' });
+            if (!response.ok) throw new Error('UNAVAILABLE');
+            const safe = project(await response.json());
+            if (active.current && serial.current === seq) setState({ state: 'ready', ...safe });
+          } catch {
+            if (active.current && serial.current === seq) setState({ state: 'error' });
+          }
+        }
+        try {
+          await Promise.all([
+            load('/johnason/plugins', {}, value => {
+              if (value.schemaVersion !== 1 || !Array.isArray(value.providers)) throw new Error('INVALID_METADATA');
+              return { providers: value.providers.map(({ id, label, type }) => ({ id, label, type })) };
+            }, setMetadata),
+            load('/vault/status', {}, value => {
+              if (typeof value.initialized !== 'boolean' || typeof value.locked !== 'boolean') throw new Error('INVALID_STATUS');
+              return { initialized: value.initialized, locked: value.locked };
+            }, setVault),
+            load('/memory-recovery/api/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }, value => {
+              if (!Array.isArray(value.value)) throw new Error('INVALID_STATUS');
+              // Retain counts only: the overview never displays session identity, paths or memory content.
+              return { enabled: value.value.filter(row => row.config?.enabled).length, sandboxed: value.value.filter(row => row.config?.sandbox).length };
+            }, setMemory),
+          ]);
+        } finally {
+          clearTimeout(timeout);
+          if (active.current && serial.current === seq) setBusy(false);
+        }
+      }
+      useEffect(() => {
+        active.current = true; refresh();
+        return () => { active.current = false; ++serial.current; pending.current?.abort(); };
+      }, []);
+      const availability = (source, ready) => source.state === 'loading' ? '加载中…' : source.state === 'error' ? '服务不可用' : ready;
+      const statusStyle = { fontSize: 13, fontWeight: 600, color: '#40546d' };
+      const card = (title, status, description, href, link) => h('article', { key: title, style: { border: '1px solid #dce1e9', borderRadius: 12, padding: 16, display: 'grid', gap: 10, alignContent: 'start', background: '#fff' } },
+        h('h3', { style: { margin: 0, fontSize: 16 } }, title),
+        h('span', { style: statusStyle, role: 'status' }, status),
+        h('p', { style: { margin: 0, color: '#526174', lineHeight: 1.6 } }, description),
+        href && h('a', { href, target: '_blank', rel: 'noopener noreferrer', style: { color: '#315cbe' } }, link));
+      const providers = metadata.providers || [];
+      const systems = (title, type) => {
+        const configured = providers.filter(provider => provider.type === type);
+        return card(title, availability(metadata, configured.length ? '已配置' : '未配置'),
+          metadata.state === 'error' ? '无法读取系统配置状态，请刷新重试。'
+            : metadata.state !== 'ready' ? '正在读取本地系统配置。'
+            : configured.length ? configured.map(provider => provider.label).join('、') + '。请进入系统管理查看授权状态或登录。'
+            : title + ' 连接尚未配置。需在本地系统配置中指定服务地址及对应核心适配器，然后重新启动；凭据通过 Vault 保存。',
+          metadata.state === 'ready' && configured.length ? '/systems' : null, '打开系统管理');
+      };
+      const memoryStatus = availability(memory, memory.enabled + ' 个会话已启用');
+      return h('section', { 'data-johnason-plugins': true, style: { color: '#17304a', colorScheme: 'light', lineHeight: 1.5, display: 'grid', gap: 16, padding: '8px 0' } },
+        h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 } },
+          h('h2', { style: { margin: 0, fontSize: 20 } }, 'Johnason 本地功能'),
+          h('button', { type: 'button', style: control, disabled: busy, onClick: refresh }, busy ? '刷新中…' : '刷新状态')),
+        h('p', { style: { margin: 0, color: '#526174' } }, '此插件提供本地功能入口。停用入口不会移除已启用的会话约束；Vault、记忆和沙箱的服务策略继续由宿主管理。'),
+        h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 260px), 1fr))', gap: 14 } },
+          card('Vault 凭据', availability(vault, !vault.initialized ? '未初始化' : vault.locked ? '已锁定' : '已解锁'), '管理加密保存的模型与系统凭据；在 Vault 页面初始化、解锁或锁定。', '/vault', '打开 Vault'),
+          card('三类记忆', memoryStatus, '按会话管理情景记忆、语义记忆与程序记忆。新会话可在发送首条消息前启用。', '/memory-recovery', '管理三类记忆'),
+          card('恢复审计', memoryStatus, '查看记忆持久化、执行效果与恢复审计记录。只显示已有会话的记录，不自动导入旧版历史。', '/memory-recovery', '查看恢复审计'),
+          card('语义子图', memoryStatus, '按会话查看语义关系与时间范围，追踪记忆来源。', '/memory-recovery', '查看语义子图'),
+          card('任务沙箱', availability(memory, memory.sandboxed + ' 个会话已启用'), '按会话显式启用，当前并非全局开启。需在会话配置中选择策略；已启用的沙箱不能移除或放宽。', '/memory-recovery', '配置会话沙箱'),
+          systems('Forge DevOps', 'forge'), systems('Data Platform', 'dataplatform'),
+          card('统一授权', availability(metadata, providers.length ? '已配置' : '未配置'),
+            metadata.state === 'error' ? '无法读取系统配置状态，请刷新重试。'
+              : metadata.state !== 'ready' ? '正在读取本地系统配置。'
+              : providers.length ? '统一管理已配置系统的登录与授权。配置完成不代表已登录，请进入系统管理确认。' : '需先配置 Forge DevOps 或 Data Platform 连接，再通过系统管理登录与授权。',
+            metadata.state === 'ready' && providers.length ? '/systems' : null, '管理统一授权')));
+    }
     function MemoryDock({ sessionId }) {
       const [open, setOpen] = useState(false), [config, setConfig] = useState(null), [status, setStatus] = useState(null);
       const [error, setError] = useState(''), [busy, setBusy] = useState(false), [stale, setStale] = useState(false);
@@ -98,6 +183,9 @@ window.__ModuleLoader__.load({
           ctx.slots.inject(name, () => ctx.slots.register({ name, priority: -10 }, () => null));
         }
         ctx.slots.inject('sidebar.brand.name', () => ctx.slots.register({ name: 'sidebar.brand.name', priority: -10 }, () => h('strong', null, 'Johnason Agent')));
+        ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+          name: 'plugins.bundle.config', key: '@johnason/dsh-memory-ui',
+        }, ({ view }) => view === 'summary' ? 'Vault、三类记忆、恢复审计、语义子图、任务沙箱与系统统一授权。' : h(LocalPluginPanel)));
         ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
           name: 'conversation.input.dock', id: 'johnason-memory', order: -20, inject: sessionId => ({ sessionId }),
         }, props => h(MemoryDock, { ...props, key: props.sessionId })));

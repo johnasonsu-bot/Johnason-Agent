@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createPluginPlan } from '../plugins/index.mjs';
 import { loadProfilePlatform } from './launch-platform.mjs';
 
@@ -36,29 +36,57 @@ export async function prepareProfile(config, options = {}) {
   const bundleDir = join(config.dataRoot, 'profiles/node_modules', bundleName);
   const baseDir = boot.resolveBundleDir('johnason-dsh', '@deepseek-ai/dsh-base', anchor, config.dataRoot);
   const baseManifest = JSON.parse(await readFile(join(baseDir, 'package.json'), 'utf8'));
+  const localManifest = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'));
   const basePatch = await readFile(join(baseDir, baseManifest.dsh.bundle.patch), 'utf8');
   const needle = "name: '@deepseek-ai/dsh-credentials-local'";
   if (basePatch.split(needle).length !== 2) throw new Error('Native base must have exactly one credential provider');
   await mkdir(bundleDir, { recursive: true, mode: 0o700 });
-  await writeFile(join(bundleDir, 'package.json'), JSON.stringify({ name: bundleName, private: true, dsh: { bundle: { patch: './cordis.patch.yml' } } }) + '\n');
+  await writeFile(join(bundleDir, 'package.json'), JSON.stringify({ name: bundleName, version: localManifest.version, private: true, dsh: { bundle: { patch: './cordis.patch.yml' } } }) + '\n');
   await writeFile(join(bundleDir, 'cordis.patch.yml'), basePatch.replace(needle, `name: ${JSON.stringify(pluginPath)}`));
   // Native patch names are match guards, not replacements. Substitute only the base bundle slot.
   const profileDir = boot.resolveProfileDir(profile, config.dataRoot);
-  let loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
-  const manifest = boot.readProfileManifest('johnason-dsh', profileDir);
-  if (manifest.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-base')) {
-    manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.map(name => name === '@deepseek-ai/dsh-base' ? bundleName : name);
-    boot.writeProfileManifest(profileDir, manifest);
-    loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
-  }
-  const overlay = plugins.profileOverlay(platform);
+  const provisionedKey = 'johnason:provisioned-bundles';
+  let previous = {};
+  try { previous = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const provisioned = previous[provisionedKey] ?? [];
+  if (!Array.isArray(provisioned) || provisioned.some(name => typeof name !== 'string')) throw new Error('Invalid local bundle provisioning record');
   for (const bundle of plugins.clientBundles) {
-    // The native runtime resolver excludes arbitrary packages in the shared
-    // profiles/node_modules directory; the owning profile has its own scope.
+    const uninstalled = provisioned.includes(bundle.name)
+      && !Object.hasOwn(previous.dependencies ?? {}, bundle.name)
+      && !previous.dsh?.profile?.bundles?.includes(bundle.name);
+    if (uninstalled) continue;
+    // Profile-local packages are resolved by both the runtime and the native manager.
     const uiDir = join(profileDir, 'node_modules', bundle.name);
     await mkdir(uiDir, { recursive: true, mode: 0o700 });
     for (const file of bundle.files) await copyFile(new URL(file, bundle.sourceRoot), join(uiDir, file));
   }
+  let loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
+  const manifest = boot.readProfileManifest('johnason-dsh', profileDir);
+  let manifestChanged = false;
+  if (manifest.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-base')) {
+    manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.map(name => name === '@deepseek-ai/dsh-base' ? bundleName : name);
+    manifestChanged = true;
+  }
+  for (const bundle of plugins.clientBundles) {
+    if (provisioned.includes(bundle.name)) continue;
+    if (!Object.hasOwn(manifest.dependencies ?? {}, bundle.name)) {
+      manifest.dependencies = { ...manifest.dependencies, [bundle.name]: `file:${fileURLToPath(bundle.sourceRoot)}` };
+      manifest.dsh ??= {};
+      manifest.dsh.profile ??= {};
+      manifest.dsh.profile.bundles = [...new Set([...manifest.dsh.profile.bundles ?? [], bundle.name])];
+      manifestChanged = true;
+    }
+    // Native package operations preserve extra manifest fields. This separates
+    // first upgrade from an explicit later uninstall without recreating files.
+    manifest[provisionedKey] = [...new Set([...manifest[provisionedKey] ?? [], bundle.name])];
+    manifestChanged = true;
+  }
+  if (manifestChanged) {
+    boot.writeProfileManifest(profileDir, manifest);
+    loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
+  }
+  const overlay = plugins.profileOverlay(platform);
   const layers = [loaded.layers.flatMap(layer => layer.patches), loaded.patches,
     boot.loadOptionalPatches('johnason-dsh', join(config.dataRoot, 'cordis.patch.yml')) ?? [],
     ...patchFiles.map(path => boot.loadOverlayPatches('johnason-dsh', path)), overlay];

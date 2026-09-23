@@ -16,6 +16,10 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 共享版本策略位于 `mvp/src/workbench/runtime/deepseek_harness/platform-release.json`。升级时先运行 `npm --prefix apps/dsh-agent run check:platform`，再完成源码契约、构建及原生回归。此检查验证版本和依赖边界，不代替构建产物内容校验。不能彻底隔离的内部接口及建议见[边界与演进清单](../../docs/architecture/dsh-platform-plugin-boundary.md)。
 
+在侧栏 **插件 → 已安装 → memory-ui** 打开「Johnason 本地功能」，可访问 Vault、三类记忆、恢复审计、语义子图、任务沙箱、Forge、Data Platform 与统一授权。状态来自本地服务；系统未配置时明确显示「未配置」，不会自动连接业务系统。Forge/Data Platform 仍需通过 `--systems`（或 Data Platform 的 `--core`）指定受信任适配器，再通过 `/systems` 登录。该插件开关控制界面入口，停用不移除已有会话约束，也不删除数据。
+
+本地插件包必须包含有效的 `name` 与 `version`，以通过新版官方 DeepSeek 请求扩展的包清单校验；缺少版本会在发送请求前触发 `REQUEST_EXTENSION`。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方 adapter 和本机 HTTP/SSE 服务覆盖这一步，不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
+
 ## 环境要求
 
 - 实测平台：macOS、Node.js v22.20.0；Windows/Linux 尚未实测，不承诺相同的 TTY、目录选择器和信号行为。

@@ -14,7 +14,7 @@ export function createPluginPlan(config) {
     implementationEntry: entry('./credentials/credentials-plugin.mjs'),
     bundleName: '@johnason/dsh-encrypted-base' });
   const clientBundles = config.mode === 'web' ? [{ name: '@johnason/dsh-memory-ui',
-    sourceRoot: new URL('../../browser/', import.meta.url), files: ['package.json', 'index.mjs', 'client.js'] }] : [];
+    sourceRoot: new URL('../../browser/', import.meta.url), files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] }] : [];
   return {
     contractVersion: 1, credential, clientBundles, providers,
     profileOverlay({ authorizationEntry }) {
@@ -26,7 +26,11 @@ export function createPluginPlan(config) {
         overlay.push({ insert: [{ id: 'dataplatform-authorization', name: authorizationEntry },
           { id: 'dataplatform', name: entry('../systems-plugin.mjs'), config: { providers } }] });
       }
-      if (clientBundles.length) overlay.push({ insert: [{ id: 'memory-ui', name: clientBundles[0].name }] });
+      // A config-only patch never inserts a disabled bundle's row. Keep it in
+      // the overlay so the native manager can re-enable the UI without restart.
+      if (clientBundles.length) {
+        overlay.push({ id: 'memory-ui', config: { providers: providers.map(({ id, label, type }) => ({ id, label, type })) } });
+      }
       return overlay;
     },
     async prepare() {
