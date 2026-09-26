@@ -1,0 +1,3 @@
+- insert:
+    - id: model-api
+      name: '@johnason/dsh-model-api'

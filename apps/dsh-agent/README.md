@@ -18,6 +18,12 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 在侧栏 **插件 → 已安装 → memory-ui** 打开「Johnason 本地功能」，可访问 Vault、三类记忆、恢复审计、语义子图、任务沙箱、Forge、Data Platform 与统一授权。状态来自本地服务；系统未配置时明确显示「未配置」，不会自动连接业务系统。Forge/Data Platform 仍需通过 `--systems`（或 Data Platform 的 `--core`）指定受信任适配器，再通过 `/systems` 登录。该插件开关控制界面入口，停用不移除已有会话约束，也不删除数据。
 
+在 **插件 → 已安装 → model-api** 打开「模型 API」，可为 Agent 新增本地 LLM 或外部云模型连接，原生 **设置 → 模型** 页也提供同一表单。先解锁 Vault，再填写连接 ID、显示名称、API 地址、协议和服务实际提供的模型 ID；云模型的 API Key 仅在密码框中输入。支持 OpenAI Chat Completions、OpenAI Responses 与 Anthropic Messages 协议，兼容程度由具体服务决定。
+
+插件使用独立的 `johnason-<连接 ID>` 供应商，不覆盖已有连接；保存后在会话模型选择器中选择新模型。默认输出上限为 4096 token，进一步调整或编辑已有连接可使用原生 Models 页面。新增连接走原生版本检查和模型注册，不创建第二套推理服务；停用或卸载入口不会删除已保存的模型、凭据或会话。
+
+本地连接仅接受 `localhost`、`127.0.0.1` 或 `::1` 的 HTTP/HTTPS 地址，外部连接要求 HTTPS。原生适配器仍要求凭据：无需认证的本地服务可以留空 API Key，插件会生成随机占位值并保存到 Vault。配置文件只保存凭据引用，Vault 锁定时不能保存或调用模型。保存操作不探测模型、不发送测试问题，也不自动切换当前会话。此处“外部 API”指云端模型接口；业务系统 API 仍由系统插件管理。
+
 本地插件包必须包含有效的 `name` 与 `version`，以通过新版官方 DeepSeek 请求扩展的包清单校验；缺少版本会在发送请求前触发 `REQUEST_EXTENSION`。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方 adapter 和本机 HTTP/SSE 服务覆盖这一步，不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
 
 ## 环境要求

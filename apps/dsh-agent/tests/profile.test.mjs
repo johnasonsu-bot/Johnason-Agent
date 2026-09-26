@@ -7,30 +7,31 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { prepareProfile } from '../src/profile.mjs';
 
-test('local features are an installed native bundle, without duplicate activation or overriding an explicit disable', async () => {
+for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api']]) {
+test(`${name} is installed without duplicate activation or overriding an explicit disable`, async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-local-bundle-'));
   const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
   const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web', '--no-open'] };
-  const name = '@johnason/dsh-memory-ui';
   const first = await prepareProfile(launch);
   const manifestPath = join(dataRoot, 'profiles/web/package.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
   assert.ok(manifest.dependencies?.[name], 'native Installed list requires a profile dependency');
   assert.ok(manifest.dsh.profile.bundles.includes(name));
-  assert.equal(first.rows.filter(row => row.id === 'memory-ui').length, 1);
+  assert.equal(first.rows.filter(row => row.id === id).length, 1);
   const bundle = JSON.parse(await readFile(join(dataRoot, 'profiles/web/node_modules', name, 'package.json'), 'utf8'));
   assert.ok(bundle.version);
   assert.ok(bundle.dsh.bundle.patch);
   const repeated = await prepareProfile(launch);
-  assert.equal(repeated.rows.filter(row => row.id === 'memory-ui').length, 1);
+  assert.equal(repeated.rows.filter(row => row.id === id).length, 1);
   // A user can hide the local UI without changing host credentials or session policy.
   manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(value => value !== name);
   await writeFile(manifestPath, JSON.stringify(manifest));
   const disabled = await prepareProfile(launch);
-  assert.equal(disabled.rows.some(row => row.id === 'memory-ui'), false);
+  assert.equal(disabled.rows.some(row => row.id === id), false);
   assert.equal(disabled.rows.filter(row => row.id === 'credentials').length, 1);
   assert.ok(disabled.rows.some(row => row.id === 'memory-recovery'));
 });
+}
 
 test('disabled local UI retains safe provider configuration for a native live re-enable', async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-bundle-reactivate-'));
@@ -52,22 +53,23 @@ test('disabled local UI retains safe provider configuration for a native live re
   assert.deepEqual(reenabled.find(row => row.id === 'memory-ui').config?.providers, [{ id: 'forge', label: 'Forge', type: 'forge' }]);
 });
 
-test('native uninstall is not undone by a later launcher run', async () => {
+for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api']]) {
+test(`${name} uninstall is not undone by a later launcher run`, async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-bundle-uninstall-'));
   const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
   const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web'] };
   await prepareProfile(launch);
   const manifestPath = join(dataRoot, 'profiles/web/package.json');
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-  const name = '@johnason/dsh-memory-ui';
   // Emulate the native manager's manifest update, retaining files per user policy.
   delete manifest.dependencies[name];
   manifest.dsh.profile.bundles = manifest.dsh.profile.bundles.filter(value => value !== name);
   await writeFile(manifestPath, JSON.stringify(manifest));
   const restarted = await prepareProfile(launch);
-  assert.equal(restarted.rows.some(row => row.id === 'memory-ui'), false);
+  assert.equal(restarted.rows.some(row => row.id === id), false);
   assert.equal(Object.hasOwn(JSON.parse(await readFile(manifestPath, 'utf8')).dependencies, name), false);
 });
+}
 
 test('native bundles survive encrypted overlay and duplicate providers fail closed', async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-profile-'));

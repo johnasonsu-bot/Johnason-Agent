@@ -25,6 +25,7 @@ flowchart LR
 | `apps/dsh-agent/src/plugins/credentials/` | Vault、锁、凭据接口、本地页面、进程内浏览器签名 |
 | `apps/dsh-agent/src/plugins/systems/` | Forge/Data Platform 命令、授权流、本地页面和 CLI |
 | `apps/dsh-agent/src/plugins/memory/` | 记忆与 Effect 存储、分页、工具、审计、恢复、本地页面及沙箱协作 |
+| `apps/dsh-agent/model-api-browser/` | 独立模型 API 配置插件；仅使用原生浏览器 Settings/Credentials Remote 和页面 slots，模型执行仍由官方 adapter 承担 |
 | `mvp/sidecars/deepseek-harness/src/platform-runtime.ts` | Workbench 唯一官方深路径导入边界 |
 | `mvp/sidecars/deepseek-harness/src/native-session.ts` | Workbench 历史、流、工具、取消的版本适配；通过版本化 adapter 契约供 Host 调用 |
 

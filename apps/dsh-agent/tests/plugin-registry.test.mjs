@@ -15,7 +15,7 @@ test('local plugin plan declares protected credentials, optional systems and Web
   assert.equal(overlay.flatMap(row => row.insert ?? []).filter(row => row.id === 'memory-recovery').length, 1);
   assert.equal(overlay.flatMap(row => row.insert ?? []).find(row => row.id === 'memory-recovery').name, fileURLToPath(new URL('../src/memory-recovery-plugin.mjs', import.meta.url)));
   assert.equal(overlay.flatMap(row => row.insert ?? []).some(row => row.id === 'dataplatform'), false);
-  assert.equal(plan.clientBundles.length, 1);
+  assert.deepEqual(plan.clientBundles.map(bundle => bundle.name), ['@johnason/dsh-memory-ui', '@johnason/dsh-model-api']);
   assert.equal(registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'headless', providers: [] }).clientBundles.length, 0);
   const systems = registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'web', providers: [
     { id: 'dataplatform', label: 'Data Platform', type: 'dataplatform', url: 'http://127.0.0.1:46120', corePath: '/trusted/core.cjs' },

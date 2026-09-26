@@ -14,7 +14,9 @@ export function createPluginPlan(config) {
     implementationEntry: entry('./credentials/credentials-plugin.mjs'),
     bundleName: '@johnason/dsh-encrypted-base' });
   const clientBundles = config.mode === 'web' ? [{ name: '@johnason/dsh-memory-ui',
-    sourceRoot: new URL('../../browser/', import.meta.url), files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] }] : [];
+    sourceRoot: new URL('../../browser/', import.meta.url), files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] },
+    { name: '@johnason/dsh-model-api', sourceRoot: new URL('../../model-api-browser/', import.meta.url),
+      files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] }] : [];
   return {
     contractVersion: 1, credential, clientBundles, providers,
     profileOverlay({ authorizationEntry }) {
