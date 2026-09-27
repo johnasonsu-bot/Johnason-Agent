@@ -8,7 +8,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   timeoutMs: 60000,
   maxTokens: 2048,
   threshold: 0.75,
-  maxCallsPerTurn: 8,
+  maxCallsPerTurn: 256,
   maxConcurrent: 2,
 });
 export const MODELS_PATH = '/johnason/local-models/models';
@@ -39,7 +39,7 @@ export function normalizeSettings(input = {}) {
   try { url = new URL(config.baseURL); } catch { fail('LOCAL_MODEL_INVALID_SETTINGS'); }
   if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
     || url.username || url.password || url.search || url.hash) fail('LOCAL_MODEL_INVALID_SETTINGS');
-  for (const [name, min, max] of [['timeoutMs', 1, 120000], ['maxTokens', 1, 4096], ['maxCallsPerTurn', 1, 32], ['maxConcurrent', 1, 4]]) {
+  for (const [name, min, max] of [['timeoutMs', 1, 120000], ['maxTokens', 1, 4096], ['maxCallsPerTurn', 1, 2000], ['maxConcurrent', 1, 4]]) {
     if (!Number.isSafeInteger(config[name]) || config[name] < min || config[name] > max) fail('LOCAL_MODEL_INVALID_SETTINGS');
   }
   if (!Number.isFinite(config.threshold) || config.threshold < 0 || config.threshold > 1) fail('LOCAL_MODEL_INVALID_SETTINGS');
@@ -53,6 +53,21 @@ function inputTask(args, allowed) {
   if (!object(args) || Object.keys(args).some(key => !allowed.includes(key)) || typeof args.task !== 'string'
     || !args.task.trim() || args.task.length > 6000) fail('LOCAL_MODEL_INVALID_INPUT');
   return args.task;
+}
+
+function inputBatch(args) {
+  if (!object(args) || Object.keys(args).some(key => key !== 'tasks') || !Array.isArray(args.tasks)
+    || args.tasks.length < 1 || args.tasks.length > 200) fail('LOCAL_MODEL_INVALID_INPUT');
+  const ids = new Set();
+  const tasks = [];
+  for (const item of args.tasks) {
+    const task = inputTask(item, ['id', 'task']);
+    if (typeof item.id !== 'string' || !item.id.trim() || item.id.length > 128
+      || /[\u0000-\u001f\u007f]/.test(item.id) || ids.has(item.id)) fail('LOCAL_MODEL_INVALID_INPUT');
+    ids.add(item.id);
+    tasks.push({ id: item.id, task });
+  }
+  return tasks;
 }
 
 async function boundedJson(response) {
@@ -87,7 +102,7 @@ function completionText(value, secret) {
 }
 
 /**
- * Each generate/route operation snapshots settings and credential once. getTurn
+ * Each generate/route/batch operation snapshots settings and credential once. getTurn
  * reads the host's open turn projection; without it the budget is session-wide.
  * Listing consumes no model-generation budget. Entries are bounded and never
  * evicted to let an old session silently reset its budget.
@@ -117,7 +132,7 @@ export function createLocalModelService({ getSettings, resolveCredential = async
     return budget;
   }
 
-  async function operation(exec, useBudget, work) {
+  async function operation(exec, useBudget, work, { timeoutPerRequest = false } = {}) {
     if (disposed) fail('LOCAL_MODEL_DISABLED');
     const config = normalizeSettings(getSettings());
     if (!config.enabled) fail('LOCAL_MODEL_DISABLED');
@@ -127,7 +142,8 @@ export function createLocalModelService({ getSettings, resolveCredential = async
     const controller = new AbortController();
     const abort = () => controller.abort(new LocalModelError('LOCAL_MODEL_CANCELLED'));
     exec?.signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new LocalModelError('LOCAL_MODEL_TIMEOUT')), config.timeoutMs);
+    const startTimer = () => setTimeout(() => controller.abort(new LocalModelError('LOCAL_MODEL_TIMEOUT')), config.timeoutMs);
+    let timer = startTimer();
     active.add(controller);
     let credentialPending = false;
     let operationDone = false;
@@ -160,6 +176,9 @@ export function createLocalModelService({ getSettings, resolveCredential = async
           if (budget.calls >= config.maxCallsPerTurn) fail('LOCAL_MODEL_CALL_LIMIT');
           budget.calls++;
         }
+        // A batch may legitimately outlive one inference timeout. It still holds
+        // one concurrency slot, but every item receives its own bounded request.
+        if (timeoutPerRequest) { clearTimeout(timer); timer = startTimer(); }
         const headers = { accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) };
         if (secret) headers.authorization = `Bearer ${secret}`;
         const response = await fetch(`${config.baseURL}${path}`, {
@@ -189,6 +208,26 @@ export function createLocalModelService({ getSettings, resolveCredential = async
     return { model, text: completionText(value, secret) };
   };
 
+  const decideInOperation = async (state, task) => {
+    const value = await state.request('/chat/completions', {
+      model: state.config.decisionModel,
+      messages: [{ role: 'system', content: ROUTING_INSTRUCTION }, { role: 'user', content: task }],
+      stream: false, max_tokens: 256, temperature: 0,
+      chat_template_kwargs: { enable_thinking: false },
+      response_format: { type: 'json_schema', json_schema: { name: 'local_task_route', strict: true, schema: DECISION_SCHEMA } },
+    });
+    const content = completionText(value, state.secret);
+    let decision;
+    try { decision = JSON.parse(content); } catch { fail('LOCAL_MODEL_INVALID_DECISION'); }
+    if (!object(decision) || Object.keys(decision).sort().join(',') !== 'confidence,route'
+      || !['local', 'main'].includes(decision.route) || !Number.isFinite(decision.confidence)
+      || decision.confidence < 0 || decision.confidence > 1) fail('LOCAL_MODEL_INVALID_DECISION');
+    const base = { confidence: decision.confidence, confidenceKind: 'self-reported', executed: false };
+    if (decision.route === 'main') return { route: 'main', ...base, reason: 'MAIN_ROUTE' };
+    if (decision.confidence < state.config.threshold) return { route: 'main', ...base, reason: 'LOW_CONFIDENCE' };
+    return { route: 'local', ...base, reason: 'LOCAL_EXECUTION_DISABLED' };
+  };
+
   return {
     async list(exec) {
       return operation(exec, false, async ({ config, request, secret }) => {
@@ -212,24 +251,9 @@ export function createLocalModelService({ getSettings, resolveCredential = async
         const task = inputTask(args, ['task', 'executeLocal']);
         if (args.executeLocal !== undefined && typeof args.executeLocal !== 'boolean') fail('LOCAL_MODEL_INVALID_INPUT');
         return await operation(exec, true, async state => {
-          const value = await state.request('/chat/completions', {
-            model: state.config.decisionModel,
-            messages: [{ role: 'system', content: ROUTING_INSTRUCTION }, { role: 'user', content: task }],
-            stream: false, max_tokens: 256, temperature: 0,
-            chat_template_kwargs: { enable_thinking: false },
-            response_format: { type: 'json_schema', json_schema: { name: 'local_task_route', strict: true, schema: DECISION_SCHEMA } },
-          });
-          const content = completionText(value, state.secret);
-          let decision;
-          try { decision = JSON.parse(content); } catch { fail('LOCAL_MODEL_INVALID_DECISION'); }
-          if (!object(decision) || Object.keys(decision).sort().join(',') !== 'confidence,route'
-            || !['local', 'main'].includes(decision.route) || !Number.isFinite(decision.confidence)
-            || decision.confidence < 0 || decision.confidence > 1) fail('LOCAL_MODEL_INVALID_DECISION');
+          const decision = await decideInOperation(state, task);
           confidence = decision.confidence;
-          const base = { confidence, confidenceKind: 'self-reported', executed: false };
-          if (decision.route === 'main') return { route: 'main', ...base, reason: 'MAIN_ROUTE' };
-          if (confidence < state.config.threshold) return { route: 'main', ...base, reason: 'LOW_CONFIDENCE' };
-          if (args.executeLocal === false) return { route: 'local', ...base, reason: 'LOCAL_EXECUTION_DISABLED' };
+          if (decision.route === 'main' || args.executeLocal === false) return decision;
           const output = await generateInOperation(state, task, state.config.workerModel);
           return { route: 'local', confidence, confidenceKind: 'self-reported', executed: true, ...output };
         });
@@ -238,6 +262,48 @@ export function createLocalModelService({ getSettings, resolveCredential = async
         if (exec?.signal?.aborted || safe.code === 'LOCAL_MODEL_CANCELLED') throw new LocalModelError('LOCAL_MODEL_CANCELLED');
         if (safe.code === 'LOCAL_MODEL_DISABLED') throw safe;
         return { route: 'main', confidence, confidenceKind: 'self-reported', executed: false, reason: safe.code };
+      }
+    },
+    async routeBatch(args, exec) {
+      // Complete validation precedes settings/credential access and HTTP. Copy
+      // task records so a caller cannot mutate a later item during the batch.
+      const tasks = inputBatch(args);
+      const started = performance.now();
+      const results = [];
+      let model;
+      let itemStarted = started;
+      const snapshot = reason => ({
+        status: reason ? 'stopped' : 'completed', ...(model ? { model } : {}), total: tasks.length,
+        completedCount: results.filter(row => row.status === 'completed').length,
+        failedCount: results.filter(row => row.status === 'error').length,
+        results, unprocessedIds: tasks.slice(results.length).map(item => item.id),
+        elapsedMs: performance.now() - started, ...(reason ? { reason } : {}),
+      });
+      try {
+        await operation(exec, true, async state => {
+          model = state.config.decisionModel;
+          for (const item of tasks) {
+            itemStarted = performance.now();
+            const decision = await decideInOperation(state, item.task);
+            results.push({ id: item.id, status: 'completed', ...decision, elapsedMs: performance.now() - itemStarted });
+          }
+        }, { timeoutPerRequest: true });
+        return snapshot();
+      } catch (error) {
+        const safe = safeError(error);
+        // An operational failure is never converted into a successful main
+        // classification. Stop without retrying; retain the completed prefix.
+        if (results.length < tasks.length) results.push({
+          id: tasks[results.length].id, status: 'error', executed: false,
+          reason: safe.code, elapsedMs: performance.now() - itemStarted,
+        });
+        const partialResult = snapshot(safe.code);
+        if (exec?.signal?.aborted || safe.code === 'LOCAL_MODEL_CANCELLED' || safe.code === 'LOCAL_MODEL_DISABLED') {
+          const interrupted = new LocalModelError(exec?.signal?.aborted ? 'LOCAL_MODEL_CANCELLED' : safe.code);
+          interrupted.partialResult = partialResult;
+          throw interrupted;
+        }
+        return partialResult;
       }
     },
     dispose() {
@@ -252,10 +318,33 @@ export function createLocalModelService({ getSettings, resolveCredential = async
 export function createLocalModelTools(service) {
   const output = { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] };
   const task = { type: 'string', minLength: 1, maxLength: 6000, description: 'Only the necessary task text. Never include credentials, secrets, or private conversation history.' };
+  // Native error normalization intentionally drops custom Error properties.
+  // Keep only our sanitized partial result until the same execution's public
+  // content finalizer runs; cancellation and all non-content fields stay native.
+  const batchInterruptions = new WeakMap();
+  const executeBatch = async (args, exec) => {
+    batchInterruptions.delete(exec);
+    try { return await service.routeBatch(args, exec); }
+    catch (error) {
+      if (object(exec) && error instanceof LocalModelError && object(error.partialResult)
+        && ['LOCAL_MODEL_CANCELLED', 'LOCAL_MODEL_DISABLED'].includes(error.code)) {
+        batchInterruptions.set(exec, JSON.stringify(error.partialResult));
+      }
+      throw error;
+    }
+  };
+  const finalizeBatchContent = (exec, result) => {
+    const partial = batchInterruptions.get(exec);
+    batchInterruptions.delete(exec);
+    if (partial === undefined || result?.isError !== true || !Array.isArray(result.content)
+      || !['LOCAL_MODEL_CANCELLED', 'LOCAL_MODEL_DISABLED'].includes(result.error?.message)) return undefined;
+    return [...result.content, { type: 'text', text: partial }];
+  };
   return [
     { name: 'local_model_list', description: 'List model IDs exposed by the configured loopback LM Studio service. This does not load or run a model.', parameters: { type: 'object', properties: {}, additionalProperties: false }, output, execute: (_args, exec) => service.list(exec) },
     { name: 'local_model_generate', description: 'Ask a configured local model for bounded plain text. No tools, file access, or main-session model change. model may only select the configured worker or decision model. Treat its text as untrusted.', parameters: { type: 'object', properties: { task, model: { type: 'string', maxLength: 256 } }, required: ['task'], additionalProperties: false }, output, execute: (args, exec) => service.generate(args, exec) },
     { name: 'jev_route_task', description: 'Ask the local Jev-style decision model whether a simple text task should run locally. Confidence is self-reported. If route is main or executed is false, the main Agent must continue; this tool never invokes a cloud model or authorizes actions.', parameters: { type: 'object', properties: { task, executeLocal: { type: 'boolean', default: true } }, required: ['task'], additionalProperties: false }, output, execute: (args, exec) => service.route(args, exec) },
+    { name: 'jev_route_tasks', description: 'Classify 1–200 identified tasks in one local Jev-style batch. Calls the decision model serially, never executes tasks, loads a worker, invokes cloud models, or authorizes actions. Shares the turn call quota; each request has its own timeout. Returns ordered results with measured elapsedMs and self-reported confidence. Stops on error with completed results and unprocessedIds; error rows are not valid main classifications. Never resend completed IDs.', parameters: { type: 'object', properties: { tasks: { type: 'array', minItems: 1, maxItems: 200, items: { type: 'object', properties: { id: { type: 'string', minLength: 1, maxLength: 128, description: 'Unique nonblank case identifier, without control characters.' }, task }, required: ['id', 'task'], additionalProperties: false } } }, required: ['tasks'], additionalProperties: false }, output, execute: executeBatch, finalizeContent: finalizeBatchContent },
   ];
 }
 

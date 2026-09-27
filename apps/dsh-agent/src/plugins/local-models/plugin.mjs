@@ -13,7 +13,7 @@ export const SettingsSchema = Schema.object({
   timeoutMs: Schema.number().min(1).max(120000).default(DEFAULT_SETTINGS.timeoutMs),
   maxTokens: Schema.number().min(1).max(4096).default(DEFAULT_SETTINGS.maxTokens),
   threshold: Schema.number().min(0).max(1).default(DEFAULT_SETTINGS.threshold),
-  maxCallsPerTurn: Schema.number().min(1).max(32).default(DEFAULT_SETTINGS.maxCallsPerTurn),
+  maxCallsPerTurn: Schema.number().min(1).max(2000).default(DEFAULT_SETTINGS.maxCallsPerTurn),
   maxConcurrent: Schema.number().min(1).max(4).default(DEFAULT_SETTINGS.maxConcurrent),
 });
 

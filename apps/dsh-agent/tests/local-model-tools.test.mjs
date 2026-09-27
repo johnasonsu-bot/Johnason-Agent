@@ -36,7 +36,7 @@ test('loopback-only configuration rejects unsafe endpoints and resource settings
   for (const baseURL of ['https://cloud.example/v1', 'file:///tmp/model', 'http://user:pass@127.0.0.1/v1', 'http://127.0.0.1/v1?key=x', 'http://127.0.0.1/v1#x', 'http://127.0.0.1.evil.test/v1']) {
     assert.throws(() => normalizeSettings({ baseURL }), code('LOCAL_MODEL_INVALID_SETTINGS'));
   }
-  for (const settings of [{ maxCallsPerTurn: 33 }, { maxConcurrent: 5 }, { maxTokens: 4097 }, { timeoutMs: 120001 }, { threshold: -0.01 }, { apiKeyRef: 'not a reference' }]) {
+  for (const settings of [{ maxCallsPerTurn: 2001 }, { maxConcurrent: 5 }, { maxTokens: 4097 }, { timeoutMs: 120001 }, { threshold: -0.01 }, { apiKeyRef: 'not a reference' }]) {
     assert.throws(() => normalizeSettings(settings), code('LOCAL_MODEL_INVALID_SETTINGS'));
   }
   assert.equal(normalizeSettings({ baseURL: 'http://[::1]:1234/v1/' }).baseURL, 'http://[::1]:1234/v1');

@@ -13,6 +13,8 @@ import { authenticateWeb, redactLaunchOutput } from './fixtures/native-web-clien
 // routing tool. Only the model HTTP responses are scripted, on loopback.
 test('bundled Skill drives a Jev-style decision and local worker inside a native agent turn', { timeout: 90000 }, async t => {
   const requests = [];
+  let cancelItemPending;
+  const cancelItemReceived = new Promise(resolve => { cancelItemPending = resolve; });
   const models = createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/v1/models') {
       res.writeHead(200, { 'content-type': 'application/json' });
@@ -24,6 +26,7 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
     const body = JSON.parse(Buffer.concat(chunks).toString());
     requests.push(body);
     if (body.model !== 'fixture-supervisor') {
+      if (body.messages?.at(-1)?.content === 'CANCEL_ITEM_2') { cancelItemPending(); return; }
       res.writeHead(200, { 'content-type': 'application/json' });
       const content = body.model === 'fixture-decision' ? JSON.stringify({ route: 'local', confidence: 0.95 }) : 'LOCAL_WORKER_RESULT: blue, red';
       res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content }, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
@@ -32,8 +35,22 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     const base = { id: randomUUID(), object: 'chat.completion.chunk', created: 1, model: body.model };
     const priorTools = body.messages.filter(message => message.role === 'tool');
+    const batchRequested = body.messages.some(message => message.role === 'user' && typeof message.content === 'string' && message.content.includes('BATCH_200_DECISIONS'));
+    const cancelBatchRequested = body.messages.some(message => message.role === 'user' && typeof message.content === 'string' && message.content.includes('CANCEL_BATCH_TEST'));
     let delta, finish;
     if (!body.tools?.length) { delta = { content: 'Fixture title' }; finish = 'stop'; }
+    else if (cancelBatchRequested) {
+      delta = { tool_calls: [{ index: 0, id: 'fixture-cancel-batch', type: 'function', function: { name: 'jev_route_tasks', arguments: JSON.stringify({ tasks: [1, 2, 3].map(index => ({ id: `CANCEL-${index}`, task: `CANCEL_ITEM_${index}` })) }) } }] };
+      finish = 'tool_calls';
+    }
+    else if (batchRequested) {
+      if (priorTools.some(message => message.tool_call_id === 'fixture-batch-200')) {
+        delta = { content: 'BATCH_200_OK' }; finish = 'stop';
+      } else {
+        delta = { tool_calls: [{ index: 0, id: 'fixture-batch-200', type: 'function', function: { name: 'jev_route_tasks', arguments: JSON.stringify({ tasks: Array.from({ length: 200 }, (_, index) => ({ id: `CASE-${index + 1}`, task: `Extract the color from blue. Case ${index + 1}.` })) }) } }] };
+        finish = 'tool_calls';
+      }
+    }
     else if (!priorTools.length) {
       delta = { tool_calls: [{ index: 0, id: 'fixture-skill', type: 'function', function: { name: 'skill', arguments: JSON.stringify({ name: 'johnason-local-models' }) } }] };
       finish = 'tool_calls';
@@ -100,8 +117,10 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
   await panel.getByLabel('LM Studio API 地址', { exact: true }).fill(baseURL);
   await panel.getByLabel('Jev 决策模型', { exact: true }).fill('fixture-decision');
   await panel.getByLabel('本地工作模型', { exact: true }).fill('fixture-worker');
+  await panel.getByLabel('每轮调用预算', { exact: true }).fill('200');
   await panel.getByRole('button', { name: '保存混合配置', exact: true }).click();
   await panel.getByRole('status').filter({ hasText: '混合配置已保存。' }).waitFor();
+  assert.equal(await panel.getByLabel('每轮调用预算', { exact: true }).getAttribute('max'), '2000');
   assert.equal(requests.length, 0, 'saving configuration must never run inference');
   assert.deepEqual(await (await client.fetch('/vault/status')).json(), { initialized: false, locked: true });
   const discoveredResponse = page.waitForResponse(response => response.url() === `${origin}/johnason/local-models/models`);
@@ -147,5 +166,45 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
   assert.equal(decision.messages.some(message => message.content.includes('Use the johnason-local-models Skill')), false, 'only explicit subtask text may reach the decision model');
   assert.equal((await client.snapshot(sessionId)).projections.values.modelSelection.next.provider, 'fixture-supervisor');
   assert.equal(output.includes(key), false);
+  // A single native tool execution makes 200 local requests in one new user turn.
+  await client.rpc('session/prompt', { request: { requestId: randomUUID(), sessionId, mode: 'queue', content: [{ type: 'text', text: 'BATCH_200_DECISIONS: classify 200 independent text cases in one jev_route_tasks call. Do not execute the worker.' }] } });
+  const batchFinishBy = Date.now() + 30000;
+  while (true) {
+    history = await client.history(sessionId);
+    if (history.records.some(row => row.event?.type === 'assistant/message' && row.event.data.message.content.some(block => block.type === 'text' && block.text.includes('BATCH_200_OK')))) break;
+    assert.ok(Date.now() < batchFinishBy, 'Native 200-case batch must finish in one turn.');
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  const batchCalls = history.records.filter(row => row.event?.type === 'tool/call' && row.event.data.name === 'jev_route_tasks');
+  assert.equal(batchCalls.length, 1);
+  assert.equal(requests.filter(row => row.model === 'fixture-decision').length, 201);
+  assert.equal(requests.filter(row => row.model === 'fixture-worker').length, 1, 'batch must never start the worker');
+  const batchResults = history.records.flatMap(row => row.event?.type === 'tool/result' ? row.event.data.message.content : []).find(block => block.type === 'tool-result' && block.toolCallId === 'fixture-batch-200');
+  assert.equal(batchResults?.isError, false);
+  const batchPayload = JSON.parse(batchResults.content.filter(block => block.type === 'text').map(block => block.text).join(''));
+  assert.equal(batchPayload.results.length, 200);
+  assert.equal(batchPayload.results.every(row => row.status === 'completed' && row.executed === false), true);
+  await client.rpc('session/prompt', { request: { requestId: randomUUID(), sessionId, mode: 'queue', content: [{ type: 'text', text: 'CANCEL_BATCH_TEST: start three decisions; the test controller cancels the second request.' }] } });
+  let pendingDeadline;
+  try {
+    await Promise.race([cancelItemReceived, new Promise((_, reject) => { pendingDeadline = setTimeout(() => reject(new Error('Second batch item did not start')), 10000); })]);
+  } finally { clearTimeout(pendingDeadline); }
+  assert.equal((await client.rpc('session/cancel', { request: { sessionId } })).accepted, true);
+  const cancelFinishBy = Date.now() + 10000;
+  while (true) {
+    history = await client.history(sessionId);
+    if (history.records.some(row => row.event?.type === 'turn/end' && row.event.data.reason?.kind === 'aborted')) break;
+    assert.ok(Date.now() < cancelFinishBy, 'Cancelled native batch must settle.');
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  const cancelledTool = history.records.flatMap(row => row.event?.type === 'tool/result' ? row.event.data.message.content : []).find(block => block.type === 'tool-result' && block.toolCallId === 'fixture-cancel-batch');
+  assert.equal(cancelledTool?.isError, true);
+  const partial = cancelledTool.content.filter(block => block.type === 'text').map(block => { try { return JSON.parse(block.text); } catch { return null; } }).find(value => value?.results);
+  assert.ok(partial, 'Native cancellation must retain the completed prefix, not just the error message.');
+  assert.equal(partial.results[0].id, 'CANCEL-1');
+  assert.equal(partial.results[0].status, 'completed');
+  assert.equal(partial.results[0].route, 'local');
+  assert.deepEqual(partial.unprocessedIds, ['CANCEL-3']);
+  assert.equal(requests.filter(row => row.model === 'fixture-decision').length, 203, 'cancel must prevent item three from starting');
   t.diagnostic(`Native Skill / hybrid browser evidence retained: ${root}`);
 });

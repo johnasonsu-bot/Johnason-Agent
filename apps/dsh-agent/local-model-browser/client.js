@@ -12,7 +12,7 @@ window.__ModuleLoader__.load({
       timeoutMs: 60000,
       maxTokens: 2048,
       threshold: 0.75,
-      maxCallsPerTurn: 8,
+      maxCallsPerTurn: 256,
       maxConcurrent: 2,
     };
     const writableFields = Object.keys(defaults);
@@ -72,7 +72,7 @@ window.__ModuleLoader__.load({
         if (typeof draft.enabled !== 'boolean' || typeof draft.noAuth !== 'boolean'
           || typeof draft.threshold !== 'number' || !Number.isFinite(draft.threshold) || draft.threshold < 0 || draft.threshold > 1
           || !validInteger(draft.timeoutMs, 1000, 120000) || !validInteger(draft.maxTokens, 64, 4096)
-          || !validInteger(draft.maxCallsPerTurn, 1, 32) || !validInteger(draft.maxConcurrent, 1, 4)) {
+          || !validInteger(draft.maxCallsPerTurn, 1, 2000) || !validInteger(draft.maxConcurrent, 1, 4)) {
           return { ok: false, message: '请检查阈值、超时、输出上限、调用预算和并发上限。' };
         }
         const key = typeof draft.apiKey === 'string' ? draft.apiKey : '';
@@ -180,7 +180,7 @@ window.__ModuleLoader__.load({
           autoComplete: type === 'password' ? 'new-password' : 'off', ...attrs }));
       return h('section', { 'data-johnason-local-models': true, style: { display: 'grid', gap: 12, maxWidth: 720, color: '#17304a', colorScheme: 'light' } },
         h('h2', { style: { margin: 0 } }, '本地模型与 Jev 混合调用'),
-        h('p', { style: { margin: 0 } }, '主 Agent 可通过 Skill johnason-local-models 调用 local_model_list、local_model_generate 和 jev_route_task。Jev 将简单文本任务交给本地工作模型；复杂任务、低置信判断或调用失败时由主 Agent 继续处理。决策置信度是模型自报值，并非校准概率。此配置不更改会话模型或权限。'),
+        h('p', { style: { margin: 0 } }, '主 Agent 可通过 Skill johnason-local-models 调用本地模型。批量判断使用 jev_route_tasks，一次最多 200 条，按顺序逐条判断，不执行本地工作模型。单条路由使用 jev_route_task。决策置信度是模型自报值，并非校准概率。此配置不更改会话模型或权限。'),
         h('a', { href: '/vault', target: '_blank', rel: 'noopener noreferrer' }, '打开 Vault'),
         h('label', null, h('input', { type: 'checkbox', 'aria-label': '启用本地模型工具', checked: draft.enabled, disabled: busy, onChange: event => change('enabled', event.target.checked) }), '启用本地模型工具'),
         input('LM Studio API 地址', 'baseURL'),
@@ -193,7 +193,8 @@ window.__ModuleLoader__.load({
         input('决策阈值', 'threshold', 'number', { min: 0, max: 1, step: 0.01 }),
         input('调用超时（毫秒）', 'timeoutMs', 'number', { min: 1000, max: 120000, step: 1 }),
         input('输出上限', 'maxTokens', 'number', { min: 64, max: 4096, step: 1 }),
-        input('每轮调用预算', 'maxCallsPerTurn', 'number', { min: 1, max: 32, step: 1 }),
+        input('每轮调用预算', 'maxCallsPerTurn', 'number', { min: 1, max: 2000, step: 1 }),
+        h('small', null, '默认每轮 256 次，最多可设为 2000 次。批量判断 200 条至少需要剩余 200 次；单条路由后执行工作模型会再消耗 1 次。'),
         input('并发上限', 'maxConcurrent', 'number', { min: 1, max: 4, step: 1 }),
         message && h('p', { role: error ? 'alert' : 'status', style: { margin: 0 } }, message),
         h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },

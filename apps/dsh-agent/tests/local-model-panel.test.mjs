@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm';
 const defaults = {
   enabled: true, baseURL: 'http://127.0.0.1:1234/v1', apiKeyRef: '',
   decisionModel: 'jev-style-qwen3.5-2b-decision', workerModel: 'qwen3.8-27b-uncensored-mlx',
-  timeoutMs: 60000, maxTokens: 2048, threshold: 0.75, maxCallsPerTurn: 8, maxConcurrent: 2,
+  timeoutMs: 60000, maxTokens: 2048, threshold: 0.75, maxCallsPerTurn: 256, maxConcurrent: 2,
 };
 
 async function plugin(fetcher = async () => { throw new Error('unexpected fetch'); }, react) {
@@ -148,7 +148,7 @@ test('no-auth clears a reference without deleting the Vault record', async () =>
 
 test('invalid URL, bounds, and locked Vault stop before settings mutation', async () => {
   const p = await plugin();
-  for (const patch of [{ baseURL: 'http://example.com/v1' }, { threshold: 1.1 }, { timeoutMs: 999 }, { maxTokens: 63 }, { maxCallsPerTurn: 33 }, { maxConcurrent: 5 }]) {
+  for (const patch of [{ baseURL: 'http://example.com/v1' }, { threshold: 1.1 }, { timeoutMs: 999 }, { maxTokens: 63 }, { maxCallsPerTurn: 2001 }, { maxConcurrent: 5 }]) {
     const { ctx, calls } = harness();
     const controller = p.createController(ctx);
     const view = await controller.load();
@@ -164,6 +164,22 @@ test('invalid URL, bounds, and locked Vault stop before settings mutation', asyn
   assert.match(result.message, /Vault.*解锁/);
   assert.equal(calls.set.length, 0);
   assert.equal(calls.mutate.length, 0);
+});
+
+test('large decision budgets can be saved without changing credentials or concurrency', async () => {
+  const p = await plugin();
+  const { ctx, calls } = harness({ value: { ...defaults, maxCallsPerTurn: 8 } });
+  const controller = p.createController(ctx);
+  const view = await controller.load();
+  for (const quota of [200, 256, 2000]) {
+    assert.equal((await controller.save({ ...view.draft, maxCallsPerTurn: quota })).ok, true);
+    const values = mutations({ mutate: [calls.mutate.at(-1)] });
+    assert.equal(values.maxCallsPerTurn, quota);
+    assert.equal(values.maxConcurrent, 2);
+    assert.equal(values.baseURL, defaults.baseURL);
+  }
+  assert.equal(calls.set.length, 0);
+  assert.equal(controller.newDraft().maxCallsPerTurn, 256);
 });
 
 test('model list uses only the same-origin GET and sanitizes remote errors', async () => {
@@ -219,6 +235,7 @@ test('panel exposes the specified controls in the plugin configuration slot', as
   assert.equal(all.find(node => node.type === 'input' && node.props['aria-label'] === 'LM Studio API 地址').props.disabled, true,
     'initial settings load must finish before the user can edit a draft');
   const vault = all.find(node => node.type === 'a' && node.props.href === '/vault');
+  assert.equal(all.find(node => node.type === 'input' && node.props['aria-label'] === '每轮调用预算').props.max, 2000);
   assert.equal(vault.props.target, '_blank');
   assert.match(vault.props.rel, /noopener/);
 });
