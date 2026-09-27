@@ -15,8 +15,11 @@ test('local plugin plan declares protected credentials, optional systems and Web
   assert.equal(overlay.flatMap(row => row.insert ?? []).filter(row => row.id === 'memory-recovery').length, 1);
   assert.equal(overlay.flatMap(row => row.insert ?? []).find(row => row.id === 'memory-recovery').name, fileURLToPath(new URL('../src/memory-recovery-plugin.mjs', import.meta.url)));
   assert.equal(overlay.flatMap(row => row.insert ?? []).some(row => row.id === 'dataplatform'), false);
-  assert.deepEqual(plan.clientBundles.map(bundle => bundle.name), ['@johnason/dsh-memory-ui', '@johnason/dsh-model-api']);
-  assert.equal(registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'headless', providers: [] }).clientBundles.length, 0);
+  assert.deepEqual(plan.clientBundles.map(bundle => bundle.name), ['@johnason/dsh-memory-ui', '@johnason/dsh-model-api', '@johnason/dsh-local-models']);
+  const headless = registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'headless', providers: [] });
+  assert.deepEqual(headless.clientBundles.map(bundle => bundle.name), ['@johnason/dsh-local-models']);
+  assert.equal(headless.profileOverlay({}).find(row => row.id === 'local-models').config.implementation,
+    fileURLToPath(new URL('../src/plugins/local-models/plugin.mjs', import.meta.url)));
   const systems = registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'web', providers: [
     { id: 'dataplatform', label: 'Data Platform', type: 'dataplatform', url: 'http://127.0.0.1:46120', corePath: '/trusted/core.cjs' },
   ] });

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { prepareProfile } from '../src/profile.mjs';
 
-for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api']]) {
+for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api'], ['@johnason/dsh-local-models', 'local-models']]) {
 test(`${name} is installed without duplicate activation or overriding an explicit disable`, async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-local-bundle-'));
   const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
@@ -53,7 +53,7 @@ test('disabled local UI retains safe provider configuration for a native live re
   assert.deepEqual(reenabled.find(row => row.id === 'memory-ui').config?.providers, [{ id: 'forge', label: 'Forge', type: 'forge' }]);
 });
 
-for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api']]) {
+for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api'], ['@johnason/dsh-local-models', 'local-models']]) {
 test(`${name} uninstall is not undone by a later launcher run`, async () => {
   const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-bundle-uninstall-'));
   const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));

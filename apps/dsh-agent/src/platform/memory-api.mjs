@@ -3,8 +3,8 @@ import { nativeRequire, nativeUrl } from './runtime.mjs';
 const require = nativeRequire();
 export const { Service } = await import(require.resolve('@deepseek-ai/cordis'));
 export const { createUserMessage } = await import(nativeUrl('packages/llm/llm/lib/index.js'));
-// Preserve the reader's ESM module identity: Web uses tsx aliases; plain Node
-// component hosts resolve the built package from the native CLI dependency graph.
+// Preserve a source host's ESM identity when it supplies aliases; the standard
+// launcher and plain Node hosts resolve the built native CLI dependency graph.
 export const { KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek-ai/dsh-session').catch(cause => {
   if (cause.code !== 'ERR_MODULE_NOT_FOUND' || !cause.message.includes("package '@deepseek-ai/dsh-session'")) throw cause;
   return import(require.resolve('@deepseek-ai/dsh-session'));

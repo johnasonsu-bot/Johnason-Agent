@@ -85,7 +85,7 @@ test('native local plugins pass official inventory preparation and a loopback De
   const inventory = model.requests[0].body.dsh_plugin_packages;
   assert.deepEqual(inventory, result.fields.dsh_plugin_packages);
   assert.equal(inventory.version, 1);
-  for (const manifestUrl of [new URL('../package.json', import.meta.url), new URL('../browser/package.json', import.meta.url), new URL('../model-api-browser/package.json', import.meta.url)]) {
+  for (const manifestUrl of [new URL('../package.json', import.meta.url), new URL('../browser/package.json', import.meta.url), new URL('../model-api-browser/package.json', import.meta.url), new URL('../local-model-browser/package.json', import.meta.url)]) {
     const manifest = JSON.parse(await readFile(manifestUrl, 'utf8'));
     assert.ok(inventory.packages.some(pkg => pkg.name === manifest.name && pkg.version === manifest.version), `${manifest.name} must reach the official request with its version`);
     assert.match(manifest.version, /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/);

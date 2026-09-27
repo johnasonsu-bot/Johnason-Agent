@@ -17,6 +17,10 @@ export function createPluginPlan(config) {
     sourceRoot: new URL('../../browser/', import.meta.url), files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] },
     { name: '@johnason/dsh-model-api', sourceRoot: new URL('../../model-api-browser/', import.meta.url),
       files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] }] : [];
+  // This bundle contributes host tools and a runtime Skill in every profile;
+  // its optional browser half is loaded only by native Web clients.
+  clientBundles.push({ name: '@johnason/dsh-local-models', sourceRoot: new URL('../../local-model-browser/', import.meta.url),
+    files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] });
   return {
     contractVersion: 1, credential, clientBundles, providers,
     profileOverlay({ authorizationEntry }) {
@@ -30,9 +34,10 @@ export function createPluginPlan(config) {
       }
       // A config-only patch never inserts a disabled bundle's row. Keep it in
       // the overlay so the native manager can re-enable the UI without restart.
-      if (clientBundles.length) {
+      if (config.mode === 'web') {
         overlay.push({ id: 'memory-ui', config: { providers: providers.map(({ id, label, type }) => ({ id, label, type })) } });
       }
+      overlay.push({ id: 'local-models', config: { implementation: entry('./local-models/plugin.mjs') } });
       return overlay;
     },
     async prepare() {

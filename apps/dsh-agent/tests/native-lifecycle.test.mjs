@@ -6,10 +6,23 @@ import { mkdtemp, mkdir, copyFile, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { existsSync } from 'node:fs';
 import { authenticateWeb, redactLaunchOutput } from './fixtures/native-web-client.mjs';
 
 const cli = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
 const fixture = name => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
+
+test('CLI config dump uses built composition without starting Vault or model services', { timeout: 30000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-cli-dump-'));
+  const output = execFileSync(process.execPath, [cli, 'headless', '--data-dir', root, '--workspace', root, '--dump-config'], {
+    env: { PATH: process.env.PATH, HOME: root }, encoding: 'utf8', timeout: 25000,
+  });
+  assert.match(output, /dsh-encrypted-base/);
+  assert.match(output, /local-models/);
+  assert.equal(existsSync(join(root, 'vault.enc')), false);
+  assert.equal(existsSync(join(root, 'memory/recovery.sqlite')), false);
+  t.diagnostic(`retained config-dump fixture: ${root}`);
+});
 async function portProbe() {
   const server = createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));

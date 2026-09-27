@@ -26,6 +26,7 @@ flowchart LR
 | `apps/dsh-agent/src/plugins/systems/` | Forge/Data Platform 命令、授权流、本地页面和 CLI |
 | `apps/dsh-agent/src/plugins/memory/` | 记忆与 Effect 存储、分页、工具、审计、恢复、本地页面及沙箱协作 |
 | `apps/dsh-agent/model-api-browser/` | 独立模型 API 配置插件；仅使用原生浏览器 Settings/Credentials Remote 和页面 slots，模型执行仍由官方 adapter 承担 |
+| `apps/dsh-agent/src/plugins/local-models/`、`local-model-browser/` | 本地 LM Studio 文本执行、Jev 类路由、bundled Skill 与配置入口；原生 Schema 依赖由 `platform/local-model-api.mjs` 统一加载 |
 | `mvp/sidecars/deepseek-harness/src/platform-runtime.ts` | Workbench 唯一官方深路径导入边界 |
 | `mvp/sidecars/deepseek-harness/src/native-session.ts` | Workbench 历史、流、工具、取消的版本适配；通过版本化 adapter 契约供 Host 调用 |
 
@@ -56,6 +57,7 @@ flowchart LR
 | P1 凭据 provider 替换 | 平台 profile 仍需替换官方 base bundle 的唯一 provider；严格拒绝重复或无加密 provider。 | 推荐推动官方 provider override 接口；当前继续按固定版本检查 base bundle 结构，不能变成宽松文本替换。 |
 | P1 Trusted Core 启动顺序 | 必须在 native environment snapshot 前预初始化并清理 DB/JWT 环境；生命周期按进程共享。 | 已注册为 pre-launch/dispose。推荐维持每进程一个活动 runner；并发多实例需要资源作用域和引用计数。dump-config 不初始化真实 Core。 |
 | P2 浏览器签名保留键 | 只对官方 browser-session record 使用进程内初始化，受 reserved key/record shape 约束。 | 继续精确键匹配和官方 BrowserAuth 契约测试；长期让原生浏览器认证与模型凭据生命周期分离。 |
+| P2 CLI 编译入口及模块身份 | 运行时禁止上游开发 tsconfig 的源码别名，确保工具调度器的模块私有 Symbol 唯一；profile 启动使用公开构建入口，plugin/dump-config 从固定版本 bin 的动态导入定位构建 chunk。 | 升级时验证 chunk 结构及原生 Skill、普通工具、插件管理、配置导出；长期请求上游公开稳定的 CLI library exports，减少构建布局适配。 |
 | P2 页面 slots 与 index 注入 | Memory dock 使用官方 slots；前端依赖声明已指向提供 slots 的 `dsh-client-ui-renderer`，并通过源 manifest 校验；部分入口仍用 tapIndex 插入链接。 | 推荐全部收敛为官方导航/工具栏 slot，待上游提供稳定 slot 清单。现阶段保留插件发现、依赖声明与真实浏览器集成测试。 |
 | P2 Workbench 历史与模型适配 | 官方深路径已集中，Session/AgentLoop 的历史组装仍需维护。 | 推荐在官方提供历史导入/SDK adapter 接口后切换；保留 V3 系统首节点、流与持久事件分离、取消完成的真实契约测试。 |
 

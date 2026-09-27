@@ -20,9 +20,15 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 在 **插件 → 已安装 → model-api** 打开「模型 API」，可为 Agent 新增本地 LLM 或外部云模型连接，原生 **设置 → 模型** 页也提供同一表单。先解锁 Vault，再填写连接 ID、显示名称、API 地址、协议和服务实际提供的模型 ID；云模型的 API Key 仅在密码框中输入。支持 OpenAI Chat Completions、OpenAI Responses 与 Anthropic Messages 协议，兼容程度由具体服务决定。
 
-插件使用独立的 `johnason-<连接 ID>` 供应商，不覆盖已有连接；保存后在会话模型选择器中选择新模型。默认输出上限为 4096 token，进一步调整或编辑已有连接可使用原生 Models 页面。新增连接走原生版本检查和模型注册，不创建第二套推理服务；停用或卸载入口不会删除已保存的模型、凭据或会话。
+插件使用独立的 `johnason-<连接 ID>` 供应商，不覆盖已有连接；模型 ID 可以每行填写一个，一次保存多个模型。已保存的本地连接卡片提供「添加模型」，追加时保留已有模型参数、地址和凭据。保存后在会话模型选择器中选择新模型。默认输出上限为 4096 token，进一步调整或编辑已有连接可使用原生 Models 页面。新增连接走原生版本检查和模型注册，不创建第二套推理服务；停用或卸载入口不会删除已保存的模型、凭据或会话。
 
 本地连接仅接受 `localhost`、`127.0.0.1` 或 `::1` 的 HTTP/HTTPS 地址，外部连接要求 HTTPS。原生适配器仍要求凭据：无需认证的本地服务可以留空 API Key，插件会生成随机占位值并保存到 Vault。配置文件只保存凭据引用，Vault 锁定时不能保存或调用模型。保存操作不探测模型、不发送测试问题，也不自动切换当前会话。此处“外部 API”指云端模型接口；业务系统 API 仍由系统插件管理。
+
+在 **插件 → 已安装 → local-models** 打开「本地模型与 Jev 混合调用」，配置 LM Studio 地址、Jev 决策模型和本地工作模型。「读取本地模型」只读取服务目录，不加载或运行模型。默认使用本机 `http://127.0.0.1:1234/v1`、`jev-style-qwen3.5-2b-decision` 与 `qwen3.8-27b-uncensored-mlx`；若安装的模型不同，按目录中的精确 ID 修改。此独立工具插件支持无认证的本地 API，API Key 留空即可；需要认证时仍只保存 Vault 引用。
+
+插件同时在 Web/headless 注册 Skill `johnason-local-models` 和三个工具：`local_model_list`、`local_model_generate`、`jev_route_task`。例如对主 Agent 说：「使用 johnason-local-models Skill，把这段文字的分类交给本地模型，复杂部分由你完成。」主 Agent 显式调用 Skill/工具后，小模型先判断；达到阈值的简单文本子任务交给本地工作模型，结果回到主 Agent。低置信度或调用失败时由主 Agent 继续处理。它不自动拦截所有提示、不切换主会话模型；置信度是模型自报值，不是校准概率。
+
+本地工具仅处理有界文本，不执行模型返回的工具或命令。单次决策加执行消耗两次推理预算；用户取消或停用插件会中止活动调用。强制记忆沙箱仍保留原有工具白名单。设计与边界见[本地模型协作说明](../../docs/architecture/2026-09-26-local-model-skill-hybrid.md)。
 
 本地插件包必须包含有效的 `name` 与 `version`，以通过新版官方 DeepSeek 请求扩展的包清单校验；缺少版本会在发送请求前触发 `REQUEST_EXTENSION`。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方 adapter 和本机 HTTP/SSE 服务覆盖这一步，不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
 
@@ -69,7 +75,7 @@ node apps/dsh-agent/src/cli.mjs plugin --workspace "/path/to/work" --profile tui
 
 默认数据目录为 `~/.johnason-dsh`。`headless` 和 `plugin` 必须显式给出 `--workspace`；Web 默认不选择工作目录，在原生界面添加和选择。CLI 密码输入无回显；非 TTY 会立即提示使用 Web 解锁入口，不等待不可见输入。Web 与独立 CLI 进程各自解锁，网页解锁不会解锁其他进程。锁定不删除历史、不取消正在运行的任务，但后续需要凭据的请求会被拒绝。
 
-子进程只继承少量操作系统环境变量，固定独立 `DSH_HOME`、禁用遥测，并固定上游 TypeScript 解析配置。启动器直接复用原生 `parseDshArgs` / `runProfile` / `runPlugin`，不调用会读取项目和用户 `.env` 的原生 bin。`plugin` 是原生 pnpm 插件管理入口，不代表默认已有终端聊天 TUI。相对插件路径保留原生的 workspace 锚定规则。
+子进程只继承少量操作系统环境变量，固定独立 `DSH_HOME`、禁用遥测，并使用不带开发路径别名的 TypeScript 解析配置。平台从构建包加载原生运行时，避免同一个工具服务同时加载源码与构建副本造成调度器失配。启动器复用原生 `parseDshArgs` / `runProfile` / `runPlugin`，不调用会读取项目和用户 `.env` 的原生 bin；插件管理及配置导出入口从该固定版本的 bin 构建清单解析。`plugin` 是原生 pnpm 插件管理入口，不代表默认已有终端聊天 TUI。相对插件路径保留原生的 workspace 锚定规则。
 
 ## 原生组合边界
 

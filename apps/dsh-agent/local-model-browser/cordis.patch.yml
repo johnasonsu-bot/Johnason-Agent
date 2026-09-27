@@ -1,0 +1,3 @@
+- insert:
+    - id: local-models
+      name: '@johnason/dsh-local-models'

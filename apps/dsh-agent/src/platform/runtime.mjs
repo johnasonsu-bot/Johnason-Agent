@@ -49,5 +49,8 @@ export function inspectPlatformBuild(upstreamRoot = DEFAULT_UPSTREAM_ROOT) {
 
 export function nativeLoaderOptions(upstreamRoot = DEFAULT_UPSTREAM_ROOT) {
   const require = createRequire(join(upstreamRoot, 'package.json'));
-  return { hook: require.resolve('tsx/esm'), tsconfig: join(upstreamRoot, 'tsconfig.json') };
+  // Transpile the CLI's .ts entry files, but resolve package imports to their
+  // built exports, as the profile loader does. Upstream development aliases
+  // would load both src and lib, splitting module-local scheduler symbols.
+  return { hook: require.resolve('tsx/esm'), tsconfig: fileURLToPath(new URL('./runtime-tsconfig.json', import.meta.url)) };
 }

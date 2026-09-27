@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { runInNewContext } from 'node:vm';
 import { randomBytes } from 'node:crypto';
 
-async function plugin() {
+async function plugin(react = { createElement() {}, useState() {}, useEffect() {}, useRef() {} }) {
   const source = await readFile(new URL('../model-api-browser/client.js', import.meta.url), 'utf8');
   let registered;
   runInNewContext(source, {
@@ -15,7 +15,7 @@ async function plugin() {
   assert.equal(registered.id, '@johnason/dsh-model-api');
   return registered.factory(id => {
     assert.equal(id, 'react');
-    return { createElement() {}, useState() {}, useEffect() {}, useRef() {} };
+    return react;
   });
 }
 
@@ -37,6 +37,45 @@ function harness({ providers = {}, revision = 4, writable = true, credential = {
 const input = (key = 'synthetic-' + randomBytes(12).toString('hex')) => ({
   type: 'cloud', slug: 'test-one', displayName: '测试一', baseURL: 'https://models.example.test/v1',
   api: 'openai-completions', modelId: 'model-one', key,
+});
+
+test('panel presents multiline model IDs and a route-specific append control', async () => {
+  const view = { writable: true, rows: [
+    { route: 'johnason-one', displayName: 'One', api: 'openai-completions', models: ['old'], credentialStatus: '凭据已配置' },
+    { route: 'johnason-two', displayName: 'Two', api: 'openai-completions', models: ['old'], credentialStatus: '凭据已配置' },
+  ] };
+  let state = 0;
+  const react = {
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+    useState: initial => [state++ === 0 ? view : typeof initial === 'function' ? initial() : initial, () => {}],
+    useEffect: () => {},
+    useRef: initial => ({ current: initial }),
+  };
+  const p = await plugin(react);
+  let panel;
+  p.apply({ slots: {
+    inject: (name, register) => { if (name === 'settings.models.footer') register(); },
+    register: (_, render) => { panel = render; },
+  }, remote: {} });
+  const element = panel();
+  const tree = element.type(element.props);
+  const all = [];
+  function visit(node) {
+    if (!node || typeof node !== 'object') return;
+    all.push(node);
+    node.children?.forEach(visit);
+  }
+  visit(tree);
+  assert.equal(all.some(node => node.type === 'textarea' && node.props['aria-label'] === '模型 ID'), true);
+  assert.deepEqual(all.filter(node => node.type === 'input' && node.props['aria-label']?.startsWith('添加模型 ID')).map(node => node.props['aria-label']), [
+    '添加模型 ID（johnason-one）', '添加模型 ID（johnason-two）',
+  ]);
+  assert.deepEqual(all.filter(node => node.type === 'button' && node.props['aria-label']?.startsWith('添加模型（')).map(node => node.props['aria-label']), [
+    '添加模型（johnason-one）', '添加模型（johnason-two）',
+  ]);
+  const vault = all.find(node => node.type === 'a' && node.props.href === '/vault');
+  assert.equal(vault.props.target, '_blank');
+  assert.match(vault.props.rel, /noopener/);
 });
 
 test('a save creates one fenced provider path and stores the key only through credentials', async () => {
@@ -61,6 +100,108 @@ test('a save creates one fenced provider path and stores the key only through cr
   });
   assert.equal(JSON.stringify(calls.mutate).includes(key), false);
   assert.equal(draft.key, '');
+});
+
+test('a new connection saves trimmed model IDs as independent model records', async () => {
+  const p = await plugin();
+  const { ctx, calls } = harness();
+  const controller = p.createController(ctx);
+  await controller.load();
+  const draft = controller.newDraft({ ...input(), modelId: '  first/model  \n\n second/model\r\n third/model  ' });
+  assert.equal((await controller.save(draft)).ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.mutate[0][1][0].value.models)), [
+    { id: 'first/model', maxTokens: 4096 },
+    { id: 'second/model', maxTokens: 4096 },
+    { id: 'third/model', maxTokens: 4096 },
+  ]);
+});
+
+test('invalid model ID lists fail before Vault or settings writes', async () => {
+  const p = await plugin();
+  for (const modelId of [' \n  ', 'same\n same ', 'x'.repeat(129), Array.from({ length: 33 }, (_, index) => 'model-' + index).join('\n')]) {
+    const { ctx, calls } = harness();
+    const controller = p.createController(ctx);
+    await controller.load();
+    assert.equal((await controller.save(controller.newDraft({ ...input(), modelId }))).ok, false, modelId.slice(0, 20));
+    assert.equal(calls.set.length, 0);
+    assert.equal(calls.mutate.length, 0);
+  }
+});
+
+test('append model writes only the existing route models with the loaded revision', async () => {
+  const p = await plugin();
+  const original = { id: 'first', maxTokens: 8192, contextWindow: 128000, name: 'Kept' };
+  const providers = { 'johnason-test-one': {
+    displayName: 'Existing', api: 'openai-completions', baseURL: 'https://models.example.test/v1',
+    models: [original], apiKeyEnv: 'JOHNASON_MODEL_API_KEPT', headers: { 'X-Keep': 'yes' },
+  } };
+  const { ctx, calls } = harness({ providers, revision: 12 });
+  const controller = p.createController(ctx);
+  await controller.load();
+  const result = await controller.appendModel('johnason-test-one', '  second  ');
+  assert.equal(result.ok, true);
+  assert.equal(calls.set.length, 0);
+  assert.equal(calls.mutate.length, 1);
+  assert.equal(calls.mutate[0][2], 12);
+  assert.deepEqual(Array.from(calls.mutate[0][1][0].path), ['providers', 'johnason-test-one', 'models']);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.mutate[0][1][0].value)), [
+    original, { id: 'second', maxTokens: 4096 },
+  ]);
+  assert.deepEqual(providers['johnason-test-one'].models, [original]);
+});
+
+test('append accepts the empty modelOverrides default returned by native Settings', async () => {
+  const p = await plugin();
+  const { ctx, calls } = harness({ providers: {
+    'johnason-test-one': { models: [{ id: 'first', maxTokens: 2048 }], modelOverrides: {} },
+  } });
+  const controller = p.createController(ctx);
+  await controller.load();
+  assert.equal((await controller.appendModel('johnason-test-one', 'second')).ok, true);
+  assert.equal(calls.mutate.length, 1);
+});
+
+test('append model rejects duplicates and unsupported provider shapes without writes', async () => {
+  const p = await plugin();
+  for (const [profile, modelId] of [
+    [{ models: [{ id: 'first' }] }, ' first '],
+    [{ models: [{ id: 'first' }], modelOverrides: { first: { maxTokens: 2048 } } }, 'second'],
+    [{ models: { first: {} } }, 'second'],
+    [{ models: [] }, ' '],
+    [{ models: [] }, 'x'.repeat(129)],
+  ]) {
+    const { ctx, calls } = harness({ providers: { 'johnason-test-one': profile } });
+    const controller = p.createController(ctx);
+    await controller.load();
+    const result = await controller.appendModel('johnason-test-one', modelId);
+    assert.equal(result.ok, false);
+    if (Object.hasOwn(profile, 'modelOverrides') || !Array.isArray(profile.models)) assert.match(result.message, /原生 Models/);
+    assert.equal(calls.set.length, 0);
+    assert.equal(calls.mutate.length, 0);
+  }
+});
+
+test('append model uses its original snapshot when a refresh occurs in flight', async () => {
+  const p = await plugin();
+  let revision = 7;
+  let providers = { 'johnason-test-one': { models: [{ id: 'first', maxTokens: 2048 }] } };
+  const { ctx, calls } = harness();
+  ctx.remote.settings.describe = async () => ({ ok: true, value: { writable: true, namespaces: [{ ns: 'llm-pi-ai', value: { providers }, revision }] } });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  ctx.remote.settings.mutate = async (...args) => { await gate; calls.mutate.push(args); return { ok: true }; };
+  const controller = p.createController(ctx);
+  await controller.load();
+  const pending = controller.appendModel('johnason-test-one', 'second');
+  providers = { 'johnason-test-one': { models: [{ id: 'elsewhere' }] } };
+  revision = 8;
+  await controller.load();
+  release();
+  await pending;
+  assert.equal(calls.mutate[0][2], 7);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.mutate[0][1][0].value)), [
+    { id: 'first', maxTokens: 2048 }, { id: 'second', maxTokens: 4096 },
+  ]);
 });
 
 test('duplicate route is refused before any credential write', async () => {

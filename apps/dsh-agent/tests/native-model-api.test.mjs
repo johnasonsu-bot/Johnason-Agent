@@ -91,7 +91,7 @@ test('model API plugin saves local and cloud connections without overwriting exi
   await panel.getByLabel('连接 ID', { exact: true }).fill('local-test');
   await panel.getByLabel('显示名称', { exact: true }).fill('本地测试模型');
   await panel.getByLabel('API 地址', { exact: true }).fill(modelURL);
-  await panel.getByLabel('模型 ID', { exact: true }).fill('local-test-model');
+  await panel.getByLabel('模型 ID', { exact: true }).fill('local-test-model\nlocal-second-model');
   // First attempt must refuse a locked/uninitialized Vault without a partial provider write.
   await panel.getByRole('button', { name: '保存连接', exact: true }).click();
   await panel.getByRole('alert').waitFor();
@@ -107,7 +107,16 @@ test('model API plugin saves local and cloud connections without overwriting exi
   assert.equal(local.baseURL, modelURL);
   assert.equal(local.api, 'openai-completions');
   assert.equal(local.models[0].id, 'local-test-model');
+  assert.deepEqual(local.models.map(model => model.id), ['local-test-model', 'local-second-model']);
   assert.equal((await client.rpc('credentials/describe', { refs: [local.apiKeyEnv] }))[local.apiKeyEnv].configured, true);
+  await panel.getByLabel('添加模型 ID（johnason-local-test）', { exact: true }).fill('local-third-model');
+  await panel.getByRole('button', { name: '添加模型（johnason-local-test）', exact: true }).click();
+  await panel.getByText(/local-third-model/).waitFor();
+  const expanded = (await namespace()).value.providers['johnason-local-test'];
+  assert.deepEqual(expanded.models.slice(0, 2), local.models, 'appending must preserve existing model parameters');
+  assert.equal(expanded.models[2].id, 'local-third-model');
+  assert.equal(expanded.apiKeyEnv, local.apiKeyEnv);
+  assert.equal(expanded.baseURL, local.baseURL);
   await panel.getByLabel('连接类型', { exact: true }).selectOption('cloud');
   await panel.getByLabel('连接 ID', { exact: true }).fill('cloud-test');
   await panel.getByLabel('显示名称', { exact: true }).fill('外部测试模型');

@@ -23,6 +23,16 @@ window.__ModuleLoader__.load({
       return 'JOHNASON_MODEL_API_' + crypto.randomUUID().replace(/-/g, '_').toUpperCase();
     }
 
+    function parseModelIds(raw) {
+      if (typeof raw !== 'string') return { message: '请填写模型 ID。' };
+      const ids = raw.split(/\r?\n/).map(id => id.trim()).filter(Boolean);
+      if (!ids.length) return { message: '请填写模型 ID。' };
+      if (ids.length > 32) return { message: '一个连接最多支持 32 个模型，请减少模型 ID。' };
+      if (ids.some(id => id.length > 128)) return { message: '模型 ID 不能超过 128 个字符。' };
+      if (new Set(ids).size !== ids.length) return { message: '模型 ID 不能重复。' };
+      return { ids };
+    }
+
     function createController(ctx) {
       let namespace;
       let writable = false;
@@ -66,7 +76,9 @@ window.__ModuleLoader__.load({
         const slug = draft.slug?.trim();
         const route = 'johnason-' + slug;
         if (!/^[a-z][a-z0-9-]*$/.test(slug)) return { ok: false, message: '连接 ID 须以小写字母开头，只能包含小写字母、数字和连字符。' };
-        if (!draft.displayName?.trim() || !draft.modelId?.trim()) return { ok: false, message: '请填写显示名称和模型 ID。' };
+        if (!draft.displayName?.trim()) return { ok: false, message: '请填写显示名称。' };
+        const parsedModels = parseModelIds(draft.modelId);
+        if (!parsedModels.ids) return { ok: false, message: parsedModels.message };
         if (!validateURL(draft.baseURL, draft.type)) return { ok: false, message: 'API 地址无效：本地只允许 loopback HTTP/HTTPS，云端只允许 HTTPS，且不能包含用户信息、查询参数或片段。' };
         if (!protocols.includes(draft.api)) return { ok: false, message: '请选择受支持的协议。' };
         if (draft.type === 'cloud' && !draft.key) return { ok: false, message: '云端连接必须填写 API Key。' };
@@ -80,7 +92,7 @@ window.__ModuleLoader__.load({
           if (status.value[draft.credentialRef]?.writable !== true) return { ok: false, message: 'Vault 已锁定或不可写，请前往 Vault 解锁后重试。' };
           const stored = await ctx.remote.credentials.set(draft.credentialRef, key);
           if (!stored.ok) return { ok: false, message: '无法保存 API Key，请前往 Vault 检查解锁状态后重试。' };
-          const profile = { displayName: draft.displayName.trim(), api: draft.api, baseURL: draft.baseURL, models: [{ id: draft.modelId.trim(), maxTokens: 4096 }], apiKeyEnv: draft.credentialRef };
+          const profile = { displayName: draft.displayName.trim(), api: draft.api, baseURL: draft.baseURL, models: parsedModels.ids.map(id => ({ id, maxTokens: 4096 })), apiKeyEnv: draft.credentialRef };
           const written = await ctx.remote.settings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', route], value: profile }], base.revision);
           if (!written.ok) return { ok: false, message: '模型设置写入失败或版本已变化。凭据已保留，请刷新列表后重试。' };
           draft.key = '';
@@ -89,7 +101,38 @@ window.__ModuleLoader__.load({
           return { ok: false, message: '保存失败，请检查 Vault 并刷新列表后重试。' };
         }
       }
-      return { newDraft, load, save };
+      async function appendModel(route, rawId) {
+        const base = namespace;
+        if (!base) return { ok: false, message: '请先刷新列表。' };
+        if (!writable) return { ok: false, message: '当前模型设置不可写，请刷新后重试。' };
+        const providers = base.value?.providers;
+        if (typeof route !== 'string' || !route.startsWith('johnason-') || !Object.hasOwn(providers ?? {}, route)) {
+          return { ok: false, message: '连接不存在，请刷新列表。' };
+        }
+        const profile = providers[route];
+        const overrides = profile?.modelOverrides;
+        const hasCustomOverrides = Object.hasOwn(profile ?? {}, 'modelOverrides')
+          && (!overrides || typeof overrides !== 'object' || Array.isArray(overrides) || Object.keys(overrides).length > 0);
+        if (!profile || typeof profile !== 'object' || hasCustomOverrides || !Array.isArray(profile.models)
+          || profile.models.some(model => !model || typeof model !== 'object' || typeof model.id !== 'string')) {
+          return { ok: false, message: '此连接的模型配置需要在原生 Models 页面编辑。' };
+        }
+        const parsed = parseModelIds(rawId);
+        if (!parsed.ids) return { ok: false, message: parsed.message };
+        if (parsed.ids.length !== 1) return { ok: false, message: '每次只能添加一个模型 ID。' };
+        const id = parsed.ids[0];
+        if (profile.models.some(model => model.id === id)) return { ok: false, message: '模型 ID 已存在。' };
+        if (profile.models.length >= 32) return { ok: false, message: '一个连接最多支持 32 个模型。' };
+        const models = [...profile.models, { id, maxTokens: 4096 }];
+        try {
+          const written = await ctx.remote.settings.mutate('llm-pi-ai', [{ op: 'set', path: ['providers', route, 'models'], value: models }], base.revision);
+          if (!written.ok) return { ok: false, message: '模型设置写入失败或版本已变化，请刷新列表后重试。' };
+          return { ok: true, message: '模型已添加。' };
+        } catch {
+          return { ok: false, message: '添加失败，请刷新列表后重试。' };
+        }
+      }
+      return { newDraft, load, save, appendModel };
     }
 
     function Panel({ controller }) {
@@ -98,8 +141,10 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [message, setMessage] = useState('');
       const [messageError, setMessageError] = useState(false);
+      const [modelAdditions, setModelAdditions] = useState({});
       const saving = useRef(false);
       async function refresh() {
+        if (saving.current) return;
         setBusy(true);
         try { setView(await controller.load()); setMessage(''); setMessageError(false); }
         catch { setMessage('无法读取模型连接，请刷新列表重试。'); setMessageError(true); }
@@ -107,6 +152,7 @@ window.__ModuleLoader__.load({
       }
       useEffect(() => { void refresh(); }, []);
       function change(name, value) {
+        if (saving.current) return;
         if (['type', 'slug', 'baseURL'].includes(name)) {
           setDraft(controller.newDraft({ ...draft, [name]: value, key: '' }));
         } else setDraft({ ...draft, [name]: value });
@@ -126,12 +172,27 @@ window.__ModuleLoader__.load({
           } else setDraft({ ...draft });
         } finally { saving.current = false; setBusy(false); }
       }
+      async function appendModel(route) {
+        if (saving.current) return;
+        saving.current = true;
+        setBusy(true);
+        try {
+          const result = await controller.appendModel(route, modelAdditions[route] || '');
+          setMessage(result.message);
+          setMessageError(!result.ok);
+          if (result.ok) {
+            setModelAdditions(current => ({ ...current, [route]: '' }));
+            try { setView(await controller.load()); }
+            catch { setMessage('模型已添加，列表刷新失败。请点击“刷新列表”重试。'); setMessageError(true); }
+          }
+        } finally { saving.current = false; setBusy(false); }
+      }
       const input = (label, name, type = 'text') => h('label', { style: { display: 'grid', gap: 5 } }, label,
         h('input', { 'aria-label': label, type, value: draft[name], disabled: busy, onChange: event => change(name, event.target.value), style: fieldStyle, autoComplete: type === 'password' ? 'new-password' : 'off', ...name === 'baseURL' ? { placeholder: 'http://127.0.0.1:1234/v1' } : {} }));
       return h('section', { 'data-johnason-model-api': true, style: { display: 'grid', gap: 14, color: '#17304a', colorScheme: 'light', maxWidth: 720 } },
         h('h2', { style: { margin: 0 } }, '模型 API'),
         h('p', { style: { margin: 0 } }, '新增模型连接；API Key 保存在 Vault。仅点击“保存连接”时写入，不会自动探测网络。保存后可在原生模型选择器中选择。'),
-        h('a', { href: '/vault' }, '打开 Vault'),
+        h('a', { href: '/vault', target: '_blank', rel: 'noopener noreferrer' }, '打开 Vault'),
         h('div', { style: { display: 'grid', gap: 8 } },
           h('label', { style: { display: 'grid', gap: 5 } }, '连接类型', h('select', { 'aria-label': '连接类型', value: draft.type, disabled: busy, onChange: event => change('type', event.target.value), style: fieldStyle },
             h('option', { value: 'cloud' }, '云端'), h('option', { value: 'local' }, '本地'))),
@@ -139,15 +200,21 @@ window.__ModuleLoader__.load({
           input('显示名称', 'displayName'), input('API 地址', 'baseURL'),
           h('label', { style: { display: 'grid', gap: 5 } }, '协议', h('select', { 'aria-label': '协议', value: draft.api, disabled: busy, onChange: event => change('api', event.target.value), style: fieldStyle },
             ...protocols.map(value => h('option', { key: value, value }, value)))),
-          input('模型 ID', 'modelId'), input('API Key', 'key', 'password')),
+          h('label', { style: { display: 'grid', gap: 5 } }, '模型 ID（每行一个）',
+            h('textarea', { 'aria-label': '模型 ID', value: draft.modelId, disabled: busy, rows: 4, onChange: event => change('modelId', event.target.value), style: fieldStyle, placeholder: 'model-one\nmodel-two' })),
+          input('API Key', 'key', 'password')),
         draft.type === 'local' && h('small', null, '本地连接可留空 API Key；保存时会生成随机占位凭据并写入 Vault。'),
         message && h('p', { role: messageError ? 'alert' : 'status', style: { margin: 0 } }, message),
         h('div', { style: { display: 'flex', gap: 8 } },
           h('button', { type: 'button', disabled: busy || !view.writable, onClick: save, style: plain }, busy ? '保存中…' : '保存连接'),
           h('button', { type: 'button', disabled: busy, onClick: refresh, style: plain }, '刷新列表')),
         h('h3', { style: { marginBottom: 0 } }, '已配置连接'),
-        view.rows.length ? h('ul', { style: { margin: 0, paddingLeft: 20 } }, ...view.rows.map(row => h('li', { key: row.route },
-          h('strong', null, row.displayName), '（', h('span', null, row.route), '） · ' + row.api + ' · ' + row.models.join('、') + ' · ' + row.credentialStatus)))
+        view.rows.length ? h('ul', { style: { margin: 0, paddingLeft: 20 } }, ...view.rows.map(row => h('li', { key: row.route, style: { marginBottom: 12 } },
+          h('strong', null, row.displayName), '（', h('span', null, row.route), '） · ' + row.api + ' · ' + row.models.join('、') + ' · ' + row.credentialStatus,
+          h('form', { onSubmit: event => { event.preventDefault(); void appendModel(row.route); }, style: { display: 'flex', gap: 8, marginTop: 6 } },
+            h('input', { 'aria-label': '添加模型 ID（' + row.route + '）', value: modelAdditions[row.route] || '', disabled: busy || !view.writable,
+              onChange: event => { if (!saving.current) setModelAdditions(current => ({ ...current, [row.route]: event.target.value })); }, style: fieldStyle, placeholder: '新增模型 ID' }),
+            h('button', { type: 'submit', 'aria-label': '添加模型（' + row.route + '）', disabled: busy || !view.writable, style: plain }, '添加模型')))))
           : h('p', { style: { margin: 0 } }, '暂无 Johnason 模型连接。'));
     }
 
