@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -42,6 +43,9 @@ def test_source_gate_cli_does_not_claim_runtime_or_plugin_readiness() -> None:
     completed = subprocess.run(
         [sys.executable, "scripts/verify_deepseek_harness_source.py"],
         cwd=REPOSITORY_ROOT / "mvp",
+        # A relative inherited PYTHONPATH changes meaning after cwd changes and
+        # could load an older editable installation from a different worktree.
+        env={**os.environ, "PYTHONPATH": str(REPOSITORY_ROOT / "mvp/src")},
         check=True,
         text=True,
         stdout=subprocess.PIPE,

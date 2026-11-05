@@ -209,6 +209,9 @@ def _write_host_v2_sidecar(root: Path) -> None:
 
 @pytest.fixture()
 def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Path]:
+    from workbench.runtime.deepseek_harness import source_gate
+
+    release = load_platform_release(Path(source_gate.__file__).with_name("platform-release.json"))
     root = tmp_path / "parent"
     source = root / "third_party" / "deepseek-harness"
     source.mkdir(parents=True)
@@ -222,8 +225,8 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
             {
                 "name": "@deepseek-ai/dsh-root",
                 "private": True,
-                "packageManager": "pnpm@11.7.0",
-                "engines": {"node": "^22.19.0 || >=24.0.0"},
+                "packageManager": release["packageManager"],
+                "engines": {"node": ">=24.9.0"},
                 "workspaces": ["packages/*/*", "apps/*", "python/sdk-runtime"],
             }
         ),
@@ -243,7 +246,7 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
     )
     _write(
         source / "apps" / "cli" / "package.json",
-        json.dumps({"name": "@deepseek-ai/dsh", "version": "0.1.6-alpha.2", "bin": {"dsh": "lib/bin.js"}}),
+        json.dumps({"name": "@deepseek-ai/dsh", "version": release["version"], "bin": {"dsh": "lib/bin.js"}}),
     )
     _write(
         source / "apps" / "cli" / "src" / "bin.ts",
@@ -288,8 +291,6 @@ def source_repository(tmp_path: Path) -> tuple[Path, DeepSeekSourceVerifier, Pat
     )
     manifest_path = root / "mvp" / "src" / "workbench" / "runtime" / "deepseek_harness" / "source_manifest.json"
     manifest_path.parent.mkdir(parents=True)
-    from workbench.runtime.deepseek_harness import source_gate
-    release = load_platform_release(Path(source_gate.__file__).with_name("platform-release.json"))
     _write(manifest_path.with_name("platform-release.json"), json.dumps({**release, "revision": revision}) + "\n")
     _write_host_v2_sidecar(root)
     manifest_path.write_bytes(canonical_manifest_bytes(verifier.build_manifest(root)))
@@ -316,28 +317,29 @@ def test_canonical_manifest_passes_and_only_claims_source_readiness(
 def test_manifest_records_frozen_build_boundary_and_sidecar_inputs(
     source_repository: tuple[Path, DeepSeekSourceVerifier, Path],
 ) -> None:
-    root, verifier, _ = source_repository
+    root, verifier, manifest_path = source_repository
+    package_manager = load_platform_release(manifest_path.with_name("platform-release.json"))["packageManager"]
 
     manifest = verifier.build_manifest(root)
 
     assert manifest["dependency_preparation"]["command"] == (
-        "corepack pnpm@11.7.0 install --frozen-lockfile"
+        f"corepack {package_manager} install --frozen-lockfile"
     )
     assert manifest["release_build"]["commands"] == [
         {
-            "command": "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-linux-x64",
+            "command": f"corepack {package_manager} exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-linux-x64",
             "host_arch": "x64",
             "host_os": "linux",
             "target": "node24-linux-x64",
         },
         {
-            "command": "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-linux-arm64",
+            "command": f"corepack {package_manager} exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-linux-arm64",
             "host_arch": "arm64",
             "host_os": "linux",
             "target": "node24-linux-arm64",
         },
         {
-            "command": "corepack pnpm@11.7.0 exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-macos-arm64",
+            "command": f"corepack {package_manager} exec tsx scripts/build-exe-for-python-sdk.ts --targets=node24-macos-arm64",
             "host_arch": "arm64",
             "host_os": "darwin",
             "target": "node24-macos-arm64",

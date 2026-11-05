@@ -11,9 +11,12 @@
 | 订阅安全适配 | 679/679 通过，native helper、TypeScript、客户端构筑通过 |
 | GitHub 同步脚本 | 15/15 通过；真实 fork 已快进到官方同一 SHA |
 | 原生 DSH + 本机 Ollama | `gemma4:e4b` 真实返回 `OLLAMA_DSH_OK` |
+| 最后配置副本修复 | 12/12 定向回归通过；重复安装通过，源码 patch 保持不变 |
 | 新组合实际安装 | 固定 web-all、dshmarket、独立订阅 runtime 安装通过 |
 | 浏览器 | 新版首页、插件市场及仅 Codex 的订阅设置可见；无启动插件错误 |
 | Codex 实际账户 | 官方 OAuth 页面已打开，等待用户选择账户并授权；尚未完成真实模型请求 |
+| 平台边界与来源清单 | 提交新版 gitlink 后 `check-platform` 通过；来源清单返回 `GO_DSH_SOURCE_READY`，不等同全部业务运行验收 |
+| 源码与构筑溯源回归 | 51/51 通过；保留 HEAD、index、checkout、dirty 及构筑回执漂移拒绝规则 |
 
 本机测试日志保存在 `/private/tmp/johnason-dsh-20261105-build.log`、`/private/tmp/johnason-dsh-20261105-app-final-tests.log`、`/private/tmp/johnason-dsh-20261105-sidecar-all-final.log`。订阅构筑文件摘要及测试证据在 `apps/dsh-agent/community/subscriptions/VERIFICATION.json`。Ollama 回执在独立临时目录 `johnason-ollama-live-zVAPgG/verification.json`。日志属于本机证据，不将含浏览器启动认证参数的运行日志提交到仓库。
 
