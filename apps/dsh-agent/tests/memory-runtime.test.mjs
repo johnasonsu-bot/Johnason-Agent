@@ -16,14 +16,16 @@ const { default: Sessions, KNOWN_SESSION_EVENT_TYPES } = await import('@deepseek
   return native('core/session');
 });
 const { default: Tools } = await native('core/tools');
+const NativeExecutor = await native('core/tool-executor-native');
+const { PtcExecutor } = await native('core/tool-executor-ptc');
 const { default: Prompt } = await native('core/system-prompt');
-const { default: Llm, createUserMessage, createSystemMessage } = await native('llm/llm');
+const { default: Llm, createUserMessage, createSystemMessage, createToolResultMessage } = await native('llm/llm');
 const { default: Agents } = await native('core/agent');
 const { default: Loop } = await native('core/agent-loop');
 const { default: SessionProjections } = await native('session/session-projection');
 const { default: Sandbox } = await native('sandbox/sandbox-local');
 const { default: Policy } = await native('sandbox/sandbox-policy');
-const { default: JsonlPersistence } = await native('session/session-persistence-jsonl');
+const JsonlPersistence = await native('session/session-persistence-jsonl');
 
 async function readStored(persistence, id, from = 0) {
   const handle = await persistence.open(id, 'read');
@@ -96,7 +98,9 @@ async function fixture(t, options = {}) {
   t.diagnostic(`Retained native integration fixture: ${root}`);
   const ctx = new Context();
   for (const plugin of [Llm, Sessions, Prompt]) await ctx.plugin(plugin);
-  await ctx.plugin(Tools, options.toolsConfig ?? {});
+  await ctx.plugin(Tools);
+  if (options.ptc) ctx.tools.setExecutor(new PtcExecutor(ctx));
+  else await ctx.plugin(NativeExecutor);
   await ctx.plugin(Agents);
   await ctx.plugin(SessionProjections);
   await ctx.plugin(JsonlPersistence, { root: join(root, 'sessions'), compression: 'none' });
@@ -112,7 +116,10 @@ async function fixture(t, options = {}) {
     sandbox: { sandbox_required: true, mode: 'workspace-write', network: 'host', workspaceRoot },
     budgetTokens: 4000, anchors: ['Keep native tool pairs intact'] };
   const configure = () => service.configureSession(agent.id, config, { expectedVersion: 0 });
-  const execute = (name, args, callId = `call-${agent.session.seq}`) => ctx.tools.execute({ agent, name, arguments: args, callId, signal: new AbortController().signal });
+  const execute = async (name, args, callId = `call-${agent.session.seq}`) => {
+    const result = await ctx.tools.execute({ agent, calls: [{ id: callId, name, arguments: JSON.stringify(args) }], signal: new AbortController().signal });
+    return result.results[0].result;
+  };
   return { root, workspaceRoot, ctx, agent, service, config, configure, execute };
 }
 
@@ -159,7 +166,7 @@ test('required sandbox catalog is session-scoped and filters own scoped tools wi
 });
 
 test('required sandbox replaces deployment PTC transport with callable confined native tools', async t => {
-  const f = await fixture(t, { toolsConfig: { mode: 'ptc' } });
+  const f = await fixture(t, { ptc: true });
   await f.configure();
   assert.equal(f.ctx.tools.get('run_code', f.agent), undefined);
   assert.ok((await advertisedNames(f.ctx, f.agent)).includes('memory_sandbox_run'));
@@ -168,11 +175,11 @@ test('required sandbox replaces deployment PTC transport with callable confined 
   assert.equal(result.value.stdout.trim(), f.workspaceRoot);
 });
 
-test('pre-step rejects incompatible late PTC presentation before advertising an unusable transport', async t => {
+test('required sandbox rejects incompatible late executor before advertising an unusable transport', async t => {
   const f = await fixture(t); await f.configure();
-  f.agent.ctx.tools.presentAs('ptc');
-  await assert.rejects(f.ctx.waterfall('agent/pre-step', { agent: f.agent, messages: [] },
-    async () => ({ kind: 'enter', messages: [] })), { code: 'SANDBOX_REQUIREMENT_UNSUPPORTED' });
+  assert.throws(() => f.agent.ctx.tools.setExecutor(new PtcExecutor(f.agent.ctx)), /Only one tool executor/);
+  assert.ok((await advertisedNames(f.ctx, f.agent)).includes('memory_sandbox_run'));
+  assert.equal((await advertisedNames(f.ctx, f.agent)).includes('run_code'), false);
   assert.equal(f.service.getSessionConfig(f.agent.id).sandbox.sandbox_required, true);
   assert.equal(f.service.listEffects(f.agent.id).length, 0);
 });
@@ -181,7 +188,7 @@ test('failed required-sandbox presentation preflight preserves the saved policy 
   const f = await fixture(t);
   registerNativeTool(f.ctx, 'Bash');
   await f.service.configureSession(f.agent.id, { ...f.config, sandbox: null }, { expectedVersion: 0 });
-  f.agent.ctx.tools.presentAs('ptc');
+  f.agent.ctx.tools.setExecutor(new PtcExecutor(f.agent.ctx));
   const before = f.service.getSessionConfig(f.agent.id);
   const schemas = f.ctx.tools.schemas(f.agent).map(tool => tool.name);
   const seq = f.agent.session.seq;
@@ -191,7 +198,7 @@ test('failed required-sandbox presentation preflight preserves the saved policy 
   assert.equal(f.agent.session.seq, seq);
   assert.deepEqual(f.ctx.tools.schemas(f.agent).map(tool => tool.name), schemas);
   assert.ok(f.ctx.tools.get('Bash', f.agent));
-  assert.ok(f.ctx.tools.get('run_code', f.agent));
+  assert.equal(f.ctx.tools.get('run_code', f.agent), undefined, 'PTC transport is not a registry capability');
   assert.equal(f.ctx.tools.get('memory_sandbox_run', f.agent), undefined);
   await f.service.barrier(f.agent.id);
   assert.equal((await readStored(f.ctx.sessionPersistence, f.agent.id)).events.filter(event => event.type === 'memory-recovery/config').length, 1);
@@ -202,7 +209,7 @@ test('persisted required session reopens with a confined catalog before its firs
   await f.ctx.sessions.flush(f.agent.session);
   await f.ctx.fiber.dispose();
   const ctx = new Context();
-  for (const plugin of [Llm, Sessions, Prompt, Tools, Agents]) await ctx.plugin(plugin);
+  for (const plugin of [Llm, Sessions, Prompt, Tools, NativeExecutor, Agents]) await ctx.plugin(plugin);
   await ctx.plugin(SessionProjections);
   await ctx.plugin(JsonlPersistence, { root: join(f.root, 'sessions'), compression: 'none' });
   await ctx.plugin(Loop, { agents: [] });
@@ -238,14 +245,14 @@ test('explicit new-session opt-in persists config and flushes sourced events, ol
 test('fresh native permission initialization is allowed but seeded or started lifecycles are not', async t => {
   const f = await fixture(t);
   // Reproduce the native permission-presets publication ordering seen in real Web:
-  // its earlier session/created observer appends these policy facts synchronously.
-  f.ctx.on('session/created', session => {
+  // its earlier agent/created observer appends these policy facts synchronously.
+  f.ctx.on('agent/created', ({ agent: { session } }) => {
     if (session.seq !== 0) return;
     session.append('permission/preset', { preset: 'workspace-write' });
     session.append('sandbox/mode', { mode: 'workspace-write' });
     session.append('approval/policy', { policy: 'ask' });
   }, { prepend: true });
-  const fresh = await createStoredSession(f.ctx, 'initialized-new', { meta: { cwd: f.workspaceRoot } });
+  const fresh = (await f.ctx.agentLoop.create('initialized-new', {}, { cwd: f.workspaceRoot })).session;
   assert.equal(f.service.getSessionConfig(fresh.id).canConfigure, true);
   assert.equal(f.service.getSessionConfig(fresh.id).configurationBlockReason, null);
   const initialEvents = fresh.snapshotEvents();
@@ -354,7 +361,7 @@ test('large canonical output is retained raw but native result uses a sourced su
   assert.match(result.content[0].text, /memory_page_in/);
   const io = f.agent.session.snapshotEvents().find(e => e.type === 'memory-recovery/tool-io');
   assert.equal(io.data.value.full, full); assert.deepEqual(io.data.sourceEventSeqs, [call.seq]);
-  f.agent.session.append('tool/result', { turn: 1, step: 1, message: createUserMessage({ source: { kind: 'tool', callId: 'raw-call' }, content: [{ type: 'tool-result', toolCallId: 'raw-call', content: result.content }] }) }, { surfaceOp: 'append', sourceEventSeqs: [dispatch.seq] });
+  f.agent.session.append('tool/result', { turn: 1, step: 1, message: createToolResultMessage({ callId: 'raw-call', content: result.content, isError: false }) }, { surfaceOp: 'append', sourceEventSeqs: [dispatch.seq] });
   await f.service.barrier(f.agent.id);
   assert.doesNotMatch(JSON.stringify(f.agent.session.deriveMessages()), /ORIGINAL LARGE BODY/);
   // Consume exactly what the native result advertises, including the old prose form;

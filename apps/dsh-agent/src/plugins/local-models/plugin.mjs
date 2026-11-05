@@ -18,9 +18,10 @@ export const SettingsSchema = Schema.object({
 });
 
 export function apply(ctx, config = {}) {
-  const settings = ctx.settings.register(name, SettingsSchema, { base: config, validate: normalizeSettings });
+  const readSettings = () => normalizeSettings(typeof config?.get === 'function' ? config.get() : config);
+  readSettings(); // Reject unsafe loopback settings before registering tools or routes.
   const service = createLocalModelService({
-    getSettings: () => settings.get(),
+    getSettings: readSettings,
     resolveCredential: ref => ctx.credentials.resolve(ref),
     getTurn: exec => {
       const session = exec?.agent?.session;

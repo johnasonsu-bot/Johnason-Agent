@@ -10,7 +10,7 @@ import { validateSandboxRequirements, runSandboxTask } from './task-sandbox.mjs'
 import { installMemoryTools, MEMORY_TOOL_NAMES } from './memory-tools.mjs';
 import { installMemoryRecoveryUi } from './memory-recovery-ui.mjs';
 
-import { Service, createUserMessage, retainRequiredEventTypes, snapshotSessionEvents } from '../../platform/memory-api.mjs';
+import { Service, createUserMessage, retainRequiredEventTypes, snapshotSessionEvents, installMemoryToolExecutor } from '../../platform/memory-api.mjs';
 export const name = 'johnason-memory-recovery';
 export const inject = ['sessions', 'tools', 'systemPrompt', 'sandbox', 'sandboxPolicy'];
 const QUEUE_EVENTS = 64;
@@ -23,7 +23,7 @@ const UNSTARTED_SESSION_EVENTS = new Set([
 ]);
 const actor = Object.freeze({ id: 'local-operator', role: 'operator' });
 const error = (code, message = code) => Object.assign(new Error(message), { code });
-const owned = event => event.type === 'user/message' && event.data.source?.kind === 'plugin' && event.data.source.plugin === name;
+const owned = event => event.type === 'user/message' && event.data.source?.kind === name;
 const textOf = message => message.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') ?? '';
 const clean = data => sanitizeEvent({ seq: 0, type: IO_EVENT, time: Date.now(), data }).event.data;
 
@@ -172,19 +172,8 @@ class MemoryRecovery extends Service {
     installMemoryTools(ctx, this);
     ctx.on('agent/created', ({ agent }) => this.#syncTools(agent));
     ctx.on('agent/disposed', ({ agent }) => this.#releaseTools(agent));
-    // Registry restrictions intersect inherited capabilities only. Own-scope
-    // registrations remain native-owned: hide their unsupported schemas here,
-    // while the monotonic execution guard still rejects stale/direct calls.
-    ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
-      const agent = context.scope;
-      if (!agent?.session || ctx.sessions.get(agent.id) !== agent.session) return next();
-      this.#syncTools(agent);
-      const assembly = await next();
-      const config = this.getSessionConfig(agent.id);
-      return { ...assembly, tools: assembly.tools.filter(tool => config.enabled
-        ? config.sandbox?.sandbox_required ? MEMORY_TOOL_NAMES.has(tool.name) : tool.name !== 'memory_sandbox_run'
-        : !MEMORY_TOOL_NAMES.has(tool.name)) };
-    }, { prepend: true });
+    // Required sessions filter their own native executor's model declarations.
+    // New upstream prompt waterfalls deliberately cannot edit tool schemas.
     ctx.systemPrompt.section({ name: 'memory-recovery:capabilities', order: 200, text: ({ scope }) => {
       if (!scope?.session || ctx.sessions.get(scope.id) !== scope.session) return '';
       const config = this.getSessionConfig(scope.id);
@@ -224,14 +213,14 @@ class MemoryRecovery extends Service {
   #prepareTools(agent, config) {
     const mode = !config.enabled ? 'disabled' : config.sandbox?.sandbox_required ? 'required' : 'memory-only';
     const current = this.#toolScopes.get(agent);
-    if (current?.mode === mode && !(mode === 'required' && this.ctx.tools.get('run_code', agent))) return;
+    if (current?.mode === mode) return;
     // Never install a host-global mask. Code transport is outside restrict(),
     // so required sessions use native presentation instead of advertising a
     // transport that their execution guard must deny. Conflicting own-scope
     // presentation declarations fail explicitly; they are never overwritten.
     let presentation;
-    if (mode === 'required' && this.ctx.tools.get('run_code', agent)) {
-      try { presentation = agent.ctx.tools.presentAs('native'); }
+    if (mode === 'required') {
+      try { presentation = installMemoryToolExecutor(agent.ctx, MEMORY_TOOL_NAMES); }
       catch (cause) { throw error('SANDBOX_REQUIREMENT_UNSUPPORTED', `required sandbox needs native tool presentation: ${cause.message}`); }
     }
     let restriction;
@@ -447,7 +436,7 @@ class MemoryRecovery extends Service {
     const text = prefix + selection.contextText;
     const current = session.surface.nodes.map(seq => events[seq]).find(owned);
     if (current && textOf(current.data) === text) return selection;
-    const message = createUserMessage({ source: { kind: 'plugin', plugin: name }, content: [{ type: 'text', text }] });
+    const message = createUserMessage({ source: { kind: name }, content: [{ type: 'text', text }] });
     const references = [...new Set([...(current ? [current.seq] : []), ...selection.pages.flatMap(p => p.sourceRefs.filter(r => r.type === 'event' && r.sessionId === id).map(r => r.seq))])];
     const source = session.append('memory-recovery/page-selection', { pages: selection.pages.map(p => ({ id: p.id, version: p.version, sourceRefs: p.sourceRefs,
       ...(p.offset === undefined ? {} : { offset: p.offset, maxChars: p.maxChars, totalChars: p.totalChars }) })), estimatedTokens: Math.ceil(text.length / 4), configVersion: config.version,

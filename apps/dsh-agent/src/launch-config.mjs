@@ -10,8 +10,8 @@ function assertSupportedNode(nodeVersion) {
   if (!match) throw new Error(`Invalid Node version: ${nodeVersion}`)
   const major = Number(match[1])
   const minor = Number(match[2])
-  if (!((major === 22 && minor >= 19) || major >= 24)) {
-    throw new Error(`Node ${nodeVersion} is unsupported; use Node 22.19+ in the 22.x line, or Node 24+`)
+  if (!((major === 24 && minor >= 9) || major >= 25)) {
+    throw new Error(`Node ${nodeVersion} is unsupported; use Node 24.9 or newer`)
   }
 }
 function takeValue(argv, index, option) {
@@ -48,6 +48,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
   let systemsPath
   let port
   let noOpen = false
+  let localOllama = false
   const passthrough = []
 
   for (let index = 1; index < argv.length; index += 1) {
@@ -55,6 +56,8 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
     if (token === '--') {
       passthrough.push(...argv.slice(index))
       break
+    } else if (token === '--local-ollama') {
+      localOllama = true
     } else if (token === '--data-dir') {
       dataRoot = resolve(takeValue(argv, index, token))
       index += 1
@@ -126,6 +129,7 @@ export function resolveLaunch(argv, { homeDir, repoRoot, env, nodeVersion }) {
 
   return {
     mode,
+    ...(localOllama ? { localOllama: true } : {}),
     dataRoot,
     workspace,
     corePath,

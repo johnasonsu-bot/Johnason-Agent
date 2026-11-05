@@ -112,13 +112,16 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
   await page.getByText('内测声明', { exact: true }).waitFor({ state: 'hidden' });
   await page.getByRole('button', { name: '插件', exact: true }).click();
   const card = page.locator('[data-plugin-package="@johnason/dsh-local-models"]');
-  await card.getByText('local-models', { exact: true }).click();
+  await card.getByRole('button', { name: /^查看 / }).click();
   const panel = page.locator('[data-johnason-local-models]');
   await panel.getByLabel('LM Studio API 地址', { exact: true }).fill(baseURL);
   await panel.getByLabel('Jev 决策模型', { exact: true }).fill('fixture-decision');
   await panel.getByLabel('本地工作模型', { exact: true }).fill('fixture-worker');
   await panel.getByLabel('每轮调用预算', { exact: true }).fill('200');
+  const savedResponse = page.waitForResponse(response => response.url() === `${origin}/api/settings/mutate`);
   await panel.getByRole('button', { name: '保存混合配置', exact: true }).click();
+  const savedEnvelope = await (await savedResponse).json();
+  assert.equal(savedEnvelope.result.ok, true, JSON.stringify(savedEnvelope));
   await panel.getByRole('status').filter({ hasText: '混合配置已保存。' }).waitFor();
   assert.equal(await panel.getByLabel('每轮调用预算', { exact: true }).getAttribute('max'), '2000');
   assert.equal(requests.length, 0, 'saving configuration must never run inference');
@@ -162,7 +165,7 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
   assert.equal(requests.filter(row => row.model === 'fixture-worker').length, 1);
   const decision = requests.find(row => row.model === 'fixture-decision');
   assert.equal(decision.response_format.type, 'json_schema');
-  assert.equal(decision.stream, false);
+  assert.equal(decision.stream ?? false, false, 'decision call must not request streaming');
   assert.equal(decision.messages.some(message => message.content.includes('Use the johnason-local-models Skill')), false, 'only explicit subtask text may reach the decision model');
   assert.equal((await client.snapshot(sessionId)).projections.values.modelSelection.next.provider, 'fixture-supervisor');
   assert.equal(output.includes(key), false);
@@ -179,7 +182,7 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
   assert.equal(batchCalls.length, 1);
   assert.equal(requests.filter(row => row.model === 'fixture-decision').length, 201);
   assert.equal(requests.filter(row => row.model === 'fixture-worker').length, 1, 'batch must never start the worker');
-  const batchResults = history.records.flatMap(row => row.event?.type === 'tool/result' ? row.event.data.message.content : []).find(block => block.type === 'tool-result' && block.toolCallId === 'fixture-batch-200');
+  const batchResults = history.records.filter(row => row.event?.type === 'tool/result').map(row => row.event.data.message).find(message => message.role === 'tool' && message.toolCallId === 'fixture-batch-200');
   assert.equal(batchResults?.isError, false);
   const batchPayload = JSON.parse(batchResults.content.filter(block => block.type === 'text').map(block => block.text).join(''));
   assert.equal(batchPayload.results.length, 200);
@@ -197,7 +200,7 @@ test('bundled Skill drives a Jev-style decision and local worker inside a native
     assert.ok(Date.now() < cancelFinishBy, 'Cancelled native batch must settle.');
     await new Promise(resolve => setTimeout(resolve, 100));
   }
-  const cancelledTool = history.records.flatMap(row => row.event?.type === 'tool/result' ? row.event.data.message.content : []).find(block => block.type === 'tool-result' && block.toolCallId === 'fixture-cancel-batch');
+  const cancelledTool = history.records.filter(row => row.event?.type === 'tool/result').map(row => row.event.data.message).find(message => message.role === 'tool' && message.toolCallId === 'fixture-cancel-batch');
   assert.equal(cancelledTool?.isError, true);
   const partial = cancelledTool.content.filter(block => block.type === 'text').map(block => { try { return JSON.parse(block.text); } catch { return null; } }).find(value => value?.results);
   assert.ok(partial, 'Native cancellation must retain the completed prefix, not just the error message.');

@@ -11,6 +11,7 @@ import SystemPrompt from "../../../../third_party/deepseek-harness/packages/core
 import ToolRuntime, {
   assertObjectJsonSchema,
 } from "../../../../third_party/deepseek-harness/packages/core/tools/lib/index.js";
+import * as NativeToolExecutor from "../../../../third_party/deepseek-harness/packages/core/tool-executor-native/lib/index.js";
 import LlmRuntime, {
   LlmError,
   createAssistantMessage,
@@ -27,7 +28,7 @@ import {
 
 export {
   Context, AgentLoop, AgentRegistry, SessionStore, Session, SessionId,
-  SessionProjections, SystemPrompt, ToolRuntime, assertObjectJsonSchema,
+  SessionProjections, SystemPrompt, ToolRuntime, NativeToolExecutor, assertObjectJsonSchema,
   LlmRuntime, LlmError, createAssistantMessage, createSystemMessage,
   createUserMessage, DeepSeekAdapter, resolveAdapterOptions, MAX_TIMER_DELAY_MS,
 };

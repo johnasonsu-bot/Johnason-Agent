@@ -2,7 +2,7 @@ window.__ModuleLoader__.load({
   id: '@johnason/dsh-local-models',
   factory: require => {
     const { createElement: h, useState, useEffect, useRef } = require('react');
-    const namespaceName = 'johnason-local-models';
+    const namespaceName = 'local-models';
     const defaults = {
       enabled: true,
       baseURL: 'http://127.0.0.1:1234/v1',
@@ -60,7 +60,7 @@ window.__ModuleLoader__.load({
         writable = response.value.writable === true;
         namespace = response.value.namespaces.find(row => row.ns === namespaceName);
         if (!namespace || !Number.isSafeInteger(namespace.revision)) throw new Error('本地模型设置尚未就绪。');
-        const value = namespace.value ?? {};
+        const value = namespace.value?.settings ?? {};
         return { writable, revision: namespace.revision, draft: newDraft(value), hasCredential: typeof value.apiKeyRef === 'string' && !!value.apiKeyRef };
       }
       async function save(draft) {
@@ -76,8 +76,8 @@ window.__ModuleLoader__.load({
           return { ok: false, message: '请检查阈值、超时、输出上限、调用预算和并发上限。' };
         }
         const key = typeof draft.apiKey === 'string' ? draft.apiKey : '';
-        const oldRef = typeof base.value?.apiKeyRef === 'string' ? base.value.apiKeyRef : '';
-        const unchangedURL = draft.baseURL === base.value?.baseURL;
+        const oldRef = typeof base.value?.settings?.apiKeyRef === 'string' ? base.value.settings.apiKeyRef : '';
+        const unchangedURL = draft.baseURL === base.value?.settings?.baseURL;
         let apiKeyRef = '';
         if (!draft.noAuth && key) apiKeyRef = draft.credentialRef;
         else if (!draft.noAuth && unchangedURL) apiKeyRef = oldRef;
@@ -99,7 +99,7 @@ window.__ModuleLoader__.load({
             timeoutMs: draft.timeoutMs, maxTokens: draft.maxTokens, threshold: draft.threshold,
             maxCallsPerTurn: draft.maxCallsPerTurn, maxConcurrent: draft.maxConcurrent,
           };
-          const operations = writableFields.map(field => ({ op: 'set', path: [field], value: values[field] }));
+          const operations = writableFields.map(field => ({ op: 'set', path: ['settings', field], value: values[field] }));
           const written = await ctx.remote.settings.mutate(namespaceName, operations, base.revision);
           if (!written.ok) return { ok: false, message: '本地模型设置写入失败或版本已变化，请刷新配置后重试。' };
           draft.apiKey = '';

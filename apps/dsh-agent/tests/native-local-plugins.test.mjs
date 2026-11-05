@@ -55,7 +55,7 @@ test('native Installed plugin opens all local feature controls and reports uncon
   const card = page.locator('[data-plugin-package="@johnason/dsh-memory-ui"]');
   await card.waitFor();
   assert.match(await card.innerText(), /Vault.*三类记忆.*恢复审计.*沙箱/);
-  await card.getByText('memory-ui', { exact: true }).click();
+  await card.getByRole('button', { name: /^查看 / }).click();
   const panel = page.locator('[data-johnason-plugins]');
   await panel.waitFor();
   await panel.getByText(/未初始化/).waitFor();

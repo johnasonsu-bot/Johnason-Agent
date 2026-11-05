@@ -20,11 +20,13 @@ export function createPluginPlan(config) {
   // This bundle contributes host tools and a runtime Skill in every profile;
   // its optional browser half is loaded only by native Web clients.
   clientBundles.push({ name: '@johnason/dsh-local-models', sourceRoot: new URL('../../local-model-browser/', import.meta.url),
+    bundlePatches: [{ id: 'local-models', config: { implementation: entry('./local-models/plugin.mjs') } }],
     files: ['package.json', 'index.mjs', 'client.js', 'cordis.patch.yml'] });
   return {
     contractVersion: 1, credential, clientBundles, providers,
     profileOverlay({ authorizationEntry }) {
-      const overlay = [{ id: credential.id, config: { path: join(config.dataRoot, 'vault.enc'), mode: config.mode } },
+      const overlay = [{ id: credential.id, config: { path: join(config.dataRoot, 'vault.enc'), mode: config.mode,
+        ...(config.localOllama ? { localOllama: true } : {}) } },
         { insert: [{ id: 'memory-recovery', name: entry('../memory-recovery-plugin.mjs'),
           config: { path: join(config.dataRoot, 'memory/recovery.sqlite'), enabled: true } }] }];
       if (providers.length) {
@@ -37,7 +39,6 @@ export function createPluginPlan(config) {
       if (config.mode === 'web') {
         overlay.push({ id: 'memory-ui', config: { providers: providers.map(({ id, label, type }) => ({ id, label, type })) } });
       }
-      overlay.push({ id: 'local-models', config: { implementation: entry('./local-models/plugin.mjs') } });
       return overlay;
     },
     async prepare() {

@@ -68,3 +68,18 @@ test('browser bootstrap exception does not unlock model refs or system authoriza
   assert.equal(f.accesses(), 7);
   assert.deepEqual(await f.provider.listRecords(), []);
 });
+
+test('opt-in loopback transport placeholder never reads Vault or unlocks real credentials', async () => {
+  const f = lockedProvider();
+  await assert.rejects(f.provider.resolve('JOHNASON_OLLAMA_LOCAL_PLACEHOLDER'), { code: 'VAULT_LOCKED' });
+  f.provider.config.localOllama = true;
+  const before = f.accesses();
+  assert.deepEqual(await f.provider.resolve('JOHNASON_OLLAMA_LOCAL_PLACEHOLDER'), {
+    value: 'local-ollama-no-auth', source: 'unauthenticated-loopback',
+  });
+  assert.equal(f.accesses(), before);
+  assert.deepEqual(await f.provider.describe('JOHNASON_OLLAMA_LOCAL_PLACEHOLDER'), {
+    configured: true, writable: false, source: 'unauthenticated-loopback',
+  });
+  await assert.rejects(f.provider.resolve('OPENAI_API_KEY'), { code: 'VAULT_LOCKED' });
+});

@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { createRequire, registerHooks } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
 
 const defaults = {
@@ -29,7 +31,7 @@ function harness({ value = defaults, revision = 9, writable = true, credential =
   const calls = { mutate: [], describeCredential: [], set: [] };
   const ctx = { remote: {
     settings: {
-      describe: async () => ({ ok: true, value: { writable, namespaces: [{ ns: 'johnason-local-models', value, revision }] } }),
+      describe: async () => ({ ok: true, value: { writable, namespaces: [{ ns: 'local-models', value: { settings: value }, revision }] } }),
       mutate: async (...args) => { calls.mutate.push(args); return mutateReply; },
     },
     credentials: {
@@ -41,7 +43,7 @@ function harness({ value = defaults, revision = 9, writable = true, credential =
 }
 
 function mutations(calls) {
-  return Object.fromEntries(calls.mutate[0][1].map(op => [op.path[0], op.value]));
+  return Object.fromEntries(calls.mutate[0][1].map(op => [op.path[1], op.value]));
 }
 
 test('load projects only editable values and credential status', async () => {
@@ -66,8 +68,9 @@ test('keyless local save needs no Vault access and writes only schema fields wit
   assert.equal(result.ok, true);
   assert.equal(calls.describeCredential.length, 0);
   assert.equal(calls.set.length, 0);
-  assert.equal(calls.mutate[0][0], 'johnason-local-models');
+  assert.equal(calls.mutate[0][0], 'local-models');
   assert.equal(calls.mutate[0][2], 9);
+  assert.ok(calls.mutate[0][1].every(op => op.path[0] === 'settings'));
   assert.deepEqual(Object.keys(mutations(calls)).sort(), Object.keys(defaults).sort());
   assert.equal(mutations(calls).workerModel, 'new-worker');
   assert.equal(mutations(calls).apiKeyRef, '');
@@ -294,7 +297,13 @@ test('a delayed first settings load keeps editing locked until the loaded draft 
 });
 
 test('host bundle delegates to its configured implementation with settings', async () => {
-  const host = await import('../local-model-browser/index.mjs');
+  const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
+  const hooks = registerHooks({ resolve(specifier, context, next) {
+    if (specifier === '@deepseek-ai/schemastery') return { url: pathToFileURL(require.resolve(specifier)).href, shortCircuit: true };
+    return next(specifier, context);
+  } });
+  let host;
+  try { host = await import('../local-model-browser/index.mjs'); } finally { hooks.deregister(); }
   assert.deepEqual(host.inject, ['settings', 'tools', 'credentials']);
   const implementation = 'data:text/javascript,export function apply(ctx,settings){return {ctx,settings}}';
   const ctx = { marker: 'host' };

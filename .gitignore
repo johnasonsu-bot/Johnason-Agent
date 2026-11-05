@@ -2,6 +2,7 @@ node_modules/
 .worktrees/
 .superpowers/
 .vendor/
+apps/dsh-agent/community/runtime/
 mvp/.runtime/
 mvp/.venv/
 .env

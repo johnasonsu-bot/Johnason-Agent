@@ -18,7 +18,7 @@ test('local plugin plan declares protected credentials, optional systems and Web
   assert.deepEqual(plan.clientBundles.map(bundle => bundle.name), ['@johnason/dsh-memory-ui', '@johnason/dsh-model-api', '@johnason/dsh-local-models']);
   const headless = registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'headless', providers: [] });
   assert.deepEqual(headless.clientBundles.map(bundle => bundle.name), ['@johnason/dsh-local-models']);
-  assert.equal(headless.profileOverlay({}).find(row => row.id === 'local-models').config.implementation,
+  assert.equal(headless.clientBundles[0].bundlePatches[0].config.implementation,
     fileURLToPath(new URL('../src/plugins/local-models/plugin.mjs', import.meta.url)));
   const systems = registry.createPluginPlan({ dataRoot: '/isolated/data', mode: 'web', providers: [
     { id: 'dataplatform', label: 'Data Platform', type: 'dataplatform', url: 'http://127.0.0.1:46120', corePath: '/trusted/core.cjs' },

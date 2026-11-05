@@ -18,11 +18,13 @@ async function loopbackModel(t) {
       requests.push({ path: request.url, body: JSON.parse(Buffer.concat(parts).toString()) });
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.end([
-        { choices: [{ delta: { role: 'assistant', content: null, reasoning_content: '' } }] },
-        { choices: [{ delta: { content: 'LOCAL_EXTENSION_OK' } }] },
-        { choices: [{ delta: { content: '' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 1 } },
-        '[DONE]',
-      ].map(event => `data: ${typeof event === 'string' ? event : JSON.stringify(event)}\n\n`).join(''));
+        { type: 'message_start', message: { id: 'fixture-message', model: 'deepseek-v4-pro', usage: { input_tokens: 3, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'LOCAL_EXTENSION_OK' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+        { type: 'message_stop' },
+      ].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''));
     } catch (error) { response.destroy(error); }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -30,11 +32,11 @@ async function loopbackModel(t) {
   return { requests, baseURL: `http://127.0.0.1:${server.address().port}` };
 }
 
-async function launchProfile(t, baseURL, { missingVersion = false, protocol, useVault = false } = {}) {
+async function launchProfile(t, baseURL, { missingVersion = false, useVault = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dsh-request-extension-'));
   const entries = [{ id: 'request-extension-acceptance',
     name: fileURLToPath(new URL('./fixtures/request-extension-plugin.mjs', import.meta.url)),
-    config: { baseURL, protocol, useVault } }];
+    config: { baseURL, useVault } }];
   if (missingVersion) {
     const bad = join(root, 'missing-version');
     await mkdir(bad);
@@ -81,7 +83,7 @@ test('native local plugins pass official inventory preparation and a loopback De
   assert.deepEqual(result.finish, { kind: 'stop' });
   assert.equal(result.blocks.filter(block => block.type === 'text').map(block => block.text).join(''), 'LOCAL_EXTENSION_OK');
   assert.equal(model.requests.length, 1);
-  assert.equal(model.requests[0].path, '/chat/completions');
+  assert.equal(model.requests[0].path, '/v1/messages');
   const inventory = model.requests[0].body.dsh_plugin_packages;
   assert.deepEqual(inventory, result.fields.dsh_plugin_packages);
   assert.equal(inventory.version, 1);
@@ -94,20 +96,22 @@ test('native local plugins pass official inventory preparation and a loopback De
   assert.ok(inventory.packages.some(pkg => pkg.name === copied.name && pkg.version === copied.version));
 });
 
-test('native official inventory keeps rejecting missing package versions before sending a model request', { timeout: 45000 }, async t => {
+test('native official inventory omits unavailable version metadata without fabricating it', { timeout: 45000 }, async t => {
   const model = await loopbackModel(t);
   const { client } = await launchProfile(t, model.baseURL, { missingVersion: true });
   const response = await client.fetch('/request-extension-acceptance');
   const result = await response.json();
-  assert.equal(response.status, 503);
-  assert.equal(result.code, 'REQUEST_EXTENSION');
-  assert.match(result.cause, /missing-version\/package\.json must declare non-empty name and version/);
-  assert.equal(model.requests.length, 0, 'Metadata failure must prevent HTTP dispatch');
+  assert.equal(response.status, 200, JSON.stringify(result));
+  const inventory = model.requests[0].body.dsh_plugin_packages;
+  assert.deepEqual(inventory, result.fields.dsh_plugin_packages);
+  assert.deepEqual(inventory.packages.find(pkg => pkg.name === '@johnason/regression-missing-version'), { name: '@johnason/regression-missing-version' });
+  assert.ok(inventory.packages.some(pkg => pkg.name === '@johnason/dsh-agent' && typeof pkg.version === 'string'));
+  assert.equal(model.requests.length, 1);
 });
 
 test('official Messages adapter reports the locked Vault action instead of a transport failure', { timeout: 45000 }, async t => {
   const model = await loopbackModel(t);
-  const { client } = await launchProfile(t, model.baseURL, { protocol: 'messages', useVault: true });
+  const { client } = await launchProfile(t, model.baseURL, { useVault: true });
   const password = randomUUID();
   const initialize = await client.fetch('/vault/initialize', { method: 'POST',
     headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password, confirmation: password }) });

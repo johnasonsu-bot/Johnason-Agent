@@ -2,6 +2,7 @@ import { nativeRequire, nativeUrl } from './runtime.mjs';
 
 const require = nativeRequire();
 export const { Service } = await import(require.resolve('@deepseek-ai/cordis'));
+const { NativeToolExecutor } = await import(nativeUrl('packages/core/tool-executor-native/lib/index.js'));
 export const { createUserMessage } = await import(nativeUrl('packages/llm/llm/lib/index.js'));
 // Preserve a source host's ESM identity when it supplies aliases; the standard
 // launcher and plain Node hosts resolve the built native CLI dependency graph.
@@ -63,4 +64,12 @@ export function snapshotSessionEvents(session, from = 0, to = undefined) {
     throw Object.assign(new Error('Pinned native Session snapshot is not an event array'), { code: 'MEMORY_NATIVE_SESSION_API_UNSUPPORTED' });
   }
   return events;
+}
+
+/** Confined sessions own an executor; registry restrictions alone cannot mask PTC transport. */
+export function installMemoryToolExecutor(ctx, allowedNames) {
+  const executor = new NativeToolExecutor(ctx);
+  const describe = executor.describe.bind(executor);
+  executor.describe = tools => describe(tools.filter(tool => allowedNames.has(tool.name)));
+  return ctx.tools.setExecutor(executor);
 }

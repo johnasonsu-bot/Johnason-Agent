@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { EphemeralGrantChannel } from "../src/grant-channel.ts";
 import { createSidecar, serveNdjson } from "../src/server.ts";
+import { textStream, toolCallStream as messagesToolCallStream } from "./fixtures/messages-stream.mjs";
 
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -37,28 +38,7 @@ function toolManifest() {
 
 
 function toolCallStream(callId = "tool-call-wire-1") {
-  return [
-    'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}',
-    `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{
-      index: 0,
-      id: callId,
-      type: "function",
-      function: { name: "platform_lookup", arguments: '{"query":"native"}' },
-    }] } }] })}`,
-    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}',
-    "data: [DONE]",
-    "",
-  ].join("\n\n");
-}
-
-
-function textStream(text) {
-  return [
-    'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}',
-    `data: ${JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: "stop" }], usage: { prompt_tokens: 6, completion_tokens: 2 } })}`,
-    "data: [DONE]",
-    "",
-  ].join("\n\n");
+  return messagesToolCallStream(callId, "platform_lookup", { query: "native" });
 }
 
 
@@ -273,7 +253,7 @@ test("production source NDJSON delegates a native tool and accepts one correlate
     const terminal = await readCompleted(wire);
     assert.equal(terminal.cursor, 4);
     assert.equal(upstream.requests.length, 2);
-    assert.deepEqual(upstream.requests[0].tools.map(tool => tool.function.name), [
+    assert.deepEqual(upstream.requests[0].tools.map(tool => tool.name), [
       "platform_lookup",
     ]);
     wire.send({

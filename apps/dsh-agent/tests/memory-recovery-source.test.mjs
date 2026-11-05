@@ -45,12 +45,12 @@ test('memory UI reattaches only proven root history and shares concurrent attach
       listed++; assert.deepEqual(request, {}); assert.ok(signal instanceof AbortSignal);
       return { items: [{ sessionId: 'saved-root', cwd: '/saved-workspace', running: false }] };
     },
-    async create(request) { creates.push(request); await new Promise(resolve => setImmediate(resolve)); attached = true; return { sessionId: request.sessionId }; },
+    async resolveAgent(id) { creates.push({ sessionId: id }); await new Promise(resolve => setImmediate(resolve)); attached = true; return { agent: { id, session: { id } } }; },
   }, { workspaceRegistry: { create() { assert.fail('reading historical config must not create or associate workspaces'); } } });
   const results = await Promise.all([post(handler, 'config', { sessionId: 'saved-root' }), post(handler, 'config', { sessionId: 'saved-root' })]);
   assert.deepEqual(results, [0, 1].map(() => ({ status: 200, body: { value: config } })));
   assert.equal(listed, 1);
-  assert.deepEqual(creates, [{ sessionId: 'saved-root', cwd: '/saved-workspace' }]);
+  assert.deepEqual(creates, [{ sessionId: 'saved-root' }]);
 });
 
 test('memory UI refuses unknown, subagent and nonabsolute historical identities without creating anything', async () => {

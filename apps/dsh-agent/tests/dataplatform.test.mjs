@@ -283,7 +283,7 @@ test("DB env is forwarded only with explicitly selected host core", () => {
       JWT_SECRET: "signing",
       UNRELATED_SECRET: "hidden",
     },
-    nodeVersion: "22.20.0",
+    nodeVersion: "24.14.1",
   };
   assert.equal(resolveLaunch(["web"], options).env.DB_PASSWORD, undefined);
   const launch = resolveLaunch(["web", "--core", "/trusted/core.js"], options);

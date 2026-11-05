@@ -45,6 +45,7 @@ test('old public imports preserve every export and class identity after relocati
     export const credentialRef = value => value;
     export const parseCredentialKey = value => value;
     export const createUserMessage = value => value;
+    export const installMemoryToolExecutor = () => () => {};
     export const retainRequiredEventTypes = () => () => {};
     export const snapshotSessionEvents = session => session.snapshotEvents();
   `)}`;

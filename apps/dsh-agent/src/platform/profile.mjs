@@ -1,8 +1,39 @@
-import { mkdir, readFile, writeFile, copyFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile, copyFile, lstat, rename } from 'node:fs/promises';
+import { join, dirname, basename } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createPluginPlan } from '../plugins/index.mjs';
 import { loadProfilePlatform } from './launch-platform.mjs';
+
+async function realDirectory(path) {
+  try { await mkdir(path, { mode: 0o700 }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; }
+  const info = await lstat(path);
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Generated plugin directory must not be a link: ${path}`);
+}
+
+async function preserveLinkedEntry(path, profileDir) {
+  let info;
+  try { info = await lstat(path); }
+  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  if (!info.isSymbolicLink() && !(info.isFile() && info.nlink > 1)) return;
+  const backups = join(profileDir, '.johnason-preserved-package-links');
+  await realDirectory(backups);
+  await rename(path, join(backups, `${basename(path)}-${randomUUID()}`));
+}
+
+async function privateBundleDirectory(profileDir, name) {
+  await mkdir(profileDir, { recursive: true, mode: 0o700 });
+  const modules = join(profileDir, 'node_modules');
+  await realDirectory(modules);
+  const target = join(modules, name);
+  if (dirname(target) !== modules) await realDirectory(dirname(target));
+  // pnpm can replace a generated package with a symlink to its source. Preserve
+  // that link before materializing our copy; never copy or patch through it.
+  await preserveLinkedEntry(target, profileDir);
+  await realDirectory(target);
+  return target;
+}
 
 /** Compose native bundles and user patches, with the encrypted provider as the final overlay. */
 export async function prepareProfile(config, options = {}) {
@@ -27,6 +58,11 @@ export async function prepareProfile(config, options = {}) {
   if (config.invocation?.fromDefaultProfile !== undefined) {
     // Initialize before loadProfile can create the target. The later native
     // boot/dump reuses this encrypted profile and must not initialize it twice.
+    const target = boot.resolveProfileDir(profile, config.dataRoot);
+    try {
+      await lstat(target);
+      throw new Error(`Profile ${profile} already exists; preserve its files and select a new profile name`);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
     await platform.initializeProfileFromDefault(profile, config.invocation.fromDefaultProfile, config.dataRoot);
   }
   if (plugins.contractVersion !== 1) throw new Error('Unsupported local plugin contract');
@@ -57,9 +93,19 @@ export async function prepareProfile(config, options = {}) {
       && !previous.dsh?.profile?.bundles?.includes(bundle.name);
     if (uninstalled) continue;
     // Profile-local packages are resolved by both the runtime and the native manager.
-    const uiDir = join(profileDir, 'node_modules', bundle.name);
-    await mkdir(uiDir, { recursive: true, mode: 0o700 });
-    for (const file of bundle.files) await copyFile(new URL(file, bundle.sourceRoot), join(uiDir, file));
+    const uiDir = await privateBundleDirectory(profileDir, bundle.name);
+    for (const file of bundle.files) {
+      const destination = join(uiDir, file);
+      await preserveLinkedEntry(destination, profileDir);
+      await copyFile(new URL(file, bundle.sourceRoot), destination);
+    }
+    if (bundle.bundlePatches?.length) {
+      // Implementation paths belong to the inherited bundle; a final overlay
+      // would make the entire entry read-only to native live Settings edits.
+      const path = join(uiDir, 'cordis.patch.yml');
+      const patches = boot.loadOverlayPatches('johnason-dsh', path);
+      await writeFile(path, JSON.stringify([...patches, ...bundle.bundlePatches], null, 2) + '\n');
+    }
   }
   let loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
   const manifest = boot.readProfileManifest('johnason-dsh', profileDir);
@@ -87,7 +133,10 @@ export async function prepareProfile(config, options = {}) {
     loaded = boot.loadProfile('johnason-dsh', profile, anchor, config.dataRoot);
   }
   const overlay = plugins.profileOverlay(platform);
-  const layers = [loaded.layers.flatMap(layer => layer.patches), loaded.patches,
+  // Native headless now disables its ambient credential provider. Johnason must
+  // retain the encrypted provider; user overrides are still validated afterward.
+  const modePatches = config.mode === 'headless' ? [{ id: 'credentials', disabled: false }] : [];
+  const layers = [loaded.layers.flatMap(layer => layer.patches), modePatches, loaded.patches,
     boot.loadOptionalPatches('johnason-dsh', join(config.dataRoot, 'cordis.patch.yml')) ?? [],
     ...patchFiles.map(path => boot.loadOverlayPatches('johnason-dsh', path)), overlay];
   const rows = boot.composeEntries(layers);
@@ -97,6 +146,6 @@ export async function prepareProfile(config, options = {}) {
   if (providers.length !== 1 || !providerNames.includes(providers[0].name) || providers[0].disabled) throw new Error('Exactly one encrypted credential provider is required');
   const overlayPath = join(config.dataRoot, `standalone-${profile}.patch.yml`);
   await mkdir(config.dataRoot, { recursive: true, mode: 0o700 });
-  await writeFile(overlayPath, JSON.stringify(overlay, null, 2) + '\n', { mode: 0o600 });
+  await writeFile(overlayPath, JSON.stringify([...modePatches, ...overlay], null, 2) + '\n', { mode: 0o600 });
   return { profile, args, rows, overlayPath, patchFiles: [...patchFiles, overlayPath] };
 }

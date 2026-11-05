@@ -85,7 +85,7 @@ test('model API plugin saves local and cloud connections without overwriting exi
   await page.getByRole('button', { name: '插件', exact: true }).click();
   const card = page.locator('[data-plugin-package="@johnason/dsh-model-api"]');
   await card.waitFor();
-  await card.getByText('model-api', { exact: true }).click();
+  await card.getByRole('button', { name: /^查看 / }).click();
   const panel = page.locator('[data-johnason-model-api]');
   await panel.waitFor();
   await panel.getByLabel('连接 ID', { exact: true }).fill('local-test');
@@ -134,7 +134,7 @@ test('model API plugin saves local and cloud connections without overwriting exi
   assert.notEqual(local.apiKeyEnv, cloud.apiKeyEnv);
   assert.deepEqual(saved.value.providers['preserved-test'], preserved);
   assert.equal(JSON.stringify(saved).includes(key), false);
-  assert.equal((await readFile(join(root, 'settings.yaml'), 'utf8')).includes(key), false);
+  assert.equal((await readFile(join(root, 'profiles/web/cordis.patch.yml'), 'utf8')).includes(key), false);
   assert.equal((await readFile(join(root, 'vault.enc'), 'utf8')).includes(key), false);
   assert.equal(output.includes(key), false);
   const created = await client.rpc('workspace/create', { request: { path: workspace } });

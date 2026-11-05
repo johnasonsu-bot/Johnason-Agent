@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/V1ki/dsh-plugin-subscriptions",
+  "commit": "be350cd7845847b487b5ec29581452c906f4b19d",
+  "upstreamVersion": "0.9.12",
+  "localVersion": "0.9.12-johnason.1",
+  "archiveSHA256": "a3c308f9da02faba1bebd0086ad5d0dc3f7721dbc78998ad289550a5cbed925f",
+  "license": "MIT",
+  "adapterFiles": [
+    "src/auth/store.ts",
+    "src/auth/secret-storage.ts",
+    "src/auth/claude-code-creds.ts",
+    "src/http.ts",
+    "native/keychain-helper.c",
+    "scripts/build-keychain.mjs",
+    "scripts/stage-runtime.mjs",
+    "src/index.ts",
+    "src/auth/rpc.ts",
+    "src/client/SubscriptionsSection.tsx",
+    "src/providers/antigravity-oauth-client.ts",
+    "src/providers/antigravity.ts"
+  ],
+  "credentialsBackend": "macOS Keychain",
+  "credentialFilesCreated": false,
+  "crossProcessPolicy": "one owner per DSH subscriptions directory, kernel flock held for host lifetime; lock loss latched until host restart"
+}

@@ -20,3 +20,13 @@ export async function attachSessionWorkspace(workspaceRegistry, { sessionId, wor
   // The native entity validates the persisted/live Session's immutable cwd.
   await workspace.attachSession(sessionId);
 }
+
+/** Resolve a proven stored Session. Native create() now only reuses blank drafts. */
+export async function resumeWorkspaceSession(sessionController, sessionId) {
+  if (typeof sessionController.resolveAgent !== 'function') throw new Error('Native session resume API unavailable');
+  const result = await sessionController.resolveAgent(sessionId);
+  if (!result?.agent || result.agent.id !== sessionId || result.agent.session?.id !== sessionId) {
+    throw new Error('Native session resume identity mismatch');
+  }
+  return { sessionId };
+}

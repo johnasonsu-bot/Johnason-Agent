@@ -18,7 +18,7 @@ export async function authenticateWeb(output, origin, { fetch: send = globalThis
   assert.ok(launchUrl, 'Native startup must print an authenticated URL for this origin');
   const login = await send(launchUrl, { redirect: 'manual', signal: AbortSignal.timeout(10000) });
   assert.equal(login.status, 303, 'Native launch-token exchange must redirect');
-  assert.equal(login.headers.get('location'), '/');
+  assert.equal(new URL(login.headers.get('location'), origin).href, `${origin}/`);
   const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
   assert.ok(cookie, 'Native launch-token exchange must issue a browser cookie');
 

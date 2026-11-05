@@ -23,7 +23,7 @@ const baseOptions = {
     DEEPSEEK_API_KEY: 'synthetic-secret-do-not-use',
     AWS_SECRET_ACCESS_KEY: 'synthetic-secret-do-not-use',
   },
-  nodeVersion: '22.20.0',
+  nodeVersion: '24.14.1',
 }
 
 test('exports the launch resolver and defaults to an isolated data root', async () => {
@@ -89,10 +89,10 @@ test('plugin requires a workspace and forwards only plugin arguments', async () 
 
 test('rejects unsupported Node versions, malformed options, and unknown modes', async () => {
   const { resolveLaunch } = await loadLauncher()
-  for (const nodeVersion of ['20.19.0', '22.18.9', '23.0.0']) {
-    assert.throws(() => resolveLaunch(['web'], { ...baseOptions, nodeVersion }), /Node.*22\.19.*24/i)
+  for (const nodeVersion of ['22.20.0', '24.8.9', '20.19.0', '23.0.0']) {
+    assert.throws(() => resolveLaunch(['web'], { ...baseOptions, nodeVersion }), /Node.*24\.9/i)
   }
-  for (const nodeVersion of ['22.19.0', '22.99.1', '24.0.0', '25.1.0']) {
+  for (const nodeVersion of ['24.9.0', '24.14.1', '25.1.0', '26.0.0']) {
     assert.doesNotThrow(() => resolveLaunch(['web'], { ...baseOptions, nodeVersion }))
   }
   assert.throws(() => resolveLaunch(['web', '--port', '0'], baseOptions), /port/i)

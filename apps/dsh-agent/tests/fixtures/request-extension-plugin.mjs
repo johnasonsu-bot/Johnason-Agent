@@ -18,12 +18,12 @@ export function apply(ctx, config) {
       try {
         let fields;
         const adapter = new DeepSeekAdapter({
-          options: () => resolveAdapterOptions({ protocol: config.protocol ?? 'chat-completions', baseURL: endpoint.origin }),
-          resolveApiKey: async () => {
-            if (!config.useVault) return apiKey;
+          options: () => resolveAdapterOptions({ baseURL: endpoint.origin, thinking: 'disabled' }),
+          resolveAuth: async () => {
+            if (!config.useVault) return { headers: { 'x-api-key': apiKey } };
             const hit = await ctx.credentials.resolve('DEEPSEEK_API_KEY');
             if (!hit) throw new LlmError('No test model credential configured', 'MISSING_CREDENTIAL');
-            return hit.value;
+            return { headers: { 'x-api-key': hit.value } };
           },
           resolveUserId: () => '00000000-0000-4000-8000-000000000001',
           prepareExtensions: async request => {
@@ -34,7 +34,7 @@ export function apply(ctx, config) {
         });
         const assembler = new BlockAssembler();
         for await (const chunk of adapter.stream({
-          provider: 'deepseek-official', model: 'deepseek-chat', signal: AbortSignal.timeout(10000),
+          provider: 'deepseek-official', model: 'deepseek-v4-pro', signal: AbortSignal.timeout(10000),
           messages: [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Local request-extension acceptance' }] })],
         })) assembler.push(chunk);
         response.writeHead(200, { 'content-type': 'application/json' });

@@ -16,6 +16,7 @@ const native = path => new URL(`../../../third_party/deepseek-harness/packages/$
 const modules = {
   cordis: stub('export class Service { constructor(ctx) { this.ctx = ctx; } }'),
   session: native('core/session/src/known-event-types.ts'),
+  executor: stub('export class NativeToolExecutor {}'),
   llm: stub('let id = 0; export const createUserMessage = value => ({ id: `source-message-${++id}`, role: "user", ...value });'),
 };
 const nativeAliases = {
@@ -25,7 +26,7 @@ const nativeAliases = {
   '@deepseek-ai/dsh-session-format-v0-to-v1': native('session/session-format-v0-to-v1/src/index.ts'),
   '@deepseek-ai/dsh-session-format-v1-to-v2': stub(`export * from ${JSON.stringify(native('session/session-format-v1-to-v2/src/validation.ts'))}; export * from ${JSON.stringify(native('session/session-format-v1-to-v2/src/dispositions.ts'))};`),
 };
-const moduleBridge = stub(`export function nativeRequire() { return { resolve(name) { if (name === '@deepseek-ai/cordis') return ${JSON.stringify(modules.cordis)}; throw new Error('Unexpected native dependency: ' + name); } }; } export function nativeUrl(path) { if (path === 'packages/llm/llm/lib/index.js') return ${JSON.stringify(modules.llm)}; throw new Error('Unexpected native path: ' + path); }`);
+const moduleBridge = stub(`export function nativeRequire() { return { resolve(name) { if (name === '@deepseek-ai/cordis') return ${JSON.stringify(modules.cordis)}; throw new Error('Unexpected native dependency: ' + name); } }; } export function nativeUrl(path) { if (path === 'packages/core/tool-executor-native/lib/index.js') return ${JSON.stringify(modules.executor)}; if (path === 'packages/llm/llm/lib/index.js') return ${JSON.stringify(modules.llm)}; throw new Error('Unexpected native path: ' + path); }`);
 const hooks = registerHooks({ resolve(specifier, context, next) {
   if (context.parentURL === memoryApiUrl) {
     if (specifier === './runtime.mjs') return { url: moduleBridge, shortCircuit: true };
@@ -225,7 +226,7 @@ test('first memory context follows the native system head and later replaces onl
     content: { nodes: [{ id: 'page-body', type: 'fact', label: 'UNIQUE_PAGE_BODY' }], edges: [] }, summary: 'Explicit tool-selected page' }, 'source regression');
   await f.service.pageIn(f.session.id, operator.id);
   assert.deepEqual(await f.preStep([]), { kind: 'enter', messages: [] });
-  const latest = f.session.surface.nodes.map(seq => f.session.snapshotEvents()[seq]).find(e => e.type === 'user/message' && e.data.source.plugin === memoryPlugin.name);
+  const latest = f.session.surface.nodes.map(seq => f.session.snapshotEvents()[seq]).find(e => e.type === 'user/message' && e.data.source.kind === memoryPlugin.name);
   assert.match(latest.data.content[0].text, /UNIQUE_PAGE_BODY/);
 });
 

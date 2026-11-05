@@ -70,3 +70,69 @@ test('custom profile template validation precedes encrypted bundle or profile wr
     invocation: { profile: 'custom', fromDefaultProfile: 'headless', args: [], patches: [] } }, { platform, plugins: {} }), /existing profile rejected/);
   assert.deepEqual(initialized, ['custom', 'headless', '/isolated/data']);
 });
+
+test('custom profile initialization refuses an existing target without replacing its user files', async () => {
+  const { mkdtemp, mkdir, writeFile, readFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { prepareProfile } = await import('../src/platform/profile.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'dsh-profile-preserve-'));
+  const target = join(root, 'profiles/custom');
+  await mkdir(target, { recursive: true });
+  const marker = join(target, 'cordis.patch.yml');
+  await writeFile(marker, 'user-profile-must-remain\n');
+  let initialized = false;
+  const platform = { boot: { resolveProfileDir: () => target },
+    async initializeProfileFromDefault() { initialized = true; throw Error('unsafe replacement invoked'); } };
+  await assert.rejects(prepareProfile({ dataRoot: root, mode: 'headless',
+    invocation: { profile: 'custom', fromDefaultProfile: 'headless', args: [], patches: [] } },
+  { platform, plugins: {} }), /already exists.*preserve/i);
+  assert.equal(initialized, false);
+  assert.equal(await readFile(marker, 'utf8'), 'user-profile-must-remain\n');
+});
+
+test('fresh profile initializer preserves existing directories and initializes only a new validated target', async () => {
+  const { mkdtemp, mkdir, readFile, writeFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const api = await import('../src/platform/launch-platform.mjs');
+  assert.equal(typeof api.initializeFreshProfile, 'function');
+  const root = await mkdtemp(join(tmpdir(), 'dsh-fresh-profile-'));
+  const templates = { headless: { bundles: ['@deepseek-ai/dsh-headless'] } };
+  const boot = { resolveProfileDir: (name, home) => join(home, 'profiles', name),
+    async initProfile(dir, bundles) { await writeFile(join(dir, 'package.json'), JSON.stringify({ bundles })); } };
+  await api.initializeFreshProfile(boot, templates, 'custom', 'headless', root);
+  assert.deepEqual(JSON.parse(await readFile(join(root, 'profiles/custom/package.json'), 'utf8')),
+    { bundles: ['@deepseek-ai/dsh-headless'] });
+  await assert.rejects(api.initializeFreshProfile(boot, templates, 'custom', 'headless', root), /already exists.*preserve/i);
+  await assert.rejects(api.initializeFreshProfile(boot, templates, 'Headless', 'headless', root), /shipped profile/i);
+  await assert.rejects(api.initializeFreshProfile(boot, templates, 'other', 'missing', root), /unknown default profile/i);
+  const existing = join(root, 'profiles/existing');
+  await mkdir(existing);
+  await writeFile(join(existing, 'marker'), 'keep');
+  await assert.rejects(api.initializeFreshProfile(boot, templates, 'existing', 'headless', root), /already exists.*preserve/i);
+  assert.equal(await readFile(join(existing, 'marker'), 'utf8'), 'keep');
+});
+
+test('built command loading follows the installed CLI dispatcher without executing either bin entry', async () => {
+  const { mkdtemp, mkdir, writeFile } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const api = await import('../src/platform/launch-platform.mjs');
+  assert.equal(typeof api.loadBuiltCommand, 'function');
+  const root = await mkdtemp(join(tmpdir(), 'dsh-cli-dispatch-'));
+  const lib = join(root, 'apps/cli/lib');
+  await mkdir(lib, { recursive: true });
+  await writeFile(join(root, 'package.json'), '{"type":"module"}');
+  await writeFile(join(lib, 'bin.js'), 'throw Error("Do not execute installed launcher"); import("./bin-entry.js");');
+  await writeFile(join(lib, 'bin-entry.js'), 'throw Error("Do not execute dispatcher"); import("./plugin-command.js");');
+  await writeFile(join(lib, 'plugin-command.js'), 'export async function runPlugin(profile) { return `loaded:${profile}`; }');
+  const command = await api.loadBuiltCommand(root, 'plugin');
+  assert.equal(await command.runPlugin('web'), 'loaded:web');
+  await assert.rejects(api.loadBuiltCommand(root, 'unsupported'), /Unsupported native CLI/);
+  await writeFile(join(lib, 'bin-entry.js'), 'import("./dump-config-fixture.js"); import("./dump-config-schema-fixture.js");');
+  await writeFile(join(lib, 'dump-config-fixture.js'), 'export const kind = "config";');
+  assert.equal((await api.loadBuiltCommand(root, 'dump-config')).kind, 'config');
+  await writeFile(join(lib, 'bin-entry.js'), 'import("./plugin-command.js"); import("./plugin-second.js");');
+  await assert.rejects(api.loadBuiltCommand(root, 'plugin'), /build entry is unavailable/);
+});

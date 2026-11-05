@@ -13,6 +13,7 @@ export const LlmRuntime = Symbol("llm");
 export const SessionStore = Symbol("sessions");
 export const SessionProjections = Symbol("sessionProjections");
 export const SystemPrompt = Symbol("systemPrompt");
+export const NativeToolExecutor = Symbol("native-tool-executor");
 export const ToolRuntime = Symbol("tools");
 export const AgentRegistry = Symbol("agents");
 export const AgentLoop = Symbol("agentLoop");
@@ -27,8 +28,8 @@ export const createUserMessage = input => Object.freeze({
 export const createAssistantMessage = input => Object.freeze({
   ...input, id: randomUUID(), role: "assistant", source: { kind: "model", ...input.source },
 });
-export const createSystemMessage = (text, plugin) => Object.freeze({
-  id: randomUUID(), role: "system", source: { kind: "plugin", plugin },
+export const createSystemMessage = text => Object.freeze({
+  id: randomUUID(), role: "system", source: { kind: "system-prompt" },
   content: text.length === 0 ? [] : [{ type: "text", text }],
 });
 export const isReplacementSurfaceEvent = event => typeof event.surfaceOp === "object";
@@ -63,8 +64,7 @@ export class DeepSeekAdapter {
   }
 }
 export function resolveAdapterOptions(config) {
-  // The new upstream default is messages. A missing explicit protocol must
-  // remain visible to assertions rather than silently adopting the old default.
+  // The pinned upstream adapter has a Messages-only wire contract.
   return { ...config, protocol: config.protocol ?? "messages" };
 }
 
@@ -82,6 +82,8 @@ export class Context {
     this.plugins.push(plugin);
     if (plugin === LlmRuntime) {
       this.llm = { registerAdapter: (routes, adapter) => { this.adapter = adapter; } };
+    } else if (plugin === SessionStore) {
+      this.sessions = { create: id => Session.create(id) };
     } else if (plugin === SystemPrompt) {
       this.promptConfig = config;
       this.systemPrompt = {

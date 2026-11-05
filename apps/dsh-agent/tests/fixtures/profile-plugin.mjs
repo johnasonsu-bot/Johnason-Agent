@@ -6,7 +6,8 @@ export function apply(ctx) {
     kind: 'exact', path: '/acceptance-fixture',
     handler: async (_req, res) => {
       try {
-        const result = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'acceptance-marker', name: 'mcp__acceptance__marker', arguments: {} });
+        const batch = await ctx.tools.execute({ signal: new AbortController().signal, calls: [{ type: 'tool-call', id: 'acceptance-marker', name: 'mcp__acceptance__marker', arguments: '{}' }] });
+        const result = batch.results[0].result;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ source: name, result }));
       } catch (error) {

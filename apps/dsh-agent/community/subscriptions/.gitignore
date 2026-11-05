@@ -1,0 +1,9 @@
+node_modules/
+lib/
+lib-test/
+*.tgz
+overlay.yml
+.DS_Store
+
+native/keychain-helper
+*.local.log

@@ -17,6 +17,7 @@ const exportsByPath = new Map([
   ["packages/core/session/lib/index.js", "SessionStore as default, Session, SessionId"],
   ["packages/session/session-projection/lib/index.js", "SessionProjections as default"],
   ["packages/core/system-prompt/lib/index.js", "SystemPrompt as default"],
+  ["packages/core/tool-executor-native/lib/index.js", "NativeToolExecutor"],
   ["packages/core/tools/lib/index.js", "ToolRuntime as default, assertObjectJsonSchema"],
   ["packages/llm/llm/lib/index.js", "LlmRuntime as default, LlmError, createAssistantMessage, createUserMessage, createSystemMessage"],
   ["packages/llm/llm-deepseek/lib/index.js", "DeepSeekAdapter, resolveAdapterOptions"],
@@ -76,10 +77,11 @@ const sourceHook = registerHooks({
     return nextLoad(url, context);
   },
 });
-let restoreReleasedV3Artifact, SystemPromptProjection;
+let restoreReleasedV4Artifact, SystemPromptProjection, KNOWN_SESSION_EVENT_TYPES;
 try {
-  ({ restoreReleasedV3Artifact } = await import(new URL(
-    "packages/session/session-format-v2-to-v3/src/validation.ts", upstream,
+  ({ KNOWN_SESSION_EVENT_TYPES } = await import(new URL("packages/core/session/src/known-event-types.ts", upstream)));
+  ({ restoreReleasedV4Artifact } = await import(new URL(
+    "packages/session/session-format-v3-to-v4/src/validation.ts", upstream,
   )));
   ({ SystemPromptProjection } = await import(new URL(
     "packages/core/agent-loop/src/runtime-context.ts", upstream,
@@ -88,14 +90,14 @@ try {
   sourceHook.deregister();
 }
 
-function restoreV3(events) {
-  return restoreReleasedV3Artifact({
-    header: { version: 3, id: "source-session", createdAt: 1, isSeeded: false, delegationDepth: 0 },
+function restoreV4(events) {
+  return restoreReleasedV4Artifact({
+    header: { version: 4, id: "source-session", createdAt: 1, isSeeded: false, delegationDepth: 0 },
     inheritedEventCount: 0, events,
-  }, new Set());
+  }, KNOWN_SESSION_EVENT_TYPES);
 }
 
-test("historical turns restore as V3 and keep the current system prompt ahead of prior messages", async () => {
+test("historical turns restore as V4 and keep the current system prompt ahead of prior messages", async () => {
   const history = [
     { role: "user", content: "First question" },
     { role: "assistant", content: "First answer" },
@@ -104,7 +106,7 @@ test("historical turns restore as V3 and keep the current system prompt ahead of
   ];
   let request;
   configureDriver(ctx => {
-    restoreV3(ctx.createOptions.seed);
+    restoreV4(ctx.createOptions.seed);
     const turn = ctx.agent.session.snapshotEvents().findLast(event => event.type === "turn/end").data.turn + 1;
     ctx.persist("turn/start", { turn });
     ctx.persist("step/start", { turn, step: 1 });
@@ -131,7 +133,7 @@ test("historical turns restore as V3 and keep the current system prompt ahead of
   const input = sessionInput();
   input.materialized.messages.unshift({ role: "system", message_id: "policy", content: "Host policy" }, ...history);
   const result = await runDeepSeekHarnessSession(input);
-  assert.doesNotThrow(() => restoreV3(result.nativeEvents));
+  assert.doesNotThrow(() => restoreV4(result.nativeEvents));
   assert.deepEqual(request.map(message => message.role), ["system", "user", "assistant", "user", "assistant", "user"]);
   assert.deepEqual(request.map(message => message.content[0].text), [
     "Platform instruction\n\nHost policy", ...history.map(message => message.content), "Current question",
@@ -147,7 +149,7 @@ test("user-only seed reserves a balanced system head and empty history leaves in
   input.materialized.messages.unshift({ role: "user", content: "Earlier context" });
   await runDeepSeekHarnessSession(input);
   const events = contexts[0].createOptions.seed;
-  assert.doesNotThrow(() => restoreV3(events));
+  assert.doesNotThrow(() => restoreV4(events));
   assert.equal(events.find(event => event.surfaceOp === "append").type, "system/message");
   assert.equal(events.at(-1).type, "turn/end");
   configureDriver(ctx => completeTurn(ctx, "answer"));
@@ -172,13 +174,13 @@ function sessionInput(overrides = {}) {
   };
 }
 
-test("native composition supplies session projections and preserves chat-completions routing", async () => {
+test("native composition supplies session projections and uses the official Messages routing", async () => {
   configureDriver(ctx => completeTurn(ctx, "answer"));
   await runDeepSeekHarnessSession(sessionInput());
   const ctx = contexts[0];
   assert.ok(ctx.plugins.includes(SessionProjections));
   assert.ok(ctx.plugins.indexOf(SessionProjections) < ctx.plugins.indexOf(AgentLoop));
-  assert.equal(ctx.adapter.connection.options().protocol, "chat-completions");
+  assert.equal(ctx.adapter.connection.options().protocol, "messages");
   assert.equal(ctx.adapter.connection.options().baseURL, "https://example.invalid");
   const extensions = await ctx.adapter.connection.prepareExtensions({ body: {} });
   assert.deepEqual(extensions.fields, {});

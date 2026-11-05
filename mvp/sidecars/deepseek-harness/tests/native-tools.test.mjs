@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createServer } from "node:http";
+import { textStream, toolCallStream } from "./fixtures/messages-stream.mjs";
 
 import { Context } from "../../../../third_party/deepseek-harness/vendor/cordis/lib/index.js";
 import SystemPrompt from "../../../../third_party/deepseek-harness/packages/core/system-prompt/lib/index.js";
+import * as NativeToolExecutor from "../../../../third_party/deepseek-harness/packages/core/tool-executor-native/lib/index.js";
 import ToolRuntime from "../../../../third_party/deepseek-harness/packages/core/tools/lib/index.js";
 
 import {
@@ -21,7 +23,16 @@ async function toolContext() {
     personaPrefix: "",
   });
   await ctx.plugin(ToolRuntime);
+  await ctx.plugin(NativeToolExecutor);
   return ctx;
+}
+
+
+async function executeSingle(ctx, { callId, name, arguments: args, signal }) {
+  const batch = await ctx.tools.execute({ calls: [{ type: "tool-call", id: callId, name, arguments: JSON.stringify(args) }], signal });
+  assert.equal(batch.results.length, 1);
+  assert.equal(batch.results[0].callId, callId);
+  return batch.results[0].result;
 }
 
 
@@ -53,44 +64,6 @@ function manifestEntry(overrides = {}) {
     idempotency: "idempotent",
     ...overrides,
   };
-}
-
-
-function toolCallStream(callId, name, arguments_) {
-  return [
-    'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}',
-    `data: ${JSON.stringify({
-      choices: [{
-        delta: {
-          tool_calls: [{
-            index: 0,
-            id: callId,
-            type: "function",
-            function: { name, arguments: JSON.stringify(arguments_) },
-          }],
-        },
-      }],
-    })}`,
-    'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}',
-    "data: [DONE]",
-    "",
-  ].join("\n\n");
-}
-
-
-function textStream(text) {
-  return [
-    'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}',
-    `data: ${JSON.stringify({
-      choices: [{
-        delta: { content: text },
-        finish_reason: "stop",
-      }],
-      usage: { prompt_tokens: 6, completion_tokens: 2 },
-    })}`,
-    "data: [DONE]",
-    "",
-  ].join("\n\n");
 }
 
 
@@ -179,12 +152,12 @@ test("native ToolRuntime delegates a frozen manifest tool to the identity-bound 
   });
 
   try {
-    assert.deepEqual(ctx.tools.schemas(), [{
+    assert.deepEqual((await ctx.systemPrompt.assemble()).tools, [{
       name: "platform_lookup",
       description: "Platform tool platform_lookup (version 3)",
       parameters: manifest[0].schema,
     }]);
-    const result = await ctx.tools.execute({
+    const result = await executeSingle(ctx, {
       callId: "tool-call-native-1",
       name: "platform_lookup",
       arguments: { query: "bounded" },
@@ -343,18 +316,9 @@ test("native Session records the platform call and completed result in one lifec
     request.on("end", () => {
       requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
       const first = requests.length === 1;
-      const body = first ? [
-        'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}',
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"tool-call-session-1","type":"function","function":{"name":"platform_lookup","arguments":"{\\"query\\":\\"native\\"}"}}]}}]}',
-        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}',
-        "data: [DONE]",
-        "",
-      ].join("\n\n") : [
-        'data: {"choices":[{"delta":{"role":"assistant","content":null}}]}',
-        'data: {"choices":[{"delta":{"content":"tool complete"},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":2}}',
-        "data: [DONE]",
-        "",
-      ].join("\n\n");
+      const body = first
+        ? toolCallStream("tool-call-session-1", "platform_lookup", { query: "native" })
+        : textStream("tool complete");
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "content-length": Buffer.byteLength(body),
@@ -415,10 +379,10 @@ test("native Session records the platform call and completed result in one lifec
     const resultEvent = result.nativeEvents.find(event => event.type === "tool/result");
     assert.equal(callEvent.data.callId, "tool-call-session-1");
     assert.equal(resultEvent.data.message.source.callId, "tool-call-session-1");
-    assert.equal(resultEvent.data.message.content[0].toolCallId, "tool-call-session-1");
-    assert.equal(resultEvent.data.message.content[0].isError, false);
+    assert.equal(resultEvent.data.message.toolCallId, "tool-call-session-1");
+    assert.equal(resultEvent.data.message.isError, false);
     assert.equal(requests.length, 2);
-    assert.deepEqual(requests[0].tools.map(tool => tool.function.name), ["platform_lookup"]);
+    assert.deepEqual(requests[0].tools.map(tool => tool.name), ["platform_lookup"]);
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
@@ -447,9 +411,9 @@ test("native Session keeps a failed platform callback correlated through tool/re
 
     assert.equal(callEvent.data.callId, "tool-call-session-failed");
     assert.equal(resultEvent.data.message.source.callId, "tool-call-session-failed");
-    assert.equal(resultEvent.data.message.content[0].toolCallId, "tool-call-session-failed");
-    assert.equal(resultEvent.data.message.content[0].isError, true);
-    assert.match(resultEvent.data.message.content[0].content[0].text, /platform rejected/);
+    assert.equal(resultEvent.data.message.toolCallId, "tool-call-session-failed");
+    assert.equal(resultEvent.data.message.isError, true);
+    assert.match(resultEvent.data.message.content[0].text, /platform rejected/);
     assert.ok(
       callIndex < resultIndex && resultIndex < terminalIndex,
       JSON.stringify(result.nativeEvents.map(event => event.type)),
@@ -487,7 +451,7 @@ test("native Session cancellation aborts the platform callback before an aborted
         return { status: "completed", output: { stale: true } };
       },
     }));
-    await started;
+    await Promise.race([started, completion]);
     controller.abort(new Error("cancelled by host"));
     await assert.rejects(completion, error => error instanceof DshSessionFailure);
 
@@ -499,7 +463,7 @@ test("native Session cancellation aborts the platform callback before an aborted
     assert.equal(callbackSignal.aborted, true);
     assert.equal(nativeEvents[callIndex].data.callId, "tool-call-session-cancelled");
     assert.equal(resultEvent.data.message.source.callId, "tool-call-session-cancelled");
-    assert.equal(resultEvent.data.message.content[0].isError, true);
+    assert.equal(resultEvent.data.message.isError, true);
     assert.ok(
       callIndex < resultIndex && resultIndex < terminalIndex,
       JSON.stringify(nativeEvents.map(event => event.type)),
@@ -523,7 +487,7 @@ test("platform failed status becomes a native ToolRuntime error result", async (
   });
 
   try {
-    const result = await ctx.tools.execute({
+    const result = await executeSingle(ctx, {
       callId: "tool-call-failed",
       name: "platform_lookup",
       arguments: {},
@@ -550,7 +514,7 @@ test("native ToolRuntime rejects an unconfirmed completed write result", async (
   });
 
   try {
-    const result = await ctx.tools.execute({
+    const result = await executeSingle(ctx, {
       callId: "tool-call-write-unconfirmed",
       name: "platform_write",
       arguments: {},
@@ -581,7 +545,7 @@ test("native ToolRuntime returns only a platform-confirmed write effect_id", asy
   });
 
   try {
-    const result = await ctx.tools.execute({
+    const result = await executeSingle(ctx, {
       callId: "tool-call-write-confirmed",
       name: "platform_write",
       arguments: {},
@@ -618,13 +582,13 @@ test("native ToolRuntime forwards caller cancellation to the active platform cal
   });
 
   try {
-    const executing = ctx.tools.execute({
+    const executing = executeSingle(ctx, {
       callId: "tool-call-cancelled",
       name: "platform_lookup",
       arguments: {},
       signal: controller.signal,
     });
-    await started;
+    await Promise.race([started, executing]);
     controller.abort(new Error("cancelled by host"));
     const result = await executing;
     assert.equal(callbackSignal.aborted, true);
@@ -652,7 +616,7 @@ test("native ToolRuntime timeout aborts the platform callback and cannot become 
   });
 
   try {
-    const result = await ctx.tools.execute({
+    const result = await executeSingle(ctx, {
       callId: "tool-call-timeout",
       name: "platform_lookup",
       arguments: {},

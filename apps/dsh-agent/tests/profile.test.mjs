@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, realpath } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, realpath, mkdir, copyFile, rename, symlink, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { prepareProfile } from '../src/profile.mjs';
+import { createPluginPlan } from '../src/plugins/index.mjs';
 
 for (const [name, id] of [['@johnason/dsh-memory-ui', 'memory-ui'], ['@johnason/dsh-model-api', 'model-api'], ['@johnason/dsh-local-models', 'local-models']]) {
 test(`${name} is installed without duplicate activation or overriding an explicit disable`, async () => {
@@ -102,4 +103,56 @@ test('native bundles survive encrypted overlay and duplicate providers fail clos
   assert.match(await readFile(patchPath, 'utf8'), /bad-extra/);
   await writeFile(patchPath, JSON.stringify([{ id: 'credentials', disabled: true }]));
   await assert.rejects(prepareProfile(launch), /exactly one|credential provider/i);
+});
+
+test('headless keeps the encrypted credential provider while honoring an explicit user disable', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-headless-credentials-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const launch = { dataRoot, upstreamRoot, mode: 'headless', args: ['--profile', 'headless', 'hello'] };
+  const prepared = await prepareProfile(launch);
+  const providers = prepared.rows.filter(row => row.id === 'credentials');
+  assert.equal(providers.length, 1);
+  assert.equal(providers[0].disabled, false);
+  const emitted = JSON.parse(await readFile(prepared.overlayPath, 'utf8'));
+  assert.ok(emitted.some(row => row.id === 'credentials' && row.disabled === false));
+  await writeFile(join(dataRoot, 'profiles/headless/cordis.patch.yml'), JSON.stringify([{ id: 'credentials', disabled: true }]));
+  await assert.rejects(prepareProfile(launch), /Exactly one encrypted credential provider/);
+});
+
+test('local model implementation stays inherited so native settings remain writable', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-live-settings-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const prepared = await prepareProfile({ dataRoot, upstreamRoot, mode: 'web', args: ['web'] });
+  assert.equal(JSON.parse(await readFile(prepared.overlayPath, 'utf8')).some(row => row.id === 'local-models'), false);
+  assert.equal(prepared.rows.find(row => row.id === 'local-models').config.implementation,
+    fileURLToPath(new URL('../src/plugins/local-models/plugin.mjs', import.meta.url)));
+});
+
+
+test('native package links cannot make generated bundle patches write through to plugin source', async () => {
+  const dataRoot = await mkdtemp(join(tmpdir(), 'dsh-linked-bundle-'));
+  const upstreamRoot = fileURLToPath(new URL('../../../third_party/deepseek-harness', import.meta.url));
+  const launch = { dataRoot, upstreamRoot, mode: 'web', args: ['web'] };
+  const plugins = createPluginPlan(launch);
+  const original = plugins.clientBundles.find(bundle => bundle.name === '@johnason/dsh-local-models');
+  const source = join(dataRoot, 'fixture-source');
+  await mkdir(source);
+  for (const file of original.files) await copyFile(new URL(file, original.sourceRoot), join(source, file));
+  // Native plugin add may replace a copied package directory with a source link.
+  const sourceRoot = pathToFileURL(source + '/');
+  const plan = { ...plugins, clientBundles: plugins.clientBundles.map(bundle => bundle === original ? { ...bundle, sourceRoot } : bundle) };
+  const pristine = await readFile(join(source, 'cordis.patch.yml'), 'utf8');
+  await prepareProfile(launch, { plugins: plan });
+  const generated = join(dataRoot, 'profiles/web/node_modules', original.name);
+  await rename(generated, join(dataRoot, 'first-generated-copy'));
+  await symlink(source, generated, 'dir');
+  const prepared = await prepareProfile(launch, { plugins: plan });
+  assert.equal(await readFile(join(source, 'cordis.patch.yml'), 'utf8'), pristine, 'plugin source must stay byte-for-byte unchanged');
+  assert.equal((await lstat(generated)).isSymbolicLink(), false, 'generated package must be a profile-owned copy');
+  const patch = JSON.parse(await readFile(join(generated, 'cordis.patch.yml'), 'utf8'));
+  assert.equal(patch.filter(row => row.id === 'local-models').length, 1);
+  assert.equal(prepared.rows.find(row => row.id === 'local-models').config.implementation, original.bundlePatches[0].config.implementation);
+  await prepareProfile(launch, { plugins: plan });
+  assert.equal(await readFile(join(source, 'cordis.patch.yml'), 'utf8'), pristine);
+  assert.deepEqual(JSON.parse(await readFile(join(generated, 'cordis.patch.yml'), 'utf8')), patch, 'restarts cannot accumulate generated patches');
 });

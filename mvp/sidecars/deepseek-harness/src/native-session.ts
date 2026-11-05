@@ -1,6 +1,6 @@
 import {
-  Context, AgentLoop, AgentRegistry, SessionStore, Session, SessionId,
-  SessionProjections, SystemPrompt, ToolRuntime, assertObjectJsonSchema,
+  Context, AgentLoop, AgentRegistry, SessionStore, SessionId,
+  SessionProjections, SystemPrompt, ToolRuntime, NativeToolExecutor, assertObjectJsonSchema,
   LlmRuntime, LlmError, createAssistantMessage, createSystemMessage,
   createUserMessage, DeepSeekAdapter, resolveAdapterOptions, MAX_TIMER_DELAY_MS,
 } from "./platform-runtime.ts";
@@ -181,59 +181,65 @@ export function registerPlatformTools(ctx, {
 }
 
 
-function historySeed(messages, provider, model, sessionId) {
-  const seed = Session.create(SessionId(`${sessionId}:seed`));
-  let turn = 0;
-  let openStep = false;
-  if (messages.length !== 0) {
-    // V3 requires its protected system node before every historical surface
-    // message, inside an open step. The loop replaces this empty head with
-    // the assembled platform prompt when admitting the current request.
-    turn = 1;
-    seed.append("turn/start", { turn });
-    seed.append("step/start", { turn, step: 1 });
-    seed.append("system/message", {
-      turn, step: 1,
-      message: createSystemMessage("", "@deepseek-ai/dsh-system-prompt"),
-    }, { surfaceOp: "append" });
-    openStep = true;
-  }
-  for (const message of messages) {
-    if (message.role === "user") {
-      seed.append("user/message", createUserMessage({
-        content: [{ type: "text", text: message.content }],
-        source: { kind: "user" },
-      }), { surfaceOp: "append" });
-      continue;
-    }
-    if (message.role !== "assistant") {
-      throw new Error("DSH native Session history supports user and assistant roles only");
-    }
-    if (!openStep) {
-      turn += 1;
+async function historySeed(messages, provider, model, sessionId) {
+  // Seed construction has its own store, so historical facts never publish as
+  // new live events on the host run's observation channel.
+  const owner = new Context();
+  await owner.plugin(SessionStore);
+  try {
+    const seed = owner.sessions.create(SessionId(`${sessionId}:seed`));
+    let turn = 0;
+    let openStep = false;
+    if (messages.length !== 0) {
+      // The native format requires its protected system node before historical surface
+      // message, inside an open step. The loop replaces this empty head with
+      // the assembled platform prompt when admitting the current request.
+      turn = 1;
       seed.append("turn/start", { turn });
       seed.append("step/start", { turn, step: 1 });
+      seed.append("system/message", {
+        turn, step: 1,
+        message: createSystemMessage(""),
+      }, { surfaceOp: "append" });
+      openStep = true;
     }
-    seed.append("assistant/message", {
-      turn,
-      step: 1,
-      stream: [],
-      message: createAssistantMessage({
-        content: [{ type: "text", text: message.content }],
-        source: { provider, model },
-      }),
-    }, { surfaceOp: "append" });
-    seed.append("step/end", { turn, step: 1 });
-    seed.append("turn/end", { turn, reason: { kind: "completed" } });
-    openStep = false;
-  }
-  // An input may supply earlier user context without any assistant response.
-  // Close the head's setup step so the live loop starts a fresh balanced turn.
-  if (openStep) {
-    seed.append("step/end", { turn, step: 1 });
-    seed.append("turn/end", { turn, reason: { kind: "completed" } });
-  }
-  return seed.snapshotEvents();
+    for (const message of messages) {
+      if (message.role === "user") {
+        seed.append("user/message", createUserMessage({
+          content: [{ type: "text", text: message.content }],
+          source: { kind: "user" },
+        }), { surfaceOp: "append" });
+        continue;
+      }
+      if (message.role !== "assistant") {
+        throw new Error("DSH native Session history supports user and assistant roles only");
+      }
+      if (!openStep) {
+        turn += 1;
+        seed.append("turn/start", { turn });
+        seed.append("step/start", { turn, step: 1 });
+      }
+      seed.append("assistant/message", {
+        turn,
+        step: 1,
+        stream: [],
+        message: createAssistantMessage({
+          content: [{ type: "text", text: message.content }],
+          source: { provider, model },
+        }),
+      }, { surfaceOp: "append" });
+      seed.append("step/end", { turn, step: 1 });
+      seed.append("turn/end", { turn, reason: { kind: "completed" } });
+      openStep = false;
+    }
+    // An input may supply earlier user context without any assistant response.
+    // Close the head's setup step so the live loop starts a fresh balanced turn.
+    if (openStep) {
+      seed.append("step/end", { turn, step: 1 });
+      seed.append("turn/end", { turn, reason: { kind: "completed" } });
+    }
+    return seed.snapshotEvents();
+  } finally { await owner.fiber.dispose(); }
 }
 
 
@@ -272,7 +278,6 @@ function realProviderAdapter(provider, credential) {
     throw new Error("DSH upstream adapter does not accept custom metadata headers");
   }
   const connection = resolveAdapterOptions({
-    protocol: "chat-completions",
     baseURL: route.base_url,
     thinking: route.thinking_enabled ? "enabled" : "disabled",
     reasoningEffort: route.thinking_enabled ? route.reasoning_effort : "off",
@@ -280,7 +285,7 @@ function realProviderAdapter(provider, credential) {
   });
   return new DeepSeekAdapter({
     options: () => connection,
-    resolveApiKey: () => Promise.resolve(credential()),
+    resolveAuth: async () => ({ headers: { "x-api-key": await credential() } }),
     resolveUserId: () => "00000000-0000-4000-8000-000000000001",
     // Match the official adapter's no-extension service behavior. Host v2's
     // fixed preset does not admit dynamically contributed request fields.
@@ -325,6 +330,7 @@ export async function runDeepSeekHarnessSession({
       personaPrefix: "",
     });
     await ctx.plugin(ToolRuntime);
+    await ctx.plugin(NativeToolExecutor);
     if (toolManifest.length !== 0) {
       registerPlatformTools(ctx, { toolManifest, runIdentity, executeTool });
     }
@@ -347,7 +353,7 @@ export async function runDeepSeekHarnessSession({
     });
     const published = await ctx.agentLoop.createAgent(ctx, {
       sessionId: SessionId(sessionId),
-      seed: historySeed(history, route, provider.model, sessionId),
+      seed: await historySeed(history, route, provider.model, sessionId),
       signal,
       agentOptions: {
         provider: route,

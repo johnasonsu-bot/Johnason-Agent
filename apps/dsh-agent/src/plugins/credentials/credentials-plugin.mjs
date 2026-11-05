@@ -53,6 +53,11 @@ export default class VaultCredentials extends CredentialProvider {
 
   async resolve(ref) {
     credentialRef(ref);
+    // pi-ai requires a non-empty transport key even when loopback Ollama does
+    // not authenticate. This public placeholder is not a user credential.
+    if (this.config.localOllama === true && ref === 'JOHNASON_OLLAMA_LOCAL_PLACEHOLDER') {
+      return { value: 'local-ollama-no-auth', source: 'unauthenticated-loopback' };
+    }
     let data;
     try {
       data = await this.vault.read();
@@ -72,6 +77,9 @@ export default class VaultCredentials extends CredentialProvider {
   }
   async describe(ref) {
     credentialRef(ref);
+    if (this.config.localOllama === true && ref === 'JOHNASON_OLLAMA_LOCAL_PLACEHOLDER') {
+      return { configured: true, writable: false, source: 'unauthenticated-loopback' };
+    }
     if ((await this.vault.status()).locked) return { configured: false, writable: false };
     const resolved = await this.resolve(ref);
     return { configured: Boolean(resolved), ...resolved && { source: 'vault' }, writable: true };

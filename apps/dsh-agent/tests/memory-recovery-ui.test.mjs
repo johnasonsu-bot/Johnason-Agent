@@ -26,12 +26,12 @@ async function seedNativeSession(root, workspace, sessionId, events) {
   const require = createRequire(new URL('../../../third_party/deepseek-harness/apps/cli/package.json', import.meta.url));
   const { Context } = require('@deepseek-ai/cordis');
   const { default: Sessions } = await import('../../../third_party/deepseek-harness/packages/core/session/lib/index.js');
-  const { default: Persistence } = await import('../../../third_party/deepseek-harness/packages/session/session-persistence-jsonl/lib/index.js');
+  const Persistence = await import('../../../third_party/deepseek-harness/packages/session/session-persistence-jsonl/lib/index.js');
   const ctx = new Context();
   try {
     await ctx.plugin(Sessions);
     await ctx.plugin(Persistence, { root: join(root, 'sessions'), compression: 'zstd', packChunks: false });
-    const session = ctx.sessions.prepare(sessionId, { meta: { cwd: workspace } });
+    const session = ctx.sessions.create(sessionId, { meta: { cwd: workspace } });
     for (const [type, data] of events) session.append(type, data);
     const handle = await ctx.sessionPersistence.create(session.header, { inheritedEventCount: session.inheritedEventCount });
     try { await handle.append(session.snapshotEvents()); await handle.flush(); }
@@ -364,7 +364,9 @@ test('independent browser creates/configures and actually opens its selected nat
   await page.getByRole('button', { name: '记忆：已启用', exact: true }).waitFor();
   await page.getByText('Johnason Agent', { exact: true }).waitFor();
   await page.locator('[data-composer-input][contenteditable="true"]').waitFor();
-  await page.locator('[data-composer-input]').fill('记忆功能验收草稿，不发送');
+  await page.locator('[data-composer-input]').click();
+  await page.keyboard.insertText('记忆功能验收草稿，不发送');
+  await page.waitForFunction(() => document.querySelector('[data-composer-input]').textContent === '记忆功能验收草稿，不发送');
   assert.equal(await page.locator('[data-composer-input]').innerText(), '记忆功能验收草稿，不发送');
   await page.locator('[data-composer-input]').fill('');
   await page.waitForTimeout(1000);

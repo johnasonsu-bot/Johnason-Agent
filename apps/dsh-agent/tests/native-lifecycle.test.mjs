@@ -76,7 +76,7 @@ test('native profile loads local MCP and Skill; normal restart restores workspac
   await copyFile(fixture('acceptance-skill/SKILL.md'), join(workspace, '.dsh/skills/dsh-acceptance-marker/SKILL.md'));
   const patch = join(root, 'fixture.patch.json');
   await writeFile(patch, JSON.stringify([{ insert: [
-    { id: 'acceptance-mcp', name: fileURLToPath(new URL('../../../third_party/deepseek-harness/packages/mcp/mcp-client/src/index.ts', import.meta.url)), config: { transport: 'stdio', serverName: 'acceptance', command: process.execPath, args: [fixture('mcp-server.mjs')], env: {}, cwd: workspace, failOnStartupError: true, toolCallTimeoutMs: 5000 } },
+    { id: 'acceptance-mcp', name: fileURLToPath(new URL('../../../third_party/deepseek-harness/packages/mcp/mcp-client/lib/index.js', import.meta.url)), config: { transport: 'stdio', serverName: 'acceptance', command: process.execPath, args: [fixture('mcp-server.mjs')], env: {}, cwd: workspace, failOnStartupError: true, toolCallTimeoutMs: 5000 } },
     { id: 'acceptance-profile', name: fixture('profile-plugin.mjs') },
   ] }]));
   const { server, port } = await portProbe();

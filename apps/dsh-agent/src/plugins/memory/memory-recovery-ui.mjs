@@ -1,7 +1,7 @@
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
-import { attachSessionWorkspace, createWorkspaceSession } from '../../platform/workspace-api.mjs';
+import { attachSessionWorkspace, createWorkspaceSession, resumeWorkspaceSession } from '../../platform/workspace-api.mjs';
 
 const page = new URL('../../../public/memory-recovery.html', import.meta.url);
 const local = address => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address);
@@ -44,7 +44,7 @@ export function createMemoryRecoveryHandler(service, sessionController, { cwd: h
       const row = listed.items.find(item => item.sessionId === id && item.origin !== 'subagent');
       if (!row || typeof row.cwd !== 'string' || !isAbsolute(row.cwd)) throw Object.assign(new Error('Unknown native session'), { code: 'MEMORY_SESSION_NOT_FOUND' });
       try {
-        const response = await sessionController.create({ sessionId: id, cwd: row.cwd });
+        const response = await resumeWorkspaceSession(sessionController, id);
         if (response.sessionId !== id) throw new Error('Native session identity mismatch');
       } catch { throw Object.assign(new Error('Native session unavailable'), { code: 'MEMORY_NATIVE_ATTACH_FAILED' }); }
     })().finally(() => attaching.delete(id)));

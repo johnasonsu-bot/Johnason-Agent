@@ -15,6 +15,7 @@ import { mapSessionEvents, sortPromptSections } from "../src/event-mapper.ts";
 import { EphemeralGrantChannel } from "../src/grant-channel.ts";
 import { runDeepSeekHarnessSession, DshSessionFailure } from "../src/native-session.ts";
 import { createSidecar } from "../src/server.ts";
+import { textStream } from "./fixtures/messages-stream.mjs";
 
 
 const FIXED_PLUGINS = [
@@ -423,16 +424,13 @@ test("real provider query streams through the pinned DeepSeek Harness adapter", 
     request.on("end", () => {
       requests.push({
         path: request.url,
+        apiKey: request.headers["x-api-key"],
         authorization: request.headers.authorization,
         body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
       });
-      const body = [
-        'data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}',
-        'data: {"choices":[{"delta":{"content":"real "}}]}',
-        'data: {"choices":[{"delta":{"content":"DSH"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}',
-        "data: [DONE]",
-        "",
-      ].join("\n\n");
+      const body = textStream(["real ", "DSH"], {
+        model: "deepseek-v4-flash", inputTokens: 3, outputTokens: 2,
+      });
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "content-length": Buffer.byteLength(body),
@@ -485,10 +483,12 @@ test("real provider query streams through the pinned DeepSeek Harness adapter", 
   }
 
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].path, "/chat/completions");
-  assert.equal(requests[0].authorization, "Bearer one-shot-test-secret");
+  assert.equal(requests[0].path, "/v1/messages");
+  assert.equal(requests[0].apiKey, "one-shot-test-secret");
+  assert.equal(requests[0].authorization, undefined);
   assert.equal(requests[0].body.model, "deepseek-v4-flash");
-  assert.equal(requests[0].body.reasoning_effort, "high");
+  assert.deepEqual(requests[0].body.thinking, { type: "enabled" });
+  assert.equal(requests[0].body.output_config.effort, "high");
   assert.deepEqual(emitted.map(event => event.type), [
     "assistant.delta",
     "assistant.delta",
@@ -508,13 +508,9 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
     request.on("data", chunk => chunks.push(chunk));
     request.on("end", () => {
       requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      const body = [
-        'data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}',
-        'data: {"choices":[{"delta":{"content":"native "}}]}',
-        'data: {"choices":[{"delta":{"content":"session"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":2}}',
-        "data: [DONE]",
-        "",
-      ].join("\n\n");
+      const body = textStream(["native ", "session"], {
+        model: "deepseek-v4-flash", inputTokens: 7, outputTokens: 2,
+      });
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "content-length": Buffer.byteLength(body),
@@ -568,14 +564,18 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
   assert.equal(requests.length, 1);
   const conversationMessages = requests[0].messages.filter(message => message.role !== "system");
   assert.deepEqual(conversationMessages.map(message => message.role), [
-    "user", "assistant", "user", "user",
+    "user", "assistant", "user",
   ]);
-  assert.deepEqual(conversationMessages.slice(0, 3).map(message => message.content), [
-    "Earlier question", "Earlier answer", "Current question",
+  assert.deepEqual(conversationMessages.slice(0, 2).map(message => message.content), [
+    [{ type: "text", text: "Earlier question" }],
+    [{ type: "text", text: "Earlier answer" }],
   ]);
-  assert.match(conversationMessages[3].content, /Context evidence$/);
-  const system = requests[0].messages.find(message => message.role === "system")?.content;
-  assert.match(system, /First instruction[\s\S]*Second instruction/);
+  // Messages merges consecutive user turns while preserving their content order.
+  assert.equal(conversationMessages[2].content.length, 2);
+  assert.deepEqual(conversationMessages[2].content[0], { type: "text", text: "Current question" });
+  assert.equal(conversationMessages[2].content[1].type, "text");
+  assert.match(conversationMessages[2].content[1].text, /Context evidence$/);
+  assert.match(requests[0].system, /First instruction[\s\S]*Second instruction/);
   assert.ok(nativeEvents.includes("turn/start"));
   assert.ok(nativeEvents.includes("step/start"));
   assert.equal(nativeEvents.includes("assistant/chunk"), false);
@@ -599,7 +599,7 @@ test("real provider query can be cancelled after the DeepSeek Harness request is
       await responseReleased;
       if (response.destroyed) return;
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end("data: [DONE]\n\n");
+      response.end(textStream([], { model: "deepseek-v4-flash" }));
     });
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -739,16 +739,13 @@ test("published NDJSON sidecar streams a real local provider through pinned Deep
     request.on("end", () => {
       requests.push({
         path: request.url,
+        apiKey: request.headers["x-api-key"],
         authorization: request.headers.authorization,
         body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
       });
-      const body = [
-        'data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":""}}]}',
-        'data: {"choices":[{"delta":{"content":"published "}}]}',
-        'data: {"choices":[{"delta":{"content":"DSH"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}',
-        "data: [DONE]",
-        "",
-      ].join("\n\n");
+      const body = textStream(["published ", "DSH"], {
+        model: "deepseek-v4-flash", inputTokens: 3, outputTokens: 2,
+      });
       response.writeHead(200, {
         "content-type": "text/event-stream",
         "content-length": Buffer.byteLength(body),
@@ -789,8 +786,9 @@ test("published NDJSON sidecar streams a real local provider through pinned Deep
     await wire.close();
     await new Promise(resolve => server.close(resolve));
   }
-  assert.equal(requests[0].path, "/chat/completions");
-  assert.equal(requests[0].authorization, "Bearer published-test-secret");
+  assert.equal(requests[0].path, "/v1/messages");
+  assert.equal(requests[0].apiKey, "published-test-secret");
+  assert.equal(requests[0].authorization, undefined);
   assert.equal(requests[0].body.model, "deepseek-v4-flash");
 });
 
@@ -807,7 +805,7 @@ test("published NDJSON sidecar accepts cancel while a real DSH request is in fli
       await responseReleased;
       if (response.destroyed) return;
       response.writeHead(200, { "content-type": "text/event-stream" });
-      response.end("data: [DONE]\n\n");
+      response.end(textStream([], { model: "deepseek-v4-flash" }));
     });
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));

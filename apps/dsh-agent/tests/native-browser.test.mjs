@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
 import { mkdtemp } from 'node:fs/promises';
@@ -36,7 +37,13 @@ test('browser reload restores the selected native session, title, model and idle
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   const client = await authenticateWeb(output, url);
-  // Setup through public native APIs only. No model request or provider credential is needed.
+  // Model selection now validates credential availability. Use isolated random
+  // credentials in the encrypted Vault without making a model request.
+  const password = randomUUID();
+  const initialized = await client.fetch('/vault/initialize', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password, confirmation: password }) });
+  assert.equal(initialized.status, 200);
+  await client.rpc('credentials/set', { ref: 'DEEPSEEK_API_KEY', value: randomUUID() });
   const created = await client.rpc('workspace/create', { request: { path: workspace } });
   const { sessionId } = await client.rpc('session/create', { request: { workspaceId: created.workspace.workspaceId } });
   const title = 'Browser refresh acceptance';

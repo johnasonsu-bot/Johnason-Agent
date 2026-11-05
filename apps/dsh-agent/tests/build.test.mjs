@@ -20,8 +20,8 @@ test('native build verifies the pinned checkout then installs and builds in orde
   assert.equal(status, 0)
   assert.deepEqual(calls.map(({ command, args }) => [command, args]), [
     ['git', ['rev-parse', 'HEAD']],
-    ['corepack', ['pnpm@11.7.0', 'install', '--frozen-lockfile']],
-    ['corepack', ['pnpm@11.7.0', 'run', 'build']],
+    ['corepack', ['pnpm@11.28.5', 'install', '--frozen-lockfile']],
+    ['corepack', ['pnpm@11.28.5', 'run', 'build']],
   ])
   assert.equal(calls[1].options.cwd, '/tmp/repo root/third_party/deepseek-harness')
   assert.equal(calls[1].options.env.CI, 'true')
