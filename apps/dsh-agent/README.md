@@ -12,11 +12,11 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 ## 平台与本地插件
 
-当前锁定官方 `0.2.2-rc.1`；社区 Web UI、插件市场、Codex 订阅与 Ollama 的安装、授权及兼容范围见[DSH 插件生态接入](../../docs/architecture/dsh-ecosystem.md)。
+当前锁定官方 `0.2.2-rc.2`；社区 Web UI、插件市场、Codex 订阅与 Ollama 的安装、授权及兼容范围见[DSH 插件生态接入](../../docs/architecture/dsh-ecosystem.md)。
 
 官方模块解析、启动、profile 组合及兼容 SDK 集中在 `src/platform/`；Vault、记忆恢复、Forge/Data Platform 实现在 `src/plugins/`。原 `src` 入口继续转发，插件注册表保留公开路径，避免破坏已有 profile 的名称匹配条件。浏览器插件生成到各 profile 自己的 `node_modules`，按新版原生解析规则装载。原生包管理若把本地包改为源码链接，启动器先把该链接移入 profile 的 `.johnason-preserved-package-links` 留存，再生成私有副本；运行时补丁只写副本，不写回源码。插件生命周期目前按每进程一个活动 runner 设计。
 
-共享版本策略位于 `mvp/src/workbench/runtime/deepseek_harness/platform-release.json`。升级时先运行 `npm --prefix apps/dsh-agent run check:platform`，再完成源码契约、构建及原生回归。此检查验证版本和依赖边界，不代替构建产物内容校验。不能彻底隔离的内部接口及建议见[边界与演进清单](../../docs/architecture/dsh-platform-plugin-boundary.md)。
+共享版本策略位于 `mvp/src/workbench/runtime/deepseek_harness/platform-release.json`。升级时先在隔离候选完成冻结构筑与真实运行回归，再提交通过验证的版本清单和 gitlink，随后运行 `npm --prefix apps/dsh-agent run check:platform` 与来源门禁；所有检查通过后才推送。此检查验证版本和依赖边界，不代替构建产物内容校验。不能彻底隔离的内部接口及建议见[边界与演进清单](../../docs/architecture/dsh-platform-plugin-boundary.md)。
 
 在侧栏 **插件 → 已安装 → memory-ui** 打开「Johnason 本地功能」，可访问 Vault、三类记忆、恢复审计、语义子图、任务沙箱、Forge、Data Platform 与统一授权。状态来自本地服务；系统未配置时明确显示「未配置」，不会自动连接业务系统。Forge/Data Platform 仍需通过 `--systems`（或 Data Platform 的 `--core`）指定受信任适配器，再通过 `/systems` 登录。该插件开关控制界面入口，停用不移除已有会话约束，也不删除数据。
 
@@ -32,19 +32,19 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 本地工具仅处理有界文本，不执行模型返回的工具或命令。单次决策加执行消耗两次推理预算；用户取消或停用插件会中止活动调用。强制记忆沙箱仍保留原有工具白名单。设计与边界见[本地模型协作说明](../../docs/architecture/2026-09-26-local-model-skill-hybrid.md)。
 
-官方 `0.2.2-rc.1` 的 DeepSeek 适配器使用 Messages 请求协议。请求扩展中的插件包清单允许仅提供 `name`：包没有可用 `version` 时省略该字段，不再因此触发 `REQUEST_EXTENSION`，也不会编造版本。本地发布包仍保留明确版本以便追溯。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方适配器和本机 Messages HTTP/SSE 服务覆盖清单及流式请求，并验证 Vault 锁定时在发送请求前拒绝读取真实凭据；不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
+官方 `0.2.2-rc.2` 的 DeepSeek 适配器使用 Messages 请求协议。请求扩展中的插件包清单允许仅提供 `name`：包没有可用 `version` 时省略该字段，不再因此触发 `REQUEST_EXTENSION`，也不会编造版本。本地发布包仍保留明确版本以便追溯。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方适配器和本机 Messages HTTP/SSE 服务覆盖清单及流式请求，并验证 Vault 锁定时在发送请求前拒绝读取真实凭据；不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
 
 ## 环境要求
 
 - 实测平台：macOS ARM64、Node.js v24.14.1；Windows/Linux 尚未实测，不承诺相同的 TTY、目录选择器和信号行为。
 - Node.js 24.9.0 或更新版本
 - Git、Corepack 可用；首次安装依赖需要网络和磁盘空间。无需旧 Python/Go 服务。
-- 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159`（官方 `0.2.2-rc.1`）
+- 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `e8f7b93a344964de3dca1ace9e72b6e4d6de87cb`（官方 `0.2.2-rc.2`）
 - 构建工具固定为 `pnpm@11.28.5`，不下载 `latest`
 
 ## 原生构建
 
-2026-11-05 的升级候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展。冻结依赖安装、macOS ARM 原生模块、平台库和 Web 构筑已完成；本轮范围见[升级验收记录](../../docs/testing/2026-11-05-dsh-ecosystem.md)。兼容层已对接新版批量工具执行器、独立 SessionStore、恢复现有会话接口及可写的原生插件设置。MVP 侧车同步使用 Messages 认证与事件协议。
+2026-11-12 的升级候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展。冻结依赖安装、macOS ARM 原生模块、平台库和 Web 构筑已完成；本轮范围见[升级验收记录](../../docs/testing/2026-11-12-dsh-ecosystem.md)。兼容层已对接新版批量工具执行器、独立 SessionStore、恢复现有会话接口及可写的原生插件设置。MVP 侧车同步使用 Messages 认证与事件协议。
 
 本轮使用全新隔离数据根，未验收旧用户记忆日志迁移；请勿直接用候选打开原有用户数据根。此前的[隔离验收记录](../../docs/testing/2026-09-21-dsh-platform-plugin-isolation.md)和[代码合并报告](../../docs/testing/2026-09-21-dsh-upstream-code-merge.md)保留各自日期的状态。
 
@@ -55,7 +55,7 @@ git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
 ```
 
-以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前隔离候选位于 `codex/dsh-ecosystem-20261105` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
+以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前隔离候选位于 `codex/dsh-ecosystem-20261112` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
 
 构建入口依次执行冻结 lockfile 安装和上游原生构建。两个步骤都显式设置 `CI=true`：上游的安装脚本会据此只跳过 Git hook 配置，避免子模块位于 linked worktree 时修改 Git 配置失败；构建前的依赖状态检查也因此使用非交互模式。依赖生命周期脚本及构建检查仍会运行。启动器不会修改子模块 Git 配置。
 
