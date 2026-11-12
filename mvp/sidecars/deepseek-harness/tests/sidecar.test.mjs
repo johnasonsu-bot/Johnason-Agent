@@ -573,8 +573,11 @@ test("pinned DeepSeek Harness Session preserves ordered input and native lifecyc
   // Messages merges consecutive user turns while preserving their content order.
   assert.equal(conversationMessages[2].content.length, 2);
   assert.deepEqual(conversationMessages[2].content[0], { type: "text", text: "Current question" });
-  assert.equal(conversationMessages[2].content[1].type, "text");
-  assert.match(conversationMessages[2].content[1].text, /Context evidence$/);
+  // The native runtime context owns the reminder frame around the Host evidence.
+  assert.deepEqual(conversationMessages[2].content[1], {
+    type: "text",
+    text: "<system-reminder>\nThe following information describes your current session:\n\nContext evidence\n</system-reminder>",
+  });
   assert.match(requests[0].system, /First instruction[\s\S]*Second instruction/);
   assert.ok(nativeEvents.includes("turn/start"));
   assert.ok(nativeEvents.includes("step/start"));

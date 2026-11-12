@@ -37,7 +37,9 @@ export function ecosystemOverlay(modelIds = ['gemma4:e4b']) {
       'web-ui-agents',
       // This profile uses Codex/Ollama. Native DeepSeek account startup reads
       // credentials before the user unlocks Vault; keep Vault's strict behavior.
-      'deepseek-account', 'account-controller', 'ui-settings-account'].map(id => ({ id, disabled: true })),
+      // rc.2 replaces account-controller with account notifications, which
+      // require the same disabled native account services.
+      'deepseek-account', 'account-controller', 'ui-account-notifications', 'ui-settings-account'].map(id => ({ id, disabled: true })),
     { id: 'llm-subscriptions', config: { providers: ['codex'] } },
     { id: 'credentials', config: { localOllama: true } },
     { id: 'llm-pi-ai', config: { providers: { 'johnason-ollama': {
