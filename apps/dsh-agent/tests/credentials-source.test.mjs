@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import { registerHooks, stripTypeScriptTypes } from 'node:module';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { Context } from './fixtures/credentials-source-native.mjs';
 
 const nativeFixture = new URL('./fixtures/credentials-source-native.mjs', import.meta.url).href;
-const browserAuthSource = new URL('../../../third_party/deepseek-harness/packages/client/connection/src/browser-auth.ts', import.meta.url);
-const names = new Set(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-credentials-local', '@deepseek-ai/dsh-credentials', '@deepseek-ai/cordis']);
+const browserAuthSource = new URL('../../../third_party/deepseek-harness/packages/host/authentication-token/src/browser-auth.ts', import.meta.url);
+const names = new Set(['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-credentials-local', '@deepseek-ai/dsh-credentials', '@deepseek-ai/dsh-client-connection', '@deepseek-ai/cordis']);
 const hook = registerHooks({
   resolve(specifier, context, nextResolve) {
     if (specifier.endsWith('/platform/credential-api.mjs')) return { url: nativeFixture, shortCircuit: true };
@@ -25,7 +26,7 @@ try {
 } finally { hook.deregister(); }
 
 function lockedProvider(root = {}) {
-  const ctx = { root, updates: [] };
+  const ctx = { [Context.root]: root, updates: [] };
   const provider = new Provider(ctx, { path: '/unused-source-fixture/vault.enc', mode: 'web' });
   let accesses = 0;
   const locked = () => { accesses++; throw Object.assign(new Error('Vault is locked'), { code: 'VAULT_LOCKED' }); };

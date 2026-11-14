@@ -6,7 +6,14 @@ const require = nativeRequire();
 const baseRequire = createRequire(require.resolve('@deepseek-ai/dsh-base'));
 const localRequire = createRequire(baseRequire.resolve('@deepseek-ai/dsh-credentials-local'));
 export const { CredentialProvider, credentialRef, parseCredentialKey } = await import(localRequire.resolve('@deepseek-ai/dsh-credentials'));
-export const { Service } = await import(require.resolve('@deepseek-ai/cordis'));
+const { Context, Service } = await import(require.resolve('@deepseek-ai/cordis'));
+export { Service };
+
+/** Preserve the native application's root identity across derived contexts. */
+export function rootContext(ctx) {
+  return ctx[Context.root];
+}
+
 // Web's tsx aliases resolve the native LLM module from source. Preserve that
 // class identity for the adapter's instanceof guard; plain Node uses its build.
 export const { LlmError } = await import('@deepseek-ai/dsh-llm').catch(cause => {

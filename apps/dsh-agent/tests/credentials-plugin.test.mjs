@@ -25,6 +25,25 @@ test('native browser authentication bootstraps while model and system credential
   await ctx.fiber.dispose();
 });
 
+test('browser signing records follow the Cordis application root across derived contexts', async t => {
+  const root = new Context();
+  const otherRoot = new Context();
+  t.after(async () => { await root.fiber.dispose(); await otherRoot.fiber.dispose(); });
+  const path = join(await mkdtemp(join(tmpdir(), 'dsh-browser-roots-')), 'vault.enc');
+  const contexts = [root.isolate('credentials').extend(), root.isolate('credentials').extend(), otherRoot.extend()];
+  const [first, reloaded, independent] = contexts.map(ctx => new Provider(ctx, { path, mode: 'web' }));
+  const key = 'client-connection/browser-session';
+  const grant = { kind: 'grant', payload: { version: 1, secret: randomBytes(32).toString('base64url') } };
+  await first.modifyRecord(key, () => grant);
+  assert.deepEqual(await reloaded.readRecord(key), grant);
+  assert.equal(await independent.readRecord(key), undefined);
+  for (const provider of [first, reloaded, independent]) {
+    assert.deepEqual(await provider.vault.status(), { initialized: false, locked: true });
+    await assert.rejects(provider.resolve('DEEPSEEK_API_KEY'), { code: 'VAULT_LOCKED' });
+    await assert.rejects(provider.readRecord('dataplatform/session'), { code: 'VAULT_LOCKED' });
+  }
+});
+
 test('locked resolution fails; changes are fresh and descriptions never reveal values', async () => {
   const ctx = new Context();
   const provider = new Provider(ctx, { path: join(await mkdtemp(join(tmpdir(), 'dsh-provider-')), 'vault.enc'), mode: 'web' });

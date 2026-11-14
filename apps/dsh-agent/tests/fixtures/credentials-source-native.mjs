@@ -2,11 +2,14 @@
 import { fileURLToPath } from 'node:url';
 export const createRequire = () => ({
   resolve(specifier) {
-    if (!['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-credentials-local', '@deepseek-ai/dsh-credentials', '@deepseek-ai/cordis'].includes(specifier)) throw new Error(`Unexpected native source dependency: ${specifier}`);
+    if (!['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-credentials-local', '@deepseek-ai/dsh-credentials', '@deepseek-ai/dsh-client-connection', '@deepseek-ai/cordis'].includes(specifier)) throw new Error(`Unexpected native source dependency: ${specifier}`);
     return fileURLToPath(import.meta.url);
   },
 });
 export const Service = { init: Symbol('init') };
+export const Context = { root: Symbol('root') };
+export const rootContext = ctx => ctx[Context.root];
+export const CONNECT_PATH = '/connect';
 export const credentialRef = value => value;
 export const parseCredentialKey = value => value;
 export const credentialKey = (namespace, name) => `${namespace}/${name}`;

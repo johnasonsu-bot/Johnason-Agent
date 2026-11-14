@@ -44,6 +44,7 @@ test('old public imports preserve every export and class identity after relocati
     export class LlmError extends Error {};
     export const credentialRef = value => value;
     export const parseCredentialKey = value => value;
+    export const rootContext = ctx => ctx;
     export const createUserMessage = value => value;
     export const installMemoryToolExecutor = () => () => {};
     export const retainRequiredEventTypes = () => () => {};

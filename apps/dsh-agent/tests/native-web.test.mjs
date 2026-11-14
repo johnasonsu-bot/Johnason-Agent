@@ -34,8 +34,14 @@ test('real isolated native Web serves native UI plus Vault and exits after SIGTE
     t.after(() => { clearTimeout(timeout); clearInterval(interval); });
   });
   const url = `http://127.0.0.1:${port}`;
-  assert.equal((await fetch(url)).status, 401);
+  const protectedRoutes = ['/', '/vault', '/vault/status', '/memory-recovery', '/johnason/plugins'];
+  for (const route of protectedRoutes) {
+    assert.equal((await fetch(url + route)).status, 401, `Unauthenticated ${route}`);
+  }
   const client = await authenticateWeb(output, url);
+  for (const route of protectedRoutes) {
+    assert.equal((await client.fetch(route)).status, 200, `Authenticated ${route}`);
+  }
   const index = await (await client.fetch('/')).text();
   assert.match(index, /__DSH_BOOT__|__ModuleLoader__/);
   assert.match(index, /href="\/vault"/);

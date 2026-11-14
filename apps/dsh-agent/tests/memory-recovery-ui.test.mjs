@@ -237,8 +237,13 @@ test('real native Web creates an unstarted scoped session, versions records and 
   const status = await f.ok('status', { sessionId }); assert.equal(status.pending, 0); assert.ok(status.durableThroughSeq >= 0);
   assert.deepEqual(await f.ok('effects', { sessionId }), []);
   for (const action of ['invokeTool', 'recover', 'projectContext', 'reconcile', 'execute']) assert.equal((await f.request(action, { sessionId, argv: ['true'], proof: { verified: true } })).status, 404);
-  assert.equal((await f.request('sessions', {}, { origin: 'https://evil.example' })).status, 403);
-  assert.equal((await f.request('sessions', {}, { 'sec-fetch-site': 'cross-site' })).status, 403);
+  // Native authentication rejects hostile requests before the local JSON handler.
+  for (const headers of [{ origin: 'https://evil.example' }, { 'sec-fetch-site': 'cross-site' }]) {
+    const denied = await f.fetch('/memory-recovery/api/sessions', {
+      method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: '{}',
+    });
+    assert.equal(denied.status, 403);
+  }
   // Node fetch overwrites a supplied Host with the URL authority; use the actual HTTP wire.
   const wrongHost = await new Promise((resolve, reject) => {
     const req = httpRequest(`${f.url}/memory-recovery/api/sessions`, { method: 'POST', headers: { cookie: f.cookie, host: 'evil.example', origin: f.url, 'content-type': 'application/json' } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode)); });

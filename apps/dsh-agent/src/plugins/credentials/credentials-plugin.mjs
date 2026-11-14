@@ -4,7 +4,7 @@ import { VaultStore } from './vault-store.mjs';
 import { installVaultUi } from './vault-ui.mjs';
 import { BROWSER_SESSION_RECORD_KEY, browserSessionRecord } from './browser-session-record.mjs';
 
-import { CredentialProvider, credentialRef, parseCredentialKey, Service, LlmError } from '../../platform/credential-api.mjs';
+import { CredentialProvider, credentialRef, parseCredentialKey, rootContext, Service, LlmError } from '../../platform/credential-api.mjs';
 
 function jsonValue(value, seen = new Set()) {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return;
@@ -39,7 +39,7 @@ export default class VaultCredentials extends CredentialProvider {
     if (!config?.path || !['web', 'headless'].includes(config.mode)) throw new Error('Vault path and mode are required');
     this.config = config;
     this.vault = new VaultStore(config.path);
-    this.browserSession = config.mode === 'web' ? browserSessionRecord(ctx.root) : undefined;
+    this.browserSession = config.mode === 'web' ? browserSessionRecord(rootContext(ctx)) : undefined;
   }
 
   async* [Service.init]() {

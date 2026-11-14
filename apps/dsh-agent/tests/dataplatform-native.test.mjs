@@ -6,6 +6,7 @@ import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { authenticateWeb, redactLaunchOutput } from "./fixtures/native-web-client.mjs";
 test(
   "native Web profile loads trusted core, signs in, executes, and strips DB environment",
   { timeout: 40000 },
@@ -54,20 +55,22 @@ test(
     });
     const deadline = Date.now() + 30000;
     while (!output.includes(`dsh web: http://127.0.0.1:${port}`)) {
-      assert.equal(child.exitCode, null, output);
-      if (Date.now() > deadline) throw Error(output);
+      assert.equal(child.exitCode, null, redactLaunchOutput(output));
+      if (Date.now() > deadline) throw Error(redactLaunchOutput(output));
       await new Promise((r) => setTimeout(r, 50));
     }
-    const origin = `http://127.0.0.1:${port}`,
-      post = async (path, data) => {
-        const r = await fetch(origin + path, {
-          method: "POST",
-          headers: { origin, "content-type": "application/json" },
-          body: JSON.stringify(data),
-        });
-        return { status: r.status, data: await r.json() };
-      };
-    assert.equal((await fetch(origin + "/dataplatform")).status, 200);
+    const origin = `http://127.0.0.1:${port}`;
+    assert.equal((await fetch(origin + "/dataplatform")).status, 401);
+    const client = await authenticateWeb(output, origin);
+    const post = async (path, data) => {
+      const r = await client.fetch(path, {
+        method: "POST",
+        headers: { origin, "content-type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      return { status: r.status, data: await r.json() };
+    };
+    assert.equal((await client.fetch("/dataplatform")).status, 200);
     const { chromium } = await import("playwright-core");
     const browser = await chromium.launch({
       headless: true,
@@ -77,6 +80,7 @@ test(
     });
     t.after(() => browser.close());
     const page = await browser.newPage();
+    await client.authenticateBrowser(page.context());
     await page.goto(origin + "/dataplatform");
     await page.waitForFunction(
       () => document.querySelector("#command").options.length > 0,
