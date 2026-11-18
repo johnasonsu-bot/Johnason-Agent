@@ -1,12 +1,12 @@
 # DSH 每日更新与 Johnason 插件
 
-本轮在独立分支 `codex/dsh-ecosystem-20261114` 构筑 DSH 0.2.2-rc.3；原工作树、未提交功能和历史数据保留。官方核心保持原样，Johnason 的 Vault、记忆恢复、模型配置与跨系统授权由本地插件提供，平台适配集中在 `apps/dsh-agent/src/platform/`。
+本轮在独立分支 `codex/dsh-ecosystem-20261118` 构筑 DSH 0.2.2-rc.4；原工作树、未提交功能和历史数据保留。官方核心保持原样，Johnason 的 Vault、记忆恢复、模型配置与跨系统授权由本地插件提供，平台适配集中在 `apps/dsh-agent/src/platform/`。
 
 ## 版本与来源
 
 | 组件 | 固定版本 | 来源 |
 | --- | --- | --- |
-| 官方 DSH | 0.2.2-rc.3 / `39163dd30f703a79079e2d2446545cff3c453738` | deepseek-ai/deepseek-harness |
+| 官方 DSH | 0.2.2-rc.4 / `ca33fd6843b205e279c7ccb6cb73a472c78f5760` | deepseek-ai/deepseek-harness |
 | dsh-web-ui（现名 dsh-web） | `@linxin666/dsh-web-all@0.4.15` | zhu1090093659/dsh-web |
 | 订阅插件 | `dsh-plugin-subscriptions@0.9.12-johnason.1` | V1ki/dsh-plugin-subscriptions 的 `be350cd7`，增加本地钥匙串适配 |
 | 插件市场 | `dshmarket@1.73.11` | dsh-market/dsh-market |
@@ -20,11 +20,12 @@
 ```sh
 git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
+export PATH="$PWD/third_party/deepseek-harness/node_modules/.bin:$PATH"
 npm ci --prefix apps/dsh-agent --ignore-scripts
 corepack pnpm@10.26.2 --dir apps/dsh-agent/community/subscriptions install --frozen-lockfile --ignore-scripts
 corepack pnpm@10.26.2 --dir apps/dsh-agent/community/subscriptions run build
 node apps/dsh-agent/scripts/provision-ecosystem.mjs --apply \
-  --data-dir "$HOME/.johnason-dsh-ecosystem-20261114" --workspace "$PWD" --port 3082
+  --data-dir "$HOME/.johnason-dsh-ecosystem-20261118" --workspace "$PWD" --port 3082
 ```
 
 省略 `--apply` 只显示计划。脚本的兼容默认值仍是旧数据根 `~/.johnason-dsh-ecosystem-20261105` 与端口 3081；升级候选必须像上例显式指定新数据根与端口 3082，保留旧配置；可用 `--data-dir`、`--workspace`、`--port`、`--ollama-model` 指定独立配置。未知的既有数据目录或用户修改过的组合配置会被保留并拒绝覆盖。
@@ -35,9 +36,9 @@ node apps/dsh-agent/scripts/provision-ecosystem.mjs --apply \
 
 ```sh
 node apps/dsh-agent/src/cli.mjs web \
-  --data-dir "$HOME/.johnason-dsh-ecosystem-20261114" \
+  --data-dir "$HOME/.johnason-dsh-ecosystem-20261118" \
   --workspace "$PWD" --local-ollama --port 3082 \
-  --patch "$HOME/.johnason-dsh-ecosystem-20261114/johnason-ecosystem.patch.json" \
+  --patch "$HOME/.johnason-dsh-ecosystem-20261118/johnason-ecosystem.patch.json" \
   --no-open
 ```
 
@@ -54,6 +55,8 @@ OAuth、刷新令牌和代理密码由 macOS Keychain 保存，不写入源码�
 
 web-all 0.4.15 的可选 Agents 面板引用新版官方已移除的内部接口，本组合显式关闭该面板。独立 dshmarket 已启用，web-all 自带的重复市场关闭。Codex/Ollama 组合同时关闭会在 Vault 解锁前读取凭据的 DeepSeek 账户登录模块及 rc.2 新增的 `ui-account-notifications`；没有削弱 Vault 锁定规则。
 
-本轮真实 Ollama 对话已返回 `OLLAMA_DSH_OK`。Codex 本轮不执行 OAuth，原有待用户授权状态不变；实际范围见 [验收记录](../testing/2026-11-14-dsh-ecosystem.md)。现有 3081 服务、历史会话、Vault 与纯色背景设置均未迁移到候选。
+本轮真实 Ollama 对话已返回 `OLLAMA_DSH_OK`。Codex 本轮不执行 OAuth，原有待用户授权状态不变；实际范围见 [验收记录](../testing/2026-11-18-dsh-ecosystem.md)。现有 3081 服务、历史会话、Vault 与纯色背景设置均未迁移到候选。
 
-rc.3 的 Cordis 根上下文通过本地 platform SDK 适配，浏览器签名记录仍仅保存在进程内存中。新版原生 `authentication-token` 保持启用；Vault、记忆及系统页面均要求浏览器认证。社区顶层版本固定，但其子包仍按上游依赖范围解析，本次部分为 0.4.18；实际安装锁文件及 peer 警告保留在验收证据中。
+rc.3 的 Cordis 根上下文通过本地 platform SDK 适配，浏览器签名记录仍仅保存在进程内存中。新版原生 `authentication-token` 保持启用；Vault、记忆及系统页面均要求浏览器认证。社区顶层版本保持不变。标准安装器在原生 Web profile 初始化后，通过该 profile 的 pnpm-workspace.yaml 顶层 overrides 固定 4 个 Web 子包为 0.4.18、marked 为 18.2.0；已有冲突配置会拒绝覆盖。这 5 项固定不等于全部传递依赖冻结，安装后仍须与上次验收锁文件逐项比较 registry 包版本及完整性摘要，通过后才启动社区组合。实际安装锁文件及 peer 警告保留在验收证据中。
+
+rc.4 的默认 bundle 已移除 `working_directory` 工具；旧 `working-directory/change` 历史不再用于恢复当前目录，官方改用 `workspace-root/change`。本轮只验证全新隔离工作区，不据此宣称旧会话迁移完成。侧车将新的 `CONTENT_REFUSED` 归类为模型服务拒绝，保留未知错误的运行时失败分类，公共事件仍不泄露模型原始错误正文。

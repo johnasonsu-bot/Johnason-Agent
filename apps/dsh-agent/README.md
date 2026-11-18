@@ -12,7 +12,7 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 ## 平台与本地插件
 
-当前锁定官方 `0.2.2-rc.3`；社区 Web UI、插件市场、Codex 订阅与 Ollama 的安装、授权及兼容范围见[DSH 插件生态接入](../../docs/architecture/dsh-ecosystem.md)。
+当前锁定官方 `0.2.2-rc.4`；社区 Web UI、插件市场、Codex 订阅与 Ollama 的安装、授权及兼容范围见[DSH 插件生态接入](../../docs/architecture/dsh-ecosystem.md)。
 
 官方模块解析、启动、profile 组合及兼容 SDK 集中在 `src/platform/`；Vault、记忆恢复、Forge/Data Platform 实现在 `src/plugins/`。原 `src` 入口继续转发，插件注册表保留公开路径，避免破坏已有 profile 的名称匹配条件。浏览器插件生成到各 profile 自己的 `node_modules`，按新版原生解析规则装载。原生包管理若把本地包改为源码链接，启动器先把该链接移入 profile 的 `.johnason-preserved-package-links` 留存，再生成私有副本；运行时补丁只写副本，不写回源码。插件生命周期目前按每进程一个活动 runner 设计。
 
@@ -32,19 +32,19 @@ Web 保留锁定版本的原生聊天、Models、skills、MCP、子代理、计�
 
 本地工具仅处理有界文本，不执行模型返回的工具或命令。单次决策加执行消耗两次推理预算；用户取消或停用插件会中止活动调用。强制记忆沙箱仍保留原有工具白名单。设计与边界见[本地模型协作说明](../../docs/architecture/2026-09-26-local-model-skill-hybrid.md)。
 
-官方 `0.2.2-rc.3` 的 DeepSeek 适配器使用 Messages 请求协议。请求扩展中的插件包清单允许仅提供 `name`：包没有可用 `version` 时省略该字段，不再因此触发 `REQUEST_EXTENSION`，也不会编造版本。本地发布包仍保留明确版本以便追溯。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方适配器和本机 Messages HTTP/SSE 服务覆盖清单及流式请求，并验证 Vault 锁定时在发送请求前拒绝读取真实凭据；不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
+官方 `0.2.2-rc.4` 的 DeepSeek 适配器使用 Messages 请求协议。请求扩展中的插件包清单允许仅提供 `name`：包没有可用 `version` 时省略该字段，不再因此触发 `REQUEST_EXTENSION`，也不会编造版本。本地发布包仍保留明确版本以便追溯。`tests/native-request-extension.test.mjs` 使用真实原生 profile、官方适配器和本机 Messages HTTP/SSE 服务覆盖清单及流式请求，并验证 Vault 锁定时在发送请求前拒绝读取真实凭据；不使用真实云凭据。更新包信息或浏览器资源后，重启同一数据根的启动器即可刷新生成的 profile 资源。
 
 ## 环境要求
 
 - 实测平台：macOS ARM64、Node.js v24.14.1；Windows/Linux 尚未实测，不承诺相同的 TTY、目录选择器和信号行为。
 - Node.js 24.9.0 或更新版本
 - Git、Corepack 可用；首次安装依赖需要网络和磁盘空间。无需旧 Python/Go 服务。
-- 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `39163dd30f703a79079e2d2446545cff3c453738`（官方 `0.2.2-rc.3`）
+- 仓库内 `third_party/deepseek-harness` 必须位于固定提交 `ca33fd6843b205e279c7ccb6cb73a472c78f5760`（官方 `0.2.2-rc.4`）
 - 构建工具固定为 `pnpm@11.28.5`，不下载 `latest`
 
 ## 原生构建
 
-2026-11-14 的升级候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展。冻结依赖安装、macOS ARM 原生模块、平台库和 Web 构筑已完成；本轮范围见[升级验收记录](../../docs/testing/2026-11-14-dsh-ecosystem.md)。兼容层已对接新版批量工具执行器、独立 SessionStore、恢复现有会话接口及可写的原生插件设置。MVP 侧车同步使用 Messages 认证与事件协议。
+2026-11-18 的升级候选保留通用系统授权、Forge、Data Platform、加密凭据及记忆/恢复扩展。冻结依赖安装、macOS ARM 原生模块、平台库和 Web 构筑已完成；本轮范围见[升级验收记录](../../docs/testing/2026-11-18-dsh-ecosystem.md)。兼容层已对接新版批量工具执行器、独立 SessionStore、恢复现有会话接口及可写的原生插件设置。MVP 侧车同步使用 Messages 认证与事件协议。
 
 本轮使用全新隔离数据根，未验收旧用户记忆日志迁移；请勿直接用候选打开原有用户数据根。此前的[隔离验收记录](../../docs/testing/2026-09-21-dsh-platform-plugin-isolation.md)和[代码合并报告](../../docs/testing/2026-09-21-dsh-upstream-code-merge.md)保留各自日期的状态。
 
@@ -55,7 +55,7 @@ git submodule update --init third_party/deepseek-harness
 node apps/dsh-agent/scripts/build.mjs
 ```
 
-以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前隔离候选位于 `codex/dsh-ecosystem-20261114` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
+以下命令假定当前目录是你的独立源码根 `<repo-root>`。带日期的[验收报告](../../docs/testing/2026-09-08-dsh-standalone-acceptance.md)记录当时的路径和版本；当前隔离候选位于 `codex/dsh-ecosystem-20261118` 分支。构建实际在 `<repo-root>/third_party/deepseek-harness` 进行，检查产物为 `apps/cli/lib/bin.js` 和 `apps/web/dist/index.html`（均相对于该子模块）。子模块若有本地改动，先保留并处理，勿强制覆盖。
 
 构建入口依次执行冻结 lockfile 安装和上游原生构建。两个步骤都显式设置 `CI=true`：上游的安装脚本会据此只跳过 Git hook 配置，避免子模块位于 linked worktree 时修改 Git 配置失败；构建前的依赖状态检查也因此使用非交互模式。依赖生命周期脚本及构建检查仍会运行。启动器不会修改子模块 Git 配置。
 
@@ -100,7 +100,7 @@ node --test apps/dsh-agent/tests/native-browser.test.mjs
 
 可从 `apps/dsh-agent` 执行 `npm run test:integration`（含真实页面刷新）或 `npm run test:browser`。已有受信任工具运行时可以用 `DSH_TEST_PLAYWRIGHT_PATH` 指向其 `playwright-core/index.mjs`，不改变正式启动依赖。浏览器回归通过原生 API准备一个不发送模型请求的空白会话，在真正页面中查看模型、执行 `page.reload()`，检查新页面客户端继续读取同一会话，模型、历史标题和 idle 状态保持；前后截图写入新临时数据根。它不替代有真实模型消息的浏览器人工验收。
 
-本轮完整启动器回归共 303 项：302 项通过、1 项跳过、0 项失败。跳过的是 `systems-native.test.mjs` 的真实 Data Platform / Forge 核心登录与 RBAC 测试；它必须显式提供 `DSH_DP_TEST_ENV`、`DSH_DP_CORE`、`FORGE_TEST_SOURCE`、`FORGE_TEST_PYTHON` 四项测试环境配置，本轮未启用，不能把该结果计作真实业务系统登录验收。随后补充的源码链接隔离修复通过全部 11 项 profile 测试；MVP 侧车全部 60 项通过。这些自动回归不表示旧版 D1–D12 人工验收全部完成。
+2026-11-18 完整启动器回归共 336 项：335 项通过、1 项跳过、0 项失败。跳过的是 `systems-native.test.mjs` 的真实 Data Platform / Forge 核心登录与 RBAC 测试；它必须显式提供 `DSH_DP_TEST_ENV`、`DSH_DP_CORE`、`FORGE_TEST_SOURCE`、`FORGE_TEST_PYTHON` 四项测试环境配置，本轮未启用，不能把该结果计作真实业务系统登录验收。社区依赖固定与冲突拒绝测试 31/31 通过；MVP 侧车全部 63 项通过。完整社区组合网页和真实 Ollama 已在独立数据根验证，详见本轮验收记录；这些自动回归不表示旧版 D1–D12 人工验收全部完成。
 
 定向集成测试在新临时目录启动真实原生 Web，检查原生首页、Vault、环境隔离及 SIGTERM 退出，不需要真实凭据，也不清理用户文件。OS 目录选择器、外部 MCP 服务和第三方账户的实际可用性仍取决于本机权限及用户配置。
 
