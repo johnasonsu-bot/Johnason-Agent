@@ -15,7 +15,7 @@ export class DshSessionFailure extends Error {
     super("DSH Session failed");
     const provider = failure && typeof failure.code === "string"
       && ["TRANSPORT", "AUTH", "RATE_LIMIT", "HTTP_ERROR", "INVALID_REQUEST",
-        "SERVER", "SERVER_ERROR", "EMPTY_RESPONSE", "MALFORMED_RESPONSE", "STREAM_CLOSED"].includes(failure.code)
+        "SERVER", "SERVER_ERROR", "EMPTY_RESPONSE", "MALFORMED_RESPONSE", "CONTENT_REFUSED", "STREAM_CLOSED"].includes(failure.code)
       || [400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504].includes(failure?.status);
     this.publicFailure = Object.freeze({
       reason_code: provider ? "provider_request_failed" : "runtime_verification_failed",

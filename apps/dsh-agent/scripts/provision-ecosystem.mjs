@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ecosystemPlan, ecosystemOverlay, runEcosystemPlan, subscriptionRuntimeDigest } from '../src/ecosystem.mjs';
+import { pinCommunityDependencies } from '../src/platform/community-dependencies.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const args = process.argv.slice(2);
@@ -54,11 +55,15 @@ try {
     if (!marker) await writeFile(markerPath, JSON.stringify({ schema: 'johnason.ecosystem.v1', createdAt: new Date().toISOString() }) + '\n', { mode: 0o600, flag: 'wx' });
     await writeFile(plan.overlayPath, overlay, { mode: 0o600 });
   }
-  const result = await runEcosystemPlan(plan, { apply, run: command => new Promise((resolveCode, reject) => {
-    const child = spawn(process.execPath, command, { cwd: repoRoot, env: process.env,
-      stdio: ['ignore', command.includes('--dump-config') ? 'ignore' : 'inherit', 'inherit'] });
-    child.once('error', reject); child.once('exit', code => resolveCode(code ?? 1));
-  }) });
+  const result = await runEcosystemPlan(plan, { apply, run: async command => {
+    const code = await new Promise((resolveCode, reject) => {
+      const child = spawn(process.execPath, command, { cwd: repoRoot, env: process.env,
+        stdio: ['ignore', command.includes('--dump-config') ? 'ignore' : 'inherit', 'inherit'] });
+      child.once('error', reject); child.once('exit', code => resolveCode(code ?? 1));
+    });
+    if (code === 0 && command === plan.commands[0]) await pinCommunityDependencies(plan.dataRoot);
+    return code;
+  } });
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
 } catch (error) {
   process.stderr.write(`${error.message}\n`);

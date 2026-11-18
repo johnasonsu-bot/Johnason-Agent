@@ -26,14 +26,33 @@ const FIXED_PLUGINS = [
   "@johnason/deepseek-harness-host-v2",
 ];
 
-test("failed Session diagnostics retain only fixed stage, reason and HTTP status", () => {
-  const error = new DshSessionFailure({code:"AUTH",status:401,message:"private-response"}, "session_execution");
-  const [event] = mapSessionEvents({run_id:"run",term_id:"term",step_id:"step"}, [
-    {seq:0,type:"turn/end",data:{reason:"failed",...error.publicFailure,detail:"private-response"}},
-  ]);
-  assert.deepEqual(event.payload,{status:"failed",reason_code:"provider_request_failed",failure_stage:"provider_request",http_status:401});
-  assert.equal(JSON.stringify(event).includes("private-response"),false);
-});
+for (const { failure, expected } of [
+  {
+    failure: { code: "AUTH", status: 401 },
+    expected: { status: "failed", reason_code: "provider_request_failed", failure_stage: "provider_request", http_status: 401 },
+  },
+  {
+    failure: { code: "CONTENT_REFUSED" },
+    expected: { status: "failed", reason_code: "provider_request_failed", failure_stage: "provider_request" },
+  },
+  {
+    failure: { code: "MALFORMED_RESPONSE" },
+    expected: { status: "failed", reason_code: "provider_request_failed", failure_stage: "provider_request" },
+  },
+  {
+    failure: { code: "UNKNOWN" },
+    expected: { status: "failed", reason_code: "runtime_verification_failed", failure_stage: "session_execution" },
+  },
+]) {
+  test(`failed Session diagnostics classify ${failure.code} and omit provider details`, () => {
+    const error = new DshSessionFailure({ ...failure, message: "private-response" }, "session_execution");
+    const [event] = mapSessionEvents({ run_id: "run", term_id: "term", step_id: "step" }, [
+      { seq: 0, type: "turn/end", data: { reason: "failed", ...error.publicFailure, detail: "private-response" } },
+    ]);
+    assert.deepEqual(event.payload, expected);
+    assert.equal(JSON.stringify(event).includes("private-response"), false);
+  });
+}
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRYPOINT = path.join(ROOT, "dist/deepseek-harness-host-v2.mjs");

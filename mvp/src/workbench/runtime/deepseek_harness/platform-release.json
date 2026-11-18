@@ -1,7 +1,7 @@
 {
   "schema": "johnason.dsh.platform.v1",
-  "revision": "39163dd30f703a79079e2d2446545cff3c453738",
-  "version": "0.2.2-rc.3",
+  "revision": "ca33fd6843b205e279c7ccb6cb73a472c78f5760",
+  "version": "0.2.2-rc.4",
   "packageManager": "pnpm@11.28.5",
   "adapterContract": 1
 }
